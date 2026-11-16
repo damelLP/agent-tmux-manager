@@ -219,11 +219,18 @@ impl OrgHandle {
         now: DateTime<Utc>,
         caller_pane: Option<String>,
     ) -> Result<Vec<Envelope>, OrgServiceError> {
-        self.execute_receipt(command, now, caller_pane)
-            .await
-            .map(|commit| commit.events)
+        tokio::time::timeout(
+            DEADLINE + Duration::from_secs(1),
+            self.execute_receipt(command, now, caller_pane),
+        )
+        .await
+        .map_err(|_| OrgServiceError::Timeout)?
+        .map(|commit| commit.events)
     }
 
+    // The retained task worker owns this wait, not its bounded RPC waiter.
+    // The actor has a bounded FIFO and five-second appends; it replies or drops
+    // the sender on failure/shutdown, so no external operation loses its bound.
     async fn execute_task(
         &self,
         command: TaskCommand,
@@ -247,10 +254,7 @@ impl OrgHandle {
             reply,
         })?;
         // The actor retains the command if this waiting future is dropped.
-        tokio::time::timeout(DEADLINE + Duration::from_secs(1), response)
-            .await
-            .map_err(|_| OrgServiceError::Timeout)?
-            .map_err(|_| self.closed_error())?
+        response.await.map_err(|_| self.closed_error())?
     }
 
     /// A read-only copy, not a safe place to decide later mutations. Submit the

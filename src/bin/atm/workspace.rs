@@ -24,7 +24,12 @@ fn run_shell_arg(path: &std::path::Path, args: &[&str]) -> String {
 /// `\`, `"` and `$` (an environment variable) need a `\`, and a newline is
 /// written `\n` because tmux drops the spaces after a raw one.
 fn run_shell_command(path: &std::path::Path, args: &[&str]) -> String {
-    let arg = run_shell_arg(path, args)
+    run_shell_command_from_arg(&run_shell_arg(path, args))
+}
+
+/// Quote a shell command for tmux without escaping its deliberate formats.
+fn run_shell_command_from_arg(arg: &str) -> String {
+    let arg = arg
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$")
@@ -272,12 +277,14 @@ where
         &script_path,
         format!(
             "#!/bin/sh\n\
-             W=$({tmux} display-message -p '#{{window_width}}')\n\
+             # Exit silently: a nonzero run-shell exit displays an error in tmux.\n\
+             [ -n \"$1\" ] || exit 0\n\
+             W=$({tmux} display-message -p -t \"$1\" '#{{window_width}}')\n\
              S=$((W * {pct} / 100))\n\
              [ $S -lt {min} ] && S={min}\n\
              [ $S -gt {max} ] && S={max}\n\
-             ORIG=$({tmux} display-message -p '#{{pane_id}}')\n\
-             PANE=$({tmux} split-window -hb -l $S -P -F '#{{pane_id}}')\n\
+             ORIG=$({tmux} display-message -p -t \"$1\" '#{{pane_id}}')\n\
+             PANE=$({tmux} split-window -hb -t \"$ORIG\" -l $S -P -F '#{{pane_id}}')\n\
              {tmux} select-pane -t \"$PANE\" -T atm-sidebar\n\
              {tmux} set-option -p -t \"$PANE\" @atm-sidebar 1\n\
              {tmux} send-keys -t \"$PANE\" \"atm --compact --tmux-session '{session}'\" Enter\n\
@@ -294,7 +301,12 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
-    let hook_cmd = run_shell_command(&script_path, &[]);
+    // run-shell expands window_id to the new window even for new-window -d
+    // (tmux 3.6a and 3.8); hook_window is empty on both versions.
+    let hook_cmd = run_shell_command_from_arg(&format!(
+        "{} '#{{window_id}}'",
+        run_shell_arg(&script_path, &[])
+    ));
     tmux_run(
         client,
         &[
@@ -718,7 +730,10 @@ mod has_session_tests {
                 super::run_shell_command(&resize, &[]),
                 super::run_shell_command(&resize, &["hook"]),
                 super::run_shell_command(&resize, &[]),
-                super::run_shell_command(&script("inject-sidebar-my.proj.sh"), &[]),
+                super::run_shell_command_from_arg(&format!(
+                    "{} '#{{window_id}}'",
+                    super::run_shell_arg(&script("inject-sidebar-my.proj.sh"), &[])
+                )),
             ]
         );
     }

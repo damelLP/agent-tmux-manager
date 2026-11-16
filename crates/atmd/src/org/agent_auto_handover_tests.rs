@@ -13,9 +13,12 @@ use atm_core::{BackgroundActivity, LifecycleContext, SessionView};
 use atm_org::auto_handover::{handover_settings, HandoverSettings};
 use atm_org::idle::HandoverReason;
 use atm_org::{DecisionCommand, DecisionKind, DecisionRequest};
+use atm_protocol::{ClientMessage, DaemonMessage};
 use chrono::{DateTime, TimeDelta, TimeZone};
-use std::collections::BTreeMap;
-use tokio::sync::watch;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{watch, RwLock};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap()
@@ -822,4 +825,246 @@ async fn a_new_turn_end_starts_the_idle_wait_again() {
     auto.rig.report("s1", LifecycleEvent::Idle).await;
     auto.asked_for(after(2 * IDLE_LIMIT + 7)).await;
     auto.quiet(&[]).await;
+}
+
+// A measured input Idle is not a completed turn. Counting it as one lets a
+// start-line-only session hand itself over again after every new session.
+async fn start_line_auto(keys: &str, harness: Harness) -> Auto {
+    let mut auto = Auto::new(keys).await;
+    if harness != Harness::Pi {
+        auto.rig.registry.remove("s1".into()).await.unwrap();
+        let mut row = SessionDomain::new("s1".into(), AgentType::GeneralPurpose, Model::Unknown);
+        row.harness = harness;
+        row.tmux_pane = Some("%1".into());
+        auto.rig.registry.register(row).await.unwrap();
+        auto.file(
+            "worker",
+            &format!(
+                "+++\nharness = '{}'\nmanager = 'lead'\n{keys}\n+++\nWork\n",
+                harness.short_tag()
+            ),
+        );
+    }
+    let line = auto.send(start_line(&id("worker"))).await;
+    auto.confirm(line, "s1", "%1").await;
+    auto
+}
+
+async fn replay_turn(auto: &Auto, frames: Vec<ClientMessage>) {
+    use crate::server::{methods::MethodRouter, ConnectionHandler};
+
+    async fn send(peer: &mut BufReader<tokio::io::DuplexStream>, frame: ClientMessage) {
+        let line = serde_json::to_string(&frame).unwrap() + "\n";
+        peer.get_mut().write_all(line.as_bytes()).await.unwrap();
+    }
+    async fn receive(peer: &mut BufReader<tokio::io::DuplexStream>) -> DaemonMessage {
+        let mut line = String::new();
+        assert_ne!(peer.read_line(&mut line).await.unwrap(), 0);
+        serde_json::from_str(&line).unwrap()
+    }
+
+    tokio::time::timeout(GUARD, async {
+        let (ours, peer) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(ours);
+        let cancel = auto.rig.cancel.child_token();
+        let handler = ConnectionHandler::new(
+            read,
+            write,
+            auto.rig.registry.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            1,
+            cancel.clone(),
+            Arc::new(MethodRouter::default()),
+        );
+        let task = tokio::spawn(handler.run());
+        let mut peer = BufReader::new(peer);
+        send(&mut peer, ClientMessage::connect(None)).await;
+        assert!(matches!(
+            receive(&mut peer).await,
+            DaemonMessage::Connected { .. }
+        ));
+        for frame in frames {
+            send(&mut peer, frame).await;
+            // The same-stream response fences application, including derived
+            // registry entries. No socket polling or readiness delay.
+            send(&mut peer, ClientMessage::list_sessions()).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::SessionList { .. }
+            ));
+        }
+        assert_eq!(
+            auto.rig
+                .registry
+                .get_session("s1".into())
+                .await
+                .unwrap()
+                .status,
+            SessionStatus::Idle
+        );
+        cancel.cancel();
+        task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+fn pi_turn_frames(share: u64) -> Vec<ClientMessage> {
+    // Captured: pi 1.5.2, 2026-11-16, sealed PTY/private-atmd recording proxy.
+    // These historical frames include the reverted forwarder's idle snapshot;
+    // already installed snapshot-sending forwarders must also remain safe.
+    let frames: Vec<Value> =
+        include_str!("../../../atm-pi-adapter/tests/fixtures/pi_turn_frames_1.5.2.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|frame| frame["run"] == "input2-skill-only" && frame["case"] == "skill")
+            .map(|frame| frame["data"].clone())
+            .collect();
+    let names: Vec<_> = frames
+        .iter()
+        .map(|data| data["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "input",
+            "agent_start",
+            "context",
+            "turn_end",
+            "agent_settled"
+        ]
+    );
+    assert_eq!(frames.first().unwrap()["payload"]["idle"], true);
+    frames
+        .into_iter()
+        .map(|mut data| {
+            // Synthetic: bind the real sequence to this seat and context line.
+            data["session_id"] = json!("s1");
+            data["tmux_pane"] = json!("%1");
+            data.as_object_mut().unwrap().remove("pid");
+            if data["event"] == "context" || data["event"] == "turn_end" {
+                data["usage"]["contextTokens"] = json!(share * 1_000);
+                data["model"]["contextWindow"] = json!(1_000_000);
+            }
+            ClientMessage::pi_event(data)
+        })
+        .collect()
+}
+
+fn text_only_frames(harness: Harness) -> Vec<ClientMessage> {
+    // Captured: Claude Code 2.1.325 and Codex 0.163.0, dates/methods in the
+    // respective adapter crate docs. Synthetic: prompt/Stop-only projection,
+    // seat attribution, and omission of transcript/cwd paths; no tool or
+    // independent WorkingStart is supplied to make the watcher count a turn.
+    let (text, session) = match harness {
+        Harness::ClaudeCode => (
+            include_str!(
+                "../../../atm-claude-adapter/tests/fixtures/claude_turn_boundaries_2.1.325.jsonl"
+            ),
+            "blocked-session",
+        ),
+        Harness::Codex => (
+            include_str!(
+                "../../../atm-codex-adapter/tests/fixtures/codex_tui_session_0.163.0.jsonl"
+            ),
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+        ),
+        _ => panic!("text-only control needs Claude or Codex"),
+    };
+    let frames: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|data| {
+            data["session_id"] == session
+                && (data["hook_event_name"] == "UserPromptSubmit"
+                    || (data["hook_event_name"] == "Stop" && data["stop_hook_active"] == false))
+        })
+        .collect();
+    let names: Vec<_> = frames
+        .iter()
+        .map(|data| data["hook_event_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["UserPromptSubmit", "Stop"]);
+    frames
+        .into_iter()
+        .map(|mut data| {
+            data["session_id"] = json!("s1");
+            data["tmux_pane"] = json!("%1");
+            for field in ["pid", "cwd", "transcript_path"] {
+                data.as_object_mut().unwrap().remove(field);
+            }
+            match harness {
+                Harness::ClaudeCode => ClientMessage::hook_event(data),
+                Harness::Codex => ClientMessage::codex_event(data),
+                _ => panic!("text-only control needs Claude or Codex"),
+            }
+        })
+        .collect()
+}
+
+async fn only_start_line_is_not_idle_work(auto: &mut Auto) {
+    auto.caught_up().await;
+    auto.set(after(IDLE_LIMIT));
+    auto.caught_up().await;
+    let asks: Vec<_> = std::iter::from_fn(|| auto.asked.try_recv().ok()).collect();
+    assert!(
+        !asks.contains(&after(EXPIRY)),
+        "unexpected handover deadline: {asks:?}"
+    );
+    auto.quiet(&DELIVERY).await;
+}
+
+async fn next_turn_enables_idle_handover(auto: &mut Auto, frames: Vec<ClientMessage>) {
+    auto.set(after(IDLE_LIMIT + 1));
+    replay_turn(auto, frames).await;
+    auto.caught_up().await;
+    auto.set(after(2 * IDLE_LIMIT + 1));
+    auto.asked_for(after(IDLE_LIMIT + EXPIRY + 1)).await;
+    auto.save_requested("worker", &[]).await;
+}
+
+#[tokio::test]
+async fn pi_start_line_context_is_excluded() {
+    let mut auto = start_line_auto(ON, Harness::Pi).await;
+    replay_turn(&auto, pi_turn_frames(630)).await;
+    let (to, body) = auto.message(&DELIVERY).await;
+    assert_eq!(to, "p/lead");
+    assert!(body.contains("started above its line"), "{body}");
+    auto.quiet(&[]).await;
+    // Once excluded at its line, later real work must not enable either rule.
+    replay_turn(&auto, pi_turn_frames(650)).await;
+    auto.set(after(IDLE_LIMIT));
+    auto.quiet(&[]).await;
+}
+
+#[tokio::test]
+async fn pi_start_line_idle_is_not_work() {
+    let mut auto = start_line_auto(IDLE, Harness::Pi).await;
+    replay_turn(&auto, pi_turn_frames(100)).await;
+    only_start_line_is_not_idle_work(&mut auto).await;
+    next_turn_enables_idle_handover(&mut auto, pi_turn_frames(100)).await;
+}
+
+#[tokio::test]
+async fn text_only_start_line_context_is_excluded() {
+    for harness in [Harness::ClaudeCode, Harness::Codex] {
+        let mut auto = start_line_auto(ON, harness).await;
+        auto.rig.share("s1", 630).await;
+        replay_turn(&auto, text_only_frames(harness)).await;
+        let (to, body) = auto.message(&DELIVERY).await;
+        assert_eq!(to, "p/lead");
+        assert!(body.contains("started above its line"), "{body}");
+        auto.quiet(&[]).await;
+    }
+}
+
+#[tokio::test]
+async fn text_only_start_line_idle_is_not_work() {
+    for harness in [Harness::ClaudeCode, Harness::Codex] {
+        let mut auto = start_line_auto(IDLE, harness).await;
+        auto.rig.share("s1", 100).await;
+        replay_turn(&auto, text_only_frames(harness)).await;
+        only_start_line_is_not_idle_work(&mut auto).await;
+        next_turn_enables_idle_handover(&mut auto, text_only_frames(harness)).await;
+    }
 }

@@ -5,6 +5,7 @@ Cargo supplies the binaries. Every wait is on a condition: a process, a socket, 
 Nothing here may reach the default socket or an installed pair: see Rig.setUp.
 """
 import contextlib
+import ctypes
 import hashlib
 import io
 import json
@@ -12,7 +13,9 @@ import os
 from pathlib import Path
 import pty
 import re
+import select
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -86,6 +89,11 @@ class Rig(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Detached tmux/daemon children must return to this test process, not PID 1.
+        # Linux PR_SET_CHILD_SUBREAPER: ownership survives both forks and parent exits.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
         # One copy of the Cargo-built pair per class; tests link to it. `new` is the same
         # build with another mode, as the promotion kit's real-setup tests have it. The
         # copies are stripped where strip exists: every run copies and hashes them often.
@@ -289,6 +297,22 @@ class Rig(unittest.TestCase):
                                           kind=kind, body=body), separators=(',', ':')) + '\n')
                 seq += 1
 
+    def reap_children(self):
+        """Stop and reap our descendants, including an autostart still forking at teardown."""
+        while children := self.children(os.getpid()):
+            for pid in children:
+                # An unreaped child cannot have a reused PID. Killing its parent may
+                # adopt more descendants; the next pass collects those after this exit.
+                fd = os.pidfd_open(pid)
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    self.assertTrue(select.select([fd], [], [], 30)[0], f'child {pid} did not exit')
+                    os.waitpid(pid, 0)
+                finally:
+                    os.close(fd)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(-1, os.WNOHANG)
+
     def stop_everything(self):
         """Only what this test owns, each by an identity read first; the tmux server goes
         even when the daemon's part fails."""
@@ -304,11 +328,16 @@ class Rig(unittest.TestCase):
                 else:
                     foreign = pid
         finally:
-            if self.server:
-                now = self.command(['tmux', '-S', self.server[0], 'display-message', '-p', '#{socket_path} #{pid}'],
-                                   env=self.pane_env)
-                if now.returncode == 0 and now.stdout.split() == self.server:
-                    self.command(['tmux', '-S', self.server[0], 'kill-server'], env=self.pane_env)
+            try:
+                if self.server:
+                    now = self.command(['tmux', '-S', self.server[0], 'display-message', '-p', '#{socket_path} #{pid}'],
+                                       env=self.pane_env)
+                    if now.returncode == 0 and now.stdout.split() == self.server:
+                        self.command(['tmux', '-S', self.server[0], 'kill-server'], env=self.pane_env)
+            finally:
+                # A restored sidebar can autostart atmd after the stop above. A tmux
+                # kill-server reply (or a missing socket) does not mean its children exited.
+                self.reap_children()
         self.assertIsNone(foreign, 'the pid file names a process that is not this test\'s daemon')
         self.assertFalse(atm_rollout.listening(self.socket), 'a daemon outlived its test')
 
@@ -1283,6 +1312,64 @@ if sys.argv[1:] == ['setup']:
                       'untouched, and not visible to it.', out)
         self.assertIn('Checks passed: identity, list, status, send.', out)
         self.assert_running(old)
+
+
+class CleanupContracts(unittest.TestCase):
+    def test_cleanup_reaps_detached_writers_before_removing_the_runtime(self):
+        class LateWriter(Rig):
+            def runTest(self):
+                # Like tmux/atmd, this launcher exits while its descendants keep running.
+                code = '''
+import os, sys
+from pathlib import Path
+if os.fork():
+    sys.exit(0)
+if os.fork():
+    os.read(0, 1)
+else:
+    print(os.getpid(), flush=True)
+    os.read(0, 1)
+    Path(sys.argv[1], 'late-write').write_text('after the directory scan')
+'''
+                self.writer = subprocess.Popen([sys.executable, '-c', code, str(self.root)], env=self.env,
+                                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                self.assertTrue(select.select([self.writer.stdout], [], [], 30)[0], 'writer never started')
+                self.writer_fd = os.pidfd_open(int(self.writer.stdout.readline()))
+                self.assertEqual(self.writer.wait(timeout=30), 0)
+
+        case, result = LateWriter(), unittest.TestResult()
+        case.setUpClass()
+        rmdir = os.rmdir
+
+        def remove(path, *args, **kwargs):
+            if Path(path) == case.root and hasattr(case, 'writer_fd'):
+                # Force a write after rmtree's scan but before its final rmdir. Cleanup
+                # must already have reaped the writer, even though its stdin is held open.
+                try:
+                    os.write(case.writer.stdin.fileno(), b'gg')
+                except BrokenPipeError:
+                    pass
+                self.assertTrue(select.select([case.writer_fd], [], [], 30)[0], 'writer did not exit')
+            return rmdir(path, *args, **kwargs)
+
+        try:
+            with patch.object(os, 'rmdir', remove):
+                case.run(result)
+            self.assertEqual(result.errors, [], 'a detached writer raced TemporaryDirectory.cleanup')
+            self.assertEqual(result.failures, [])
+            self.assertFalse(case.root.exists())
+            self.assertEqual(case.children(os.getpid()), [], 'cleanup left unreaped children')
+        finally:
+            if hasattr(case, 'writer'):
+                case.writer.stdin.close()
+                case.writer.stdout.close()
+                case.writer.wait(timeout=30)
+            if hasattr(case, 'writer_fd'):
+                self.assertTrue(select.select([case.writer_fd], [], [], 30)[0])
+                os.close(case.writer_fd)
+            if hasattr(case, 'root') and case.root.exists():
+                shutil.rmtree(case.root)  # Red-run fallback: only this fixture's runtime.
+            case.doClassCleanups()
 
 
 if __name__ == '__main__':

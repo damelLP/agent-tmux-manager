@@ -1,0 +1,163 @@
+{"case": "startup", "event": "session_start", "payload": {"type": "session_start", "reason": "startup"}, "session_id": "session-1", "idle": true, "run": "main"}
+{"case": "startup", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "normal", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "normal"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "normal", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "normal"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "normal", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "normal", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "normal", "event": "context", "payload": {"type": "context"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "normal", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "normal", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "normal", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "normal", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "continuation", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "continue-once"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "continuation", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "continue-once"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "context", "payload": {"type": "context"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "context", "payload": {"type": "context"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "continuation", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "handled", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "handled"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "skill", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "/skill:local-skill"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "skill", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "<skill name=\"local-skill\" location=\"/sealed-run/skill/local-skill/SKILL.md\">\nReferences are relative to /sealed-run/skill/local-skill.\n\nReturn a local reply.\n</skill>"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "skill", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "skill", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "skill", "event": "context", "payload": {"type": "context"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "skill", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "skill", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "skill", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "skill", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "escape", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "abort-local"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "escape", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "abort-local"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "escape", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "escape", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "escape", "event": "context", "payload": {"type": "context"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "escape", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "aborted", "continue": false, "stopReason": "aborted"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "escape", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "escape", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": true}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "compact-success", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "manual", "willRetry": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-success", "event": "session_compact", "payload": {"type": "session_compact", "reason": "manual", "willRetry": false, "fromExtension": true}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "seed-before-cancel"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "seed-before-cancel"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "context", "payload": {"type": "context"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "manual", "willRetry": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-cancel", "event": "session_compact_failed", "payload": {"type": "session_compact_failed", "reason": "manual", "willRetry": false, "aborted": true, "fromExtension": false}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "compact-error", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "manual", "willRetry": false}, "session_id": "session-1", "idle": false, "pending": false, "run": "main"}
+{"case": "compact-error", "event": "session_compact_failed", "payload": {"type": "session_compact_failed", "reason": "manual", "willRetry": false, "aborted": false, "fromExtension": false, "errorMessage": "Compaction failed: Summarization failed: Error: local compaction failure"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "new", "event": "session_before_switch", "payload": {"type": "session_before_switch", "reason": "new"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "new", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "new"}, "session_id": "session-1", "idle": true, "pending": false, "run": "main"}
+{"case": "new", "event": "session_start", "payload": {"type": "session_start", "reason": "new"}, "session_id": "session-2", "idle": true, "run": "main"}
+{"case": "new", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-2", "idle": true, "pending": false, "run": "main"}
+{"case": "reload", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "reload"}, "session_id": "session-2", "idle": true, "pending": false, "run": "main"}
+{"case": "reload", "event": "session_start", "payload": {"type": "session_start", "reason": "reload"}, "session_id": "session-2", "idle": true, "run": "main"}
+{"case": "reload", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "reload"}, "session_id": "session-2", "idle": true, "pending": false, "run": "main"}
+{"case": "quit", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "quit"}, "session_id": "session-2", "idle": true, "pending": false, "run": "main"}
+{"case": "startup", "event": "session_start", "payload": {"type": "session_start", "reason": "startup"}, "session_id": "session-3", "idle": true, "run": "auto"}
+{"case": "startup", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-3", "idle": true, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "local-threshold"}, "session_id": "session-3", "idle": true, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "local-threshold"}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "context", "payload": {"type": "context"}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "threshold", "willRetry": false}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "session_compact", "payload": {"type": "session_compact", "reason": "threshold", "willRetry": false, "fromExtension": true}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-3", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-success", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-3", "idle": true, "pending": false, "run": "auto"}
+{"case": "new", "event": "session_before_switch", "payload": {"type": "session_before_switch", "reason": "new"}, "session_id": "session-3", "idle": true, "pending": false, "run": "auto"}
+{"case": "new", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "new"}, "session_id": "session-3", "idle": true, "pending": false, "run": "auto"}
+{"case": "new", "event": "session_start", "payload": {"type": "session_start", "reason": "new"}, "session_id": "session-4", "idle": true, "run": "auto"}
+{"case": "new", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-4", "idle": true, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "local-threshold-cancel"}, "session_id": "session-4", "idle": true, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "local-threshold-cancel"}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "context", "payload": {"type": "context"}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "threshold", "willRetry": false}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "session_compact_failed", "payload": {"type": "session_compact_failed", "reason": "threshold", "willRetry": false, "aborted": true, "fromExtension": false}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-4", "idle": false, "pending": false, "run": "auto"}
+{"case": "threshold-cancel", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-4", "idle": true, "pending": false, "run": "auto"}
+{"case": "new", "event": "session_before_switch", "payload": {"type": "session_before_switch", "reason": "new"}, "session_id": "session-4", "idle": true, "pending": false, "run": "auto"}
+{"case": "new", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "new"}, "session_id": "session-4", "idle": true, "pending": false, "run": "auto"}
+{"case": "new", "event": "session_start", "payload": {"type": "session_start", "reason": "new"}, "session_id": "session-5", "idle": true, "run": "auto"}
+{"case": "new", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-5", "idle": true, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "local-seed"}, "session_id": "session-5", "idle": true, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "local-seed"}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "context", "payload": {"type": "context"}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-5", "idle": true, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "manual", "willRetry": false}, "session_id": "session-5", "idle": false, "pending": false, "run": "auto"}
+{"case": "manual-escape", "event": "session_compact_failed", "payload": {"type": "session_compact_failed", "reason": "manual", "willRetry": false, "aborted": true, "fromExtension": true}, "session_id": "session-5", "idle": true, "pending": false, "run": "auto"}
+{"case": "quit", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "quit"}, "session_id": "session-5", "idle": true, "pending": false, "run": "auto"}
+{"case": "startup", "event": "session_start", "payload": {"type": "session_start", "reason": "startup"}, "session_id": "session-6", "idle": true, "run": "overflow"}
+{"case": "startup", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-6", "idle": true, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "local-overflow"}, "session_id": "session-6", "idle": true, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "local-overflow"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "context", "payload": {"type": "context"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "error", "continue": false, "stopReason": "error"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "overflow", "willRetry": true}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "session_compact", "payload": {"type": "session_compact", "reason": "overflow", "willRetry": true, "fromExtension": true}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "context", "payload": {"type": "context"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-6", "idle": false, "pending": false, "run": "overflow"}
+{"case": "overflow-retry", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-6", "idle": true, "pending": false, "run": "overflow"}
+{"case": "quit", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "quit"}, "session_id": "session-6", "idle": true, "pending": false, "run": "overflow"}
+{"case": "startup", "event": "session_start", "payload": {"type": "session_start", "reason": "startup"}, "session_id": "session-7", "idle": true, "run": "busy-input"}
+{"case": "startup", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-7", "idle": true, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "hold-local"}, "session_id": "session-7", "idle": true, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "before_agent_start", "payload": {"type": "before_agent_start", "prompt": "hold-local"}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "agent_start", "payload": {"type": "agent_start"}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "turn_start", "payload": {"type": "turn_start"}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "context", "payload": {"type": "context"}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "input", "payload": {"type": "input", "source": "interactive", "streamingBehavior": "steer", "text": "handled"}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "agent_end", "payload": {"type": "agent_end"}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "agent_before_settle", "payload": {"type": "agent_before_settle", "outcome": "completed", "continue": false}, "session_id": "session-7", "idle": false, "pending": false, "run": "busy-input"}
+{"case": "busy-handled", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "session_id": "session-7", "idle": true, "pending": false, "run": "busy-input"}
+{"case": "quit", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "quit"}, "session_id": "session-7", "idle": true, "pending": false, "run": "busy-input"}
+{"case": "startup", "event": "session_start", "payload": {"type": "session_start", "reason": "startup"}, "session_id": "session-8", "idle": true, "run": "handled-first"}
+{"case": "startup", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-8", "idle": true, "pending": false, "run": "handled-first"}
+{"case": "handler-before-atm", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "handled"}, "session_id": "session-8", "idle": true, "pending": false, "run": "handled-first"}
+{"case": "quit", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "quit"}, "session_id": "session-8", "idle": true, "pending": false, "run": "handled-first"}
+{"case": "startup", "event": "session_start", "payload": {"type": "session_start", "reason": "startup"}, "session_id": "session-9", "idle": true, "run": "dialog"}
+{"case": "startup", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-9", "idle": true, "pending": false, "run": "dialog"}
+{"case": "idle-dialog", "event": "ui_prompt_start", "payload": {"type": "ui_prompt_start", "reason": "ui_prompt"}, "session_id": "session-9", "idle": true, "pending": false, "run": "dialog"}
+{"case": "idle-dialog", "event": "ui_prompt_end", "payload": {"type": "ui_prompt_end", "reason": "ui_prompt"}, "session_id": "session-9", "idle": true, "pending": false, "run": "dialog"}
+{"case": "quit", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "quit"}, "session_id": "session-9", "idle": true, "pending": false, "run": "dialog"}
+{"case": "startup", "event": "session_start", "payload": {"type": "session_start", "reason": "startup"}, "session_id": "session-10", "idle": true, "run": "reconnect"}
+{"case": "startup", "event": "resources_discover", "payload": {"type": "resources_discover", "reason": "startup"}, "session_id": "session-10", "idle": true, "pending": false, "run": "reconnect"}
+{"case": "rebind-input", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "handled"}, "session_id": "session-10", "idle": true, "pending": false, "run": "reconnect"}
+{"case": "quit", "event": "session_shutdown", "payload": {"type": "session_shutdown", "reason": "quit"}, "session_id": "session-10", "idle": true, "pending": false, "run": "reconnect"}
+{"case": "queued-failure", "event": "session_before_compact", "payload": {"type": "session_before_compact", "reason": "manual", "willRetry": false}, "idle": false, "pending": false, "session_id": "session-11", "run": "late-failure"}
+{"case": "queued-failure", "event": "input", "payload": {"type": "input", "source": "interactive", "text": "queued-held-turn"}, "idle": true, "pending": false, "session_id": "session-11", "run": "late-failure"}
+{"case": "queued-failure", "event": "agent_start", "payload": {"type": "agent_start"}, "idle": false, "pending": false, "session_id": "session-11", "run": "late-failure"}
+{"case": "queued-failure", "event": "context", "payload": {"type": "context"}, "idle": false, "pending": false, "session_id": "session-11", "run": "late-failure"}
+{"case": "queued-failure", "event": "session_compact_failed", "payload": {"type": "session_compact_failed", "reason": "manual", "willRetry": false, "aborted": true, "fromExtension": false}, "idle": false, "pending": false, "session_id": "session-11", "run": "late-failure", "stage": "after-earlier-async-handler"}
+{"case": "queued-failure", "event": "turn_end", "payload": {"type": "turn_end", "outcome": "completed", "continue": false, "stopReason": "stop"}, "idle": false, "pending": false, "session_id": "session-11", "run": "late-failure"}
+{"case": "queued-failure", "event": "agent_settled", "payload": {"type": "agent_settled", "aborted": false}, "idle": true, "pending": false, "session_id": "session-11", "run": "late-failure"}

@@ -273,6 +273,21 @@ valid startup region never excuses an unexplained rule. Plain retains its
 legacy startup-only exception: it cannot supply that attribute proof. Other
 historical full-width rules remain ambiguous and conservatively refuse.
 
+Styled also refuses a same-width Working border anywhere above the chosen editor
+top. Otherwise a running turn's queued draft ending in a pane-wide rule and a
+cursor row can look idle and Empty, or falsely match only a message appended on
+that cursor row. `tests/queued_draft_rule.rs` reuses the real P1 held-Working and
+`clear_post_turn_pi_1.5.0.txt` captures for Synthetic probes, including the
+update-notice case. These are parser probes, not evidence that pi's live editor
+can render a pane-wide draft rule. No new model turn was run.
+
+Border faintness is not a reliable alternative: the P1 upper borders are SGR 2,
+but real clear/startup frames at pi 1.5.0 and 1.5.2 use colored, nonfaint borders
+(SGR 38;5;4 and built-in dark/light RGB colors). Requiring faint leading glyphs
+rejects those real editors. Plain observation retains its legacy behavior and
+cannot disambiguate the notice-free queued-rule case; production requests Styled
+and staged matching never accepts Plain.
+
 No RPC method is added. Captured success and synthetic refusal tests cover
 parser conformance; static clear/launch policy has exact-value tests.
 

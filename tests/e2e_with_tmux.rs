@@ -48,9 +48,10 @@
 //!
 //! 5. **`atm workspace create` / `atm workspace attach`**: verifies both
 //!    workspace flows install the resize and new-window hooks. The create
-//!    scenario also opens a new tmux window and asserts the hook injects a
-//!    sidebar there; the attach scenario starts from a multi-window session
-//!    and asserts every window gets exactly one sidebar, including on a
+//!    scenario opens detached and selected windows and checks the hook puts a
+//!    sidebar only in each new window, sizes it there and restores its original
+//!    pane without switching the client's window; attach starts from a
+//!    multi-window session and asserts every window gets exactly one sidebar, including on a
 //!    second idempotency run. Both keep their scripts in a data dir whose
 //!    path has a space, quotes, `$` and `#`, so every hook, prefix-R and
 //!    attach's own resize run must quote it. A no-name attach that
@@ -2151,6 +2152,120 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         "prefix-a ({prefix_a_cmd}) should focus the sidebar after it left index 0"
     );
 
+    // A detached window must not inject another sidebar beside the client's
+    // current pane. Different widths also catch an untargeted width query.
+    let current_window = read_sidebar("#{window_id}");
+    tmux_stdout(
+        create_tmux.label(),
+        &[
+            "set-option",
+            "-t",
+            &create_session_name,
+            "default-size",
+            "200x40",
+        ],
+    );
+    tmux_stdout(
+        create_tmux.label(),
+        &["resize-window", "-t", &current_window, "-x", "80"],
+    );
+    assert_eq!(read_sidebar("#{window_width}"), "80");
+    let current_panes = tmux_stdout(
+        create_tmux.label(),
+        &[
+            "list-panes",
+            "-t",
+            &current_window,
+            "-F",
+            "#{pane_id}:#{@atm-sidebar}",
+        ],
+    );
+    let mut client = ControlClient::attach(create_tmux.label(), &create_session_name);
+    let created = tmux_stdout(
+        create_tmux.label(),
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            &create_session_name,
+            "-P",
+            "-F",
+            "#{window_id}|#{pane_id}",
+        ],
+    );
+    let (new_window, original_pane) = created
+        .trim()
+        .split_once('|')
+        .expect("new window and pane IDs");
+    assert_ne!(new_window, current_window);
+    // Non-background run-shell completion is the barrier, as above; no
+    // readiness polling can hide a sidebar injected into the wrong window.
+    assert_eq!(
+        tmux_stdout(
+            create_tmux.label(),
+            &[
+                "list-panes",
+                "-t",
+                &current_window,
+                "-F",
+                "#{pane_id}:#{@atm-sidebar}"
+            ],
+        ),
+        current_panes,
+        "detached new-window must leave the client's current window untouched"
+    );
+    let new_panes =
+        list_panes_with_sidebar_marker(create_tmux.label()).expect("list detached panes");
+    let new_sidebars: Vec<_> = new_panes
+        .iter()
+        .filter(|pane| pane.window_id == new_window && pane.is_sidebar)
+        .collect();
+    assert_eq!(
+        new_sidebars.len(),
+        1,
+        "one sidebar in the detached window: {new_panes:?}"
+    );
+    assert_eq!(
+        tmux_stdout(
+            create_tmux.label(),
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &new_sidebars[0].pane_id,
+                "#{window_width}:#{pane_width}"
+            ],
+        )
+        .trim(),
+        "200:32",
+        "sidebar width must be calculated from the new window, not the current 80-column window"
+    );
+    assert_eq!(
+        tmux_stdout(
+            create_tmux.label(),
+            &["display-message", "-p", "-t", new_window, "#{pane_id}"],
+        )
+        .trim(),
+        original_pane,
+        "restore the detached window's original pane, not a pane from the current window"
+    );
+    client
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"display-message -p 'client-window=#{window_id}'\n")
+        .unwrap();
+    assert_eq!(
+        client
+            .until(|line| line.starts_with("client-window="))
+            .expect("client window reply")
+            .trim(),
+        format!("client-window={current_window}"),
+        "creating a detached window must not switch the attached client's window"
+    );
+    drop(client);
+
     let mut cmd = Command::new("tmux");
     cmd.args([
         "-L",
@@ -2173,8 +2288,45 @@ async fn scenario_workspace_create(env: &E2eEnv) {
         }
     }
     assert!(
-        windows_with_sidebar.len() == 2 && windows_with_sidebar.values().all(|count| *count == 1),
+        windows_with_sidebar.len() == 3 && windows_with_sidebar.values().all(|count| *count == 1),
         "new window should receive exactly one sidebar via after-new-window hook; panes: {panes:?}"
+    );
+
+    // An older hook line or a hand-run script may omit the window argument.
+    // Keep a client attached so an empty target would resolve to its window.
+    let _client = ControlClient::attach(create_tmux.label(), &create_session_name);
+    let script = create_data_dir
+        .path()
+        .join("atm")
+        .join(format!("inject-sidebar-{create_session_name}.sh"));
+    let pane_set = || {
+        tmux_stdout(
+            create_tmux.label(),
+            &[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{window_id}:#{pane_id}:#{@atm-sidebar}:#{pane_width}:#{pane_active}",
+            ],
+        )
+    };
+    let mut changes = Vec::new();
+    for args in [&[][..], &[""][..]] {
+        let before = pane_set();
+        // Process completion is the barrier for all script tmux commands.
+        let output = command_output(Command::new(&script).args(args));
+        assert!(
+            output.status.success() && output.stdout.is_empty() && output.stderr.is_empty(),
+            "a missing window must exit successfully and silently: {args:?}: {output:?}"
+        );
+        let after = pane_set();
+        if after != before {
+            changes.push(format!("{args:?}: {before:?} -> {after:?}"));
+        }
+    }
+    assert!(
+        changes.is_empty(),
+        "sidebar script without a window must leave every window unchanged: {changes:?}"
     );
 }
 
@@ -3511,6 +3663,34 @@ struct ControlClient {
 }
 
 impl ControlClient {
+    fn attach(socket_label: &str, session: &str) -> Self {
+        let deadline = Instant::now() + HANG_GUARD;
+        let (reader, writer) = UnixStream::pair().expect("control output socketpair");
+        let child = Command::new("tmux")
+            .args([
+                "-L",
+                socket_label,
+                "-C",
+                "attach-session",
+                "-t",
+                &format!("={session}:"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("attach a control client");
+        let mut client = Self {
+            child,
+            reader: BufReader::new(reader),
+            deadline,
+        };
+        client
+            .until(|line| line.starts_with("%session-changed "))
+            .expect("control client attached before guard");
+        client
+    }
+
     fn until(&mut self, done: impl Fn(&str) -> bool) -> io::Result<String> {
         loop {
             let line = read_frame(&mut self.reader, self.deadline)?;
@@ -3541,30 +3721,7 @@ impl Drop for ControlClient {
 /// line instead would re-parse tmux's printed form, and tmux 3.4 prints a
 /// `$` in it as `\\$`.
 async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + HANG_GUARD;
-    let (reader, writer) = UnixStream::pair().expect("control output socketpair");
-    let child = Command::new("tmux")
-        .args([
-            "-L",
-            socket_label,
-            "-C",
-            "attach-session",
-            "-t",
-            &format!("={session}:"),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(OwnedFd::from(writer)))
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("attach a control client");
-    let mut client = ControlClient {
-        child,
-        reader: BufReader::new(reader),
-        deadline,
-    };
-    client
-        .until(|line| line.starts_with("%session-changed "))
-        .expect("control client attached before guard");
+    let mut client = ControlClient::attach(socket_label, session);
     // Query through the attached client, not list-clients polling from outside.
     client
         .child

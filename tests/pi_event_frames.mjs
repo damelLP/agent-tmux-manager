@@ -83,7 +83,7 @@ for (const source of sources) {
 		// Synthetic: conversation bodies larger than the daemon limit. These
 		// must never displace the usage snapshot or prevent the terminal frame.
 		const message = Object.freeze({ role: "assistant", content: Object.freeze([{ type: "text", text: "x".repeat(1_100_000) }]) });
-		for (const name of ["context", "turn_end", "agent_end"]) {
+		for (const name of ["context", "turn_end", "agent_settled"]) {
 			await t.test(`${name} omits its conversation body`, async () => {
 				const payload = Object.freeze(name === "turn_end"
 					? { type: name, turnIndex: 0, message, toolResults: [] }
@@ -92,7 +92,7 @@ for (const source of sources) {
 				assert.ok(bytes <= maxFrameBytes, `${name} frame exceeds atmd's line limit`);
 				assert.equal(Object.getPrototypeOf(data.payload), Object.prototype);
 				assert.deepEqual(Object.keys(data.payload), [], `${name} must not forward conversation content`);
-				assert.deepEqual(data.usage, name === "agent_end" ? undefined : { cost: 0.75, tokens: 110, contextTokens: 4567 });
+				assert.deepEqual(data.usage, name === "agent_settled" ? undefined : { cost: 0.75, tokens: 110, contextTokens: 4567 });
 				assert.equal(message.content[0].text.length, 1_100_000, "pi's message was mutated");
 			});
 		}

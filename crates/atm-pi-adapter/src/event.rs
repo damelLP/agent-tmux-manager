@@ -7,8 +7,10 @@
 //!
 //! Captured: pi 0.73.1, 2026-10-24, the `on(event: ...)` names in that
 //! file. It declares 29 events, `tool_call` and `tool_result` included.
-//! All but `thinking_level_select` are variants here; that one lands
-//! in `Other`, and pi-atm doesn't forward it.
+//! All but `thinking_level_select` were variants here; that one lands
+//! in `Other`, and pi-atm doesn't forward it. Final settlement and
+//! compaction failure were added from the pi 1.5.2 captures documented
+//! in the crate docs.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -29,6 +31,7 @@ pub enum PiEventType {
     SessionBeforeFork,
     SessionBeforeCompact,
     SessionCompact,
+    SessionCompactFailed,
     SessionShutdown,
     SessionBeforeTree,
     SessionTree,
@@ -45,6 +48,7 @@ pub enum PiEventType {
     BeforeAgentStart,
     AgentStart,
     AgentEnd,
+    AgentSettled,
     TurnStart,
     TurnEnd,
     MessageStart,
@@ -98,6 +102,7 @@ impl PiEventType {
             Self::SessionBeforeFork => "session_before_fork",
             Self::SessionBeforeCompact => "session_before_compact",
             Self::SessionCompact => "session_compact",
+            Self::SessionCompactFailed => "session_compact_failed",
             Self::SessionShutdown => "session_shutdown",
             Self::SessionBeforeTree => "session_before_tree",
             Self::SessionTree => "session_tree",
@@ -108,6 +113,7 @@ impl PiEventType {
             Self::BeforeAgentStart => "before_agent_start",
             Self::AgentStart => "agent_start",
             Self::AgentEnd => "agent_end",
+            Self::AgentSettled => "agent_settled",
             Self::TurnStart => "turn_start",
             Self::TurnEnd => "turn_end",
             Self::MessageStart => "message_start",
@@ -144,6 +150,7 @@ impl PiEventType {
             "session_before_fork" => Self::SessionBeforeFork,
             "session_before_compact" => Self::SessionBeforeCompact,
             "session_compact" => Self::SessionCompact,
+            "session_compact_failed" => Self::SessionCompactFailed,
             "session_shutdown" => Self::SessionShutdown,
             "session_before_tree" => Self::SessionBeforeTree,
             "session_tree" => Self::SessionTree,
@@ -154,6 +161,7 @@ impl PiEventType {
             "before_agent_start" => Self::BeforeAgentStart,
             "agent_start" => Self::AgentStart,
             "agent_end" => Self::AgentEnd,
+            "agent_settled" => Self::AgentSettled,
             "turn_start" => Self::TurnStart,
             "turn_end" => Self::TurnEnd,
             "message_start" => Self::MessageStart,
@@ -207,6 +215,8 @@ mod tests {
             PiEventType::SessionShutdown,
             PiEventType::AgentStart,
             PiEventType::AgentEnd,
+            PiEventType::AgentSettled,
+            PiEventType::SessionCompactFailed,
             PiEventType::ToolExecutionStart,
             PiEventType::ToolExecutionEnd,
             PiEventType::ToolCall,

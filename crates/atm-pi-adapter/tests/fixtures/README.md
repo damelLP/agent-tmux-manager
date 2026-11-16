@@ -315,8 +315,8 @@ Captured: pi 1.5.0, 2026-11-15, sealed private tmux 3.8
 Captured: pi 1.5.2, 2026-11-15, sealed private tmux 3.8
 `capture-pane -p -e -N`; offline/resource startups, no input or prompt.
 
-All `clear_*_pi_<version>.txt` bodies are verbatim captures with no added header,
-normalization or path substitution. They contain only private run-dir paths.
+All `clear_*_pi_<version>.txt` bodies are verbatim captures with no added header or
+normalization. Only private run roots become equal-width `/tmp/xxx…` paths.
 `tests/clear_startup_notice.rs` records provenance beside each replay.
 
 | Fixture stem (`clear_<stem>_pi_1.5.0.txt`) | Source / state |

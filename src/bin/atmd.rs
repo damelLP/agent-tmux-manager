@@ -770,6 +770,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // A spawned child inherits flock fds until exec. Keep process creation from
+    // overlapping tests that require immediate lock release when a File drops.
+    static LOCK_AND_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // Captured: Linux 7.2.14 procfs, 2026-11-14, a leader that called
     // pthread_exit while one worker slept, under a parent that does not reap.
     // Read before and after the worker exited; the process's pidfd became
@@ -1176,6 +1180,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn pidfd_exit_observation_survives_reaping() {
+        let _guard = LOCK_AND_SPAWN.lock().unwrap();
         let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
         let pid = child.id();
         let fd = open_pidfd(pid)
@@ -1251,6 +1256,7 @@ mod tests {
 
     #[test]
     fn test_daemon_lock_is_exclusive_until_dropped() {
+        let _guard = LOCK_AND_SPAWN.lock().unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
         // The socket's parent doesn't exist yet, as on a fresh runtime dir.
         let socket = socket_in(dir.path());
@@ -1263,6 +1269,7 @@ mod tests {
 
     #[test]
     fn test_daemon_lock_takes_a_read_only_lock_file() {
+        let _guard = LOCK_AND_SPAWN.lock().unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = socket_in(dir.path());
         drop(lock_daemon(&socket).expect("lock"));

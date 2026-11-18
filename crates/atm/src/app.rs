@@ -8,7 +8,10 @@
 
 use crate::{
     beads::BeadsTask,
-    work::{build_work_tree, WorkEffect, WorkInput, WorkState, NO_WINDOW},
+    work::{
+        build_work_threads, build_work_tree, WorkEffect, WorkGrouping, WorkInput, WorkState,
+        NO_WINDOW,
+    },
 };
 use atm_core::{
     all_node_ids, build_tree, flatten_tree, SessionId, SessionView, TreeNode, TreeNodeId, TreeRow,
@@ -20,11 +23,11 @@ use std::{
     time::Duration,
 };
 
-/// Sessions remains the initial view; Work uses the same rows and actions.
+/// Work is the initial view; older daemons initially fall back to Sessions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AppView {
-    #[default]
     Sessions,
+    #[default]
     Work,
 }
 
@@ -68,8 +71,13 @@ pub struct App {
 
     /// Current grouping, independent of the session data and selection identity.
     pub view: AppView,
+    /// Only an untouched startup choice may fall back on the first capabilities.
+    initial_view_pending: bool,
     /// Pure Work caches and generation bookkeeping; only the binary executes effects.
     pub work: WorkState,
+    /// Reporting threads by default; gw exposes the physical window view.
+    pub work_grouping: WorkGrouping,
+    work_window_count: usize,
     /// Monotonic frame time injected by the event loop for Work freshness.
     pub work_now: Duration,
 
@@ -172,8 +180,11 @@ impl App {
     pub fn new() -> Self {
         Self {
             state: AppState::Connecting,
-            view: AppView::Sessions,
+            view: AppView::Work,
+            initial_view_pending: true,
             work: WorkState::default(),
+            work_grouping: WorkGrouping::default(),
+            work_window_count: 0,
             work_now: Duration::ZERO,
             sessions: HashMap::new(),
             selected_index: 0,
@@ -206,9 +217,32 @@ impl App {
         }
     }
 
+    /// Selects a one-based tab (Work, Sessions); invalid tabs leave effects and state alone.
+    #[must_use]
+    pub fn select_tab(&mut self, one_based: usize, now: Duration) -> Option<Vec<WorkEffect>> {
+        let view = match one_based {
+            1 => AppView::Work,
+            2 => AppView::Sessions,
+            _ => return None,
+        };
+        self.initial_view_pending = false;
+        Some(if self.view != view {
+            self.toggle_work_view(now)
+        } else {
+            self.reduce_work(
+                match view {
+                    AppView::Work => WorkInput::Shown,
+                    AppView::Sessions => WorkInput::Hidden,
+                },
+                now,
+            )
+        })
+    }
+
     /// Switches grouping without changing a selected agent's identity or the other view's folds.
     #[must_use]
     pub fn toggle_work_view(&mut self, now: Duration) -> Vec<WorkEffect> {
+        self.initial_view_pending = false;
         let selected = self
             .selected_session()
             .map(|session| TreeNodeId::Agent(session.id.clone()));
@@ -243,13 +277,52 @@ impl App {
         )
     }
 
+    /// Opens the new Work grouping without disturbing tab, filter, pane identity or read ownership.
+    #[must_use]
+    pub fn toggle_work_grouping(&mut self, now: Duration) -> Option<Vec<WorkEffect>> {
+        if self.view != AppView::Work {
+            return None;
+        }
+        self.initial_view_pending = false;
+        let selected = self
+            .selected_session()
+            .map(|s| TreeNodeId::Agent(s.id.clone()));
+        self.work_grouping = match self.work_grouping {
+            WorkGrouping::Threads => WorkGrouping::Windows,
+            WorkGrouping::Windows => WorkGrouping::Threads,
+        };
+        self.rebuild_tree();
+        self.expanded = all_node_ids(&self.tree);
+        if !self.filter_query.is_empty() {
+            self.pre_filter_expanded = Some(Some(self.expanded.clone()));
+        }
+        self.restore_node(selected.as_ref());
+        Some(self.reduce_work(WorkInput::Shown, now))
+    }
+
     /// Reduces one terminal reply/event without rebuilding Sessions for hidden Work I/O.
     #[must_use]
     pub fn reduce_work(&mut self, input: WorkInput, now: Duration) -> Vec<WorkEffect> {
         self.work_now = now;
-        let rebuild =
-            self.view == AppView::Work && matches!(&input, WorkInput::WindowsReply { .. });
-        let effects = self.work.reduce(input, now);
+        let rebuild = self.view == AppView::Work
+            && matches!(
+                &input,
+                WorkInput::WindowsReply { .. }
+                    | WorkInput::OrgReply { .. }
+                    | WorkInput::Capabilities { .. }
+            );
+        let initial = self.initial_view_pending && matches!(&input, WorkInput::Capabilities { .. });
+        if initial {
+            self.initial_view_pending = false;
+        }
+        let mut effects = self.work.reduce(input, now);
+        if initial && self.view == AppView::Work {
+            if self.work.needs_newer_daemon() {
+                effects.extend(self.toggle_work_view(now));
+            } else {
+                effects.extend(self.work.reduce(WorkInput::Shown, now));
+            }
+        }
         if rebuild {
             self.rebuild_tree();
         }
@@ -260,12 +333,18 @@ impl App {
     #[must_use]
     pub fn work_counts(&self) -> (usize, usize) {
         (
-            self.tree
-                .iter()
-                .filter(|node| matches!(node, TreeNode::Window {id,..} if id != NO_WINDOW))
-                .count(),
+            self.work_window_count,
             self.tree.iter().map(TreeNode::agent_count).sum(),
         )
+    }
+
+    /// Reporting roots in the full filtered tree, including collapsed threads.
+    #[must_use]
+    pub fn work_thread_count(&self) -> usize {
+        self.tree
+            .iter()
+            .filter(|node| matches!(node, TreeNode::Team { .. }))
+            .count()
     }
 
     fn restore_node(&mut self, selected: Option<&TreeNodeId>) {
@@ -423,7 +502,19 @@ impl App {
         };
         let built = match self.view {
             AppView::Sessions => build_tree(&sessions),
-            AppView::Work => build_work_tree(&sessions, self.work.windows()),
+            AppView::Work => {
+                let windows = build_work_tree(&sessions, self.work.windows());
+                self.work_window_count = windows
+                    .iter()
+                    .filter(|node| matches!(node, TreeNode::Window {id,..} if id != NO_WINDOW))
+                    .count();
+                match (self.work_grouping, self.work.org()) {
+                    (WorkGrouping::Threads, Some(org)) => {
+                        build_work_threads(&sessions, self.work.windows(), org)
+                    }
+                    _ => windows,
+                }
+            }
         };
         let previous_tree = std::mem::replace(&mut self.tree, built);
         crate::role::coordinators_first(&mut self.tree, &self.coordinator_panes);
@@ -983,8 +1074,440 @@ fn ancestor_ids(tree: &[TreeNode], target: &TreeNodeId) -> Option<Vec<TreeNodeId
 mod tests {
     use super::*;
 
-    fn work_app() -> App {
+    fn work_capabilities(windows: bool) -> WorkInput {
+        let mut methods = vec!["org.tree".into()];
+        if windows {
+            methods.push("session.windows".into());
+        }
+        WorkInput::Capabilities {
+            methods,
+            watch: false,
+        }
+    }
+
+    // Break caught: a constructor or compact/sidebar path keeps the old start tab.
+    #[test]
+    fn default_work_in_full_compact_pick_and_filtered_apps() {
+        assert_eq!(AppView::default(), AppView::Work);
+        for mut app in [
+            App::new(),
+            App::default(),
+            App::with_pick_mode(),
+            App::with_tmux_session_filter("work".into()),
+        ] {
+            for compact in [false, true] {
+                app.compact = compact;
+                assert_eq!(app.view, AppView::Work);
+                assert!(app.reduce_work(WorkInput::Wake, Duration::ZERO).is_empty());
+            }
+        }
+    }
+
+    // Break caught: an older daemon gets an initial Work error, or reconnect steals the tab again.
+    #[test]
+    fn first_unsupported_capabilities_select_sessions_once() {
         let mut app = App::new();
+        app.view = AppView::Work;
+        let effects = app.reduce_work(work_capabilities(false), Duration::ZERO);
+        assert_eq!(app.view, AppView::Sessions);
+        assert!(effects.is_empty());
+        let _ = app.toggle_work_view(Duration::ZERO);
+        assert_eq!(app.view, AppView::Work);
+        for windows in [false, true, false] {
+            let _ = app.reduce_work(work_capabilities(windows), Duration::from_secs(1));
+            assert_eq!(app.view, AppView::Work);
+        }
+        assert!(app.work.needs_newer_daemon());
+    }
+
+    // Break caught: default Work never receives Shown, or starts reads before capabilities.
+    #[test]
+    fn modern_capabilities_start_work_without_w() {
+        let mut app = App::new();
+        assert!(app.reduce_work(WorkInput::Wake, Duration::ZERO).is_empty());
+        let effects = app.reduce_work(work_capabilities(true), Duration::ZERO);
+        assert_eq!(app.view, AppView::Work);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, WorkEffect::RequestWindows(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, WorkEffect::RequestOrg(_)))
+                .count(),
+            1
+        );
+        assert!(effects.contains(&WorkEffect::WakeAt(Duration::from_secs(3))));
+        let effects = app.reduce_work(work_capabilities(true), Duration::from_secs(1));
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, WorkEffect::RequestWindows(_) | WorkEffect::RequestOrg(_))));
+    }
+
+    // Break caught: the first supported connection leaves a later reconnect free to steal Work.
+    #[test]
+    fn first_supported_capabilities_do_not_enable_a_later_fallback() {
+        let mut app = App::new();
+        let _ = app.reduce_work(work_capabilities(true), Duration::ZERO);
+        let effects = app.reduce_work(work_capabilities(false), Duration::from_secs(1));
+        assert_eq!(app.view, AppView::Work);
+        assert!(app.work.needs_newer_daemon());
+        assert!(effects.is_empty());
+    }
+
+    // Break caught: automatic fallback overrides a user's deliberate pre-handshake choice.
+    #[test]
+    fn explicit_tab_before_capabilities_wins() {
+        for toggles in [1, 2] {
+            let mut app = App::new();
+            app.view = AppView::Work;
+            for _ in 0..toggles {
+                let _ = app.toggle_work_view(Duration::ZERO);
+            }
+            let selected = app.view;
+            let _ = app.reduce_work(work_capabilities(false), Duration::ZERO);
+            assert_eq!(app.view, selected);
+        }
+    }
+
+    // Break caught: selecting the current tab destroys folds/selection or disarms the next poll.
+    #[test]
+    fn same_numbered_tab_keeps_selection_folds_and_next_wake() {
+        let mut app = work_app();
+        let effects = app.toggle_work_view(Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        let selected = app.selected_session().unwrap().id.clone();
+        app.collapse_all();
+        let folds = app.expanded.clone();
+        let effects = app.select_tab(1, Duration::ZERO).unwrap();
+        assert_eq!(effects, [WorkEffect::WakeAt(Duration::from_secs(3))]);
+        assert_eq!(app.expanded, folds);
+        assert_eq!(app.selected_session().map(|s| &s.id), None);
+        assert!(app.select_tab(3, Duration::from_secs(1)).is_none());
+        assert_eq!(app.work_now, Duration::ZERO);
+        assert_eq!(app.reduce_work(WorkInput::Wake, Duration::ZERO), effects);
+        app.expand_all();
+        select(&mut app, selected.as_str());
+        let effects = app.select_tab(1, Duration::ZERO).unwrap();
+        assert_eq!(effects, [WorkEffect::WakeAt(Duration::from_secs(3))]);
+        assert_eq!(app.selected_session().unwrap().id, selected);
+    }
+
+    // Break caught: an invalid tab consumes fallback, or valid same-tab intent is forgotten.
+    #[test]
+    fn numbered_tab_choice_controls_initial_fallback_only_when_valid() {
+        for (number, expected) in [(1, AppView::Work), (3, AppView::Sessions)] {
+            let mut app = App::new();
+            let _ = app.select_tab(number, Duration::ZERO);
+            let _ = app.reduce_work(work_capabilities(false), Duration::ZERO);
+            assert_eq!(app.view, expected);
+        }
+    }
+
+    // Synthetic: cross-repo reporting graph with nested leads, not captured owner data.
+    fn thread_org_value() -> serde_json::Value {
+        serde_json::json!({"seq":42,"projects":[
+            {"seats":[
+                {"agent_id":"alpha/chief","pane":"%1","manager":"owner","tasks":[]},
+                {"agent_id":"alpha/lead","pane":"%2","manager":"alpha/chief","tasks":["t1"]},
+                {"agent_id":"alpha/worker","pane":"%3","manager":"alpha/lead","tasks":["t2"]}],
+             "tasks":[{"task_id":"t1","title":"Improve cache behavior"},{"task_id":"t2","title":"Fix reconnect watch"}]},
+            {"seats":[{"agent_id":"beta/worker","pane":"%4","manager":"alpha/lead","tasks":[]}],"tasks":[]}
+        ],"needs_owner":{"items":[]}})
+    }
+
+    fn thread_org() -> crate::work::WorkOrg {
+        serde_json::from_value(thread_org_value()).unwrap()
+    }
+
+    fn thread_windows() -> crate::work::WorkWindows {
+        serde_json::from_value(serde_json::json!({"state":"ok","windows":[
+            {"id":"@1","name":"primary","links":[{"session":"work","index":0}],"panes":["%1","%2","%3"]},
+            {"id":"@2","name":"secondary","links":[{"session":"work","index":1}],"panes":["%4"]}
+        ]})).unwrap()
+    }
+
+    fn thread_app(org: crate::work::WorkOrg) -> App {
+        let mut app = App::new();
+        app.update_sessions(
+            (1..=4)
+                .map(|n| SessionView {
+                    id: format!("s{n}").into(),
+                    id_short: format!("s{n}"),
+                    tmux_pane: Some(format!("%{n}")),
+                    project_root: Some("/fixtures/repo".into()),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        let effects = app.reduce_work(work_capabilities(true), Duration::ZERO);
+        thread_load(&mut app, effects, org);
+        app
+    }
+
+    fn thread_load(app: &mut App, effects: Vec<WorkEffect>, org: crate::work::WorkOrg) {
+        for effect in effects {
+            let input = match effect {
+                WorkEffect::RequestWindows(generation) => WorkInput::WindowsReply {
+                    generation,
+                    result: Ok(thread_windows()),
+                },
+                WorkEffect::RequestOrg(generation) => WorkInput::OrgReply {
+                    generation,
+                    result: Ok(org.clone()),
+                },
+                _ => continue,
+            };
+            let _ = app.reduce_work(input, Duration::ZERO);
+        }
+    }
+
+    fn thread_members(app: &App) -> Vec<(String, Vec<String>)> {
+        let mut groups = Vec::<(String, Vec<String>)>::new();
+        for row in &app.tree_rows {
+            match &row.kind {
+                TreeRowKind::Team { name } => groups.push((name.clone(), vec![])),
+                TreeRowKind::Window { id, .. } => groups.push((id.clone(), vec![])),
+                TreeRowKind::Agent { session } => {
+                    groups.last_mut().unwrap().1.push(session.id.to_string())
+                }
+                _ => panic!("unexpected Work group"),
+            }
+        }
+        groups
+    }
+
+    // Break caught: org replies never regroup Work, cross-repo members are split, or windows are fake threads.
+    #[test]
+    fn threads_use_existing_cross_repo_reporting_lines() {
+        let app = thread_app(thread_org());
+        let groups = thread_members(&app);
+        assert_eq!(
+            groups.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["alpha/chief", "alpha/lead"]
+        );
+        let lead = groups.iter().find(|(id, _)| id == "alpha/lead").unwrap();
+        assert_eq!(
+            lead.1
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["s2", "s3", "s4"].into_iter().collect()
+        );
+        assert_eq!(app.work_counts(), (2, 4));
+        assert_eq!(
+            app.sessions[&SessionId::from("s4")].tmux_pane.as_deref(),
+            Some("%4")
+        );
+    }
+
+    // Break caught: physical-window order replaces newest-first ordering inside a reporting thread.
+    #[test]
+    fn thread_rows_keep_newest_and_coordinator_order_across_windows() {
+        let mut app = thread_app(thread_org());
+        let rows = (1..=4)
+            .map(|n| {
+                let mut row = app.sessions[&SessionId::from(format!("s{n}"))].clone();
+                row.started_at = format!("2026-01-15T12:00:0{n}Z");
+                row
+            })
+            .collect();
+        app.update_sessions(rows);
+        let members = |app: &App| {
+            thread_members(app)
+                .into_iter()
+                .find(|(id, _)| id == "alpha/lead")
+                .unwrap()
+                .1
+        };
+        assert_eq!(members(&app), ["s4", "s3", "s2"]);
+        app.update_coordinator_panes(["%2".into()].into_iter().collect());
+        assert_eq!(members(&app), ["s2", "s4", "s3"]);
+    }
+
+    // Break caught: a managing seat is emitted in both its parent's and its own team.
+    #[test]
+    fn nested_leads_are_not_duplicated_in_chief_thread() {
+        let mut app = thread_app(thread_org());
+        assert_eq!(thread_members(&app).first().unwrap().1, ["s1"]);
+        assert_eq!(agent_ids(&app).len(), 4);
+        select(&mut app, "s3");
+        app.close_fold();
+        assert_eq!(thread_members(&app).last().unwrap().0, "alpha/lead");
+        assert!(!app
+            .expanded
+            .contains(&TreeNodeId::Team("alpha/lead".into())));
+    }
+
+    // Break caught: short names, unknown managers, invalid chains or ambiguous pane claims merge seats.
+    #[test]
+    fn same_short_names_and_missing_or_broken_lines_do_not_merge() {
+        let mut org = thread_org_value();
+        org["projects"][1]["seats"] = serde_json::json!([
+            {"agent_id":"beta/lead","pane":"%4","manager":"owner","tasks":[]},
+            {"agent_id":"beta/worker","pane":"%5","manager":"beta/lead","tasks":[]},
+            {"agent_id":"beta/missing","pane":"%6","manager":"absent/lead","tasks":[]},
+            {"agent_id":"beta/broken","pane":"%7","manager":"alpha/lead","line_error":"broken","tasks":[]},
+            {"agent_id":"beta/cycle-a","pane":"%8","manager":"beta/cycle-b","tasks":[]},
+            {"agent_id":"beta/cycle-b","pane":"%9","manager":"beta/cycle-a","tasks":[]},
+            {"agent_id":"beta/duplicate","pane":"%3","manager":"alpha/lead","tasks":[]},
+            {"agent_id":"alpha/paneless","pane":null,"manager":"alpha/lead","tasks":[]}
+        ]);
+        let mut app = thread_app(serde_json::from_value(org).unwrap());
+        app.update_sessions(
+            (5..=9)
+                .map(|n| SessionView {
+                    id: format!("s{n}").into(),
+                    tmux_pane: Some(format!("%{n}")),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        let groups = thread_members(&app);
+        assert!(groups.iter().any(|(id, _)| id == "alpha/lead"));
+        assert!(groups.iter().any(|(id, ids)| id == "beta/lead"
+            && ids.contains(&"s5".into())
+            && !ids.contains(&"s3".into())));
+        let fallback: Vec<_> = groups
+            .iter()
+            .filter(|(id, _)| id.starts_with('@') || id == NO_WINDOW)
+            .flat_map(|(_, ids)| ids)
+            .map(String::as_str)
+            .collect();
+        for id in ["s3", "s6", "s7", "s8", "s9"] {
+            assert!(fallback.contains(&id), "{groups:?}");
+        }
+        assert_eq!(agent_ids(&app).len(), 9);
+    }
+
+    // Break caught: task/window/filter changes rename Team identity or steal the selected pane.
+    #[test]
+    fn thread_identity_survives_title_window_and_filter_changes() {
+        let mut app = thread_app(thread_org());
+        select(&mut app, "s3");
+        let id = TreeNodeId::Team("alpha/lead".into());
+        assert!(app.expanded.contains(&id));
+        let mut org = thread_org();
+        org.projects
+            .first_mut()
+            .unwrap()
+            .tasks
+            .first_mut()
+            .unwrap()
+            .title = "Different work".into();
+        let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+        thread_load(&mut app, effects, org);
+        type_query(&mut app, "s3");
+        assert!(app.tree_rows.iter().any(|row| row.node_id == id));
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "s3");
+        let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+        for effect in effects {
+            let input = match effect {
+                WorkEffect::RequestWindows(generation) => {
+                    let mut windows = thread_windows();
+                    windows
+                        .windows
+                        .first_mut()
+                        .unwrap()
+                        .panes
+                        .retain(|p| p.0 != "%3");
+                    windows
+                        .windows
+                        .last_mut()
+                        .unwrap()
+                        .panes
+                        .push(crate::work::PaneId("%3".into()));
+                    WorkInput::WindowsReply {
+                        generation,
+                        result: Ok(windows),
+                    }
+                }
+                WorkEffect::RequestOrg(generation) => WorkInput::OrgReply {
+                    generation,
+                    result: Ok(thread_org()),
+                },
+                _ => continue,
+            };
+            let _ = app.reduce_work(input, Duration::ZERO);
+        }
+        assert!(app.tree_rows.iter().any(|row| row.node_id == id));
+        assert_eq!(app.work_counts(), (1, 1));
+        assert_eq!(
+            app.selected_session().unwrap().tmux_pane.as_deref(),
+            Some("%3")
+        );
+        let _ = app.reduce_work(work_capabilities(false), Duration::ZERO);
+        let _ = app.toggle_work_view(Duration::ZERO);
+        let rows = format!("{:?}", app.tree_rows);
+        let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+        assert!(effects.is_empty());
+        assert_eq!(format!("{:?}", app.tree_rows), rows);
+    }
+
+    // Break caught: absent lead sessions erase visible reporters, or org-only seats invent rows.
+    #[test]
+    fn paneless_lead_heads_visible_reporters_without_inventing_sessions() {
+        let mut org = thread_org();
+        org.projects
+            .first_mut()
+            .unwrap()
+            .seats
+            .get_mut(1)
+            .unwrap()
+            .pane = None;
+        let mut app = thread_app(org);
+        app.remove_session("s2");
+        let lead = thread_members(&app)
+            .into_iter()
+            .find(|(id, _)| id == "alpha/lead")
+            .unwrap();
+        assert_eq!(
+            lead.1
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["s3".to_owned(), "s4".to_owned()].into_iter().collect()
+        );
+        assert_eq!(agent_ids(&app).len(), 3);
+    }
+
+    // Break caught: a terminal org reply for hidden Work regroups the active Sessions tree.
+    #[test]
+    fn hidden_thread_reply_releases_its_slot_without_rebuilding_sessions() {
+        let mut app = App::new();
+        app.update_sessions(vec![SessionView {
+            id: "s1".into(),
+            tmux_pane: Some("%1".into()),
+            ..Default::default()
+        }]);
+        let effects = app.reduce_work(work_capabilities(true), Duration::ZERO);
+        let _ = app.toggle_work_view(Duration::ZERO);
+        let rows = list_buffer(&app);
+        thread_load(&mut app, effects, thread_org());
+        assert_eq!(app.view, AppView::Sessions);
+        assert_eq!(list_buffer(&app), rows);
+        let effects = app.toggle_work_view(Duration::ZERO);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, WorkEffect::RequestOrg(_)))
+                .count(),
+            1
+        );
+    }
+
+    fn sessions_app() -> App {
+        let mut app = App::new();
+        app.view = AppView::Sessions;
+        app
+    }
+
+    fn work_app() -> App {
+        let mut app = sessions_app();
+        app.work_grouping = WorkGrouping::Windows;
         let mut parent = role_session("parent", Some("%1"), None, "2");
         parent.project_root = Some("/fixtures/alpha".into());
         parent.worktree_path = parent.project_root.clone();
@@ -1287,7 +1810,7 @@ mod tests {
 
     #[test]
     fn coordinator_updates_reorder_without_losing_selection_or_rebuilding_unchanged_sets() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         assert!(app.coordinator_panes.is_empty());
         app.update_sessions(vec![
             role_session("old", Some("%1"), None, "1"),
@@ -1308,7 +1831,7 @@ mod tests {
 
     #[test]
     fn coordinator_classification_and_toggle_use_full_map_even_when_parent_rows_are_hidden() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![
             role_session("lead", Some("%1"), None, "1"),
             role_session("child", Some("%1"), Some("lead"), "2"),
@@ -1345,7 +1868,7 @@ mod tests {
 
     #[test]
     fn coordinator_toggle_is_immediate_and_ignores_ineligible_rows() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![
             role_session("lead", Some("%1"), None, "1"),
             role_session("child", Some("%1"), Some("lead"), "2"),
@@ -1391,6 +1914,7 @@ mod tests {
         let mate = role_session("mate", Some("%2"), Some("lead"), "3");
         let newer = role_session("newer", Some("%3"), None, "4");
         let mut app = App::with_tmux_session_filter("private".into());
+        app.view = AppView::Sessions;
         app.update_filter_panes(HashSet::from(["%1".into(), "%2".into(), "%3".into()]));
         app.update_sessions(vec![lead, child, mate, newer]);
         app.update_coordinator_panes(HashSet::from(["%1".into(), "%2".into()]));
@@ -1518,7 +2042,7 @@ mod tests {
         mate.parent_session_id = Some(lead.id.clone());
         mate.harness = "codex".to_string();
         let other = create_test_session("other", "2024-01-15T10:02:00Z");
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![lead, mate, other]);
 
         type_query(&mut app, "codex");
@@ -1539,7 +2063,7 @@ mod tests {
 
     #[test]
     fn test_filter_expands_collapsed_groups_holding_matches() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![create_test_session("s1", "2024-01-15T10:00:00Z")]);
         app.collapse_all();
         assert!(agent_ids(&app).is_empty());
@@ -1551,7 +2075,7 @@ mod tests {
 
     #[test]
     fn test_clear_filter_restores_all_sessions() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![
             create_test_session("aaa", "2024-01-15T10:00:00Z"),
             create_test_session("bbb", "2024-01-15T10:01:00Z"),
@@ -1579,7 +2103,7 @@ mod tests {
         a.project_root = Some("/p/alpha".to_string());
         let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
         b.project_root = Some("/p/beta".to_string());
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![a, b]);
         app.collapse_all();
         assert!(agent_ids(&app).is_empty());
@@ -1606,7 +2130,7 @@ mod tests {
             s.worktree_path = Some(path.to_string());
             s
         };
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![
             wt("aaa", "/p", "2024-01-15T10:00:00Z"),
             wt("bbb", "/p/.worktrees/feat", "2024-01-15T10:01:00Z"),
@@ -1628,7 +2152,7 @@ mod tests {
         a.project_root = Some("/p/alpha".to_string());
         let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
         b.project_root = Some("/p/beta".to_string());
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![a, b]);
         let beta = TreeNodeId::Project("/p/beta".to_string());
         app.set_node_expanded(&beta, false);
@@ -1646,7 +2170,7 @@ mod tests {
 
     #[test]
     fn test_backspace_to_empty_removes_filter() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![create_test_session("aaa", "2024-01-15T10:00:00Z")]);
         type_query(&mut app, "zz");
         assert!(agent_ids(&app).is_empty());
@@ -1662,7 +2186,7 @@ mod tests {
 
     #[test]
     fn test_filter_applies_to_sessions_arriving_later() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         type_query(&mut app, "codex");
         let mut late = create_test_session("late", "2024-01-15T10:00:00Z");
         late.harness = "codex".to_string();
@@ -1682,7 +2206,7 @@ mod tests {
         a.harness = "qq".to_string();
         let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
         b.project_root = Some("/p/beta".to_string());
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![a, b.clone()]);
         app.set_node_expanded(&TreeNodeId::Project("/p/beta".to_string()), false);
         // No prefix of "qq" matches bbb, so typing never opens beta.
@@ -1708,7 +2232,7 @@ mod tests {
         let mut a = wt("aaa", "/p", "2024-01-15T10:00:00Z");
         a.harness = "qq".to_string();
         let mut b = wt("bbb", "/p/.worktrees/feat", "2024-01-15T10:01:00Z");
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![a, b.clone()]);
         app.collapse_all();
         type_query(&mut app, "qq");
@@ -1727,7 +2251,7 @@ mod tests {
         a.harness = "qq".to_string();
         let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
         b.project_root = Some("/p/beta".to_string());
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![a.clone(), b]);
         app.set_node_expanded(&TreeNodeId::Project("/p/beta".to_string()), false);
         type_query(&mut app, "qq");
@@ -1740,7 +2264,7 @@ mod tests {
 
     #[test]
     fn test_clear_filter_after_zero_results_keeps_selection() {
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![
             create_test_session("aaa", "2024-01-15T10:00:00Z"),
             create_test_session("bbb", "2024-01-15T10:01:00Z"),
@@ -1760,7 +2284,7 @@ mod tests {
         a.project_root = Some("/p/alpha".to_string());
         let mut b = create_test_session("bbb", "2024-01-15T10:01:00Z");
         b.project_root = Some("/p/beta".to_string());
-        let mut app = App::new();
+        let mut app = sessions_app();
         type_query(&mut app, "aaa");
         app.update_sessions(vec![a, b]);
 
@@ -2250,7 +2774,7 @@ mod tests {
     /// Builds an app with two projects containing two agents each.
     /// Resulting tree (fully expanded): proj-a, agent, agent, proj-b, agent, agent.
     fn app_two_projects() -> App {
-        let mut app = App::new();
+        let mut app = sessions_app();
         app.update_sessions(vec![
             session_in("sess-a1", "2024-01-15T10:00:00Z", "/repos/proj-a"),
             session_in("sess-a2", "2024-01-15T10:01:00Z", "/repos/proj-a"),

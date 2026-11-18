@@ -71,6 +71,17 @@ pub trait TmuxClient: Send + Sync {
     /// a dedicated trait method. Prefer typed methods for shared workflows.
     async fn raw_command(&self, subcommand: &str, args: &[&str]) -> Result<String, TmuxError>;
 
+    /// Copies literal text to the default tmux buffer through stdin, without
+    /// pasting it. Empty input leaves the existing buffer unchanged (tmux 3.8).
+    /// Implementors without stdin support return an unsupported I/O error.
+    async fn load_buffer(&self, _text: &str) -> Result<(), TmuxError> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "tmux stdin buffer loading unsupported",
+        )
+        .into())
+    }
+
     /// Splits a pane, returning the new pane ID (e.g., "%7").
     ///
     /// # Arguments

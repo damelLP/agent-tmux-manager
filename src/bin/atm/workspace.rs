@@ -279,15 +279,19 @@ pub(super) async fn cmd_workspace_attach(session: Option<String>, isolate: bool)
             "-t",
             &exact_session(&session_name),
             "-F",
-            "#{window_id} #{window_width}",
+            "#{window_id} #{window_width} #{window_name}",
         ],
     )
     .await?;
 
     for line in windows_output.lines() {
-        let mut parts = line.splitn(2, ' ');
+        let mut parts = line.splitn(3, ' ');
         let window_id = parts.next().unwrap_or_default();
         let cols: u16 = parts.next().and_then(|w| w.parse().ok()).unwrap_or(80);
+        // Reattaching must preserve the reserved, sidebar-free chat window too.
+        if parts.next() == Some("chat") {
+            continue;
+        }
         // Check if this window already has an atm-sidebar pane (using @atm-sidebar option,
         // which survives ATM crashes unlike pane titles that the shell can overwrite)
         let panes_output = tmux_run(

@@ -5,7 +5,7 @@ expression: buf
 Buffer {
     area: Rect { x: 0, y: 0, width: 45, height: 8 },
     content: [
-        "┌ Sessions (2) ─────────────────────────────┐",
+        "┌ Work | Sessions (2) ──────────────────────┐",
         "│>▼ project-alpha                           │",
         "│   >   40% parent00 [claude] Opus 4.5      │",
         "│     >   15% childsub [claude] Sonne...    │",
@@ -16,6 +16,10 @@ Buffer {
     ],
     styles: [
         x: 0, y: 0, fg: White, bg: Reset, underline: Reset, modifier: NONE,
+        x: 2, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: DIM,
+        x: 6, y: 0, fg: White, bg: Reset, underline: Reset, modifier: NONE,
+        x: 9, y: 0, fg: Cyan, bg: Reset, underline: Reset, modifier: BOLD | REVERSED,
+        x: 17, y: 0, fg: White, bg: Reset, underline: Reset, modifier: NONE,
         x: 1, y: 1, fg: Cyan, bg: Rgb(30, 30, 40), underline: Reset, modifier: BOLD,
         x: 2, y: 1, fg: Reset, bg: Rgb(30, 30, 40), underline: Reset, modifier: NONE,
         x: 4, y: 1, fg: White, bg: Rgb(30, 30, 40), underline: Reset, modifier: BOLD,

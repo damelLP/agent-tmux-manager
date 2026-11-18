@@ -2317,6 +2317,45 @@ async fn scenario_real_tmux_lib(env: &E2eEnv) {
     );
 }
 
+// Break caught: copying through argv rejects valid long message bodies, or an
+// empty copy changes the existing buffer (tmux 3.8 leaves it intact). No daemon.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_buffer_preserves_long_and_empty_bodies() {
+    if tmux_on_path().is_none() {
+        eprintln!("SKIP: tmux not on PATH");
+        return;
+    }
+    let server = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "copy",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let tmux = RealTmuxClient::with_socket(server.label());
+    let boundary = "x".repeat(16_384);
+    let long = format!("- literal λ\n{}", "x".repeat(65_536));
+    for (body, want) in [
+        ("previous buffer", "previous buffer"),
+        ("", "previous buffer"),
+        (boundary.as_str(), boundary.as_str()),
+        (long.as_str(), long.as_str()),
+        ("", long.as_str()),
+    ] {
+        tmux.load_buffer(body).await.expect("copy complete body");
+        assert_eq!(tmux.raw_command("show-buffer", &[]).await.unwrap(), want);
+    }
+    let missing = RealTmuxClient::with_socket(format!("{}-missing", server.label()));
+    for body in [String::new(), "x".repeat(1 << 20)] {
+        let error = missing
+            .load_buffer(&body)
+            .await
+            .expect_err("missing server");
+        assert!(
+            matches!(error, atm_tmux::TmuxError::CommandFailed {ref command,..} if command=="load-buffer"),
+            "{error:?}"
+        );
+    }
+}
+
 /// Scenario 3b: `RealTmuxClient::paste_text`, then the real `atm send`,
 /// against panes running `cat > file`, so each file holds exactly the
 /// bytes its program read.
@@ -2837,6 +2876,294 @@ async fn scenario_atm_spawn_defaults_to_tmux_pane(env: &E2eEnv, probe_pane: &str
         .kill_pane(&new_pane.pane_id)
         .await
         .expect("kill 4b pane");
+}
+
+fn workspace_pane_identity(label: &str, window: &str) -> String {
+    tmux_stdout(
+        label,
+        &[
+            "list-panes",
+            "-t",
+            window,
+            "-F",
+            "#{pane_id}|#{pane_pid}|#{@atm-sidebar}",
+        ],
+    )
+}
+
+/// A separate hook array entry fences the production hook, including no-ops.
+/// Each creation owns a distinct latched signal; no pane-count polling.
+fn workspace_chat_test_window(label: &str, session: &str, name: &str, detached: bool) -> String {
+    let signal = format!("chat-window-{}", next_private_sequence());
+    tmux_stdout(
+        label,
+        &[
+            "set-hook",
+            "-t",
+            &format!("={session}:"),
+            "after-new-window[1]",
+            &format!("wait-for -S {signal}"),
+        ],
+    );
+    let mut args = vec!["new-window", "-S", "-P", "-F", "#{window_id}"];
+    if detached {
+        args.push("-d");
+    }
+    let target = format!("={session}:");
+    args.extend([
+        "-t",
+        &target,
+        "-n",
+        name,
+        if name == "chat" {
+            "atm chat"
+        } else {
+            "/bin/sh"
+        },
+    ]);
+    // tmux takes PATH from this creating client, not just the server's env.
+    let binary = atm_binary().unwrap();
+    let path = format!(
+        "{}:{}",
+        binary.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let window = String::from_utf8(run_tmux_or_panic(
+        tmux_command()
+            .env("PATH", path)
+            .args(["-L", label])
+            .args(args),
+        "chat test new-window",
+    ))
+    .unwrap()
+    .trim()
+    .to_owned();
+    wait_for_signal(label, &signal, Instant::now() + HANG_GUARD)
+        .expect("new-window hook completed");
+    window
+}
+
+// Break caught: the after-new-window script treats chat like an agent window,
+// checks the current window instead of its target, or overmatches chat's name.
+#[tokio::test(flavor = "current_thread")]
+async fn workspace_chat_window_has_no_sidebar() {
+    let Some(env) = E2eEnv::try_setup().await else {
+        return;
+    };
+    let session = private_session_name("chat-create");
+    let data = awkward_data_dir();
+    let config = tempfile::tempdir().unwrap();
+    let standin = tempfile::tempdir().unwrap();
+    let log = standin.path().join("pi.log");
+    let pi = write_pi_standin(standin.path(), &log);
+    write_pi_default_config(config.path(), &pi);
+    let path = format!(
+        "{}:{}",
+        env.atm_path.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let server = PrivateTmux {
+        socket_label: format!("atm-{session}"),
+    };
+    let output = command_output(
+        workspace_create_command(&env, &session, config.path(), data.path()).env("PATH", &path),
+    );
+    assert!(output.status.success(), "create: {output:?}");
+    let agent = top_non_sidebar_pane(server.label(), &session);
+    read_pi_record(server.label(), &agent, &log, Instant::now() + HANG_GUARD);
+    let work = tmux_stdout(
+        server.label(),
+        &["display-message", "-p", "-t", &agent, "#{window_id}"],
+    )
+    .trim()
+    .to_owned();
+    let work_before = workspace_pane_identity(server.label(), &work);
+    let chat = workspace_chat_test_window(server.label(), &session, "chat", false);
+    let chat_before = workspace_pane_identity(server.label(), &chat);
+    assert_eq!(chat_before.lines().count(), 1, "chat panes: {chat_before}");
+    assert!(
+        chat_before.trim().ends_with('|'),
+        "chat has a sidebar: {chat_before}"
+    );
+    assert_eq!(workspace_pane_identity(server.label(), &work), work_before);
+
+    tmux_stdout(server.label(), &["select-window", "-t", &work]);
+    tmux_stdout(
+        server.label(),
+        &["new-window", "-S", "-n", "chat", "atm chat"],
+    );
+    assert_eq!(workspace_pane_identity(server.label(), &chat), chat_before);
+    // Retain the original chat process while creating a second, detached chat.
+    tmux_stdout(
+        server.label(),
+        &["rename-window", "-t", &chat, "retained-chat"],
+    );
+    tmux_stdout(server.label(), &["select-window", "-t", &work]);
+    let _client = ControlClient::attach(server.label(), &session);
+    let detached = workspace_chat_test_window(server.label(), &session, "chat", true);
+    let panes = workspace_pane_identity(server.label(), &detached);
+    assert_eq!(panes.lines().count(), 1, "detached chat panes: {panes}");
+    assert!(
+        panes.trim().ends_with('|'),
+        "detached chat has a sidebar: {panes}"
+    );
+    assert_eq!(workspace_pane_identity(server.label(), &work), work_before);
+    assert_eq!(workspace_pane_identity(server.label(), &chat), chat_before);
+    assert_eq!(
+        tmux_stdout(
+            server.label(),
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={session}:"),
+                "#{window_id}"
+            ]
+        )
+        .trim(),
+        work,
+        "detached creation must leave the attached client's work window current"
+    );
+    for name in ["Chat", "chat-notes", "work $(false) \"quoted\" spaces"] {
+        let window = workspace_chat_test_window(server.label(), &session, name, true);
+        let panes = workspace_pane_identity(server.label(), &window);
+        assert_eq!(panes.lines().count(), 2, "ordinary {name:?}: {panes}");
+        assert_eq!(
+            panes.lines().filter(|line| line.ends_with("|1")).count(),
+            1,
+            "ordinary {name:?}: {panes}"
+        );
+    }
+}
+
+// Break caught: reattach injects into a clean reserved chat, fails to replace
+// stale scripts, or destroys an already-contaminated chat's retained panes.
+#[tokio::test(flavor = "current_thread")]
+async fn workspace_attach_preserves_chat_and_refreshes_hooks() {
+    let Some(env) = E2eEnv::try_setup().await else {
+        return;
+    };
+    let session = private_session_name("chat-attach");
+    let data = awkward_data_dir();
+    let server = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        &session,
+        [("ATM_SOCKET", env.daemon.socket_path.as_os_str())],
+    );
+    let path = format!(
+        "{}:{}",
+        env.atm_path.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    tmux_stdout(server.label(), &["set-environment", "-g", "PATH", &path]);
+    tmux_stdout(
+        server.label(),
+        &["rename-window", "-t", &format!("={session}:"), "work"],
+    );
+    let work = tmux_stdout(server.label(), &["display-message", "-p", "#{window_id}"])
+        .trim()
+        .to_owned();
+    // No production hook is installed yet: existing chat is a clean one-pane window.
+    let chat = workspace_chat_test_window(server.label(), &session, "chat", true);
+    let chat_before = workspace_pane_identity(server.label(), &chat);
+    assert_eq!(chat_before.lines().count(), 1);
+    let ordinary = ["Chat", "chat-notes", "work $(false) \"quoted\" spaces"]
+        .map(|name| workspace_chat_test_window(server.label(), &session, name, true));
+    let attach = || {
+        let output = command_output(
+            Command::new(&env.atm_path)
+                .args(["workspace", "attach", &session])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .env("ATM_TMUX_SOCKET", server.label())
+                .env("ATM_SOCKET", &env.daemon.socket_path)
+                .env("ATM_NO_ATTACH", "1")
+                .env("XDG_DATA_HOME", data.path())
+                .env("XDG_STATE_HOME", &env.daemon.state_dir)
+                .env("PATH", &path),
+        );
+        assert!(output.status.success(), "attach: {output:?}");
+    };
+    attach();
+    assert_eq!(
+        workspace_pane_identity(server.label(), &chat),
+        chat_before,
+        "attach changed chat panes"
+    );
+    for window in std::iter::once(&work).chain(&ordinary) {
+        let panes = workspace_pane_identity(server.label(), window);
+        assert_eq!(panes.lines().count(), 2, "ordinary window: {panes}");
+        assert_eq!(
+            panes.lines().filter(|line| line.ends_with("|1")).count(),
+            1,
+            "ordinary window: {panes}"
+        );
+    }
+    let all_panes = || {
+        tmux_stdout(
+            server.label(),
+            &[
+                "list-panes",
+                "-s",
+                "-t",
+                &format!("={session}:"),
+                "-F",
+                "#{window_id}|#{pane_id}|#{pane_pid}|#{@atm-sidebar}",
+            ],
+        )
+    };
+    let before = all_panes();
+    let script = single_workspace_script(data.path(), &format!("inject-sidebar-{session}.sh"));
+    std::fs::write(&script, "#!/bin/sh\nexit 37\n").unwrap();
+    attach();
+    assert_eq!(
+        all_panes(),
+        before,
+        "repeated attach changed pane identities"
+    );
+    assert_ne!(
+        std::fs::read_to_string(&script).unwrap(),
+        "#!/bin/sh\nexit 37\n"
+    );
+
+    let sidebar = tmux_stdout(
+        server.label(),
+        &[
+            "split-window",
+            "-d",
+            "-h",
+            "-t",
+            &chat,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "/bin/sh",
+        ],
+    )
+    .trim()
+    .to_owned();
+    tmux_stdout(
+        server.label(),
+        &["set-option", "-p", "-t", &sidebar, "@atm-sidebar", "1"],
+    );
+    let contaminated = workspace_pane_identity(server.label(), &chat);
+    attach();
+    assert_eq!(
+        workspace_pane_identity(server.label(), &chat),
+        contaminated,
+        "reattach must not remove an old sidebar or restart chat"
+    );
+    tmux_stdout(
+        server.label(),
+        &["rename-window", "-t", &chat, "retained-chat"],
+    );
+    let fresh = workspace_chat_test_window(server.label(), &session, "chat", true);
+    let panes = workspace_pane_identity(server.label(), &fresh);
+    assert_eq!(panes.lines().count(), 1, "refreshed hook chat: {panes}");
+    assert!(
+        panes.trim().ends_with('|'),
+        "refreshed hook added a sidebar: {panes}"
+    );
 }
 
 /// Scenario 5a — `atm workspace create` should install the same long-lived

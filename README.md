@@ -5,13 +5,13 @@
 
 A live dashboard and a daemon-backed control plane for coding agents in tmux.
 
-**0.5.0 adds a window-grouped Work view, owner decision answers and spoken-answer relays, message history, return digests and evaluation reports, and separate owner chat.** It is not a complete unattended workflow: see [known limits and not yet](#known-limits-and-not-yet).
+**0.5.1 opens the dashboard on Work, with vim-style tabs and reporting threads, and fixes chat copy, logging and its workspace sidebar.** ATM also includes owner decision answers and spoken-answer relays, message history, return digests, and evaluation reports. It is not a complete unattended workflow: see [known limits and not yet](#known-limits-and-not-yet).
 
 ## What it does
 
 ATM gives you a live dashboard and CLI for coding agents running in tmux, including Claude Code, pi, and Codex CLI. See context usage, cost, model, and activity at a glance — and control agents without switching panes.
 
-- **Dashboard** — real-time Sessions and window-grouped Work views, context bars, cost tracking, and live terminal capture
+- **Dashboard** — Work-first reporting threads and Sessions tabs, context bars, cost tracking, and live terminal capture
 - **Agent control** — spawn, kill, interrupt, send text, and reply to prompts from the CLI
 - **Named agents** — project-local roles with stable `project/name` identities, start/adopt/clear/respawn commands, and save-before-clear handover
 - **Durable coordination** — confirmed message references and inboxes, scoped history, project-attributed tasks with reviews and observed usage
@@ -152,7 +152,7 @@ Protocol **1.1** retains major-1 hook compatibility, including the existing 1.0 
 atm                    # launch TUI (starts daemon automatically)
 ```
 
-Sessions appear as you use supported coding-agent harnesses. Press `Enter` to jump to any session, `q` to quit. Press `w` to toggle the window-grouped Work view and Sessions; Sessions remains the start view.
+Sessions appear as you use supported coding-agent harnesses. The full dashboard and compact sidebar start on **Work**, followed by **Sessions**. Press `gt` / `gT` for the next / previous tab (wrapping), `1gt` / `2gt` to select Work / Sessions, or `w` as a toggle alias. Press `Enter` to jump to a session, `q` to quit.
 
 An open TUI restarts the daemon within a few seconds if it goes away, including after `atmd stop`. Quit every TUI before you stop the daemon for good, or before you restart it by hand: a TUI may start it first, with the TUI's environment. The daemon log defaults to `~/.local/state/atm/atm.log` (or `$XDG_STATE_HOME/atm/atm.log` when `XDG_STATE_HOME` is absolute); each background start keeps the previous run's log as `atm.log.1`. Set `ATM_STATE_DIR` to a nonempty directory path to keep the daemon's PID file (`atmd.pid`), logs (`atm.log`, `atm.log.1`) and event log (`log/`), and the TUI's `tui.log`, there instead. Use a directory that survives a reboot: atmd replays the event log at start.
 
@@ -162,11 +162,13 @@ Known limit (unverified in a seccomp-filtered runtime): if a filter rejects Linu
 
 ### Work view
 
-Press **`w`** to switch between Sessions and Work; Sessions remains the default. Work groups agents by their actual tmux window, not their Git project or a new task/work record. Sessions without a known window appear under **`(no window)`**. Named rows show task, decision and attention marks; window groups summarize open-task and decision counts and attention. These are recorded projections, not proof of execution.
+Work defaults to **reporting threads**: each lead with registered reports heads a group containing its own session and reporting seats; nested leads get their own groups, including across repositories. The headline is the lead's first known open-task title, falling back to its name. Named rows likewise put the task title first, with the agent name and repository/worktree as dim detail; `+N`, decision and attention marks retain their counts. **Setting a custom short work title is not implemented yet**, pending the separate title-setting contract; these are task-title/name fallbacks, not new work records.
+
+Inside Work, press **`gw`** to switch between reporting threads and physical tmux windows. Unmatched, ambiguous or broken reporting lines retain window groups; sessions without a known window appear under **`(no window)`**. Groups summarize open-task and decision counts and attention. These recorded projections are not proof of execution, and reporting groups do not add authority.
 
 Use **j/k** to navigate, **Enter** to fold a group or jump to a session, **`/`** to filter, **zc/zo/za** to close/open/toggle a fold and **zM/zR** to collapse/expand all. **n/N** visit attention and waiting-decision rows, opening their ancestors within the current filter. The filter is shared between views; each view keeps its own folds. **`r`** refreshes.
 
-Work reads `session.windows` and `org.tree` through the daemon. Failed reads keep the last good data, with a **stale** age once its freshness threshold passes. Without `session.windows`, Work asks for a newer `atmd`; without `org.tree`, it shows **no org data** while window grouping remains available, not invented task counts.
+Work reads `session.windows` and `org.tree` through the daemon. Failed reads keep the last good data and show **unavailable**, with a **stale** age once its freshness threshold passes. On the first connection to a daemon without `session.windows`, an untouched startup choice falls back to Sessions once; selecting Work still shows its needs-newer-`atmd` message. Reconnects do not change your chosen tab. Without `org.tree`, Work shows **no org data** and uses window grouping, not invented task counts.
 
 ## CLI at a glance
 
@@ -245,6 +247,8 @@ atm agent handover worker                   # ask it to save its state, then cle
 atm agent respawn worker                    # replace its pane and start it again
 atm agent down worker --kill                # stop the agent and kill its pane
 ```
+
+`atm agent down <agent>` releases the seat and leaves any existing pane and its program running; `atm agent down <agent> --kill` closes them instead.
 
 For `clear`, `handover`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
 
@@ -1075,6 +1079,15 @@ The owner-run source-checkout tool `scripts/atm-supervise` records stable/previo
 One automatic rollback is conditional on **unhealthy two-way probation**, both diagnostic logs retained, unchanged verified slots/pairs and rollout's own quiet checks. Unhealthy ONE-WAY probation, uncertain final health, refused recovery or missing evidence remains **NEEDS YOU**; there is no automatic retry, resume or slot reconciliation. Pair rollback still does not rewind organisation state, and candidate credential sharing remains routing isolation, not a sandbox. See the [supervisor procedure](scripts/atm-promotion.md#supervisor) and [known limits/manual recovery](scripts/atm-promotion.md#known-limits-and-the-manual-way-out); inspect retained evidence before intervention.
 
 ## Changelog
+
+### 0.5.1
+
+- **Work-first tabs:** full and compact dashboards start on Work; `gt` / `gT` wrap through Work and Sessions, `1gt` / `2gt` select a tab, and `w` remains an alias. An older daemon initially falls back to Sessions once.
+- **Work headlines:** reporting threads and task-first rows foreground the work, with repositories and agent names secondary. `gw` retains window grouping. Custom short work-title setting is not yet implemented; headlines fall back to known task titles, then names.
+- **Chat window:** prefix C-t no longer adds a workspace sidebar to chat. For each existing workspace, run `atm workspace attach <name>` once (add `--isolate` for an isolated workspace). Close and reopen chat if it already has a sidebar.
+- **Chat copy and logging:** copy long messages without hitting tmux's command-argument limit. Chat runs without a log if it can't open the log file.
+- **Chat visibility:** chat uses fewer tmux calls to check whether its pane is visible.
+- **Named agents:** `atm agent` subcommands have help text. `atm agent down` says the pane and its program keep running unless you pass `--kill`.
 
 ### 0.5.0
 

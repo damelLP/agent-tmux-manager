@@ -223,6 +223,66 @@ async fn agent_cli_roots_default_to_cwd_only_for_up_and_adopt() {
 }
 
 #[tokio::test]
+async fn agent_cli_help_describes_actions_and_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rpc.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut missing = Vec::new();
+    for (args, descriptions) in [
+        (
+            &["agent", "--help"][..],
+            &[
+                ("up", "Start a named agent from its role in a new tmux pane"),
+                (
+                    "adopt",
+                    "Register an existing pane as a named agent without restarting its program",
+                ),
+                ("clear", "Clear an agent's current context in its existing pane"),
+                (
+                    "handover",
+                    "Ask an agent to save its state to its memory file, then clear its context",
+                ),
+                ("respawn", "Restart an agent in a new pane, closing its old pane if present"),
+                ("down", "Take an agent down, leaving its pane open unless --kill is passed"),
+                ("list", "List named agents and their status, optionally filtered by project"),
+            ][..],
+        ),
+        (
+            &["agent", "down", "--help"][..],
+            &[(
+                "--kill",
+                "Close the pane and its program; without it the seat is released and the program keeps running",
+            )][..],
+        ),
+    ] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            command(args, dir.path(), &socket).output(),
+        )
+        .await
+        .expect("help command did not exit within its hang guard")
+        .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        std::future::poll_fn(|cx| {
+            assert!(listener.poll_accept(cx).is_pending(), "{args:?} connected");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(!dir.path().join("fallback").exists());
+
+        let help = String::from_utf8(output.stdout).unwrap();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (label, description) in descriptions {
+            if !help.contains(&format!("{label} {description}")) {
+                missing.push(label);
+            }
+        }
+    }
+    assert!(missing.is_empty(), "missing help text for {missing:?}");
+}
+
+#[tokio::test]
 async fn agent_cli_timeout_boundaries_full_ids_and_down_default_are_transmitted() {
     let id = "01234567890123456789012345678901/01234567890123456789012345678901";
     let session = "full-session-id-never-abbreviated-0123456789";
@@ -253,7 +313,17 @@ async fn agent_cli_timeout_boundaries_full_ids_and_down_default_are_transmitted(
             "agent.down",
             json!({"agent":id,"kill":false}),
             json!({"agent_id":id}),
-            format!("{id}\n"),
+            format!(
+                "{id}\nWithout --kill, any existing pane and its program keep running; \
+                 --kill closes them instead.\n"
+            ),
+        ),
+        (
+            vec!["agent", "down", id, "--format", "json"],
+            "agent.down",
+            json!({"agent":id,"kill":false}),
+            json!({"agent_id":id}),
+            format!("{{\"agent_id\":\"{id}\"}}\n"),
         ),
     ] {
         let output = exchange(

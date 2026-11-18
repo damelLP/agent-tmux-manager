@@ -686,6 +686,7 @@ async fn recorded_overrule_drains_redo_and_labels_a_failed_continuation() {
 mod real_daemon {
     use super::*;
     use atm_org::{Address, DecisionStatus, OrgCommand};
+    use atm_tui::control::ControlNotice;
     use atmd::{
         org::{agents::AgentHandle, messages::MessageHandle, OrgHandle},
         registry::spawn_registry,
@@ -1024,6 +1025,541 @@ mod real_daemon {
         );
         controller.shutdown();
         rig.stop().await;
+    }
+
+    // Adopted from the VW2b review: real private daemon/client/controllers/rendering.
+    use crate::tui_work::WorkController;
+    use atm_tui::{
+        app::{App, AppView},
+        work::{WorkEffect, WorkInput},
+    };
+
+    fn review_effects(
+        app: &mut App,
+        work: &mut WorkController,
+        owner: &mut DecisionController,
+        mut effects: Vec<WorkEffect>,
+    ) {
+        loop {
+            if let Some(seq) = app.work.org().and_then(|org| org.seq) {
+                owner.advance_work_cursor(seq);
+            }
+            match work.execute(effects, owner) {
+                Some(input) => effects = app.reduce_work(input, Duration::ZERO),
+                None => break,
+            }
+        }
+    }
+    fn review_input(
+        app: &mut App,
+        work: &mut WorkController,
+        owner: &mut DecisionController,
+        input: WorkInput,
+        now: u64,
+    ) {
+        let effects = app.reduce_work(input, Duration::from_secs(now));
+        review_effects(app, work, owner, effects);
+    }
+    async fn review_step(
+        rig: &mut ServerRig,
+        app: &mut App,
+        work: &mut WorkController,
+        owner: &mut DecisionController,
+        now: u64,
+    ) -> String {
+        tokio::select! {
+            update = owner.recv() => {
+                let update = update.unwrap();
+                let kind = if matches!(&update, Update::Snapshot {..}) { "decision.snapshot" } else { "decision.reply" };
+                owner.apply(update); kind.into()
+            }
+            input = work.recv() => {
+                let kind = match &input {
+                    WorkInput::WindowsReply { .. } => "windows.reply",
+                    WorkInput::OrgReply { .. } => "org.reply",
+                    _ => "work.wake",
+                };
+                review_input(app, work, owner, input, now); kind.into()
+            }
+            event = rig._events.recv() => {
+                let Event::Control(notice) = event.unwrap() else { return "session.event".into() };
+                let kind = match &notice {
+                    ControlNotice::Event(DaemonMessage::Event {kind, ..}) => kind.clone(),
+                    _ => "control.notice".into(),
+                };
+                owner.notice(&notice);
+                let input = match notice {
+                    ControlNotice::Capabilities {methods, ..} => Some(WorkInput::Capabilities {methods, watch: true}),
+                    ControlNotice::Event(DaemonMessage::Event {seq, kind, ..}) => Some(WorkInput::WatchEvent {seq, kind}),
+                    ControlNotice::WatchFailed(error) => panic!("unexpected watch failure: {error:?}"),
+                    _ => None,
+                };
+                if let Some(input) = input { review_input(app, work, owner, input, now); }
+                kind
+            }
+        }
+    }
+    async fn review_show(
+        rig: &mut ServerRig,
+        app: &mut App,
+        work: &mut WorkController,
+        owner: &mut DecisionController,
+    ) {
+        let effects = app.toggle_work_view(Duration::ZERO);
+        review_effects(app, work, owner, effects);
+        let (mut windows, mut org, mut fresh) = (false, false, false);
+        // Work's own replies are insufficient now: await the post-join decision read too.
+        while !windows || !org || !fresh {
+            match guarded(review_step(rig, app, work, owner, 0))
+                .await
+                .as_str()
+            {
+                "windows.reply" => windows = true,
+                "org.reply" => org = true,
+                "decision.snapshot" => fresh = true,
+                _ => {}
+            }
+        }
+        assert_eq!(app.view, AppView::Work);
+        assert!(app.work.org().is_some());
+    }
+    fn review_list(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        terminal
+            .draw(|frame| atm_tui::ui::session_list::render_session_list(frame, frame.area(), app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(140)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn review_popup_ready(owner: &mut DecisionController, status: DecisionStatus) -> bool {
+        matches!(owner.popup.as_ref().map(|p| &p.screen), Some(Screen::Inspect(entry)) if entry.decision.status == status)
+            && !rendered(owner.popup.as_mut().unwrap(), 100, 40)
+                .contains("refreshing before answering")
+    }
+    async fn review_body(rig: &mut ServerRig, work_first: bool, hide_first: bool) {
+        use atm_org::{
+            DecisionCommand, DecisionResolution, ProvisionalChoice, TaskActor, TaskCommand,
+            TaskCreated, TaskKind, TaskMeasure,
+        };
+        let id = rig.request().await;
+        let mut owner = rig.controller(Some("%99"));
+        owner.refresh();
+        apply_next(&mut owner).await;
+        let mut app = App::new();
+        app.view = AppView::Sessions;
+        app.update_sessions(vec![SessionView {
+            id: "worker-row".into(),
+            id_short: "worker-row".into(),
+            tmux_pane: Some("%7".into()),
+            ..Default::default()
+        }]);
+        let mut work = WorkController::new(rig.control.clone(), Some("%99".into()));
+        loop {
+            if let Event::Control(notice @ ControlNotice::Capabilities { .. }) =
+                guarded(rig._events.recv()).await.unwrap()
+            {
+                owner.notice(&notice);
+                let ControlNotice::Capabilities { methods, .. } = notice else {
+                    unreachable!()
+                };
+                review_input(
+                    &mut app,
+                    &mut work,
+                    &mut owner,
+                    WorkInput::Capabilities {
+                        methods,
+                        watch: true,
+                    },
+                    0,
+                );
+                break;
+            }
+        }
+        if work_first {
+            review_show(rig, &mut app, &mut work, &mut owner).await;
+            rig.inspect(&mut owner, id).await;
+        } else {
+            rig.inspect(&mut owner, id).await;
+            review_show(rig, &mut app, &mut work, &mut owner).await;
+        }
+        while !review_popup_ready(&mut owner, DecisionStatus::Pending) {
+            guarded(review_step(rig, &mut app, &mut work, &mut owner, 0)).await;
+        }
+        assert!(review_popup_ready(&mut owner, DecisionStatus::Pending));
+        assert!(review_list(&app).contains("worker"));
+        // A following agent.stuck event fences earlier task delivery on the real watcher.
+        guarded(rig.org.execute(
+            OrgCommand::Task(TaskCommand::Create(TaskCreated {
+                project_id: Some("project".parse().unwrap()),
+                title: "Concurrent review task".into(),
+                kind: TaskKind::Work,
+                creator: Address::Owner,
+                parent: None,
+                judges: None,
+                measure: TaskMeasure::Owner,
+                budget: None,
+                files: vec![],
+                rests_on: None,
+            })),
+            chrono::Utc::now(),
+        ))
+        .await
+        .unwrap();
+        let task_id = guarded(rig.org.snapshot())
+            .await
+            .unwrap()
+            .tasks()
+            .next()
+            .unwrap()
+            .id
+            .clone();
+        guarded(rig.org.execute(
+            OrgCommand::Task(TaskCommand::Assign {
+                task_id,
+                agent_id: "project/worker".parse().unwrap(),
+                by: TaskActor {
+                    who: Address::Owner,
+                    manager_of: None,
+                },
+            }),
+            chrono::Utc::now(),
+        ))
+        .await
+        .unwrap();
+        guarded(rig.org.execute(
+            OrgCommand::Stuck {
+                agent_id: "project/worker".parse().unwrap(),
+                reason: "review fence".into(),
+            },
+            chrono::Utc::now(),
+        ))
+        .await
+        .unwrap();
+        let mut task_events = Vec::new();
+        loop {
+            let kind = guarded(review_step(rig, &mut app, &mut work, &mut owner, 5)).await;
+            if kind.starts_with("task.") {
+                task_events.push(kind.clone());
+            }
+            if kind == "agent.stuck" {
+                break;
+            }
+        }
+        assert!(
+            task_events.iter().any(|kind| kind == "task.created"),
+            "task.created was lost while decision popup and Work were both open: {task_events:?}"
+        );
+        assert!(
+            task_events.iter().any(|kind| kind == "task.assigned"),
+            "task.assigned was lost: {task_events:?}"
+        );
+        while !review_list(&app).contains("Concurrent review task")
+            || !review_popup_ready(&mut owner, DecisionStatus::Pending)
+        {
+            guarded(review_step(rig, &mut app, &mut work, &mut owner, 5)).await;
+        }
+        assert!(review_list(&app).contains('!'));
+        assert_eq!(app.view, AppView::Work);
+        guarded(rig.org.execute(
+            OrgCommand::Decision(DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                decision_id: id,
+                option: " yes ".into(),
+                by: Address::System,
+                relayed_by: None,
+            })),
+            chrono::Utc::now(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            if guarded(review_step(rig, &mut app, &mut work, &mut owner, 10)).await
+                == "decision.taken_provisionally"
+            {
+                break;
+            }
+        }
+        owner.key(key(KeyCode::Enter));
+        assert!(
+            rendered(owner.popup.as_mut().unwrap(), 100, 40)
+                .contains("refreshing before answering"),
+            "newer decision event failed to invalidate the simultaneously open popup"
+        );
+        while !review_popup_ready(&mut owner, DecisionStatus::TakenProvisionally)
+            || !app
+                .work
+                .org()
+                .unwrap()
+                .needs_owner
+                .items
+                .iter()
+                .any(|item| item.kind == "decision_provisional")
+        {
+            guarded(review_step(rig, &mut app, &mut work, &mut owner, 10)).await;
+        }
+        assert!(review_list(&app).contains("Concurrent review task"));
+        if hide_first {
+            let effects = app.toggle_work_view(Duration::from_secs(15));
+            review_effects(&mut app, &mut work, &mut owner, effects);
+            assert_eq!(app.view, AppView::Sessions);
+            guarded(rig.org.execute(
+                OrgCommand::Decision(DecisionCommand::Resolve(DecisionResolution {
+                    decision_id: id,
+                    by: Address::Owner,
+                    option: " yes ".into(),
+                    note: None,
+                    standing_rule: false,
+                })),
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                if guarded(review_step(rig, &mut app, &mut work, &mut owner, 15)).await
+                    == "decision.resolved"
+                {
+                    break;
+                }
+            }
+            while !review_popup_ready(&mut owner, DecisionStatus::Resolved) {
+                guarded(review_step(rig, &mut app, &mut work, &mut owner, 15)).await;
+            }
+            owner.key(key(KeyCode::Esc));
+            assert!(owner.popup.is_none());
+        } else {
+            owner.key(key(KeyCode::Esc));
+            assert!(owner.popup.is_none());
+            let old_seq = app.work.org().unwrap().seq.unwrap();
+            guarded(rig.org.execute(
+                OrgCommand::Down {
+                    agent_id: "project/worker".parse().unwrap(),
+                    reason: "review close fence".into(),
+                },
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                if guarded(review_step(rig, &mut app, &mut work, &mut owner, 15)).await
+                    == "agent.down"
+                {
+                    break;
+                }
+            }
+            while app.work.org().unwrap().seq.unwrap() <= old_seq {
+                guarded(review_step(rig, &mut app, &mut work, &mut owner, 15)).await;
+            }
+            assert!(owner.popup.is_none());
+            assert_eq!(app.view, AppView::Work);
+            assert!(
+                !review_list(&app).contains("Concurrent review task"),
+                "closed popup disabled Work's live refresh"
+            );
+            let effects = app.toggle_work_view(Duration::from_secs(15));
+            review_effects(&mut app, &mut work, &mut owner, effects);
+        }
+        work.shutdown();
+        owner.shutdown();
+        eprintln!(
+            "simultaneous real-daemon proof: work_first={work_first}, hide_first={hide_first}"
+        );
+    }
+    async fn review_checked(work_first: bool, hide_first: bool) {
+        let mut rig = ServerRig::start().await;
+        let result = {
+            let future = guarded(review_body(&mut rig, work_first, hide_first));
+            tokio::pin!(future);
+            std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    future.as_mut().poll(cx)
+                })) {
+                    Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(Ok(())),
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Err(error) => std::task::Poll::Ready(Err(error)),
+                }
+            })
+            .await
+        };
+        rig.stop().await;
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
+    #[tokio::test]
+    async fn review_simultaneous_work_first_hide_first() {
+        review_checked(true, true).await;
+    }
+    #[tokio::test]
+    async fn review_simultaneous_work_first_popup_closes_first() {
+        review_checked(true, false).await;
+    }
+    #[tokio::test]
+    async fn review_simultaneous_popup_first_hide_first() {
+        review_checked(false, true).await;
+    }
+    #[tokio::test]
+    async fn review_simultaneous_popup_first_popup_closes_first() {
+        review_checked(false, false).await;
+    }
+
+    // Neutral real committed frames, shared by both sides of the replay/draw measurement.
+    pub(super) async fn recorded_work_usage_log(count: usize) -> Vec<DaemonMessage> {
+        let mut rig = ServerRig::start().await;
+        let result = {
+            let future = async {
+                let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+                guarded(rig.org.execute(
+                    OrgCommand::Adopt {
+                        agent_id: "project/worker".parse().unwrap(),
+                        pane: "%7".into(),
+                        session_id: Some("recorded-session".into()),
+                    },
+                    now,
+                ))
+                .await
+                .unwrap();
+                let cursor = rig.org.status().unwrap();
+                let mut last = cursor;
+                for _ in 0..count {
+                    let events = guarded(rig.org.execute(
+                        OrgCommand::ObserveTaskUsage(atm_org::TaskUsageObservation {
+                            session_id: "recorded-session".into(),
+                            pane: Some("%7".into()),
+                            turn: true,
+                            cumulative_cost: None,
+                            context_percent: None,
+                        }),
+                        now,
+                    ))
+                    .await
+                    .unwrap();
+                    assert_eq!(events.len(), 1);
+                    last = events.first().unwrap().seq;
+                }
+                rig.control.watch(vec!["task.".into()], cursor).unwrap();
+                let mut frames = Vec::new();
+                loop {
+                    if let Event::Control(ControlNotice::Event(
+                        frame @ DaemonMessage::Event { seq, .. },
+                    )) = guarded(rig._events.recv()).await.unwrap()
+                    {
+                        frames.push(frame);
+                        if seq == last {
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(frames.len(), count);
+                frames
+            };
+            tokio::pin!(future);
+            std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    future.as_mut().poll(cx)
+                })) {
+                    Ok(std::task::Poll::Ready(frames)) => std::task::Poll::Ready(Ok(frames)),
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Err(error) => std::task::Poll::Ready(Err(error)),
+                }
+            })
+            .await
+        };
+        rig.stop().await;
+        result.unwrap_or_else(|error| std::panic::resume_unwind(error))
+    }
+
+    // Characterization: real committed usage replays, and replacement is not additive.
+    #[tokio::test]
+    async fn recorded_usage_watch_replacement_is_single_scope() {
+        let mut rig = ServerRig::start().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+            guarded(rig.org.execute(
+                OrgCommand::Adopt {
+                    agent_id: "project/worker".parse().unwrap(),
+                    pane: "%7".into(),
+                    session_id: Some("recorded-session".into()),
+                },
+                now,
+            ))
+            .await
+            .unwrap();
+            let cursor = rig.org.status().unwrap();
+            let mut last = cursor;
+            for _ in 0..16 {
+                last = guarded(rig.org.execute(
+                    OrgCommand::ObserveTaskUsage(atm_org::TaskUsageObservation {
+                        session_id: "recorded-session".into(),
+                        pane: Some("%7".into()),
+                        turn: true,
+                        cumulative_cost: None,
+                        context_percent: None,
+                    }),
+                    now,
+                ))
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .seq;
+            }
+            rig.control.watch(vec!["task.".into()], cursor).unwrap();
+            let mut count = 0;
+            loop {
+                if let Event::Control(ControlNotice::Event(DaemonMessage::Event {
+                    seq,
+                    kind,
+                    ..
+                })) = guarded(rig._events.recv()).await.unwrap()
+                {
+                    assert_eq!(kind, "task.usage_observed");
+                    count += 1;
+                    if seq == last {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(count, 16);
+            rig.control.watch(vec!["decision.".into()], cursor).unwrap();
+            let id = rig.request().await;
+            loop {
+                if let Event::Control(ControlNotice::Event(DaemonMessage::Event {
+                    seq,
+                    kind,
+                    body,
+                    ..
+                })) = guarded(rig._events.recv()).await.unwrap()
+                {
+                    eprintln!("replacement event: seq={seq} kind={kind} body={body}");
+                    assert_eq!(kind, "decision.requested");
+                    assert_eq!(format!("d{seq}"), id.to_string());
+                    break;
+                }
+            }
+            eprintln!("real private atmd: 16 committed usage records replayed; replacement delivered decision only");
+        });
+        let result = {
+            tokio::pin!(result);
+            std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    result.as_mut().poll(cx)
+                })) {
+                    Ok(std::task::Poll::Ready(())) => std::task::Poll::Ready(Ok(())),
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Err(error) => std::task::Poll::Ready(Err(error)),
+                }
+            })
+            .await
+        };
+        rig.stop().await;
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
     }
 }
 
@@ -2154,6 +2690,450 @@ async fn work_event(rig: &mut Rig, peer: &mut Peer, seq: u64) -> atm_tui::contro
     }
 }
 
+// A join must start a new projection before replacing the old physical watch.
+async fn work_wire_fence(rig: &mut Rig, peer: &mut Peer) {
+    peer.fence(&rig.commands).await;
+    // Discover fences commands, not a still-pending Pong. This ordered inbound
+    // frame proves the client processed that Pong before we fence outgoing Watch.
+    peer.send(DaemonMessage::session_list(vec![])).await;
+    while !matches!(
+        guarded(rig._events.recv()).await.unwrap(),
+        Event::SessionListReplace(_)
+    ) {}
+    peer.fence(&rig.commands).await;
+}
+async fn work_join_org(peer: &mut Peer) -> String {
+    match peer.raw().await {
+        MessageType::Request {
+            id,
+            method,
+            from_pane,
+            ..
+        } if method == "org.tree" => {
+            assert_eq!(from_pane.as_deref(), Some("%99"));
+            id
+        }
+        other => panic!("Work installed a stale union before a post-join snapshot: {other:?}"),
+    }
+}
+async fn work_finish_join(controller: &mut DecisionController, peer: &mut Peer, seq: u64) {
+    let id = work_join_org(peer).await;
+    let mut org = tree();
+    org["seq"] = json!(seq);
+    peer.send(DaemonMessage::response_ok(id, org)).await;
+    peer.reply("decision.list", page(vec![entry(41, "alpha/lead")], None))
+        .await;
+    apply_next(controller).await;
+    work_next_watch(peer).await;
+}
+
+// Break caught: an old decision floor adds thousands of already-covered task frames per w.
+#[tokio::test]
+async fn work_join_waits_for_post_join_snapshot_without_replaying_covered_tasks() {
+    let (mut rig, mut peer) = Rig::start(METHODS).await;
+    let mut controller = rig.controller();
+    work_snapshot(&mut controller, &mut peer, 41).await;
+    peer.fence(&rig.commands).await;
+    let recorded: Vec<_> = (42..=2089)
+        .map(|seq| DaemonMessage::Event {
+            topic: "task".into(),
+            seq,
+            ts: "2026-01-15T12:00:00Z".into(),
+            kind: "task.usage_observed".into(),
+            body: json!({}),
+        })
+        .collect();
+    for fresh in [1065, 2089] {
+        controller
+            .set_work_watch(Some(work_interest(fresh)))
+            .unwrap();
+        work_finish_join(&mut controller, &mut peer, fresh).await;
+        let (topics, cursor) = peer.watches.last().unwrap();
+        assert_eq!(*cursor, fresh);
+        assert!(topics.iter().any(|topic| topic == "task."));
+        let cursor = *cursor;
+        for event in &recorded {
+            if matches!(event, DaemonMessage::Event {seq, ..} if *seq > cursor && *seq <= fresh) {
+                peer.send(event.clone()).await;
+            }
+        }
+        // This frame fences every replay write on the same socket and event channel.
+        peer.send(DaemonMessage::session_list(vec![])).await;
+        let mut replayed = 0;
+        loop {
+            match guarded(rig._events.recv()).await.unwrap() {
+                Event::Control(atm_tui::control::ControlNotice::Event(DaemonMessage::Event {
+                    kind,
+                    ..
+                })) if kind.starts_with("task.") => replayed += 1,
+                Event::SessionListReplace(_) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(replayed, 0, "covered task replay on Work join at {fresh}");
+        controller.set_work_watch(None).unwrap();
+        work_next_watch(&mut peer).await;
+        peer.fence(&rig.commands).await;
+    }
+    controller.shutdown();
+    rig.stop().await;
+}
+
+// Break caught: a read whose org.tree predates the join activates its task topics.
+#[tokio::test]
+async fn work_join_ignores_pre_join_snapshot_completion() {
+    let (rig, mut peer) = Rig::start(METHODS).await;
+    let mut controller = rig.controller();
+    work_snapshot(&mut controller, &mut peer, 41).await;
+    peer.fence(&rig.commands).await;
+    controller.refresh();
+    peer.reply("org.tree", tree()).await;
+    let (held, _) = peer.request("decision.list").await;
+    controller
+        .set_work_watch(Some(work_interest(1065)))
+        .unwrap();
+    peer.fence(&rig.commands).await;
+    assert_eq!(
+        peer.watches.len(),
+        1,
+        "pre-join read must leave the old watch live"
+    );
+    peer.send(DaemonMessage::response_ok(held, page(vec![], None)))
+        .await;
+    apply_next(&mut controller).await;
+    work_finish_join(&mut controller, &mut peer, 1065).await;
+    assert_eq!(peer.watches.last().unwrap().1, 1065);
+    controller.shutdown();
+    rig.stop().await;
+}
+
+// Break caught: taking max loses the older consumer's tail, or repeated joins spawn extra reads.
+#[tokio::test]
+async fn work_join_keeps_minimum_of_fresh_floors() {
+    for (decision, work) in [(1065, 1070), (1070, 1065)] {
+        let (mut rig, mut peer) = Rig::start(METHODS).await;
+        let mut controller = rig.controller();
+        work_snapshot(&mut controller, &mut peer, 41).await;
+        peer.fence(&rig.commands).await;
+        controller
+            .set_work_watch(Some(work_interest(work)))
+            .unwrap();
+        work_finish_join(&mut controller, &mut peer, decision).await;
+        assert_eq!(peer.watches.last().unwrap().1, 1065);
+        for (seq, kind) in [(1066, "task.usage_observed"), (1067, "decision.requested")] {
+            peer.send(DaemonMessage::Event {
+                topic: "org".into(),
+                seq,
+                ts: "2026-01-15T12:00:00Z".into(),
+                kind: kind.into(),
+                body: json!({}),
+            })
+            .await;
+        }
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            if let Event::Control(atm_tui::control::ControlNotice::Event(DaemonMessage::Event {
+                seq,
+                ..
+            })) = guarded(rig._events.recv()).await.unwrap()
+            {
+                seen.push(seq);
+            }
+        }
+        assert_eq!(seen, [1066, 1067]);
+        controller.shutdown();
+        rig.stop().await;
+    }
+}
+
+// Break caught: repeated/advanced interest installs an intermediate stale union or parallel read.
+#[tokio::test]
+async fn work_join_repeated_interest_coalesces_refresh() {
+    let (rig, mut peer) = Rig::start(METHODS).await;
+    let mut controller = rig.controller();
+    work_snapshot(&mut controller, &mut peer, 41).await;
+    peer.fence(&rig.commands).await;
+    controller
+        .set_work_watch(Some(work_interest(1065)))
+        .unwrap();
+    let held = work_join_org(&mut peer).await;
+    controller
+        .set_work_watch(Some(work_interest(1065)))
+        .unwrap();
+    controller
+        .set_work_watch(Some(work_interest(1070)))
+        .unwrap();
+    peer.fence(&rig.commands).await;
+    assert_eq!(peer.watches.len(), 1);
+    let mut org = tree();
+    org["seq"] = json!(1070);
+    peer.send(DaemonMessage::response_ok(held, org)).await;
+    peer.reply("decision.list", page(vec![], None)).await;
+    apply_next(&mut controller).await;
+    work_next_watch(&mut peer).await;
+    peer.fence(&rig.commands).await;
+    assert_eq!(peer.watches.len(), 2);
+    assert_eq!(peer.watches.last().unwrap().1, 1070);
+    controller.shutdown();
+    rig.stop().await;
+}
+
+// Break caught: a late join read restores hidden Work, or reopening accepts that old read.
+#[tokio::test]
+async fn work_join_hidden_and_reopened_does_not_activate_obsolete_interest() {
+    for reopen_while_held in [false, true] {
+        let (mut rig, mut peer) = Rig::start(METHODS).await;
+        let mut controller = rig.controller();
+        work_snapshot(&mut controller, &mut peer, 41).await;
+        peer.fence(&rig.commands).await;
+        controller
+            .set_work_watch(Some(work_interest(1065)))
+            .unwrap();
+        let held = work_join_org(&mut peer).await;
+        controller.set_work_watch(None).unwrap();
+        work_wire_fence(&mut rig, &mut peer).await;
+        controller.set_work_watch(None).unwrap();
+        peer.fence(&rig.commands).await;
+        assert_eq!(peer.watches.len(), 2);
+        if reopen_while_held {
+            controller
+                .set_work_watch(Some(work_interest(2089)))
+                .unwrap();
+        }
+        let mut org = tree();
+        org["seq"] = json!(1065);
+        peer.send(DaemonMessage::response_ok(held, org)).await;
+        peer.reply("decision.list", page(vec![], None)).await;
+        apply_next(&mut controller).await;
+        if !reopen_while_held {
+            work_next_watch(&mut peer).await;
+            assert_eq!(
+                peer.watches.last().unwrap().0,
+                ["decision.", "agent.", "project."]
+            );
+            controller
+                .set_work_watch(Some(work_interest(2089)))
+                .unwrap();
+        }
+        work_finish_join(&mut controller, &mut peer, 2089).await;
+        assert_eq!(peer.watches.last().unwrap().1, 2089);
+        peer.fence(&rig.commands).await;
+        controller.shutdown();
+        rig.stop().await;
+    }
+}
+
+// Break caught: a refused/malformed join refresh strands Work or fabricates a newer floor.
+#[tokio::test]
+async fn work_join_refresh_failure_preserves_safe_watch() {
+    for malformed in [false, true] {
+        let (mut rig, mut peer) = Rig::start(METHODS).await;
+        let mut controller = rig.controller();
+        work_snapshot(&mut controller, &mut peer, 41).await;
+        peer.fence(&rig.commands).await;
+        controller
+            .set_work_watch(Some(work_interest(1065)))
+            .unwrap();
+        let held = work_join_org(&mut peer).await;
+        peer.send(if malformed {
+            DaemonMessage::response_ok(held, json!({"seq":"invalid"}))
+        } else {
+            DaemonMessage::response_err(held, "unavailable", "held projection refused")
+        })
+        .await;
+        apply_next(&mut controller).await;
+        peer.fence(&rig.commands).await;
+        work_wire_fence(&mut rig, &mut peer).await;
+        assert_eq!(
+            peer.watches.len(),
+            2,
+            "failed join must activate one safe union"
+        );
+        assert_eq!(peer.watches.last().unwrap().1, 41);
+        assert!(peer
+            .watches
+            .last()
+            .unwrap()
+            .0
+            .iter()
+            .any(|topic| topic == "task."));
+        assert!(controller.waiting_panes.is_empty());
+        peer.fence(&rig.commands).await;
+        assert_eq!(
+            peer.watches.len(),
+            2,
+            "one conservative fallback, no retry loop"
+        );
+        peer.send(DaemonMessage::Event {
+            topic: "task".into(),
+            seq: 1066,
+            ts: "2026-01-15T12:00:00Z".into(),
+            kind: "task.usage_observed".into(),
+            body: json!({}),
+        })
+        .await;
+        loop {
+            if let Event::Control(
+                notice @ atm_tui::control::ControlNotice::Event(DaemonMessage::Event {
+                    seq: 1066,
+                    ..
+                }),
+            ) = guarded(rig._events.recv()).await.unwrap()
+            {
+                controller.notice(&notice);
+                break;
+            }
+        }
+        peer.fence(&rig.commands).await;
+        controller.shutdown();
+        rig.stop().await;
+    }
+}
+
+// Break caught: a timed-out fresh read leaves the join gate permanently armed.
+#[tokio::test(start_paused = true)]
+async fn work_join_refresh_timeout_falls_back_without_real_socket_clock() {
+    let (tx, mut commands) = mpsc::unbounded_channel();
+    let mut controller = DecisionController::new(ControlHandle::new(tx), None);
+    controller.refresh();
+    let old = guarded(commands.recv()).await.unwrap();
+    controller
+        .set_work_watch(Some(work_interest(1065)))
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(17)).await;
+    apply_next(&mut controller).await;
+    let fresh = guarded(commands.recv()).await.unwrap();
+    assert!(format!("{fresh:?}").contains("org.tree"));
+    assert!(commands.try_recv().is_err());
+    tokio::time::advance(Duration::from_secs(17)).await;
+    apply_next(&mut controller).await;
+    let fallback = commands
+        .try_recv()
+        .expect("fresh timeout must synchronously submit the fallback");
+    let fallback = format!("{fallback:?}");
+    assert!(fallback.contains("Watch { topics:"), "{fallback}");
+    assert!(
+        fallback.contains("task.") && fallback.contains("cursor: 1065"),
+        "{fallback}"
+    );
+    assert!(commands.try_recv().is_err());
+    controller.shutdown();
+    drop((old, fresh));
+}
+
+// Break caught: a disconnected join gate blocks decision-only recovery when Work does not rejoin.
+#[tokio::test]
+async fn work_join_disconnected_without_rejoin_recovers_decision_only() {
+    use atm_tui::control::ControlNotice;
+    let (mut rig, mut peer) = Rig::start(METHODS).await;
+    let mut controller = rig.controller();
+    work_snapshot(&mut controller, &mut peer, 41).await;
+    peer.fence(&rig.commands).await;
+    controller
+        .set_work_watch(Some(work_interest(1065)))
+        .unwrap();
+    let old = work_join_org(&mut peer).await;
+    controller.disconnected();
+    controller.set_work_watch(None).unwrap();
+    assert!(matches!(peer.raw().await, MessageType::Unwatch));
+    controller.notice(&ControlNotice::Capabilities {
+        protocol_version: ProtocolVersion::new(1, 1),
+        methods: METHODS.iter().map(|m| (*m).into()).collect(),
+    });
+    let fresh = work_join_org(&mut peer).await;
+    peer.send(DaemonMessage::response_ok(old, tree())).await;
+    let mut org = tree();
+    org["seq"] = json!(2089);
+    peer.send(DaemonMessage::response_ok(fresh, org)).await;
+    peer.reply("decision.list", page(vec![], None)).await;
+    apply_next(&mut controller).await;
+    peer.fence(&rig.commands).await;
+    work_wire_fence(&mut rig, &mut peer).await;
+    assert_eq!(
+        peer.watches.len(),
+        2,
+        "decision watch remained blocked by disconnected join"
+    );
+    assert_eq!(
+        peer.watches.last().unwrap(),
+        &(
+            vec!["decision.".into(), "agent.".into(), "project.".into()],
+            2089
+        )
+    );
+    controller.shutdown();
+    rig.stop().await;
+}
+
+// Break caught: WatchFailed leaves a pending Work interest, or failure dirties a mutation.
+#[tokio::test]
+async fn work_join_failure_during_open_get_or_mutation_keeps_op7_gate() {
+    use atm_tui::control::{ControlFailure, ControlNotice};
+    for mutating in [false, true] {
+        let (rig, mut peer) = Rig::start(METHODS).await;
+        let mut controller = rig.controller();
+        work_snapshot(&mut controller, &mut peer, 41).await;
+        let held_popup = if mutating {
+            open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
+            controller.key(key(KeyCode::Enter));
+            peer.request("decision.resolve").await.0
+        } else {
+            controller.open(atm_org::DecisionId::new(41));
+            peer.request("decision.get").await.0
+        };
+        controller
+            .set_work_watch(Some(work_interest(1065)))
+            .unwrap();
+        let held_join = work_join_org(&mut peer).await;
+        controller.notice(&ControlNotice::WatchFailed(ControlFailure::Timeout));
+        controller.set_work_watch(None).unwrap();
+        assert!(matches!(peer.raw().await, MessageType::Unwatch));
+        peer.send(DaemonMessage::response_err(
+            held_join,
+            "unavailable",
+            "join failed",
+        ))
+        .await;
+        apply_next(&mut controller).await;
+        peer.send(if mutating {
+            DaemonMessage::response_err(held_popup, "unavailable", "reply lost after admission")
+        } else {
+            DaemonMessage::response_ok(held_popup, json!({"decision":entry(41,"alpha/lead")}))
+        })
+        .await;
+        apply_popup(&mut controller).await;
+        controller.key(key(KeyCode::Enter));
+        if mutating {
+            assert!(
+                rendered(controller.popup.as_mut().unwrap(), 100, 40).contains("Outcome unknown")
+            );
+        } else {
+            assert!(
+                matches!(controller.popup.as_ref().unwrap().screen, Screen::Loading),
+                "an old loading reply must remain gated after the pending join fails"
+            );
+            assert!(
+                !rendered(controller.popup.as_mut().unwrap(), 100, 40).contains("Recording answer")
+            );
+            let (fresh, _) = peer.request("decision.get").await;
+            peer.send(DaemonMessage::response_ok(
+                fresh,
+                json!({"decision":provisional_entry()}),
+            ))
+            .await;
+            apply_popup(&mut controller).await;
+        }
+        peer.fence(&rig.commands).await;
+        assert_eq!(
+            peer.watches.len(),
+            1,
+            "failed pending join must not restore Work"
+        );
+        controller.shutdown();
+        rig.stop().await;
+    }
+}
+
 // Break caught: max(cursor), lost decision/project topics, or reordered legacy topics.
 #[test]
 fn work_watch_union_uses_earliest_snapshot_cursor() {
@@ -2265,6 +3245,7 @@ async fn work_union_refresh_uses_advanced_work_floor() {
     work_snapshot(&mut controller, &mut peer, 41).await;
     peer.fence(&rig.commands).await;
     controller.set_work_watch(Some(work_interest(30))).unwrap();
+    work_finish_join(&mut controller, &mut peer, 41).await;
     peer.watch_at(30).await;
     peer.fence(&rig.commands).await;
     controller.notice(&atm_tui::control::ControlNotice::Event(
@@ -2320,8 +3301,9 @@ async fn work_union_replay_does_not_dirty_a_covered_decision() {
     let _cancel = rig.cancel.clone().drop_guard();
     let mut controller = rig.controller();
     work_snapshot(&mut controller, &mut peer, 41).await;
-    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     controller.set_work_watch(Some(work_interest(30))).unwrap();
+    work_finish_join(&mut controller, &mut peer, 41).await;
+    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     peer.fence(&rig.commands).await;
     for seq in [40, 41] {
         controller.notice(&work_event(&mut rig, &mut peer, seq).await);
@@ -2341,8 +3323,9 @@ async fn work_union_newer_event_invalidates_open_popup() {
     let _cancel = rig.cancel.clone().drop_guard();
     let mut controller = rig.controller();
     work_snapshot(&mut controller, &mut peer, 41).await;
-    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     controller.set_work_watch(Some(work_interest(30))).unwrap();
+    work_finish_join(&mut controller, &mut peer, 41).await;
+    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     peer.fence(&rig.commands).await;
     controller.notice(&work_event(&mut rig, &mut peer, 42).await);
     controller.key(key(KeyCode::Enter));
@@ -2388,6 +3371,7 @@ async fn work_union_newer_event_during_get_requires_follow_up() {
     work_snapshot(&mut controller, &mut peer, 41).await;
     peer.fence(&rig.commands).await;
     controller.set_work_watch(Some(work_interest(30))).unwrap();
+    work_finish_join(&mut controller, &mut peer, 41).await;
     peer.fence(&rig.commands).await;
     controller.open(atm_org::DecisionId::new(41));
     let (old, _) = peer.request("decision.get").await;
@@ -2426,8 +3410,9 @@ async fn work_watch_failure_preserves_open_draft_gate() {
     let _cancel = rig.cancel.clone().drop_guard();
     let mut controller = rig.controller();
     work_snapshot(&mut controller, &mut peer, 41).await;
-    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     controller.set_work_watch(Some(work_interest(30))).unwrap();
+    work_finish_join(&mut controller, &mut peer, 41).await;
+    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     peer.watch_at(30).await;
     peer.fence(&rig.commands).await;
     controller.notice(&atm_tui::control::ControlNotice::WatchFailed(
@@ -2470,6 +3455,7 @@ async fn work_watch_failure_during_loading_requires_a_fresh_get() {
     let mut controller = rig.controller();
     work_snapshot(&mut controller, &mut peer, 41).await;
     controller.set_work_watch(Some(work_interest(30))).unwrap();
+    work_finish_join(&mut controller, &mut peer, 41).await;
     peer.watch_at(30).await;
     controller.open(atm_org::DecisionId::new(41));
     let (held, _) = peer.request("decision.get").await;
@@ -2517,8 +3503,9 @@ async fn work_watch_failure_during_mutation_never_replays_the_answer() {
     let _cancel = rig.cancel.clone().drop_guard();
     let mut controller = rig.controller();
     work_snapshot(&mut controller, &mut peer, 41).await;
-    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     controller.set_work_watch(Some(work_interest(30))).unwrap();
+    work_finish_join(&mut controller, &mut peer, 41).await;
+    open_peer_entry(&mut controller, &mut peer, entry(41, "alpha/lead")).await;
     peer.watch_at(30).await;
     controller.key(key(KeyCode::Enter));
     let (held, _) = peer.request("decision.resolve").await;

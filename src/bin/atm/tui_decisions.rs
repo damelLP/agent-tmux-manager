@@ -81,6 +81,7 @@ pub(super) struct DecisionController {
     pending_open: Option<Option<String>>,
     decision_watch: Option<u64>,
     work_watch: Option<(u64, Vec<String>)>,
+    pending_work_join: Option<u64>,
     control: ControlHandle,
     from_pane: Option<String>,
     generation: u64,
@@ -104,6 +105,7 @@ impl DecisionController {
             pending_open: None,
             decision_watch: None,
             work_watch: None,
+            pending_work_join: None,
             control,
             from_pane,
             generation: 0,
@@ -115,6 +117,9 @@ impl DecisionController {
         }
     }
     fn install_watch(&self) -> Result<(), ControlFailure> {
+        if self.pending_work_join.is_some() {
+            return Ok(());
+        }
         match watch_scope(self.decision_watch, self.work_watch.as_ref()) {
             Some((topics, cursor)) => self.control.watch(topics, cursor),
             None => self.control.unwatch(),
@@ -127,7 +132,18 @@ impl DecisionController {
         if self.work_watch == interest {
             return Ok(());
         }
+        let joining = self.work_watch.is_none() && interest.is_some();
         self.work_watch = interest;
+        if self.work_watch.is_none() {
+            self.pending_work_join = None;
+        } else if joining
+            && (self.decision_watch.is_some() || self.reader.is_some() || !self.online)
+        {
+            // Even an in-flight read may have captured org.tree before this join.
+            // Keep the old watch live until a post-join generation covers decisions.
+            self.pending_work_join = Some(self.read_generation.wrapping_add(1));
+            self.refresh();
+        }
         let result = self.install_watch();
         if result.is_err() {
             self.waiting_panes.clear();
@@ -288,6 +304,10 @@ impl DecisionController {
             return;
         }
         self.reader = None;
+        let joined = self.pending_work_join == Some(generation);
+        if joined {
+            self.pending_work_join = None;
+        }
         match result {
             Ok(snapshot) => {
                 self.waiting_panes = snapshot
@@ -359,6 +379,10 @@ impl DecisionController {
             }
             Err(error) => {
                 self.waiting_panes.clear();
+                if joined {
+                    // A failed refresh must not strand Work without its event stream.
+                    let _ = self.install_watch();
+                }
                 if self.pending_open.take().is_some() {
                     if let Some(popup) = &mut self.popup {
                         popup.reduce(Input::Failed(error.to_string()));
@@ -442,6 +466,7 @@ impl DecisionController {
             ControlNotice::WatchFailed(_) => {
                 self.decision_watch = None;
                 self.work_watch = None;
+                self.pending_work_join = None;
                 self.waiting_panes.clear();
                 let _ = self.control.unwatch();
                 if let Some(id) = self.open_id() {
@@ -454,6 +479,7 @@ impl DecisionController {
     pub(super) fn disconnected(&mut self) {
         self.decision_watch = None;
         self.work_watch = None;
+        self.pending_work_join = None;
         self.online = false;
         self.dirty = true;
         self.waiting_panes.clear();
@@ -507,6 +533,7 @@ impl DecisionController {
     pub(super) fn shutdown(&mut self) {
         self.decision_watch = None;
         self.work_watch = None;
+        self.pending_work_join = None;
         self.get = None;
         self.online = false;
         self.dirty = false;

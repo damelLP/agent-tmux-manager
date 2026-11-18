@@ -760,6 +760,16 @@ pub(super) async fn run_event_loop(
                                 let effects = app.toggle_work_view(work.now());
                                 execute_work_effects(app, &mut work, &mut decisions, effects);
                             }
+                            UiAction::ToggleWorkGrouping => {
+                                if let Some(effects) = app.toggle_work_grouping(work.now()) {
+                                    execute_work_effects(app, &mut work, &mut decisions, effects);
+                                }
+                            }
+                            UiAction::GoToTab(index) => {
+                                if let Some(effects) = app.select_tab(index, work.now()) {
+                                    execute_work_effects(app, &mut work, &mut decisions, effects);
+                                }
+                            }
                             UiAction::Refresh => {
                                 apply_work_input(
                                     app,
@@ -1372,6 +1382,7 @@ mod kill_action_tests {
 
     fn selected_app(pane: Option<&str>) -> App {
         let mut app = App::new();
+        app.view = atm_tui::app::AppView::Sessions;
         app.update_sessions(vec![SessionView {
             id: "selected".into(),
             project_root: Some("/project".into()),
@@ -1974,6 +1985,7 @@ mod kill_action_tests {
             let daemon = DaemonClient::with_defaults(events, command_rx, cancel.clone());
             let connection = tokio::spawn(async move { daemon.run().await });
             let mut app = App::new();
+            app.view = atm_tui::app::AppView::Sessions;
             app.update_sessions(vec![
                 SessionView {
                     id: "lead".into(),
@@ -4517,6 +4529,7 @@ mod interrupt_action_tests {
 
     fn selected_app(pane: Option<&str>) -> App {
         let mut app = App::new();
+        app.view = atm_tui::app::AppView::Sessions;
         app.update_sessions(vec![SessionView {
             id: "selected".into(),
             project_root: Some("/project".into()),

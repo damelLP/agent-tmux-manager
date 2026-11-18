@@ -43,8 +43,12 @@ pub enum UiAction {
     Quit,
     /// Toggle the help popup.
     ToggleHelp,
-    /// Toggle between Sessions and the window-grouped Work view.
+    /// Toggle between the Work and Sessions tabs.
     ToggleWorkView,
+    /// Toggle reporting threads / physical windows inside Work.
+    ToggleWorkGrouping,
+    /// Select a one-based tab: Work (1), Sessions (2).
+    GoToTab(usize),
     /// Open the `/` search prompt to filter sessions.
     StartSearch,
     /// Inspect the selected session's waiting decision, or the authorized queue.
@@ -124,6 +128,38 @@ pub(crate) struct KeybindingHint {
 pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
     // -- Navigation ----------------------------------------------------------
     KeybindingHint {
+        help_key: "gt / gT",
+        help_desc: "Next / previous tab (wrap)",
+        footer_key: "gt/gT",
+        footer_desc: "tabs",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "w",
+        help_desc: "Toggle Work / Sessions (alias)",
+        footer_key: "w",
+        footer_desc: "alias",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "Ngt",
+        help_desc: "Select tab: 1 Work, 2 Sessions",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "gw",
+        help_desc: "Work grouping: threads / windows",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Navigation,
+        tmux_only: false,
+    },
+    KeybindingHint {
         help_key: "j / \u{2193}",
         help_desc: "Move down",
         footer_key: "j/\u{2193}",
@@ -196,14 +232,6 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
         tmux_only: false,
     },
     // -- Actions -------------------------------------------------------------
-    KeybindingHint {
-        help_key: "w",
-        help_desc: "Toggle Work / Sessions view",
-        footer_key: "",
-        footer_desc: "",
-        category: HintCategory::Actions,
-        tmux_only: false,
-    },
     KeybindingHint {
         help_key: "a",
         help_desc: "Answer waiting decision",
@@ -347,6 +375,9 @@ pub(crate) enum KeyMeaning {
     Motion(MotionKind),
     /// The `g` prefix key.
     GPrefix,
+    /// The tab commands, only meaningful after `g`.
+    NextTab,
+    PreviousTab,
     /// The `d` prefix key (first `d` of `dd` kill).
     DPrefix,
     /// The `o` prefix key for directional spawn.
@@ -450,6 +481,8 @@ impl VimKeyResolver {
             'k' => KeyMeaning::Motion(MotionKind::Up),
             'G' => KeyMeaning::Motion(MotionKind::GoToBottom),
             'g' => KeyMeaning::GPrefix,
+            't' => KeyMeaning::NextTab,
+            'T' => KeyMeaning::PreviousTab,
             'd' => KeyMeaning::DPrefix,
             // `h` and `l` both open a collapsed fold. They never close —
             // the z-chord family owns all close/toggle semantics.
@@ -580,7 +613,7 @@ impl InputHandler {
             }
             KeyMeaning::Motion(kind) => Self::motion_with_count(1, kind),
             KeyMeaning::SimpleAction(action) => Some(action),
-            KeyMeaning::Unbound => None,
+            KeyMeaning::NextTab | KeyMeaning::PreviousTab | KeyMeaning::Unbound => None,
         }
     }
 
@@ -612,19 +645,22 @@ impl InputHandler {
             }
             KeyMeaning::Motion(kind) => Self::motion_with_count(n, kind),
             KeyMeaning::SimpleAction(action) => Some(action),
-            KeyMeaning::Unbound => None,
+            KeyMeaning::NextTab | KeyMeaning::PreviousTab | KeyMeaning::Unbound => None,
         }
     }
 
     /// Transitions from the `PendingG` state.
     fn step_pending_g(&mut self, count: Option<usize>, meaning: KeyMeaning) -> Option<UiAction> {
         match meaning {
+            KeyMeaning::NextTab => Some(count.map_or(UiAction::ToggleWorkView, UiAction::GoToTab)),
+            KeyMeaning::PreviousTab if count.is_none() => Some(UiAction::ToggleWorkView),
             KeyMeaning::GPrefix => match count {
                 None => Some(UiAction::GoToFirst),
                 Some(n) => Some(UiAction::GoToRow(n.saturating_sub(1))),
             },
-            // Keep gw free for Work navigation; only bare w toggles the view.
-            KeyMeaning::SimpleAction(UiAction::ToggleWorkView) => None,
+            KeyMeaning::SimpleAction(UiAction::ToggleWorkView) => {
+                count.is_none().then_some(UiAction::ToggleWorkGrouping)
+            }
             KeyMeaning::SimpleAction(action) => Some(action),
             _ => None,
         }
@@ -705,6 +741,67 @@ impl InputHandler {
 mod tests {
     use super::*;
 
+    // Break caught: tab chords are unreachable or consume gg, unprefixed t/T or modifiers.
+    #[test]
+    fn gt_g_t_wrap_and_w_remains_alias() {
+        let mut handler = InputHandler::new();
+        for chord in ["gt", "gT", "w", "gt", "gT"] {
+            let mut action = None;
+            for c in chord.chars() {
+                action = handler.handle(key(KeyCode::Char(c)));
+            }
+            assert_eq!(action, Some(UiAction::ToggleWorkView), "{chord}");
+            assert!(!handler.is_pending());
+        }
+        for c in ['t', 'T'] {
+            assert_eq!(handler.handle(key(KeyCode::Char(c))), None);
+            for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                assert_eq!(handler.handle(key(KeyCode::Char('g'))), None);
+                assert_eq!(
+                    handler.handle(KeyEvent::new(KeyCode::Char(c), modifier)),
+                    None
+                );
+                assert!(!handler.is_pending());
+            }
+        }
+        assert_eq!(handler.handle(key(KeyCode::Char('g'))), None);
+        assert_eq!(
+            handler.handle(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
+            Some(UiAction::ToggleWorkView)
+        );
+    }
+
+    // Break caught: counted gt becomes row motion, changes the existing count clamp, or leaks gT counts.
+    #[test]
+    fn numbered_tabs_preserve_count_and_other_g_grammar() {
+        for (keys, expected) in [
+            ("1gt", Some(UiAction::GoToTab(1))),
+            ("2gt", Some(UiAction::GoToTab(2))),
+            ("3gt", Some(UiAction::GoToTab(3))),
+            ("999999gt", Some(UiAction::GoToTab(MAX_COUNT))),
+            ("2gT", None),
+            ("gg", Some(UiAction::GoToFirst)),
+            ("2gg", Some(UiAction::GoToRow(1))),
+            ("gw", Some(UiAction::ToggleWorkGrouping)),
+            ("2gw", None),
+            ("gG", None),
+            ("gj", None),
+        ] {
+            let mut handler = InputHandler::new();
+            let mut action = None;
+            for c in keys.chars() {
+                action = handler.handle(key(KeyCode::Char(c)));
+            }
+            assert_eq!(action, expected, "{keys}");
+            assert!(!handler.is_pending());
+        }
+        let mut handler = InputHandler::new();
+        assert_eq!(
+            handler.handle(key(KeyCode::Char('0'))),
+            Some(UiAction::GoToFirst)
+        );
+    }
+
     // Break caught: Work is unreachable or steals reserved prefix chords/modifier keys.
     #[test]
     fn work_key_toggles_without_consuming_reserved_chords() {
@@ -720,7 +817,14 @@ mod tests {
         );
         for prefix in ['g', 'd', 'o', 'z'] {
             assert_eq!(handler.handle(key(KeyCode::Char(prefix))), None);
-            assert_eq!(handler.handle(key(KeyCode::Char('w'))), None);
+            assert_eq!(
+                handler.handle(key(KeyCode::Char('w'))),
+                if prefix == 'g' {
+                    Some(UiAction::ToggleWorkGrouping)
+                } else {
+                    None
+                }
+            );
             assert!(!handler.is_pending());
         }
         for modifiers in [

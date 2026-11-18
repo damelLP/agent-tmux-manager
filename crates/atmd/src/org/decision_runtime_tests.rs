@@ -63,6 +63,7 @@ fn answer() -> DecisionResolution {
 }
 fn content() -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: "p/worker".parse().unwrap(),
         kind: MessageKind::Answer,
@@ -95,6 +96,7 @@ fn decision_answer_mapping_uses_status_and_exact_durable_message() {
     );
     for event in [
         OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+            relayed_by: None,
             decision_id: DecisionId::new(3),
             option: "yes".into(),
             by: Address::System,
@@ -214,6 +216,7 @@ fn decision_overrule_wakes_bridge_without_another_decision_event() {
         guarded(handle.initialized()).await.unwrap();
         org.execute(
             OrgCommand::Decision(DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                relayed_by: None,
                 decision_id: DecisionId::new(3),
                 option: "yes".into(),
                 by: Address::System,
@@ -275,7 +278,7 @@ fn decision_pages_bound_complete_rows_and_keep_unknown_replay_readable() {
         limit: 100,
         count_only: false,
     };
-    let page = list(&state, &Address::Owner, &params).unwrap();
+    let page = list(&state, &Address::Owner, &BTreeSet::new(), &params).unwrap();
     assert_eq!(page.decisions.len(), 2);
     assert_eq!(page.pending_count, 4);
     assert_eq!(page.next_after, Some(DecisionId::new(5)));
@@ -295,12 +298,13 @@ fn decision_pages_bound_complete_rows_and_keep_unknown_replay_readable() {
         ..params
     };
     assert!(matches!(
-        list(&state, &Address::Owner, &params),
+        list(&state, &Address::Owner, &BTreeSet::new(), &params),
         Err(DecisionError::Refused(_))
     ));
     assert!(matches!(
         bounded(GetResult {
-            decision: entry(&state, DecisionId::new(7)).unwrap()
+            decision: entry(&state, DecisionId::new(7)).unwrap(),
+            redo: None,
         }),
         Err(DecisionError::Refused(_))
     ));
@@ -357,6 +361,8 @@ async fn recover(dir: &Path) -> (OrgHandle, CancellationToken) {
         .get(
             GetParams {
                 id: DecisionId::new(3),
+                redo_after: None,
+                redo_limit: None,
             },
             caller(),
         )
@@ -529,7 +535,10 @@ async fn retry_timeout(execute_timeout: bool) {
         let mut released = Some(released);
         while let Some(mut request) = receive.recv().await {
             let target = match &request {
-                crate::org::Request::Snapshot(_) => !execute_timeout,
+                crate::org::Request::Snapshot(_) | crate::org::Request::SnapshotAt(_) => {
+                    !execute_timeout
+                }
+                crate::org::Request::ReportSnapshot(_) => false,
                 crate::org::Request::Execute { command, .. } => {
                     execute_timeout && matches!(**command, OrgCommand::SendMessage(_))
                 }
@@ -538,6 +547,8 @@ async fn retry_timeout(execute_timeout: bool) {
                 entered.take().unwrap().send(()).unwrap();
                 match &mut request {
                     crate::org::Request::Snapshot(reply) => reply.closed().await,
+                    crate::org::Request::SnapshotAt(reply) => reply.closed().await,
+                    crate::org::Request::ReportSnapshot(reply) => reply.closed().await,
                     crate::org::Request::Execute { reply, .. } => reply.closed().await,
                 }
                 timed_out.take().unwrap().send(()).unwrap();
@@ -612,6 +623,7 @@ async fn retry_timeout(execute_timeout: bool) {
                     option: "no".into(),
                     note: None,
                     standing_rule: false,
+                    relay: false,
                 },
                 caller(),
             )
@@ -667,7 +679,9 @@ async fn decision_bridge_failure_refuses_mutations_but_retains_reads() {
         handle
             .get(
                 GetParams {
-                    id: DecisionId::new(3)
+                    id: DecisionId::new(3),
+                    redo_after: None,
+                    redo_limit: None,
                 },
                 caller()
             )
@@ -685,7 +699,8 @@ async fn decision_bridge_failure_refuses_mutations_but_retains_reads() {
                     id: DecisionId::new(3),
                     option: "yes".into(),
                     note: Some("go".into()),
-                    standing_rule: true
+                    standing_rule: true,
+                    relay: false,
                 },
                 caller()
             )

@@ -169,7 +169,13 @@ pub struct PiPayload {
     #[serde(default)]
     pub needs_user_input: Option<bool>,
 
-    // === Synthetic atm events (atm_needs_input_open) ===
+    // === Synthetic atm events (atm_needs_input_open/resolved) ===
+    /// Final wrapped-select closure's measured idle state. Only resolved
+    /// dialogs consume this field; input remains a single PromptSubmit.
+    /// Absent for older forwarders, unavailable measurements or pending input.
+    #[serde(default)]
+    pub idle: Option<bool>,
+
     /// Title/prompt of the dialog that just opened. Some extensions
     /// (pi-amplike) include the bash command being gated; the title
     /// surfaces in the TUI's activity-detail field.
@@ -321,6 +327,39 @@ mod tests {
     // the same fields: `tests/fixtures/pi_tool_run_0.73.1.jsonl`, plus
     // the tool_execution_start and tool_result lines pi-atm doesn't
     // forward, from the same run's pi-spike tracer (quoted in PR #73).
+
+    #[test]
+    fn pi_1_5_2_dialog_idle_resolution_payload() {
+        // Synthetic: optional measurement and strict malformed-value twins.
+        for (payload, expected) in [
+            (serde_json::json!({"idle":true}), Some(true)),
+            (serde_json::json!({"idle":false}), Some(false)),
+            (serde_json::json!({}), None),
+            (serde_json::json!({"idle":null}), None),
+        ] {
+            let raw: RawPiEvent = serde_json::from_value(serde_json::json!({
+                "event":"atm_needs_input_resolved", "payload":payload
+            }))
+            .unwrap();
+            assert_eq!(raw.payload.idle, expected);
+        }
+        for idle in [
+            serde_json::json!("true"),
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<RawPiEvent>(serde_json::json!({
+                    "event":"atm_needs_input_resolved", "payload":{"idle":idle}
+                }))
+                .is_err(),
+                "nonboolean idle must be rejected: {idle}"
+            );
+        }
+    }
 
     #[test]
     fn parse_session_start_real_payload() {

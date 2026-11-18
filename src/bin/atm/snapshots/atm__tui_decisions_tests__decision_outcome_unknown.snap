@@ -1,0 +1,36 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 514
+expression: "rendered(&mut view, 80, 32)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────────────────────────┐
+ │Outcome unknown. Inspect before retrying (i); no automatic resubmit.        │
+ │daemon disconnected; request was not retried                                │
+ │Selected: none — j/k to choose                                              │
+ │Note (optional):                                                            │
+ │Owner answers require a genuinely unbound owner shell.                      │
+ │d41 from alpha/lead                                                         │
+ │Approve the smaller interface?                                              │
+ │Kind: Plan; class: ChangesIntent; status: Pending                           │
+ │Deadline: 2027-01-01T00:00:00+00:00                                         │
+ │Context:                                                                    │
+ │Read the whole plan.                                                        │
+ │Second line: é🙂                                                             │
+ │Attachments (references only):                                              │
+ │  plans/shape.md                                                            │
+ │Recommended: " yes "                                                        │
+ │Provisional: none                                                           │
+ │Options (exact strings):                                                    │
+ │  " yes "                                                                   │
+ │  "No"                                                                      │
+ │↑/↓: scroll; i: inspect; Esc: back                                          │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘

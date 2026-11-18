@@ -1,4 +1,5 @@
-//! Durable event bodies. IDs are strings; optional facts emit null. Role config
+//! Durable event bodies. IDs are strings; optional facts emit null except the
+//! omitted-when-absent `msg.sent.delivery_notice` metadata. Role config
 //! is flat, timestamps are RFC3339, and summary cost is an exact microdollar
 //! object (not core Money's floating-point USD encoding). Known JSON bodies
 //! tolerate additive fields; unknown kinds are skipped before decoding a body.
@@ -16,6 +17,13 @@
 //! It records Starting while retaining pane, session and exclusion. Existing
 //! kinds are unchanged. Older readers skip it and may incorrectly retain Ready;
 //! this is another reason downgrading a newer log is not a safety guarantee.
+//!
+//! `msg.sent.delivery_notice` optionally records `{source_message_id, reason}`
+//! on a system-to-owner note. The note and its lifetime semantic key commit in
+//! one record; serialized SendMessage repeats emit nothing. Absent/null metadata
+//! reads as None and is omitted on write, preserving older bodies byte-for-byte.
+//! Older readers ignore the field but cannot preserve deduplication. Old unkeyed
+//! notes do not claim keys and may be followed by one keyed note after upgrade.
 
 use crate::{
     Address, AgentId, DecisionId, DecisionRequest, DecisionResolutionEvent, DecisionWithdrawal,
@@ -52,6 +60,14 @@ pub enum MessageKind {
     Review,
 }
 
+/// Lifetime delivery-notice key. Reasons are stable semantic tags, not
+/// diagnostics; future nonempty tags remain readable without a codec change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryNotice {
+    pub source_message_id: MessageId,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageContent {
     pub from: Address,
@@ -60,6 +76,9 @@ pub struct MessageContent {
     pub body: String,
     pub attachments: Vec<String>,
     pub task: Option<TaskId>,
+    /// The note and its durable dedupe key are one committed `msg.sent` fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_notice: Option<DeliveryNotice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +242,10 @@ pub enum OrgEvent {
     OwnerAway(crate::OwnerAway),
     #[serde(rename = "owner.back")]
     OwnerBack(crate::OwnerBack),
+    #[serde(rename = "owner.relay_set")]
+    OwnerRelaySet(crate::OwnerRelaySet),
+    #[serde(rename = "owner.digest_created")]
+    OwnerDigestCreated(crate::OwnerDigestCreated),
 }
 
 impl OrgEvent {
@@ -270,6 +293,8 @@ impl OrgEvent {
             Self::DecisionWithdrawn(_) => "decision.withdrawn",
             Self::OwnerAway(_) => "owner.away",
             Self::OwnerBack(_) => "owner.back",
+            Self::OwnerRelaySet(_) => "owner.relay_set",
+            Self::OwnerDigestCreated(_) => "owner.digest_created",
         }
     }
 
@@ -330,6 +355,8 @@ impl OrgEvent {
                 | "decision.withdrawn"
                 | "owner.away"
                 | "owner.back"
+                | "owner.relay_set"
+                | "owner.digest_created"
         ) {
             return Ok(None);
         }

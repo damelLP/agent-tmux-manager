@@ -310,6 +310,86 @@ async fn fifo_policy_is_refused_without_a_writer() {
     .unwrap();
 }
 
+// Break caught: create admits a project but fails to record the same selected snapshot.
+#[tokio::test]
+async fn creation_records_named_owner_and_legacy_defaults() {
+    let rig = Rig::new().await;
+    for pane in [Some("%7"), None] {
+        let made = rig
+            .create(pane, params(json!({"kind":"owner"})))
+            .await
+            .unwrap();
+        let task = rig.org.snapshot().await.unwrap();
+        let id = serde_json::from_value(made["task_id"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(task.task(&id).unwrap()).unwrap()["project_id"],
+            "first"
+        );
+    }
+    rig.project("second", "%8").await;
+    let made = rig
+        .create(
+            None,
+            json!({"title":"Selected", "project_id":"second", "measure":{"kind":"owner"}}),
+        )
+        .await
+        .unwrap();
+    let state = rig.org.snapshot().await.unwrap();
+    let id = serde_json::from_value(made["task_id"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(state.task(&id).unwrap()).unwrap()["project_id"],
+        "second"
+    );
+}
+
+// Break caught: checking home intent instead of the selected target's current policy.
+#[tokio::test]
+async fn cross_project_creation_uses_only_fresh_target_measures() {
+    let rig = Rig::new().await;
+    rig.project("alpha", "%8").await;
+    rig.project("gamma", "%9").await;
+    rig.intent("gamma", "# Home intent\nNo measures here\n");
+    rig.intent("alpha", "## How we will know\n- mechanical: alpha-check\n");
+    let role = rig.dir.path().join("alpha/.atm/roles");
+    fs::create_dir_all(&role).unwrap();
+    fs::write(
+        role.join("worker.md"),
+        "+++\nharness='pi'\nmanager='gamma/worker'\n+++\n",
+    )
+    .unwrap();
+    let request = json!({"title":"Targeted", "project_id":"alpha", "measure":{"kind":"mechanical", "command":"alpha-check"}});
+    let made = rig.create(Some("%9"), request.clone()).await.unwrap();
+    let state = rig.org.snapshot().await.unwrap();
+    let id = serde_json::from_value(made["task_id"].clone()).unwrap();
+    let task = state.task(&id).unwrap();
+    assert_eq!(task.creator.to_string(), "gamma/worker");
+    assert_eq!(serde_json::to_value(task).unwrap()["project_id"], "alpha");
+    rig.refused(
+        Some("%9"),
+        params(json!({"kind":"mechanical", "command":"alpha-check"})),
+        "refused",
+    )
+    .await;
+    for text in [
+        "",
+        "# Intent\nNo measures",
+        "## How we will know\n",
+        "## How we will know\n- unknown\n",
+        "## How we will know\n- mechanical: other\n",
+    ] {
+        rig.intent("alpha", text);
+        rig.refused(Some("%9"), request.clone(), "refused").await;
+        rig.refused(None, request.clone(), "refused").await;
+    }
+    rig.intent("gamma", "## How we will know\n- mechanical: home-only\n");
+    rig.refused(Some("%9"), json!({"title":"Not targeted", "project_id":"alpha", "measure":{"kind":"mechanical", "command":"home-only"}}), "refused").await;
+    fs::remove_file(rig.dir.path().join("alpha/.atm/intent.md")).unwrap();
+    rig.create(Some("%9"), request.clone()).await.unwrap();
+    let mut unknown = request;
+    unknown["project_id"] = json!("missing");
+    rig.refused(Some("%9"), unknown, "not_found").await;
+}
+
 // Break caught: policy validation living only in a test helper rather than wire method dispatch.
 #[tokio::test]
 async fn intent_success_and_refusal_wire_fixtures() {

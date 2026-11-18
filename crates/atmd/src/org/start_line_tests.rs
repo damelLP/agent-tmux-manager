@@ -42,6 +42,7 @@ fn only_canonical_or_historical_start_notes_get_the_current_start_text() {
     assert_eq!(
         line,
         MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to: Address::Agent(agent("lead")),
             kind: MessageKind::Note,
@@ -144,6 +145,7 @@ fn a_start_line_is_due_unless_one_is_open_or_this_session_had_one() {
     let line = || sent(start_line(&lead));
     let note = |to: Address| {
         sent(MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to,
             kind: MessageKind::Note,

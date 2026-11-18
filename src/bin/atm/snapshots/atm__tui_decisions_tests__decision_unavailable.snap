@@ -1,0 +1,14 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 121
+expression: "rendered(&mut loading, 60, 10)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────┐
+ │Decision service unavailable: Decision service unavailab│
+ │le: old daemon                                          │
+ │Esc: close                                              │
+ │                                                        │
+ │                                                        │
+ │                                                        │
+ └────────────────────────────────────────────────────────┘

@@ -99,15 +99,15 @@ pub(crate) async fn stop_stages(stop_work: impl FnOnce(), stages: Stages) -> Vec
 
 #[cfg(test)]
 mod tests {
-    //! Paused clock; every stage is a task the test holds. A virtual sleep
-    //! here returns only once every other task is blocked, so "nothing else
-    //! happened" is read after one, never guessed from real time.
+    //! Paused clock; every stage is a task the test holds. Negative claims
+    //! follow an explicit Pending poll of the real stop future; abort claims
+    //! follow the stalled task's drop event, never a settling delay.
     use super::*;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{mpsc, oneshot, Notify};
 
     /// A stage that reports its cancel, then ends when the test releases it.
     struct Held {
@@ -157,14 +157,15 @@ mod tests {
 
     /// A stage that never ends, whatever is cancelled. `dropped` is set when
     /// its task is aborted.
-    fn stalled(dropped: &Arc<AtomicBool>) -> Stage {
-        struct Flag(Arc<AtomicBool>);
+    fn stalled(dropped: &Arc<AtomicBool>, exited: &Arc<Notify>) -> Stage {
+        struct Flag(Arc<AtomicBool>, Arc<Notify>);
         impl Drop for Flag {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::SeqCst);
+                self.1.notify_one();
             }
         }
-        let flag = Flag(dropped.clone());
+        let flag = Flag(dropped.clone(), exited.clone());
         let task = tokio::spawn(async move {
             let _flag = flag;
             std::future::pending::<()>().await;
@@ -175,16 +176,22 @@ mod tests {
         }
     }
 
-    async fn settle() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
     struct Rig {
         events: mpsc::UnboundedReceiver<&'static str>,
         messages: Held,
         agents: Held,
         control: Held,
         stop: JoinHandle<Vec<Overrun>>,
+        probe: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    }
+
+    async fn pending(probe: &mpsc::UnboundedSender<oneshot::Sender<()>>) {
+        let (reply, pending) = oneshot::channel();
+        probe.send(reply).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), pending)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     fn rig() -> Rig {
@@ -197,13 +204,31 @@ mod tests {
             agents: agents_stage,
             control: control_stage,
         };
-        let stop = tokio::spawn(stop_stages(move || send.send("work").unwrap(), stages));
+        let (probe, mut probes) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
+        let stop = tokio::spawn(async move {
+            let stop = stop_stages(move || send.send("work").unwrap(), stages);
+            tokio::pin!(stop);
+            loop {
+                tokio::select! {
+                    result = &mut stop => return result,
+                    reply = probes.recv() => {
+                        let Some(reply) = reply else { return stop.await };
+                        let polled = std::future::poll_fn(|cx| {
+                            std::task::Poll::Ready(std::future::Future::poll(stop.as_mut(), cx))
+                        }).await;
+                        assert!(polled.is_pending(), "stop completed with a stage still held");
+                        reply.send(()).unwrap();
+                    }
+                }
+            }
+        });
         Rig {
             events,
             messages,
             agents,
             control,
             stop,
+            probe,
         }
     }
 
@@ -222,13 +247,19 @@ mod tests {
         rig.messages.release.send(()).unwrap();
         assert_eq!(rig.events.recv().await, Some("agents"));
         assert!(rig.messages.ended.load(Ordering::SeqCst));
-        settle().await;
+        let held_at = Instant::now();
+        pending(&rig.probe).await;
+        assert_eq!(
+            Instant::now(),
+            held_at,
+            "probing a held stage advanced time"
+        );
         assert!(!rig.control.cancel.is_cancelled());
         assert!(!rig.stop.is_finished());
         rig.agents.release.send(()).unwrap();
         assert_eq!(rig.events.recv().await, Some("control"));
         assert!(rig.agents.ended.load(Ordering::SeqCst));
-        settle().await;
+        pending(&rig.probe).await;
         assert!(!rig.stop.is_finished());
         rig.control.release.send(()).unwrap();
         assert_eq!(rig.stop.await.unwrap(), []);
@@ -245,7 +276,7 @@ mod tests {
         assert_eq!(rig.events.recv().await, Some("messages"));
         assert!(rig.messages.cancel.is_cancelled());
         // While its task runs, nothing after it is stopped.
-        settle().await;
+        pending(&rig.probe).await;
         assert!(!rig.agents.cancel.is_cancelled());
         assert!(!rig.control.cancel.is_cancelled());
         assert!(!rig.messages.ended.load(Ordering::SeqCst));
@@ -267,10 +298,11 @@ mod tests {
             ("control", CONTROL),
         ] {
             let aborted = Arc::new(AtomicBool::new(false));
+            let exited = Arc::new(Notify::new());
             let ended: [Arc<AtomicBool>; 3] = Default::default();
             let build = |name: &str, ended: &Arc<AtomicBool>| {
                 if name == stage {
-                    stalled(&aborted)
+                    stalled(&aborted, &exited)
                 } else {
                     prompt(ended)
                 }
@@ -285,7 +317,10 @@ mod tests {
             assert_eq!(overruns, [Overrun { stage, bound }], "{stage}");
             // Reported at its bound, and not waited for after it.
             assert_eq!(started.elapsed(), bound, "{stage}");
-            settle().await;
+            tokio::time::timeout(Duration::from_secs(60), exited.notified())
+                .await
+                .unwrap();
+            assert_eq!(started.elapsed(), bound, "abort confirmation advanced time");
             assert!(aborted.load(Ordering::SeqCst), "{stage} was not aborted");
             let others = ended.iter().filter(|e| e.load(Ordering::SeqCst)).count();
             assert_eq!(others, 2, "the other stages still stop around {stage}");
@@ -308,7 +343,7 @@ mod tests {
                 cancel,
                 task: Some(slow),
             },
-            agents: stalled(&aborted),
+            agents: stalled(&aborted, &Arc::new(Notify::new())),
             control: prompt(&ended),
         };
         let started = Instant::now();

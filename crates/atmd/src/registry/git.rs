@@ -105,6 +105,25 @@ impl GitLookups {
         stuck
     }
 
+    #[cfg(test)]
+    pub(super) fn replay_state(&self, origin: Instant) -> serde_json::Value {
+        let entries: std::collections::BTreeMap<_, _> = self
+            .in_flight
+            .iter()
+            .map(|(cwd, lookup)| {
+                let offset = match lookup.started_at.checked_duration_since(origin) {
+                    Some(delta) => delta.as_nanos().to_string(),
+                    None => format!("-{}", origin.duration_since(lookup.started_at).as_nanos()),
+                };
+                (
+                    cwd,
+                    serde_json::json!({"offset_ns": offset, "stuck": lookup.reported_stuck}),
+                )
+            })
+            .collect();
+        serde_json::to_value(entries).unwrap()
+    }
+
     /// Whether any lookup has not reported back.
     #[cfg(test)]
     pub(super) fn has_in_flight(&self) -> bool {
@@ -120,7 +139,7 @@ mod tests {
     use std::sync::Mutex;
 
     const HUNG: &str = "/hung";
-    const WAIT: Duration = Duration::from_secs(5);
+    const WAIT: Duration = Duration::from_secs(60);
 
     fn context_of(cwd: &str) -> GitContext {
         (Some(cwd.to_string()), None, Some("main".to_string()))
@@ -154,9 +173,50 @@ mod tests {
             .expect("the channel stays open")
     }
 
-    /// Fails unless no other call shows up within a short wait.
+    fn assert_admissions_unchanged(
+        lookups: &GitLookups,
+        before: &serde_json::Value,
+        origin: Instant,
+    ) {
+        assert_eq!(
+            &lookups.replay_state(origin),
+            before,
+            "unexpected git worker admission"
+        );
+    }
+
+    #[test]
+    fn admission_fence_rejects_duplicate_workers_before_they_can_report() {
+        let (release, tokens) = std_mpsc::channel::<()>();
+        let tokens = Mutex::new(tokens);
+        let (calls_tx, calls) = std_mpsc::channel();
+        let (mut lookups, _results) = GitLookups::new(move |cwd| {
+            // Hold every candidate before its call can become observable.
+            let _ = tokens.lock().unwrap().recv();
+            let _ = calls_tx.send(cwd.to_string());
+            context_of(cwd)
+        });
+        let origin = Instant::now();
+        lookups.request(HUNG, origin);
+        let before = lookups.replay_state(origin);
+        // Synthetic negative control: freeing a live slot admits another
+        // worker, even though neither worker can report a call yet.
+        lookups.finished(HUNG);
+        lookups.request(HUNG, origin + Duration::from_secs(1));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_admissions_unchanged(&lookups, &before, origin);
+            assert_no_more_calls(&calls);
+        }));
+        drop(release);
+        assert!(
+            rejected.is_err(),
+            "unreported duplicate admission escaped the fence"
+        );
+    }
+
+    /// Inspect only after the synchronous admission-state fence above.
     fn assert_no_more_calls(calls: &std_mpsc::Receiver<String>) {
-        let extra = calls.recv_timeout(Duration::from_millis(100));
+        let extra = calls.try_recv();
         assert!(extra.is_err(), "unexpected resolver call: {extra:?}");
     }
 
@@ -176,16 +236,20 @@ mod tests {
         let (mut lookups, mut results, calls, release) = lookups();
         let now = Instant::now();
 
-        for _ in 0..5 {
-            lookups.request(HUNG, now);
+        lookups.request(HUNG, now);
+        let admitted = lookups.replay_state(now);
+        for _ in 0..4 {
+            lookups.request(HUNG, now + Duration::from_secs(1));
         }
 
         assert_eq!(calls.recv_timeout(WAIT).unwrap(), HUNG);
+        assert_admissions_unchanged(&lookups, &admitted, now);
         assert_no_more_calls(&calls);
         release.send(()).unwrap();
         assert_eq!(next_result(&mut results).await.0, HUNG);
         assert!(lookups.has_in_flight(), "only `finished` frees the slot");
-        lookups.request(HUNG, now);
+        lookups.request(HUNG, now + Duration::from_secs(1));
+        assert_admissions_unchanged(&lookups, &admitted, now);
         assert_no_more_calls(&calls);
     }
 
@@ -231,7 +295,9 @@ mod tests {
         assert!(lookups.newly_stuck(stuck).is_empty());
         assert!(lookups.newly_stuck(stuck + WAIT).is_empty());
 
+        let admitted = lookups.replay_state(start);
         lookups.request(HUNG, stuck + WAIT);
+        assert_admissions_unchanged(&lookups, &admitted, start);
         assert_no_more_calls(&calls);
     }
 

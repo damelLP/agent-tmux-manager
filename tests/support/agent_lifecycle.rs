@@ -8,9 +8,9 @@
 //! twice the stand-in's height plus the border, so the daemon's vertical split
 //! leaves the stand-in its size. Never split/resize a running stand-in or attach.
 //! Take an event cursor before each action; wait for rendered/row events and
-//! release manual-clock gates explicitly. Initial shell readiness and audit-log
-//! delivery completion lack subscriptions and use the shared bounded condition
-//! poll. Journal observations are assertions, not production readiness evidence
+//! release manual-clock gates explicitly. Committed audit/delivery completion
+//! uses the shared message Watch; shell readiness uses a terminal acknowledgment
+//! followed by the shell's own completion write. Journal observations are assertions, not production readiness evidence
 //! or a raw-key transcript.
 
 use std::path::{Path, PathBuf};
@@ -249,27 +249,16 @@ impl AgentRig {
         ]));
         // This window contains only its shell. Geometry never changes after
         // input starts the stand-in, even if another agent window is created.
-        let pane_id = checked(self.rig.tmux(&[
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-c",
-            self.project.to_str().unwrap(),
-            "/bin/bash --noprofile --norc",
-        ]));
+        let pane_id = self.rig.shell_window(&self.project);
         let root =
             checked(
                 self.rig
                     .tmux(&["display-message", "-p", "-t", &pane_id, "#{pane_pid}"]),
             );
-        self.rig.wait("interactive shell prompt with no child", || {
-            let children =
-                std::fs::read_to_string(format!("/proc/{root}/task/{root}/children")).unwrap();
-            let screen = checked(self.rig.tmux(&["capture-pane", "-p", "-t", &pane_id]));
-            children.trim().is_empty() && screen.trim_end().ends_with("stand-in-shell$")
-        });
+        let children =
+            std::fs::read_to_string(format!("/proc/{root}/task/{root}/children")).unwrap();
+        let screen = checked(self.rig.tmux(&["capture-pane", "-p", "-t", &pane_id]));
+        assert!(children.trim().is_empty() && screen.trim_end().ends_with("stand-in-shell$"));
         let text = format!(
             "{} --atm-config {}",
             quote(&self.rig.launcher(config.mode)),
@@ -308,21 +297,12 @@ impl AgentRig {
             "default-size",
             &format!("{}x{}", config.columns, config.rows * 2 + 1),
         ]));
-        let pane_id = checked(self.rig.tmux(&[
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-c",
-            self.project.to_str().unwrap(),
-            "/bin/bash --noprofile --norc",
-        ]));
-        self.rig.wait("the placement shell's prompt", || {
+        let pane_id = self.rig.shell_window(&self.project);
+        assert!(
             checked(self.rig.tmux(&["capture-pane", "-p", "-t", &pane_id]))
                 .trim_end()
                 .ends_with("stand-in-shell$")
-        });
+        );
         pane_id
     }
 
@@ -405,6 +385,20 @@ impl AgentRig {
                 assert_eq!(event["draft"], "", "unexpected draft: {event}");
             }
         }
+    }
+
+    /// Report completion only after tmux acknowledges the empty idle editor.
+    /// Lifecycle hooks ordinarily precede rendering; a successful handover must
+    /// not let its clear preflight capture the preceding Working frame.
+    #[allow(dead_code)] // Only the handover suites use this shared-support method.
+    pub fn finish_turn_at_ready_editor(&self, pane: &StandInPane, finish: impl FnOnce()) {
+        let after = self.rig.event_cursor(pane);
+        self.rig.control(pane, json!({"command":"hold_next_hook"}));
+        finish();
+        self.rig.wait_event(pane, after, |e| {
+            e["kind"] == "rendered" && e["state"] == "idle" && e["draft"] == ""
+        });
+        self.rig.control(pane, json!({"command":"release_hook"}));
     }
 
     /// Prime an existing conversation without changing its session identity.

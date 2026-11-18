@@ -76,14 +76,16 @@ impl Step {
         let task_id = target.map_or_else(|| tid(999_999), |task| task.id.clone());
         let anyone = TaskActor {
             who: CALLERS[self.who].parse().unwrap(),
-            lead: self.variant.is_multiple_of(5),
+            manager_of: target
+                .filter(|_| self.variant.is_multiple_of(5))
+                .and_then(|task| task.agent_id.clone()),
         };
         // The task's agent for its own moves; the owner for the others, who
         // has authority over every task and is never a task's agent.
         let own = match target.and_then(|task| task.agent_id.clone()) {
             Some(agent_id) if self.fit => TaskActor {
                 who: Address::Agent(agent_id),
-                lead: false,
+                manager_of: None,
             },
             _ => anyone.clone(),
         };
@@ -126,6 +128,7 @@ impl Step {
                     (false, true) => None,
                     (_, false) => self.variant.is_multiple_of(2).then(|| other_id.clone()),
                 };
+                body.project_id = self.variant.is_multiple_of(2).then(|| "p".parse().unwrap());
                 body.parent = self.variant.is_multiple_of(4).then_some(other_id);
                 body.rests_on = self
                     .variant
@@ -283,6 +286,7 @@ fn assert_moves(before: &OrgState, after: &OrgState, command: &TaskCommand) {
             );
         }
         // What a task was created with never changes.
+        assert_eq!(new.project_id, old.project_id);
         assert_eq!(
             (&new.title, new.kind, &new.creator, &new.parent, &new.judges),
             (&old.title, old.kind, &old.creator, &old.parent, &old.judges)
@@ -419,7 +423,7 @@ fn a_final_task_never_changes_state_again() {
             for lead in [false, true] {
                 let who = TaskActor {
                     who: who.parse().unwrap(),
-                    lead,
+                    manager_of: lead.then(|| agent(BUILD)),
                 };
                 let mut moves = vec![
                     assign(&task, OTHER, who.clone()),

@@ -1,0 +1,11 @@
+{"seq":1,"ts":"2026-11-16T07:00:00Z","kind":"project.registered","body":{"project_id":"alpha","root":"/alpha"}}
+{"seq":2,"ts":"2026-11-16T07:00:00Z","kind":"agent.adopted","body":{"agent_id":"alpha/builder","pane":"%7","session_id":null}}
+{"seq":8,"ts":"2026-11-16T08:00:00Z","kind":"owner.away","body":{"by":"owner","stacking_caps":{"alpha":1}}}
+{"seq":11,"ts":"2026-11-16T08:01:00Z","kind":"decision.requested","body":{"requester":"alpha/builder","kind":"plan","title":"Choose cache","context":"","files":[],"options":["small","large"],"recommended":"small","may_be_undone":true,"changes_intent":false,"deadline":null}}
+{"seq":14,"ts":"2026-11-16T08:01:00Z","kind":"task.created","body":{"title":"Write cache","kind":"work","creator":"owner","parent":null,"judges":null,"measure":{"kind":"owner"},"budget":null,"files":[],"rests_on":"d11"}}
+{"seq":15,"ts":"2026-11-16T08:01:00Z","kind":"task.assigned","body":{"task_id":"t14","agent_id":"alpha/builder","by":"owner"}}
+{"seq":16,"ts":"2026-11-16T08:01:00Z","kind":"task.submitted","body":{"task_id":"t14","what":"result","files":[],"by":"alpha/builder"}}
+{"seq":17,"ts":"2026-11-16T08:01:00Z","kind":"task.verdict","body":{"task_id":"t14","verdict":"accepted","review_task":null,"note":null,"by":"owner"}}
+{"seq":18,"ts":"2026-11-16T08:02:00Z","kind":"decision.taken_provisionally","body":{"decision_id":"d11","option":"small","by":"alpha/builder"}}
+{"seq":30,"ts":"2026-11-16T18:00:00Z","kind":"owner.back","body":{"by":"owner"}}
+{"seq":31,"ts":"2026-11-16T18:00:00Z","kind":"owner.digest_created","body":{"by":"owner","back_seq":30}}

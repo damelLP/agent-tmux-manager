@@ -36,9 +36,9 @@
 //!   tries no more in that session. A session whose start-line turn ends at
 //!   or above its line is noted and excluded from both automatic rules for
 //!   the whole session, so a large starting context cannot cause a loop.
-//! - It is refused at admission like any handover (the agent is not ready, a
-//!   handover of it already runs): nothing was sent, nobody is told, and the
-//!   session's one attempt is not used up.
+//! - Preflight refusal queues no request, sends no note and returns the
+//!   attempt; queue/audit failure after admission may leave a request and
+//!   produces one failure note, keeping the attempt.
 //! - Once admitted it ends in exactly one note from `system` to the agent's
 //!   manager (the owner for an agent whose role names none): done, or why
 //!   not. That note replaces the note at the context line.
@@ -169,6 +169,7 @@ pub(super) fn outcome_note(
         ),
     };
     MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: manager,
         kind: MessageKind::Note,
@@ -179,8 +180,8 @@ pub(super) fn outcome_note(
 }
 
 /// What follows an automatic handover's end: its one note, to the agent's
-/// manager. A handover refused at admission sent nothing, so it gets no note
-/// and its session gets its one attempt back.
+/// manager. Only a preflight refusal queues no request and gets no note,
+/// returning its session's attempt; admission write failures keep the attempt.
 pub(super) fn settle(
     attempted: &mut BTreeMap<AgentId, SessionId>,
     attempt: Attempt,
@@ -236,8 +237,8 @@ pub(super) struct Attempt {
     pub memory: PathBuf,
 }
 
-/// How an automatic handover ended. `Err`: refused at admission, so nothing
-/// was sent. `Ok`: the agent's manager, and the handover's own answer.
+/// How an automatic handover ended. `Err`: preflight refusal, no request
+/// queued. `Ok`: the manager and outcome, including admission write failures.
 pub(super) type Outcome = Result<(Address, Result<HandoverResult, MethodError>), MethodError>;
 
 struct Watch {
@@ -490,7 +491,9 @@ impl Watch {
             };
             let outcome = match handovers.admit(p, caller, deadline).await {
                 Err(refused) => Err(refused),
-                Ok(Admitted { job, manager, .. }) => Ok((manager, job.run().await)),
+                Ok(Admitted { job, manager, .. }) => {
+                    Ok((manager, async { job.await?.run().await }.await))
+                }
             };
             // A closed channel is the watcher's end: nobody is left to tell.
             let _ = ended.send((attempt, outcome)).await;

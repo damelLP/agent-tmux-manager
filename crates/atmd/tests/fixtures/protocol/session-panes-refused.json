@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"panes-refused","method":"session.panes","params":{"session_name":"work","caller_server":"/unverified/server"}},"response":{"type":"response","id":"panes-refused","error":{"code":"refused","message":"ignored"}},"ignore":["/error/message"]}

@@ -101,12 +101,14 @@ dependencies = [
 
 [[package]]
 name = "atm"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atm-chat",
  "atm-claude-adapter",
  "atm-codex-adapter",
+ "atm-comms",
  "atm-core",
  "atm-org",
  "atm-pi-adapter",
@@ -119,6 +121,7 @@ dependencies = [
  "crossterm",
  "daemonize",
  "dirs",
+ "insta",
  "libc",
  "ratatui",
  "serde",
@@ -134,8 +137,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "atm-chat"
+version = "0.5.0"
+dependencies = [
+ "atm-comms",
+ "atm-tui",
+ "chrono",
+ "crossterm",
+ "insta",
+ "ratatui",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "atm-claude-adapter"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "atm-core",
  "proptest",
@@ -145,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "atm-codex-adapter"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-core",
@@ -156,8 +173,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atm-comms"
+version = "0.5.0"
+dependencies = [
+ "atm-core",
+ "atm-org",
+ "chrono",
+ "serde",
+]
+
+[[package]]
 name = "atm-core"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -169,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "atm-org"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "atm-core",
  "chrono",
@@ -182,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "atm-pi-adapter"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-core",
@@ -193,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "atm-protocol"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "atm-core",
  "chrono",
@@ -205,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "atm-tmux"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -219,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "atm-tui"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-codex-adapter",
@@ -245,17 +272,17 @@ dependencies = [
 
 [[package]]
 name = "atmd"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "atm-claude-adapter",
  "atm-codex-adapter",
+ "atm-comms",
  "atm-core",
  "atm-org",
  "atm-pi-adapter",
  "atm-protocol",
  "atm-tmux",
  "chrono",
- "clap",
  "libc",
  "procfs",
  "serde",

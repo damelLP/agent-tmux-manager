@@ -1,0 +1,37 @@
+Needs you: 6 items; 2 unread for you; 1 unnamed session needs attention; away since -
+  decision_pending d41 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_provisional d42 agent=beta/lead project=beta since=2026-01-15T12:01:00Z
+  seat_stuck beta/stalled agent=beta/stalled project=beta since=2026-01-15T12:02:00Z
+  seat_attention alpha/worker agent=alpha/worker project=alpha since=2026-01-15T12:03:00Z
+  delivery_failed m43 agent=- project=- since=2026-01-15T12:04:00Z
+  line_broken beta/broken agent=beta/broken project=beta since=-
+Generated: 2026-01-15T12:05:00Z
+
+Project alpha (/fixtures/repos/alpha)
+  Seats:
+    alpha/lead [ready; harness=pi; context=42.5%; tasks=t11] -> owner
+      alpha/worker [ready; harness=codex; context=74%; tasks=t12,t13]
+    alpha/watch [down; harness=-; context=-; tasks=-] -> gamma/chief
+  Open tasks: 3
+    t11 [working; kind=work; agent=alpha/lead; creator=owner] Review plan
+    t12 [assigned; kind=review; agent=alpha/worker; creator=alpha/lead] Check output
+    t13 [waiting; kind=errand; agent=alpha/worker; creator=alpha/lead] Gather notes
+  Decisions: 1 pending, 0 provisional
+
+Project beta (/fixtures/repos/beta)
+  Seats:
+    beta/broken [ready; harness=pi; context=10%; tasks=-]; line_error=reporting line at beta/broken: invalid role configuration
+    beta/lead [ready; harness=codex; context=-; tasks=t14] -> owner
+      beta/stalled [stuck; harness=-; context=-; tasks=-]
+  Open tasks: 1
+    t14 [blocked; kind=plan; agent=beta/lead; creator=owner] Draft next step
+  Decisions: 0 pending, 1 provisional
+
+Project gamma (/fixtures/folders/gamma)
+  Seats:
+    gamma/chief [ready; harness=pi; context=0%; tasks=-] -> owner
+  Open tasks: 0
+  Decisions: 0 pending, 0 provisional
+
+Unplaced tasks: 1
+  t15 [open; kind=work; agent=-; creator=owner] Triage queue

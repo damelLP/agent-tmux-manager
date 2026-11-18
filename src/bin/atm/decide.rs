@@ -1,17 +1,16 @@
 //! One-shot decision commands; recording an answer is not receipt confirmation.
+pub(super) use super::msg::status_text as word;
 use super::msg::{escaped, output, MessageFormat};
+use super::output::stdout;
 use anyhow::{bail, Context, Result};
 use atmd::org::decisions::{
-    DecisionId, DecisionKind, DecisionStatus, ListParams, ListResult, MutationResult,
-    RequestParams, RequestResult, ResolveParams, WithdrawParams,
+    DecisionId, DecisionKind, DecisionStatus, GetParams, GetResult, ListParams, ListResult,
+    MutationResult, RequestParams, RequestResult, ResolveParams, WithdrawParams,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
 use serde::{de::DeserializeOwned, Serialize};
-use std::{
-    io::{self, Write},
-    time::Duration,
-};
+use std::{io::Write, time::Duration};
 
 const RPC_BUDGET: Duration = Duration::from_secs(27);
 #[derive(Debug, Args)]
@@ -21,6 +20,8 @@ pub struct DecideArgs {
     note: Option<String>,
     #[arg(long = "rule")]
     standing_rule: bool,
+    #[arg(long, conflicts_with_all = ["note", "standing_rule"])]
+    relay: bool,
     #[arg(long, value_enum, default_value = "text")]
     format: MessageFormat,
 }
@@ -113,24 +114,79 @@ async fn request<P: Serialize, R: DeserializeOwned>(
         serde_json::from_value(raw.clone()).context("invalid decision result from daemon")?;
     Ok((result, raw))
 }
-fn word(value: impl Serialize) -> Result<String> {
-    Ok(serde_json::to_value(value)?
-        .as_str()
-        .unwrap_or("unknown")
-        .into())
+
+fn relay_text(id: DecisionId, option: &str, result: &MutationResult) -> Result<String> {
+    let decision = &result.decision.decision;
+    let taken = decision
+        .provisional
+        .as_ref()
+        .context("invalid relay result: missing provisional choice")?;
+    if decision.id != id
+        || taken.decision_id != id
+        || taken.option != option
+        || decision.status != DecisionStatus::TakenProvisionally
+    {
+        bail!("invalid relay result: expected the requested provisional answer");
+    }
+    Ok(format!(
+        "{id} taken_provisionally: {}{}\nAwaiting the owner's confirmation.",
+        escaped(&taken.option, false),
+        if result.changed { "" } else { " (unchanged)" }
+    ))
 }
 
 pub async fn cmd_decide(args: DecideArgs) -> Result<()> {
-    let (result, raw): (MutationResult, _) = request(
+    if args.relay {
+        let (result, raw): (MutationResult, _) = request(
+            "decision.resolve",
+            serde_json::json!({"id":args.id,"option":&args.option,"relay":true}),
+        )
+        .await?;
+        let text = relay_text(args.id, &args.option, &result)?;
+        return stdout(|out| output(&raw, args.format, &text, out));
+    }
+    let (mut result, mut raw): (MutationResult, _) = request(
         "decision.resolve",
         ResolveParams {
             id: args.id,
             option: args.option,
             note: args.note,
             standing_rule: args.standing_rule,
+            relay: false,
         },
     )
     .await?;
+    if let Some(redo) = raw.get("redo").filter(|redo| !redo.is_null()).cloned() {
+        if result.decision.decision.status != DecisionStatus::Overruled {
+            bail!("redo metadata on a nonoverrule");
+        }
+        let id = args.id;
+        let redo =
+            super::away::collect_pages(redo, super::away::PageKind::Redo, |after| async move {
+                let (page, raw): (GetResult, _) = request(
+                    "decision.get",
+                    GetParams {
+                        id,
+                        redo_after: Some(serde_json::from_value(after)?),
+                        redo_limit: None,
+                    },
+                )
+                .await?;
+                if page.decision.decision.id != id
+                    || page.decision.decision.status != DecisionStatus::Overruled
+                {
+                    bail!("redo page changed its decision");
+                }
+                raw.get("redo")
+                    .cloned()
+                    .context("missing redo continuation")
+            })
+            .await?;
+        raw.as_object_mut()
+            .context("invalid decision result")?
+            .insert("redo".into(), redo);
+        result = serde_json::from_value(raw.clone()).context("invalid assembled redo result")?;
+    }
     let decision = &result.decision.decision;
     if !matches!(
         decision.status,
@@ -142,14 +198,63 @@ pub async fn cmd_decide(args: DecideArgs) -> Result<()> {
         .resolution
         .as_ref()
         .context("invalid decision result from daemon: missing answer")?;
-    let text = format!(
+    let mut text = format!(
         "{} {}: {}{}",
         decision.id,
         word(decision.status)?,
         escaped(&answer.option, false),
         if result.changed { "" } else { " (unchanged)" }
     );
-    output(&raw, args.format, &text, &mut io::stdout().lock())
+    if decision.status == DecisionStatus::Overruled {
+        if let Some(redo) = result
+            .redo
+            .as_ref()
+            .filter(|redo| redo.required_count.is_some())
+        {
+            let required = redo.required_count.context("missing redo requirement")?;
+            let completed = redo
+                .completed_count
+                .context("missing redo completion count")?;
+            let ids: Vec<_> = redo
+                .task_ids
+                .iter()
+                .map(|id| escaped(&id.to_string(), false))
+                .collect();
+            let label = if result.changed {
+                "Redo required"
+            } else {
+                "Redo already recorded"
+            };
+            match ids.as_slice() {
+                [] if result.changed => {
+                    text.push_str("\nRedo required: none. No files were reverted.")
+                }
+                [] => text.push_str("\nRedo already recorded: none."),
+                [id] => {
+                    text.push_str(&format!("\n{label}: {id}."));
+                    if result.changed {
+                        text.push_str(" It is open and unassigned; no files were reverted.");
+                    }
+                }
+                _ => {
+                    text.push_str(&format!("\n{label}:"));
+                    for id in ids {
+                        text.push_str(&format!("\n  {id}"));
+                    }
+                    if result.changed {
+                        text.push_str("\nThey are open and unassigned; no files were reverted.");
+                    }
+                }
+            }
+            text.push_str(&format!(
+                "\nTasks redone for {}: {completed}/{required} accepted again.",
+                decision.id
+            ));
+        } else {
+            text.push_str("\nRedo: not recorded by this daemon.");
+        }
+    }
+    stdout(|out| output(&raw, args.format, &text, out))
 }
 fn render_list(result: &ListResult, out: &mut impl Write) -> Result<()> {
     if result.decisions.is_empty() {
@@ -283,7 +388,7 @@ async fn cmd_decision_action(action: DecisionsAction) -> Result<()> {
             )
         }
     };
-    output(&raw, format, &text, &mut io::stdout().lock())
+    stdout(|out| output(&raw, format, &text, out))
 }
 pub async fn cmd_decisions(args: DecisionsArgs) -> Result<()> {
     if let Some(action) = args.action {
@@ -313,11 +418,10 @@ pub async fn cmd_decisions(args: DecisionsArgs) -> Result<()> {
         },
     )
     .await?;
-    let mut out = io::stdout().lock();
-    match args.format {
-        MessageFormat::Text => render_list(&result, &mut out),
-        MessageFormat::Json => output(&raw, args.format, "", &mut out),
-    }
+    stdout(|out| match args.format {
+        MessageFormat::Text => render_list(&result, out),
+        MessageFormat::Json => output(&raw, args.format, "", out),
+    })
 }
 
 /// The global pending count, and whether the owner is marked away.
@@ -342,6 +446,56 @@ pub(super) async fn pending_count() -> Result<(usize, bool)> {
 mod tests {
     use super::super::Args;
     use clap::Parser;
+
+    // Synthetic: provisional RPC results exercise status/identity validation,
+    // including retries of a pre-existing system take with no relay mark.
+    fn provisional_result() -> super::MutationResult {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/atm_decide/list.json"))
+                .unwrap();
+        let mut decision = value["decisions"].as_array_mut().unwrap().remove(0);
+        decision["status"] = serde_json::json!("taken_provisionally");
+        decision["provisional"] =
+            serde_json::json!({"decision_id":"d41","option":"no","by":"system"});
+        serde_json::from_value(serde_json::json!({"decision":decision,"changed":false})).unwrap()
+    }
+
+    // Break caught: treating a provisional relay as final, or falsely claiming
+    // new provenance for an unchanged earlier nonrelay take.
+    #[test]
+    fn relay_text_is_provisional_and_refuses_malformed_results() {
+        let id = super::DecisionId::new(41);
+        let result = provisional_result();
+        assert_eq!(
+            super::relay_text(id, "no", &result).unwrap(),
+            "d41 taken_provisionally: no (unchanged)\nAwaiting the owner's confirmation."
+        );
+        let mut changed = result.clone();
+        changed.changed = true;
+        assert_eq!(
+            super::relay_text(id, "no", &changed).unwrap(),
+            "d41 taken_provisionally: no\nAwaiting the owner's confirmation."
+        );
+        let mut bad = result.clone();
+        bad.decision.decision.provisional = None;
+        assert!(super::relay_text(id, "no", &bad).is_err());
+        bad = result.clone();
+        bad.decision.decision.status = super::DecisionStatus::Resolved;
+        assert!(super::relay_text(id, "no", &bad).is_err());
+        assert!(super::relay_text(super::DecisionId::new(42), "no", &result).is_err());
+        assert!(super::relay_text(id, "yes", &result).is_err());
+    }
+
+    // Break caught: --relay accepts caller free text or the standing-rule path.
+    #[test]
+    fn relay_arguments_exclude_note_and_rule() {
+        assert!(Args::try_parse_from(["atm", "decide", "d3", "no", "--relay"]).is_ok());
+        for extra in [vec!["note"], vec!["--rule"], vec!["--by", "owner"]] {
+            let mut args = vec!["atm", "decide", "d3", "no", "--relay"];
+            args.extend(extra);
+            assert_eq!(Args::try_parse_from(args).unwrap_err().exit_code(), 2);
+        }
+    }
 
     fn request_args<'a>(kind: &'a str, undone: &'a str, intent: &'a str) -> Vec<&'a str> {
         vec![

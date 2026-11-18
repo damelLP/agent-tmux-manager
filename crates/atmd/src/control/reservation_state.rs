@@ -88,6 +88,31 @@ pub(in crate::control) enum InputGate {
 }
 
 impl State {
+    pub(super) fn health(&self) -> crate::server::health::ReservationHealth {
+        use crate::server::health::{ReservationFailure, ReservationHealth, ReservationState};
+        let quarantined = self
+            .entries
+            .iter()
+            .filter(|e| e.phase == Phase::Quarantined)
+            .count();
+        let live = self.entries.len().saturating_sub(quarantined);
+        ReservationHealth {
+            state: if self.quarantine_overflow {
+                ReservationState::Failed
+            } else if live >= CAPACITY {
+                ReservationState::Full
+            } else {
+                ReservationState::Ok
+            },
+            reason: self
+                .quarantine_overflow
+                .then_some(ReservationFailure::QuarantineOverflow),
+            live,
+            quarantined,
+            capacity: CAPACITY,
+        }
+    }
+
     pub(super) fn input_gate(&self, pane: &PaneId) -> InputGate {
         if self.quarantine_overflow {
             return InputGate::Unavailable;

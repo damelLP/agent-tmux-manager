@@ -15,6 +15,7 @@
 pub mod app;
 pub mod beads;
 pub mod client;
+pub mod control;
 pub mod daemon;
 pub mod error;
 pub mod filter;
@@ -24,6 +25,7 @@ pub mod role;
 pub mod setup;
 pub mod tmux;
 pub mod ui;
+pub mod work;
 
 // Re-export commonly used types
 pub use app::App;

@@ -1,0 +1,39 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+expression: "rendered(&mut popup(relayed_entry(41, \"demo/builder\", \"demo/chief\")), 110, 36)"
+---
+
+ ┌ Answer waiting decision ─────────────────────────────────────────────────────────────────────────────────┐
+ │j/k: option; Tab: note; Enter: record; ↑/↓: scroll; Esc: back                                             │
+ │Selected: none — j/k to choose                                                                            │
+ │Note (optional):                                                                                          │
+ │Owner answers require a genuinely unbound owner shell.                                                    │
+ │d41 from demo/builder                                                                                     │
+ │Approve the smaller interface?                                                                            │
+ │Kind: Plan; class: ChangesIntent; status: TakenProvisionally                                              │
+ │Deadline: 2027-01-01T00:00:00+00:00                                                                       │
+ │Context:                                                                                                  │
+ │Read the whole plan.                                                                                      │
+ │Second line: é🙂                                                                                           │
+ │Attachments (references only):                                                                            │
+ │  plans/shape.md                                                                                          │
+ │Relayed by demo/chief as your spoken answer; not confirmed by you                                         │
+ │Recommended: " yes "                                                                                      │
+ │Provisional: " yes "                                                                                      │
+ │Options (exact strings):                                                                                  │
+ │  " yes "                                                                                                 │
+ │  "No"                                                                                                    │
+ │↑/↓: scroll; i: inspect; Esc: back                                                                        │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ │                                                                                                          │
+ └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘

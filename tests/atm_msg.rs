@@ -174,6 +174,111 @@ async fn run_in(
     .await;
     output
 }
+fn history_params() -> Value {
+    json!({"agent":null,"task":null,"correspondent":null,"since":null,"until":null,"text":null,"limit":100,"cursor":null})
+}
+
+// Break: local lookups, lost filters/pane attribution, automatic pagination, or a text renderer.
+#[tokio::test]
+async fn history_is_one_json_request_preserving_filters_and_additive_fields() {
+    let controls = "\n\u{1b}\u{7f}\u{85}";
+    let reply = json!({"seq":42,"snapshot_seq":40,"visibility":"full","messages":[inbox_entry(controls)],"next_cursor":"opaque continuation","extra":{"value":null}});
+    let cursor = "{\"version\":1,\"opaque\":\"é\"}";
+    for (args, params, pane) in [
+        (vec!["msg", "history"], history_params(), None),
+        (
+            vec![
+                "msg",
+                "history",
+                "--agent",
+                "alpha/worker",
+                "--task",
+                "t7",
+                "--correspondent",
+                "beta/lead",
+                "--since",
+                "2026-01-01T00:00:00Z",
+                "--until",
+                "2026-02-01T00:00:00Z",
+                "--text",
+                "review café",
+                "--limit",
+                "5",
+                "--cursor",
+                cursor,
+                "--format",
+                "json",
+            ],
+            json!({"agent":"alpha/worker","task":"t7","correspondent":"beta/lead","since":"2026-01-01T00:00:00Z","until":"2026-02-01T00:00:00Z","text":"review café","limit":5,"cursor":cursor}),
+            Some("%7"),
+        ),
+    ] {
+        let output = run(
+            &args,
+            pane,
+            vec![ok("msg.history", params, reply.clone())],
+            true,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            reply
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("\\u007f") && text.contains("\\u0085"));
+    }
+}
+
+// Break: missing capabilities still send a request, or refusal/timeout silently succeeds/retries.
+#[tokio::test]
+async fn history_capability_and_daemon_errors_are_loud_without_retry() {
+    let old = run(
+        &["msg", "history"],
+        None,
+        vec![ok("", Value::Null, Value::Null)],
+        false,
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&old.stderr).contains("the daemon is too old; restart atmd"));
+    for code in ["refused", "timeout", "unavailable", "invalid_params"] {
+        let output = run(
+            &["msg", "history"],
+            None,
+            vec![Step {
+                method: "msg.history",
+                params: history_params(),
+                payload: json!({"error":{"code":code,"message":"inspect history request"}}),
+            }],
+            false,
+        )
+        .await;
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("inspect history request"));
+    }
+}
+
+// Break: bare names, invalid timestamps, text format or out-of-bounds filters cause local lookup/I/O.
+#[tokio::test]
+async fn history_rejects_non_full_ids_and_invalid_options_before_connecting() {
+    for options in [
+        vec!["--agent", "worker"],
+        vec!["--correspondent", "lead"],
+        vec!["--since", "yesterday"],
+        vec!["--format", "text"],
+        vec!["--limit", "0"],
+        vec!["--limit", "1001"],
+        vec!["--text", ""],
+    ] {
+        let mut args = vec!["msg", "history"];
+        args.extend(options);
+        let output = run(&args, None, vec![], false).await;
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+}
+
 fn send(to: &str, body: &str) -> Value {
     json!({"to":to,"kind":"note","body":body,"attachments":[],"task":null})
 }
@@ -235,12 +340,121 @@ async fn message_commands_send_exact_json() {
     }
 }
 
+// Break: the CLI drops the advisory in text or reserializes JSON and loses additive fields.
+#[tokio::test]
+async fn give_up_warning_is_rendered_and_json_is_preserved() {
+    for line in [
+        "[m1] Read: atm inbox --id m1",
+        "[m1] New session: run the shell command atm me",
+    ] {
+        let warning = format!(
+            "Possible leftover in the recipient's editor: {line}. Giving up did not clear the editor; \
+             further delivery may wait for an empty editor. Inspect the pane before editing it."
+        );
+        let reply = json!({"message_id":"m1","status":"failed","editor_warning":warning,"future":{"value":null}});
+        for format in ["text", "json"] {
+            let out = run(
+                &["msg", "give-up", "m1", "--format", format],
+                None,
+                vec![ok("msg.give_up", json!({"id":"m1"}), reply.clone())],
+                true,
+            )
+            .await;
+            assert!(out.stderr.is_empty());
+            if format == "text" {
+                assert_eq!(
+                    String::from_utf8(out.stdout).unwrap(),
+                    format!("m1 failed\nwarning: {warning}\n")
+                );
+            } else {
+                assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), reply);
+            }
+        }
+    }
+}
+
+// Break: a daemon advisory can forge output lines/control sequences, or known fields stop validating.
+#[tokio::test]
+async fn give_up_warning_escapes_terminal_controls() {
+    let warning = "line\n\t\\\u{1b}\u{7f}\u{85}tail";
+    let reply = json!({"message_id":"m1","status":"failed","editor_warning":warning});
+    for format in ["text", "json"] {
+        let out = run(
+            &["msg", "give-up", "m1", "--format", format],
+            None,
+            vec![ok("msg.give_up", json!({"id":"m1"}), reply.clone())],
+            true,
+        )
+        .await;
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        if format == "text" {
+            assert_eq!(
+                text,
+                "m1 failed\nwarning: line\\n\\t\\\\\\u{1b}\\u{7f}\\u{85}tail\n"
+            );
+        } else {
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), reply);
+        }
+    }
+    for invalid in [json!(false), json!(["warning"])] {
+        let out = run(
+            &["msg", "give-up", "m1"],
+            None,
+            vec![ok(
+                "msg.give_up",
+                json!({"id":"m1"}),
+                json!({"message_id":"m1","status":"failed","editor_warning":invalid}),
+            )],
+            false,
+        )
+        .await;
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid message result from daemon"));
+    }
+}
+
 #[tokio::test]
 async fn send_preserves_multiline_body_and_literal_attachments_and_all_six_kinds() {
     for kind in ["note", "brief", "report", "question", "answer", "review"] {
         let body = "  first\n\n雪 \"quoted\"\n";
         let out=run(&["msg","send","--to","owner","--kind",kind,"--body",body,"--attach","not a file","--attach","../brief","--task","t1","--format","json"],Some("%7"),vec![ok("msg.send",json!({"to":"owner","kind":kind,"body":body,"attachments":["not a file","../brief"],"task":"t1"}),json!({"message_id":"m5"}))],true).await;
         assert_eq!(out.stdout, b"{\"message_id\":\"m5\"}\n");
+    }
+}
+
+// Break caught: metadata-only rows stop parsing/rendering or invent a new wire shape.
+#[tokio::test]
+async fn redacted_manager_inbox_keeps_existing_text_and_json_contract() {
+    let result = json!({"messages":[{
+        "message_id":"m3", "content":{"from":"owner","to":"alpha/worker","kind":"report","body":"","attachments":[],"task":null},
+        "sent_at":"2026-11-14T00:00:00Z", "status":"queued", "read_at":null,
+        "delivery":{"phase":"blocked","reason":null,"attempt":1,"pane":"%1","session_id":null,"confirmation":null,"retry_at":null,"blocked_by":"m2"}
+    }],"unread_count":1,"next_after":null});
+    let parsed: atmd::org::messages::InboxResult = serde_json::from_value(result.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), result);
+    for format in ["text", "json"] {
+        let mut params = inbox();
+        params["for"] = json!("alpha/worker");
+        let output = run(
+            &["inbox", "--for", "alpha/worker", "--format", format],
+            Some("%2"),
+            vec![ok("msg.inbox", params, result.clone())],
+            true,
+        )
+        .await;
+        if format == "json" {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                result
+            );
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for metadata in ["m3", "alpha/worker", "report", "blocked", "%1", "m2"] {
+                assert!(text.contains(metadata), "{text}");
+            }
+            assert!(!text.contains("SECRET"));
+        }
     }
 }
 

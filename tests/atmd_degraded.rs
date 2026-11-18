@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// `atmd start` in the foreground, isolated under `dir`.
 fn atmd(dir: &Path) -> Command {
@@ -34,17 +34,6 @@ fn atmd(dir: &Path) -> Command {
     cmd
 }
 
-fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    true
-}
-
 /// A running atmd, killed on drop so a failed assertion doesn't leave it
 /// behind.
 struct Daemon(Child);
@@ -56,7 +45,10 @@ impl Daemon {
         unsafe {
             libc::kill(self.0.id() as i32, libc::SIGTERM);
         }
-        wait_until(|| self.0.try_wait().ok().flatten().is_some())
+        if control_support::process::wait_exit(self.0.id(), Duration::from_secs(30)).is_err() {
+            return false;
+        }
+        self.0.wait().is_ok()
     }
 }
 
@@ -78,6 +70,7 @@ fn test_accept_errors_back_off() {
     let socket = dir.path().join("atmd.sock");
     let log = dir.path().join("atmd.log");
 
+    let mut events = control_support::LogEvents::new(&log);
     let mut cmd = atmd(dir.path());
     // tracing writes to stdout
     cmd.stdout(std::fs::File::create(&log).expect("create log"));
@@ -95,8 +88,9 @@ fn test_accept_errors_back_off() {
         });
     }
     let mut daemon = Daemon(cmd.spawn().expect("spawn atmd"));
+    events.listening(Some(daemon.0.id()));
     assert!(
-        wait_until(|| control_support::socket_is_ready(&socket)),
+        control_support::socket_is_ready(&socket),
         "atmd never accepted a connection"
     );
 
@@ -111,7 +105,9 @@ fn test_accept_errors_back_off() {
             .matches("Failed to accept connection")
             .count()
     };
-    let failing = wait_until(|| failures() > 0);
+    let failing = events
+        .wait_for("Failed to accept connection", Some(daemon.0.id()))
+        .is_ok();
     let before = failures();
     std::thread::sleep(Duration::from_secs(1));
     let in_one_second = failures() - before;

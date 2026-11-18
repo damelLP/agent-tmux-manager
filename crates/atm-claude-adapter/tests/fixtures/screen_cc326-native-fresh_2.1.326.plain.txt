@@ -1,0 +1,41 @@
+Captured: Claude Code 2.1.326, 2026-11-17, sealed fake-API TUI.
+
+ ▐▛███▛█   Claude Code v2.1.326                           
+▝▜██████▀  Haiku 5.5 · API Usage Billing                  
+ ▝▝   ▝▝   /tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxx/native/project                                                        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                ◐ medium · /effort  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "fix lint errors"      
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents     

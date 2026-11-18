@@ -66,7 +66,7 @@ fn run_hook_with_pane(
     fs::create_dir(&bin).unwrap();
     // Unlike `exec -a`, the executable's basename sets Linux comm. The live
     // processes record comm below, so a platform change fails explicitly.
-    for name in ["claude", "sh"] {
+    for name in ["claude", "sh", "cp wrapper", "cp)wrapper", "cp wrapper)"] {
         symlink("/bin/bash", bin.join(name)).unwrap();
     }
     // Forward to jq at its original path so wrappers retain their $0, and keep
@@ -157,7 +157,7 @@ exit "$rc"
     let mut pids = HashMap::new();
     let mut previous_pid = None;
     for (line, (comm, label)) in records.lines().zip(&nodes) {
-        let fields: Vec<_> = line.split_whitespace().collect();
+        let fields: Vec<_> = line.splitn(4, ' ').collect();
         assert_eq!(fields.len(), 4, "{line}");
         assert_eq!(fields[0], label);
         assert_eq!(
@@ -304,6 +304,31 @@ fn skips_shells_before_claude() {
     assert_pid(
         &[("claude", "session"), ("sh", "hook-shell")],
         Some("session"),
+    );
+}
+
+#[test]
+fn skips_wrapper_with_space_or_parenthesis_before_claude() {
+    // Break caught: whitespace-field or first-`)` stat parsing loses the parent.
+    for comm in ["cp wrapper", "cp)wrapper", "cp wrapper)"] {
+        assert_pid(
+            &[("claude", "session"), (comm, "hook-wrapper")],
+            Some("session"),
+        );
+    }
+}
+
+#[test]
+fn special_comm_ends_the_nearest_claude_run() {
+    // Break caught: crossing a non-Claude boundary selects the outer session.
+    assert_pid(
+        &[
+            ("claude", "outer"),
+            ("cp wrapper)", "boundary"),
+            ("claude", "inner"),
+            ("sh", "hook-shell"),
+        ],
+        Some("inner"),
     );
 }
 

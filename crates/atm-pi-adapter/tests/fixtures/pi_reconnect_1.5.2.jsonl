@@ -1,0 +1,11 @@
+{"run":"idle-only","case":"startup","data":{"event":"atm_idle","payload":{},"session_id":"idle-1","pid":40001,"tmux_pane":"%42","model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"idle-only","case":"restart","data":{"event":"atm_idle","payload":{},"session_id":"idle-1","pid":40001,"tmux_pane":"%42","model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"idle-only","case":"new","data":{"event":"atm_idle","payload":{},"session_id":"idle-2","pid":40001,"tmux_pane":"%42","model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"idle-only","case":"reload","data":{"event":"atm_idle","payload":{},"session_id":"idle-2","pid":40001,"tmux_pane":"%42","model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"held-input","data":{"event":"session_start","payload":{"type":"session_start","reason":"startup"},"session_id":"held-input","pid":40002,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"held-input","data":{"event":"atm_idle","payload":{},"session_id":"held-input","pid":40002,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"held-input","data":{"event":"input","payload":{"type":"input","text":"neutral start-line probe","source":"interactive"},"session_id":"held-input","pid":40002,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"held-input","data":{"event":"agent_start","payload":{"type":"agent_start"},"session_id":"held-input","pid":40002,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"held-input","data":{"event":"turn_end","payload":{},"session_id":"held-input","pid":40002,"model":{"id":"probe","provider":"sealed","contextWindow":128000},"usage":{"cost":0,"tokens":0,"contextTokens":418}}}
+{"run":"held-input","data":{"event":"agent_settled","payload":{},"session_id":"held-input","pid":40002,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"run":"held-input","data":{"event":"atm_idle","payload":{},"session_id":"held-input","pid":40002,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}

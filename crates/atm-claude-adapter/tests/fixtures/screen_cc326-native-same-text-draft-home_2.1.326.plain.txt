@@ -1,0 +1,41 @@
+Captured: Claude Code 2.1.326, 2026-11-17, sealed fake-API TUI.
+
+ ▐▛███▛█   Claude Code v2.1.326                           
+▝▜██████▀  Haiku 5.5 · API Usage Billing                  
+ ▝▝   ▝▝   /tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxx/native/project                                                        
+
+
+❯ /clear                                                                                                            
+
+❯ survey turn: reply with the neutral fixture response                                                              
+
+● Neutral fixture response 1.
+
+✻ Cooked for 0s · done 2:10 AM                            
+
+❯ survey turn: reply with the neutral fixture response 2                                                            
+
+● Neutral fixture response 2.
+
+✻ Brewed for 0s · done 2:10 AM                            
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                          
+
+
+                                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ check the neutral fixture after this completed turn     
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                              

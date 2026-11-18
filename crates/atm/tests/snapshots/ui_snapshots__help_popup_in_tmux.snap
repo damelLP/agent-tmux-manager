@@ -1,5 +1,6 @@
 ---
 source: crates/atm/tests/ui_snapshots.rs
+assertion_line: 631
 expression: buf
 ---
 Buffer {
@@ -30,14 +31,14 @@ Buffer {
         "                        │                                                                      │                        ",
         "                        │  Actions                                                             │                        ",
         "                        │                                                                      │                        ",
+        "                        │    w           Toggle Work / Sessions view                           │                        ",
+        "                        │    a           Answer waiting decision                               │                        ",
         "                        │    c           Toggle coordinator tag                                │                        ",
         "                        │    Enter       Jump to session (leaf) / toggle fold (group)          │                        ",
         "                        │    r           Rescan / refresh                                      │                        ",
         "                        │    q           Quit                                                  │                        ",
         "                        │    /           Filter (vendor, status, project, branch...)           │                        ",
         "                        │    ?           Toggle this help                                      │                        ",
-        "                        │    Esc         Close help / clear filter / quit                      │                        ",
-        "                        │    Ctrl-c      Quit                                                  │                        ",
         "                        └──────────────────────────────────────────────────────────────────────┘                        ",
         "                                                                                                                        ",
         "                                                                                                                        ",

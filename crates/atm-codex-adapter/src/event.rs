@@ -90,6 +90,7 @@ impl CodexEventType {
     }
 
     /// Returns true if this is a pre-execution event.
+    #[cfg(test)]
     #[must_use]
     pub fn is_pre_event(&self) -> bool {
         matches!(
@@ -99,6 +100,7 @@ impl CodexEventType {
     }
 
     /// Returns true if this is a post-execution event.
+    #[cfg(test)]
     #[must_use]
     pub fn is_post_event(&self) -> bool {
         matches!(

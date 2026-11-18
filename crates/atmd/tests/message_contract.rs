@@ -180,6 +180,36 @@ fn result_projection_reuses_domain_content_and_same_id_retry() {
     );
 }
 
+// Break: dropping the additive advisory, rejecting old replies, or accepting a malformed known field.
+#[test]
+fn give_up_result_roundtrips_optional_editor_warning() {
+    let warning = "Possible leftover in the recipient's editor: [m7] Read: atm inbox --id m7. Giving up did not clear the editor; further delivery may wait for an empty editor. Inspect the pane before editing it.";
+    let reply = json!({"message_id":"m7","status":"failed","editor_warning":warning});
+    let parsed: GiveUpResult = serde_json::from_value(reply.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), reply);
+    for old in [
+        json!({"message_id":"m7","status":"failed"}),
+        json!({"message_id":"m7","status":"failed","editor_warning":null,"future":true}),
+    ] {
+        let parsed: GiveUpResult = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap(),
+            json!({"message_id":"m7","status":"failed"})
+        );
+    }
+    let parsed: GiveUpResult = serde_json::from_value(
+        json!({"message_id":"m7","status":"failed","editor_warning":warning,"future":true}),
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), reply);
+    for invalid in [json!(true), json!(7), json!([]), json!({})] {
+        assert!(serde_json::from_value::<GiveUpResult>(
+            json!({"message_id":"m7","status":"failed","editor_warning":invalid})
+        )
+        .is_err());
+    }
+}
+
 #[tokio::test]
 async fn explicit_disabled_facade_preserves_its_cause_for_every_call() {
     let handle = MessageHandle::disabled("test cause");

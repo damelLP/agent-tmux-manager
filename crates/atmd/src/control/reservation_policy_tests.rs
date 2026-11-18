@@ -1,5 +1,120 @@
 //! Pure policy regressions: explicit time, no runtime waits.
 use super::*;
+
+// Catch lost sticky failure/precedence, miscounted quarantines or live slots,
+// and a full verdict that does not recover when one live operation finishes.
+#[test]
+fn reservation_health_full_counts_all_live_phases_but_not_quarantines() {
+    let now = Instant::now();
+    let mut state = State::default();
+    let bad = state
+        .admit(request("p/bad", None, ReservationKind::Up, now), now)
+        .unwrap();
+    state.ready(now);
+    state.finish(bad, false);
+    let mut ids = Vec::new();
+    for n in 0..32 {
+        ids.push(
+            state
+                .admit(
+                    request(&format!("p/a{n}"), None, ReservationKind::Up, now),
+                    now,
+                )
+                .unwrap(),
+        );
+    }
+    let full = serde_json::json!({"state":"full", "reason":null, "live":32, "quarantined":1, "capacity":32});
+    assert_eq!(serde_json::to_value(state.health()).unwrap(), full);
+    let ready = state.ready(now);
+    let fence = ready.first().unwrap().1.as_ref().unwrap();
+    state.begin_cleanup(fence, now + CLEANUP_TIMEOUT).unwrap();
+    assert_eq!(serde_json::to_value(state.health()).unwrap(), full);
+    assert!(matches!(
+        state.admit(request("p/overflow", None, ReservationKind::Up, now), now),
+        Err(ReservationError::Unavailable)
+    ));
+    state.finish(ids[0], true);
+    assert_eq!(
+        serde_json::to_value(state.health()).unwrap(),
+        serde_json::json!({"state":"ok", "reason":null, "live":31, "quarantined":1, "capacity":32})
+    );
+}
+
+#[test]
+fn reservation_health_claim_collision_is_failed_even_when_full_and_stays_failed() {
+    let now = Instant::now();
+    let mut state = State::default();
+    assert_eq!(
+        serde_json::to_value(state.health()).unwrap(),
+        serde_json::json!({"state":"ok", "reason":null, "live":0, "quarantined":0, "capacity":32})
+    );
+    let mut ids = Vec::new();
+    for n in 0..32 {
+        ids.push(
+            state
+                .admit(
+                    request(
+                        &format!("p/a{n}"),
+                        Some(&format!("%{n}")),
+                        ReservationKind::Up,
+                        now,
+                    ),
+                    now,
+                )
+                .unwrap(),
+        );
+    }
+    let ready = state.ready(now);
+    let fence = ready.first().unwrap().1.as_ref().unwrap();
+    assert!(matches!(
+        state.claim(fence, PaneId::parse("%1").unwrap()),
+        Err(ReservationError::Unavailable)
+    ));
+    assert_eq!(
+        serde_json::to_value(state.health()).unwrap(),
+        serde_json::json!({"state":"failed", "reason":"quarantine_overflow", "live":32, "quarantined":0, "capacity":32})
+    );
+    for id in ids {
+        state.finish(id, true);
+    }
+    let failed = serde_json::json!({"state":"failed", "reason":"quarantine_overflow", "live":0, "quarantined":0, "capacity":32});
+    assert_eq!(serde_json::to_value(state.health()).unwrap(), failed);
+    assert_eq!(serde_json::to_value(state.health()).unwrap(), failed);
+    assert!(matches!(
+        state.admit(request("p/new", None, ReservationKind::Up, now), now),
+        Err(ReservationError::Unavailable)
+    ));
+}
+
+#[test]
+fn reservation_health_quarantine_overflow_is_failed_not_normal_saturation() {
+    let now = Instant::now();
+    let mut state = State::default();
+    for n in 0..32 {
+        let id = state
+            .admit(
+                request(&format!("p/a{n}"), None, ReservationKind::Up, now),
+                now,
+            )
+            .unwrap();
+        state.ready(now);
+        state.finish(id, false);
+    }
+    assert_eq!(
+        serde_json::to_value(state.health()).unwrap(),
+        serde_json::json!({"state":"ok", "reason":null, "live":0, "quarantined":32, "capacity":32})
+    );
+    let id = state
+        .admit(request("p/last", None, ReservationKind::Up, now), now)
+        .unwrap();
+    state.ready(now);
+    state.finish(id, false);
+    assert_eq!(
+        serde_json::to_value(state.health()).unwrap(),
+        serde_json::json!({"state":"failed", "reason":"quarantine_overflow", "live":0, "quarantined":32, "capacity":32})
+    );
+}
+
 fn request(
     agent: &str,
     pane: Option<&str>,

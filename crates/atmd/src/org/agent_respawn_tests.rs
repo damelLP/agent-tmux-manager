@@ -322,6 +322,7 @@ async fn respawn_failed_new_start_is_stuck_on_new_pane_with_owner_note() {
     assert_eq!(agent.status, AgentStatus::Stuck);
     assert_eq!(agent.pane.as_deref(), Some("%2"));
     assert_eq!(agent.session_id, None);
+    assert_told_stuck(&result, &agent);
     let reason = agent.reason.as_deref().unwrap();
     assert!(reason.starts_with("start did not complete: the new pane was selected"));
     assert!(reason.ends_with("; inspect %2"));
@@ -460,6 +461,50 @@ async fn respawn_placement_tag_reused_refuses() {
             starting.unread_all() + starting.rig.client.pending_reads(&pane("%7")).unwrap(),
             0
         );
+    }
+}
+
+#[tokio::test]
+async fn respawn_after_kill_placement_refusal_notifies_owner_once() {
+    // Break caught: a post-kill placement refusal silently leaves Down,
+    // emits duplicate notes, or continues to split/type despite the refusal.
+    for gone in [false, true] {
+        let mut starting = ready_beside_boss().await;
+        let mut committed = starting.rig.org.committed.subscribe();
+        starting.inspect("%7", Some("q/boss"));
+        starting.inspect("%1", Some("q/lead"));
+        starting.rig.client.script_tag_check(
+            &Starting::inspection("%1", Some("q/lead"), "zsh"),
+        ).unwrap();
+        starting.rig.client.script_inspect(&pane("%1"), None).unwrap();
+        let why = if gone {
+            starting.rig.client.script_inspect(&pane("%7"), None).unwrap();
+            "the pane to split, %7, is gone"
+        } else {
+            starting.inspect("%7", Some("q/other"));
+            "%7 is no longer agent q/boss's pane"
+        };
+        let result = starting.respawn().await;
+        assert!(matches!(&result, Err(AgentError::Refused(reason))
+            if reason == &format!("agent q/lead was taken down and not started again: {why}")),
+            "{result:?}");
+        let agent = starting.agent().await.unwrap();
+        assert_eq!(agent.status, AgentStatus::Down);
+        assert_eq!(agent.pane, None);
+        assert_eq!(agent.session_id, None);
+        assert_eq!(starting.effects(), ["kill %1"], "no split, paste or keys");
+        let state = starting.rig.org.snapshot().await.unwrap();
+        let notes: Vec<_> = state.messages()
+            .filter(|message| message.content.to == atm_org::Address::Owner)
+            .collect();
+        assert_eq!(notes.len(), 1, "the owner must learn why the agent is down");
+        assert_eq!(notes[0].content.from, atm_org::Address::System);
+        assert_eq!(notes[0].content.kind, atm_org::MessageKind::Note);
+        assert_eq!(notes[0].content.body, format!(
+            "agent q/lead is down: respawn placement failed after take-down: {why}; fix the placement and run atm agent up lead from project q"
+        ));
+        assert_eq!(committed_kinds(&mut committed), ["control.killed", "agent.down", "msg.sent"]);
+        assert_eq!(starting.unread_all() + starting.rig.client.pending_reads(&pane("%7")).unwrap(), 0);
     }
 }
 

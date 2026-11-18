@@ -22,8 +22,10 @@ for (const source of sources) {
 		const sockets = new Set();
 		const frames = on(server, "frame", { signal: t.signal });
 		const previousEnv = process.env;
+		let teardown;
 		process.env = { ...previousEnv, ATM_SOCKET: join(dir, "atm.sock"), ATM_DEBUG: "0", TMUX_PANE: "%42" };
 		t.after(async () => {
+			await teardown?.();
 			process.env = previousEnv;
 			await frames.return();
 			for (const socket of sockets) socket.destroy();
@@ -62,6 +64,7 @@ for (const source of sources) {
 			},
 			getContextUsage: () => ({ tokens: 4567 }),
 		};
+		teardown = () => handlers.get("session_shutdown")({}, ctx);
 		async function emit(name, payload, context = ctx) {
 			await handlers.get(name)(payload, context);
 			for (;;) {

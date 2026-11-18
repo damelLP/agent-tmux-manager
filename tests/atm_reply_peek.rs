@@ -3,8 +3,13 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-#[path = "support/control.rs"]
-mod control_support;
+use stand_in::control_support;
+#[allow(dead_code)]
+#[path = "support/message_delivery.rs"]
+mod delivery_support;
+#[allow(dead_code)]
+#[path = "support/agent_lifecycle.rs"]
+mod lifecycle;
 #[path = "support/stand_in.rs"]
 mod stand_in;
 // Reuse the component tests' controlled external-I/O boundary, not a second rig.
@@ -41,6 +46,7 @@ fn tail(rig: &StandInRig) -> Vec<Value> {
 #[test]
 fn reply_keys_and_peek_bytes_go_through_a_real_daemon_and_tmux() {
     let mut rig = StandInRig::start();
+    let mut watch = delivery_support::Watch::on(&rig, 0);
     for (flags, line, option) in [
         (vec![], "Sent Enter", Some(1)),
         (vec!["-y"], "Sent Enter", Some(1)),
@@ -99,15 +105,19 @@ fn reply_keys_and_peek_bytes_go_through_a_real_daemon_and_tmux() {
             e["kind"] == "rendered" && e["state"] != "dialog"
         });
     }
-    let mut records = Vec::new();
-    rig.wait("four reply audits", || {
-        records = tail(&rig);
+    for _ in 0..4 {
+        watch.wait("a reply audit", |e| {
+            e["body"]["action"]["method"] == "session.reply"
+        });
+    }
+    let records = tail(&rig);
+    assert_eq!(
         records
             .iter()
             .filter(|e| e["body"]["action"]["method"] == "session.reply")
-            .count()
-            == 4
-    });
+            .count(),
+        4
+    );
     let controls: Vec<_> = records
         .iter()
         .filter(|e| {
@@ -199,8 +209,7 @@ async fn sigint_of_the_real_reply_cli_discards_pre_key_input() {
     services.state_dir = dir.path().into();
     let server =
         DaemonServer::with_services(dir.path().join("atmd.sock"), services, cancel.clone());
-    let server = tokio::spawn(async move { server.run().await });
-    control_support::wait_for_socket(&dir.path().join("atmd.sock")).await;
+    let server = control_support::start_server(server, &dir.path().join("atmd.sock")).await;
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_atm"));
     command
         .args(["reply", "%1", "-o", "2"])

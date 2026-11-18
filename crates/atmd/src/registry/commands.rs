@@ -230,10 +230,12 @@ pub enum RegistryError {
     ChannelClosed,
 
     /// Failed to parse status line or event data.
+    #[cfg(test)]
     #[error("parse error: {0}")]
     ParseError(String),
 }
 
+#[cfg(test)]
 impl RegistryError {
     /// Creates a parse error from any error type.
     pub fn parse<E: std::fmt::Display>(err: E) -> Self {
@@ -283,6 +285,7 @@ pub enum RemovalReason {
     Explicit,
 
     /// Removed to make room for new sessions when registry was full.
+    #[cfg(test)]
     RegistryFull,
 
     /// Adapter (Claude, pi or Codex) emitted a session-end lifecycle event
@@ -302,6 +305,7 @@ impl std::fmt::Display for RemovalReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Explicit => write!(f, "explicitly removed"),
+            #[cfg(test)]
             Self::RegistryFull => write!(f, "registry capacity reached"),
             Self::SessionEnded => write!(f, "session ended"),
             Self::ProcessDied => write!(f, "process died without a session-end signal"),

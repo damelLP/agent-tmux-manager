@@ -671,6 +671,153 @@ if mode == 'failure':
             self.assertNotEqual(self.in_process(), 0)
         self.assertIsNone(relevant.poll())
 
+    def nondumpable_child(self):
+        return self.child(sys.executable, dict(self.env, ATM_SOCKET=str(self.root / 'foreign.sock')),
+                          '-I', '-S', '-c', 'import ctypes, sys\n'
+                          'assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0\n'
+                          'for line in sys.stdin.buffer:\n'
+                          '    sys.stdout.buffer.write(line); sys.stdout.buffer.flush()')
+
+    def quiescent_child(self, child):
+        import atm_promotion
+        pairs = self.root / 'empty-pairs'
+        pairs.mkdir(mode=0o700, exist_ok=True)
+        real_iterdir = Path.iterdir
+        def iterdir(path):
+            # Scope enumeration only; all reads of the owned child's procfs are real.
+            if path == Path('/proc'):
+                return iter((Path('/proc') / str(child.pid),))
+            return real_iterdir(path)
+        with patch.object(Path, 'iterdir', iterdir):
+            return atm_promotion.quiescent(self.bin, Path(self.env['ATM_SOCKET']), pairs)
+
+    # Treating every denied/empty identity as live incorrectly blocks a dead child.
+    def test_unreaped_nondumpable_zombie_does_not_block_promotion(self):
+        process = self.nondumpable_child()
+        proc = Path('/proc') / str(process.pid)
+        process.stdin.close()
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+        self.assertTrue(proc.exists())
+        self.assertEqual(proc.stat().st_uid, os.getuid())
+        fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+        self.assertEqual((fields[0], fields[17]), ('Z', '1'))
+        self.assertEqual((proc / 'cmdline').read_bytes(), b'')
+        with self.assertRaises(PermissionError):
+            os.readlink(proc / 'exe')
+        self.assertIsNone(self.quiescent_child(process))
+
+    # An exit exemption must never admit a live empty, named or target-argv identity.
+    def test_inaccessible_live_identities_still_refuse(self):
+        import atm_promotion
+        process = self.nondumpable_child()
+        proc = Path('/proc') / str(process.pid)
+        real_bytes, real_text = Path.read_bytes, Path.read_text
+        for label, command, name in (('empty', b'', 'foreign'),
+                                     ('comm', b'/usr/bin/python3\0', 'atmd'),
+                                     ('target', os.fsencode(self.bin / 'atm') + b'\0', 'foreign'),
+                                     ('basename', b'atm\0', 'foreign')):
+            with self.subTest(identity=label):
+                def read_bytes(path, *args, **kwargs):
+                    return command if path == proc / 'cmdline' else real_bytes(path, *args, **kwargs)
+                def read_text(path, *args, **kwargs):
+                    return name if path == proc / 'comm' else real_text(path, *args, **kwargs)
+                with patch.object(Path, 'read_bytes', read_bytes), patch.object(Path, 'read_text', read_text):
+                    with self.assertRaisesRegex(atm_promotion.Refused, 'cannot inspect possible ATM process'):
+                        self.quiescent_child(process)
+        self.assertIsNone(process.poll())
+
+    # Only a valid Z / 1 permits exit; neither a zombie leader nor bad state does.
+    def test_inaccessible_exit_exemption_requires_valid_single_thread_zombie(self):
+        import atm_promotion
+        process = self.nondumpable_child()
+        proc = Path('/proc') / str(process.pid)
+        real_bytes, real_text = Path.read_bytes, Path.read_text
+        fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+        # Synthetic mutations of the real stat, including a legal comm with spaces/parentheses.
+        fields[0], fields[17] = 'Z', '1'
+        prefix = f'{process.pid} (odd ) process name) '
+        valid = prefix + ' '.join(fields)
+        cases = [('zombie', valid, True),
+                 ('leader with worker', prefix + ' '.join([*fields[:17], '2', *fields[18:]]), False)]
+        for state, threads in (('S', '1'), ('Z', '0'), ('Z', 'unknown')):
+            changed = list(fields)
+            changed[0], changed[17] = state, threads
+            cases.append((f'{state}/{threads}', prefix + ' '.join(changed), False))
+        for value in ('not-a-number', '--1', '١'):
+            malformed = list(fields)
+            malformed[5] = value
+            cases.append((f'bad numeric field: {value}', prefix + ' '.join(malformed), False))
+        cases += [('truncated', prefix + ' '.join(fields[:17]), False),
+                  ('missing state', '', False),
+                  ('wrong pid', '0 (foreign) ' + ' '.join(fields), False),
+                  ('missing delimiter', f'{process.pid} (foreign ' + ' '.join(fields), False),
+                  ('denied', PermissionError('stat hidden'), False),
+                  ('gone', FileNotFoundError('process gone'), True),
+                  ('exited', ProcessLookupError('process gone'), True)]
+        def read_bytes(path, *args, **kwargs):
+            return b'' if path == proc / 'cmdline' else real_bytes(path, *args, **kwargs)
+        for label, raw, exited in cases:
+            with self.subTest(state=label):
+                def read_text(path, *args, **kwargs):
+                    if path == proc / 'stat':
+                        if isinstance(raw, Exception):
+                            raise raw
+                        return raw
+                    return real_text(path, *args, **kwargs)
+                with patch.object(Path, 'read_bytes', read_bytes), patch.object(Path, 'read_text', read_text):
+                    if exited:
+                        self.assertIsNone(self.quiescent_child(process))
+                    else:
+                        with self.assertRaisesRegex(atm_promotion.Refused, 'cannot inspect possible ATM process'):
+                            self.quiescent_child(process)
+        self.assertIsNone(process.poll())
+
+    # Actual exit at the final lookup must accept both a held zombie and a reaped PID.
+    def test_exit_during_inaccessible_state_recheck_is_accepted(self):
+        for reap in (False, True):
+            with self.subTest(reaped=reap):
+                process = self.nondumpable_child()
+                proc = Path('/proc') / str(process.pid)
+                real_bytes, real_text = Path.read_bytes, Path.read_text
+                def read_bytes(path, *args, **kwargs):
+                    return b'' if path == proc / 'cmdline' else real_bytes(path, *args, **kwargs)
+                def read_text(path, *args, **kwargs):
+                    if path == proc / 'stat':
+                        process.stdin.close()
+                        if reap:
+                            process.wait(timeout=30)
+                        else:
+                            os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+                    return real_text(path, *args, **kwargs)
+                with patch.object(Path, 'read_bytes', read_bytes), patch.object(Path, 'read_text', read_text):
+                    self.assertIsNone(self.quiescent_child(process))
+                if reap:
+                    self.assertFalse(proc.exists())
+                else:
+                    self.assertEqual((proc / 'stat').read_text().rsplit(')', 1)[1].split()[0], 'Z')
+
+    def test_live_pid_reuse_at_inaccessible_state_recheck_still_refuses(self):
+        import atm_promotion
+        process = self.nondumpable_child()
+        replacement = self.nondumpable_child()
+        proc = Path('/proc') / str(process.pid)
+        real_bytes, real_text = Path.read_bytes, Path.read_text
+        def read_bytes(path, *args, **kwargs):
+            return b'' if path == proc / 'cmdline' else real_bytes(path, *args, **kwargs)
+        def read_text(path, *args, **kwargs):
+            if path == proc / 'stat':
+                process.stdin.close()
+                process.wait(timeout=30)
+                raw = real_text(Path('/proc') / str(replacement.pid) / 'stat')
+                # Synthetic PID reuse: a real live replacement's stat under the old PID.
+                return str(process.pid) + raw.removeprefix(str(replacement.pid))
+            return real_text(path, *args, **kwargs)
+        with patch.object(Path, 'read_bytes', read_bytes), patch.object(Path, 'read_text', read_text):
+            with self.assertRaisesRegex(atm_promotion.Refused, 'cannot inspect possible ATM process'):
+                self.quiescent_child(process)
+        self.assertFalse(proc.exists())
+        self.assertIsNone(replacement.poll())
+
     def test_matching_socket_environment_refuses_without_signaling_process(self):
         process = self.child('/bin/cat', self.env)
         self.call(ok=False)

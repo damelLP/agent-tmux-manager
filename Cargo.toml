@@ -19,6 +19,7 @@ resolver = "2"
 members = [
     "crates/atm-core",
     "crates/atm-org",
+    "crates/atm-comms",
     "crates/atm-protocol",
     "crates/atm-tmux",
     "crates/atm-claude-adapter",
@@ -26,6 +27,7 @@ members = [
     "crates/atm-codex-adapter",
     "crates/atmd",
     "crates/atm",
+    "crates/atm-chat",
 ]
 
 [lints]
@@ -51,7 +53,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 # MSRV. The floor comes from dependencies (ratatui -> instability, darling).
 # Clippy reads it, so a std API newer than this fails `clippy -D warnings`
@@ -110,15 +112,17 @@ insta = "1"
 proptest = "1"
 
 # Internal crates (version required for crates.io, path for local dev)
-atm-core = { version = "0.4.2", path = "crates/atm-core" }
-atm-org = { version = "0.4.2", path = "crates/atm-org" }
-atm-protocol = { version = "0.4.2", path = "crates/atm-protocol" }
-atm-tmux = { version = "0.4.2", path = "crates/atm-tmux" }
-atm-claude-adapter = { version = "0.4.2", path = "crates/atm-claude-adapter" }
-atm-pi-adapter = { version = "0.4.2", path = "crates/atm-pi-adapter" }
-atm-codex-adapter = { version = "0.4.2", path = "crates/atm-codex-adapter" }
-atm-tui = { version = "0.4.2", path = "crates/atm" }
-atmd = { version = "0.4.2", path = "crates/atmd" }
+atm-core = { version = "0.5.0", path = "crates/atm-core" }
+atm-org = { version = "0.5.0", path = "crates/atm-org" }
+atm-comms = { version = "0.5.0", path = "crates/atm-comms" }
+atm-protocol = { version = "0.5.0", path = "crates/atm-protocol" }
+atm-tmux = { version = "0.5.0", path = "crates/atm-tmux" }
+atm-claude-adapter = { version = "0.5.0", path = "crates/atm-claude-adapter" }
+atm-pi-adapter = { version = "0.5.0", path = "crates/atm-pi-adapter" }
+atm-codex-adapter = { version = "0.5.0", path = "crates/atm-codex-adapter" }
+atm-tui = { version = "0.5.0", path = "crates/atm" }
+atm-chat = { version = "0.5.0", path = "crates/atm-chat" }
+atmd = { version = "0.5.0", path = "crates/atmd" }
 
 [dependencies]
 # Required for root package to compile the binaries
@@ -127,6 +131,8 @@ atm-org = { workspace = true }
 atm-protocol = { workspace = true }
 atm-tmux = { workspace = true }
 atm-tui = { workspace = true }
+atm-chat = { workspace = true }
+atm-comms = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ratatui = { workspace = true }
@@ -147,6 +153,7 @@ libc = { workspace = true }
 atmd = { workspace = true }
 
 [dev-dependencies]
+insta = { workspace = true }
 atm-claude-adapter = { workspace = true }
 atm-codex-adapter = { workspace = true }
 atm-pi-adapter = { workspace = true }

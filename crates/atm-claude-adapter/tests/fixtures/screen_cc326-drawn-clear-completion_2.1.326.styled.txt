@@ -1,0 +1,41 @@
+Captured: Claude Code 2.1.326, 2026-11-17, sealed fake-API TUI.
+
+[38;5;174m ▐[48;5;16m▟███▟█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.326[39m                           
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 5.5 · API Usage Billing[39m                  
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxx/drawn/project[39m                                                         
+
+
+[38;5;246m[48;5;237m❯ [38;5;231msurvey turn: reply with the neutral fixture response[39m                                                              
+
+[38;5;231m[49m●[39m Neutral fixture response 1.
+
+[38;5;246m✻[39m [38;5;246mCooked for 0s · done 2:10 AM[39m                            
+
+[38;5;246m[48;5;237m❯ [38;5;231msurvey turn: reply with the neutral fixture response 2[39m                                                            
+
+[38;5;231m[49m●[39m Neutral fixture response 2.
+
+[38;5;246m✻[39m [38;5;246mWorked for 0s · done 2:10 AM[39m                            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  [38;5;153m❯ /[1mclear[0m[38;5;153m              Start a new session with empty context; previous session stays on disk (resumable with[39m      
+                        [38;5;153m/resume)[39m                                                                                    
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [38;5;153m/clear[7m[39m [0m                                                 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m                                                                              

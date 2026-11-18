@@ -4,10 +4,13 @@
 #[path = "reply_tests.rs"]
 mod tests;
 
+#[cfg(test)]
 use atm_core::SessionView;
 use atm_tmux::TmuxClient;
 
-use super::{resolve_pane_id, ControlError};
+#[cfg(test)]
+use super::resolve_pane_id;
+use super::ControlError;
 
 /// The successfully completed reply, for the caller to render.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -19,6 +22,7 @@ pub enum ReplyOutcome {
 }
 
 /// Resolve a target and answer its prompt with the legacy shortcut/navigation rules.
+#[cfg(test)]
 pub async fn reply(
     client: &(impl TmuxClient + ?Sized),
     sessions: &[SessionView],

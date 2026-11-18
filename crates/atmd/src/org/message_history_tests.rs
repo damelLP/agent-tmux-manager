@@ -25,6 +25,7 @@ fn pane() -> PaneId {
 }
 fn content(to: AgentId) -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: Address::Owner,
         to: Address::Agent(to),
         kind: MessageKind::Note,
@@ -1991,6 +1992,18 @@ fn only_replay_and_activity_are_accepted_before_the_watermark() {
                 hold: ExecutorHold::TokenVisible,
             },
             HistoryUpdate::OwnerRetry { id, attempt_seq: 4 },
+            HistoryUpdate::AttemptExited {
+                id,
+                attempt_seq: 4,
+                paste: EffectCertainty::Applied,
+                enter: EffectCertainty::NotStarted,
+                cancelled: false,
+            },
+            HistoryUpdate::RecoveryClaimed {
+                scope: scope.clone(),
+                receipt: false,
+                cancelled: false,
+            },
         ]
     };
     for update in live_inputs() {
@@ -2560,4 +2573,907 @@ fn follower_stale_blocker_bound_starts_when_it_becomes_the_head() {
     );
     wait(step_of(&f, follower, 100_749), WaitReason::InputNotEmpty);
     blocked(step_of(&f, follower, 100_750), FailureReason::DraftPresent);
+}
+
+// Recovery tests catch permission inferred from a diagnostic, forgotten input
+// uncertainty, or a claim/revocation that can be reset. All inputs are synthetic
+// neutral facts; there is no recovery executor or external operation here.
+fn recovery_armed() -> (Fixture, AttemptScope) {
+    let mut f = Fixture::new(0);
+    f.observe(observation(SessionStatus::Idle), 0);
+    let scope = f.attempt(1);
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        1,
+    );
+    (f, scope)
+}
+
+fn recovery_exit(
+    f: &mut Fixture,
+    scope: &AttemptScope,
+    paste: EffectCertainty,
+    enter: EffectCertainty,
+    cancelled: bool,
+) {
+    f.record(
+        HistoryUpdate::AttemptExited {
+            id: f.id,
+            attempt_seq: scope.attempt_seq,
+            paste,
+            enter,
+            cancelled,
+        },
+        2,
+    );
+}
+
+fn recovery_claim(scope: &AttemptScope) -> HistoryUpdate {
+    HistoryUpdate::RecoveryClaimed {
+        scope: scope.clone(),
+        receipt: false,
+        cancelled: false,
+    }
+}
+
+fn recovery_ready() -> (Fixture, AttemptScope) {
+    let (mut f, scope) = recovery_armed();
+    paste(&mut f, EffectCertainty::Applied, 2);
+    f.record(
+        HistoryUpdate::Held {
+            id: f.id,
+            attempt_seq: scope.attempt_seq,
+            hold: ExecutorHold::InputOutcomeUnknown,
+        },
+        2,
+    );
+    recovery_exit(
+        &mut f,
+        &scope,
+        EffectCertainty::Applied,
+        EffectCertainty::NotStarted,
+        false,
+    );
+    (f, scope)
+}
+
+fn candidate(f: &Fixture) -> Option<AttemptScope> {
+    f.history.recovery_candidate(f.id, at(10_000)).unwrap()
+}
+
+#[test]
+fn recovery_original_unsent_attempt_claims_once() {
+    for start_line in [false, true] {
+        let (mut f, mut scope) = recovery_armed();
+        if start_line {
+            f.apply(
+                OrgEvent::MessageDeliveryFailed {
+                    message_id: f.id,
+                    reason: "replaced by start line".into(),
+                    final_failure: true,
+                },
+                1,
+            );
+            f.apply(
+                OrgEvent::MessageSent(super::start_line::start_line(&agent())),
+                1,
+            );
+            f.id = MessageId::new(f.seq);
+            scope = f.attempt(1);
+            f.record(
+                HistoryUpdate::Armed {
+                    scope: scope.clone(),
+                },
+                1,
+            );
+        }
+        assert_eq!(candidate(&f), None);
+        paste(&mut f, EffectCertainty::Applied, 2);
+        f.record(
+            HistoryUpdate::Held {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+                hold: ExecutorHold::InputOutcomeUnknown,
+            },
+            2,
+        );
+        recovery_exit(
+            &mut f,
+            &scope,
+            EffectCertainty::Applied,
+            EffectCertainty::NotStarted,
+            false,
+        );
+        let before = f.snapshot(10_000);
+        let step = f.step(10_000);
+        for _ in 0..2 {
+            assert_eq!(candidate(&f), Some(scope.clone()));
+        }
+        f.record(recovery_claim(&scope), 10_000);
+        assert_eq!(candidate(&f), None);
+        assert!(matches!(
+            f.history.record(recovery_claim(&scope), at(10_000)),
+            Err(super::messages::MessageError::Conflict(_))
+        ));
+        let after = f.snapshot(10_000);
+        assert_eq!(after.message, before.message);
+        assert_eq!(after.live, before.live);
+        assert_eq!(after.hold, before.hold);
+        assert_eq!(after.blocked_by, before.blocked_by);
+        assert_eq!(after.last_attempt_seq, before.last_attempt_seq);
+        assert_eq!(f.step(10_000), step);
+        f.record(
+            HistoryUpdate::OwnerRetry {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+            },
+            10_000,
+        );
+        fail_for_retry(&mut f, 10_001);
+        second_attempt(&mut f, &scope, 10_002);
+        let mut next = scope.clone();
+        next.attempt_seq = f.seq;
+        recovery_exit(
+            &mut f,
+            &next,
+            EffectCertainty::Applied,
+            EffectCertainty::NotStarted,
+            false,
+        );
+        assert_eq!(candidate(&f), None, "one-shot survived a new attempt");
+    }
+}
+
+#[test]
+fn recovery_original_input_certainty_table() {
+    use EffectCertainty::{Applied, NotStarted, Unknown};
+    for (paste, enter, want) in [
+        (NotStarted, NotStarted, false),
+        (NotStarted, Applied, false),
+        (NotStarted, Unknown, false),
+        (Applied, NotStarted, true),
+        (Applied, Applied, false),
+        (Applied, Unknown, false),
+        (Unknown, NotStarted, false),
+        (Unknown, Applied, false),
+        (Unknown, Unknown, false),
+    ] {
+        let (mut f, scope) = recovery_armed();
+        recovery_exit(&mut f, &scope, paste, enter, false);
+        assert_eq!(candidate(&f).is_some(), want, "{paste:?}/{enter:?}");
+        assert_eq!(
+            f.history.record(recovery_claim(&scope), at(10_000)).is_ok(),
+            want
+        );
+    }
+}
+
+#[test]
+fn recovery_prior_attempt_uncertainty_is_sticky() {
+    use EffectCertainty::{Applied, NotStarted, Unknown};
+    for (previous, want) in [
+        (None, false),
+        (Some((NotStarted, NotStarted)), true),
+        (Some((Applied, NotStarted)), false),
+        (Some((Unknown, NotStarted)), false),
+        (Some((NotStarted, Applied)), false),
+        (Some((NotStarted, Unknown)), false),
+    ] {
+        let (mut f, scope) = recovery_armed();
+        if let Some((paste, enter)) = previous {
+            recovery_exit(&mut f, &scope, paste, enter, false);
+        }
+        f.record(
+            HistoryUpdate::OwnerRetry {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+            },
+            3,
+        );
+        fail_for_retry(&mut f, 4);
+        second_attempt(&mut f, &scope, 5);
+        let mut next = scope.clone();
+        next.attempt_seq = f.seq;
+        recovery_exit(&mut f, &next, Applied, NotStarted, false);
+        assert_eq!(candidate(&f).is_some(), want, "{previous:?}");
+        assert!(
+            f.history
+                .record(recovery_claim(&scope), at(10_000))
+                .is_err(),
+            "stale scope"
+        );
+        assert_eq!(
+            f.history.record(recovery_claim(&next), at(10_000)).is_ok(),
+            want
+        );
+    }
+}
+
+#[test]
+fn recovery_restart_retry_never_reconstructs_proof() {
+    let mut f = Fixture::new(4);
+    let scope = f.attempt(1);
+    f.record(
+        HistoryUpdate::OwnerRetry {
+            id: f.id,
+            attempt_seq: scope.attempt_seq,
+        },
+        2,
+    );
+    // Today's mutable restarted flag can be released. The original process's
+    // input outcomes cannot be reconstructed, even with a supplied exit.
+    f.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        2,
+    );
+    recovery_exit(
+        &mut f,
+        &scope,
+        EffectCertainty::Applied,
+        EffectCertainty::NotStarted,
+        false,
+    );
+    assert_eq!(candidate(&f), None);
+    assert!(f
+        .history
+        .record(recovery_claim(&scope), at(10_000))
+        .is_err());
+    fail_for_retry(&mut f, 3);
+    second_attempt(&mut f, &scope, 4);
+    let mut next = scope;
+    next.attempt_seq = f.seq;
+    recovery_exit(
+        &mut f,
+        &next,
+        EffectCertainty::Applied,
+        EffectCertainty::NotStarted,
+        false,
+    );
+    assert_eq!(candidate(&f), None);
+
+    // A message merely sent before restart, never attempted then, can have a
+    // genuinely live original attempt; restart does not disable new work.
+    let mut fresh = Fixture::new(3);
+    fresh.observe(observation(SessionStatus::Idle), 0);
+    let scope = fresh.attempt(1);
+    fresh.record(
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        1,
+    );
+    recovery_exit(
+        &mut fresh,
+        &scope,
+        EffectCertainty::Applied,
+        EffectCertainty::NotStarted,
+        false,
+    );
+    assert_eq!(candidate(&fresh), Some(scope));
+    assert!(Fixture::new(4)
+        .history
+        .recovery_candidate(MessageId::new(3), at(0))
+        .is_err());
+}
+
+#[test]
+fn recovery_identity_changes_never_resurrect_same_attempt() {
+    for change in 0..7 {
+        let (mut f, scope) = recovery_ready();
+        let mut wrong = scope.clone();
+        match change {
+            0 => wrong.message_id = MessageId::new(999),
+            1 => wrong.attempt_seq += 1,
+            2 => wrong.recipient = "p/other".parse().unwrap(),
+            3 => wrong.pane = PaneId::parse("%9").unwrap(),
+            4 => wrong.session_id = Some("s2".into()),
+            5 => wrong.harness = Harness::Codex,
+            6 => {
+                wrong.excluded_sessions.insert("old".into());
+            }
+            _ => unreachable!(),
+        }
+        assert!(f.history.record(recovery_claim(&wrong), at(3)).is_err());
+        assert_eq!(candidate(&f), Some(scope));
+    }
+    for change in [
+        "pane", "session", "clear", "down", "harness", "lost", "presence", "role", "status",
+    ] {
+        let (mut f, scope) = recovery_ready();
+        match change {
+            "pane" | "session" => f.apply(
+                OrgEvent::AgentAdopted {
+                    agent_id: agent(),
+                    pane: if change == "pane" { "%9" } else { "%1" }.into(),
+                    session_id: Some(if change == "session" { "s2" } else { "s1" }.into()),
+                },
+                3,
+            ),
+            "clear" => f.apply(OrgEvent::AgentClearRequested { agent_id: agent() }, 3),
+            "down" => f.apply(
+                OrgEvent::AgentDown {
+                    agent_id: agent(),
+                    reason: "stopped".into(),
+                },
+                3,
+            ),
+            "harness" => {
+                let mut obs = observation(SessionStatus::Idle);
+                obs.session.as_mut().unwrap().harness = Harness::Codex;
+                f.observe(obs, 3);
+            }
+            "lost" => f.record(HistoryUpdate::ObservationLost { recipient: agent() }, 3),
+            "presence" => {
+                let mut obs = observation(SessionStatus::Idle);
+                obs.presence = PanePresence::Unknown;
+                f.observe(obs, 3);
+            }
+            "role" => f.apply(
+                OrgEvent::AgentUpRequested {
+                    agent_id: agent(),
+                    role: atm_org::parse_role("worker", "+++\nharness='codex'\n+++\n").unwrap(),
+                },
+                3,
+            ),
+            "status" => f.apply(
+                OrgEvent::AgentStuck {
+                    agent_id: agent(),
+                    reason: "unavailable".into(),
+                },
+                3,
+            ),
+            _ => unreachable!(),
+        }
+        // Restore the same visible/applied identity. That is not continuous
+        // ownership of the original draft or a fresh recovery allowance.
+        if !matches!(change, "harness" | "lost" | "presence") {
+            f.apply(
+                OrgEvent::AgentAdopted {
+                    agent_id: agent(),
+                    pane: "%1".into(),
+                    session_id: Some("s1".into()),
+                },
+                4,
+            );
+        }
+        f.observe(observation(SessionStatus::Idle), 4);
+        assert_eq!(candidate(&f), None, "{change}");
+        assert!(
+            f.history.record(recovery_claim(&scope), at(5)).is_err(),
+            "{change}"
+        );
+        // Duplicate original facts cannot resurrect after revocation either.
+        recovery_exit(
+            &mut f,
+            &scope,
+            EffectCertainty::Applied,
+            EffectCertainty::NotStarted,
+            false,
+        );
+        assert_eq!(candidate(&f), None, "duplicate after {change}");
+    }
+    let (mut f, scope) = recovery_ready();
+    f.observe(observation(SessionStatus::Idle), 3);
+    f.record(
+        HistoryUpdate::Applied {
+            seq: f.seq + 1,
+            at: at(3),
+            event: None,
+        },
+        3,
+    );
+    assert_eq!(
+        candidate(&f),
+        Some(scope),
+        "unchanged observation/unknown log kind"
+    );
+}
+
+#[test]
+fn recovery_receipt_and_terminal_precedence() {
+    for change in [
+        "queued",
+        "give-up",
+        "delivered",
+        "cancelled",
+        "retry",
+        "receipt",
+        "claim-receipt",
+        "claim-cancel",
+    ] {
+        let (mut f, scope) = recovery_ready();
+        let receipt = DeliveryReceipt {
+            session_id: "s1".into(),
+            confirmation: "exact".into(),
+        };
+        match change {
+            "queued" => fail_for_retry(&mut f, 3),
+            "give-up" => f.apply(
+                OrgEvent::MessageDeliveryFailed {
+                    message_id: f.id,
+                    reason: "owner gave up".into(),
+                    final_failure: true,
+                },
+                3,
+            ),
+            "delivered" => f.apply(
+                OrgEvent::MessageDelivered {
+                    message_id: f.id,
+                    session_id: "s1".into(),
+                    confirmation: "exact".into(),
+                },
+                3,
+            ),
+            "cancelled" => recovery_exit(
+                &mut f,
+                &scope,
+                EffectCertainty::Applied,
+                EffectCertainty::NotStarted,
+                true,
+            ),
+            "retry" => f.record(
+                HistoryUpdate::OwnerRetry {
+                    id: f.id,
+                    attempt_seq: scope.attempt_seq,
+                },
+                3,
+            ),
+            "receipt" => f.record(
+                HistoryUpdate::Evidence {
+                    id: f.id,
+                    receipt: Some(receipt.clone()),
+                    probably_landed: false,
+                },
+                3,
+            ),
+            _ => {}
+        }
+        let claim = HistoryUpdate::RecoveryClaimed {
+            scope: scope.clone(),
+            receipt: change == "claim-receipt",
+            cancelled: change == "claim-cancel",
+        };
+        assert!(f.history.record(claim, at(4)).is_err(), "{change}");
+        if !change.starts_with("claim-") {
+            assert_eq!(candidate(&f), None, "{change}");
+        }
+        if change == "give-up" {
+            f.record(
+                HistoryUpdate::Evidence {
+                    id: f.id,
+                    receipt: Some(receipt.clone()),
+                    probably_landed: false,
+                },
+                5,
+            );
+            assert_eq!(f.step(10_000), DeliveryStep::Confirm { receipt });
+        }
+    }
+    let (mut f, scope) = recovery_ready();
+    f.record(recovery_claim(&scope), 3);
+    let receipt = DeliveryReceipt {
+        session_id: "s1".into(),
+        confirmation: "late exact".into(),
+    };
+    f.record(
+        HistoryUpdate::Evidence {
+            id: f.id,
+            receipt: Some(receipt.clone()),
+            probably_landed: false,
+        },
+        4,
+    );
+    assert_eq!(candidate(&f), None);
+    assert_eq!(f.step(10_000), DeliveryStep::Confirm { receipt });
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: f.id,
+            session_id: "s1".into(),
+            confirmation: "late exact".into(),
+        },
+        5,
+    );
+    assert_eq!(f.step(10_000), DeliveryStep::Complete);
+}
+
+#[test]
+fn recovery_exit_updates_cannot_rearm_or_upgrade() {
+    for consumed in [false, true] {
+        let (mut f, scope) = recovery_ready();
+        if consumed {
+            f.record(recovery_claim(&scope), 3);
+        }
+        let mut stale = scope.clone();
+        stale.attempt_seq += 1;
+        assert!(f
+            .history
+            .record(
+                HistoryUpdate::AttemptExited {
+                    id: f.id,
+                    attempt_seq: stale.attempt_seq,
+                    paste: EffectCertainty::Applied,
+                    enter: EffectCertainty::NotStarted,
+                    cancelled: false
+                },
+                at(4)
+            )
+            .is_err());
+        f.record(
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            4,
+        );
+        f.record(
+            HistoryUpdate::Held {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+                hold: ExecutorHold::EnterNotSent,
+            },
+            4,
+        );
+        recovery_exit(
+            &mut f,
+            &scope,
+            EffectCertainty::Applied,
+            EffectCertainty::NotStarted,
+            false,
+        );
+        assert_eq!(candidate(&f).is_some(), !consumed);
+        // A conflicting later cleanup cannot turn certainty into permission.
+        recovery_exit(
+            &mut f,
+            &scope,
+            EffectCertainty::Applied,
+            EffectCertainty::Unknown,
+            false,
+        );
+        recovery_exit(
+            &mut f,
+            &scope,
+            EffectCertainty::Applied,
+            EffectCertainty::NotStarted,
+            false,
+        );
+        assert_eq!(candidate(&f), None);
+    }
+    let (mut f, scope) = recovery_ready();
+    evidence_latch(&mut f, 3);
+    f.record(
+        HistoryUpdate::Evidence {
+            id: f.id,
+            receipt: None,
+            probably_landed: false,
+        },
+        4,
+    );
+    assert_eq!(candidate(&f), None);
+    assert!(f.history.record(recovery_claim(&scope), at(5)).is_err());
+
+    // A copy between the next attempt's fold and arm names the OLD scope.
+    let (mut f, scope) = recovery_armed();
+    recovery_exit(
+        &mut f,
+        &scope,
+        EffectCertainty::NotStarted,
+        EffectCertainty::NotStarted,
+        false,
+    );
+    fail_for_retry(&mut f, 3);
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: f.id,
+            attempt: 2,
+            pane: "%1".into(),
+        },
+        4,
+    );
+    evidence_latch(&mut f, 4);
+    let mut next = scope;
+    next.attempt_seq = f.seq;
+    f.record(
+        HistoryUpdate::Armed {
+            scope: next.clone(),
+        },
+        5,
+    );
+    recovery_exit(
+        &mut f,
+        &next,
+        EffectCertainty::Applied,
+        EffectCertainty::NotStarted,
+        false,
+    );
+    assert_eq!(candidate(&f), Some(next));
+}
+
+#[test]
+fn recovery_diagnostics_are_not_proof() {
+    let (mut f, scope) = recovery_armed();
+    let mut obs = observation(SessionStatus::Idle);
+    obs.facts.input = InputState::Draft;
+    f.observe(obs, 2);
+    for hold in [ExecutorHold::EnterNotSent, ExecutorHold::TokenVisible] {
+        f.record(
+            HistoryUpdate::Held {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+                hold,
+            },
+            2,
+        );
+        assert_eq!(candidate(&f), None);
+        assert_eq!(
+            f.history.recovery_candidate(f.id, at(86_400_000)).unwrap(),
+            None
+        );
+        assert!(f.history.record(recovery_claim(&scope), at(3)).is_err());
+    }
+    // An exit without the original arm is still unproven.
+    let mut f = Fixture::new(0);
+    let scope = f.attempt(1);
+    recovery_exit(
+        &mut f,
+        &scope,
+        EffectCertainty::Applied,
+        EffectCertainty::NotStarted,
+        false,
+    );
+    assert_eq!(candidate(&f), None);
+}
+
+#[test]
+fn recovery_handle_shares_claim_and_disabled_boundary() {
+    let (f, scope) = recovery_ready();
+    let history = MessageHistoryHandle::new(0, at(0), DeliveryPolicy::default()).unwrap();
+    // Rebuild only applied facts, as at startup: this new handle has no exit.
+    for (seq, event) in [
+        (
+            1,
+            OrgEvent::ProjectRegistered {
+                project_id: "p".parse().unwrap(),
+                root: "/project".into(),
+            },
+        ),
+        (
+            2,
+            OrgEvent::AgentAdopted {
+                agent_id: agent(),
+                pane: "%1".into(),
+                session_id: Some("s1".into()),
+            },
+        ),
+        (3, OrgEvent::MessageSent(content(agent()))),
+        (
+            4,
+            OrgEvent::MessageDeliveryAttempted {
+                message_id: f.id,
+                attempt: 1,
+                pane: "%1".into(),
+            },
+        ),
+    ] {
+        history
+            .record(
+                HistoryUpdate::Applied {
+                    seq,
+                    at: at(0),
+                    event: Some(event),
+                },
+                at(0),
+            )
+            .unwrap();
+    }
+    history
+        .record(
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            at(1),
+        )
+        .unwrap();
+    history
+        .record(
+            HistoryUpdate::AttemptExited {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+                paste: EffectCertainty::Applied,
+                enter: EffectCertainty::NotStarted,
+                cancelled: false,
+            },
+            at(2),
+        )
+        .unwrap();
+    let copy = history.clone();
+    assert_eq!(
+        copy.recovery_candidate(f.id, at(3)).unwrap(),
+        Some(scope.clone())
+    );
+    history.record(recovery_claim(&scope), at(3)).unwrap();
+    assert!(copy.record(recovery_claim(&scope), at(3)).is_err());
+    assert_eq!(copy.recovery_candidate(f.id, at(3)).unwrap(), None);
+    assert!(copy.recovery_candidate(MessageId::new(999), at(3)).is_err());
+    assert!(MessageHistoryHandle::disabled("off")
+        .recovery_candidate(f.id, at(3))
+        .is_err());
+}
+
+// Catch retaining the first zero-effect exit while forgetting a conflicting
+// later outcome when the next Attempted resets per-attempt revocation.
+#[test]
+fn recovery_conflicting_exit_uncertainty_survives_retry() {
+    use EffectCertainty::{Applied, NotStarted, Unknown};
+    for (paste, enter, cancelled, want) in [
+        (NotStarted, NotStarted, false, true),
+        (Applied, NotStarted, false, false),
+        (Unknown, NotStarted, false, false),
+        (NotStarted, Applied, false, false),
+        (NotStarted, Unknown, false, false),
+        (NotStarted, NotStarted, true, false),
+    ] {
+        let (mut f, scope) = recovery_armed();
+        recovery_exit(&mut f, &scope, NotStarted, NotStarted, false);
+        recovery_exit(&mut f, &scope, paste, enter, cancelled);
+        f.record(
+            HistoryUpdate::OwnerRetry {
+                id: f.id,
+                attempt_seq: scope.attempt_seq,
+            },
+            3,
+        );
+        fail_for_retry(&mut f, 4);
+        second_attempt(&mut f, &scope, 5);
+        let mut next = scope;
+        next.attempt_seq = f.seq;
+        recovery_exit(&mut f, &next, Applied, NotStarted, false);
+        assert_eq!(
+            candidate(&f).is_some(),
+            want,
+            "{paste:?}/{enter:?}/{cancelled}"
+        );
+        assert_eq!(
+            f.history.record(recovery_claim(&next), at(10_000)).is_ok(),
+            want
+        );
+    }
+}
+
+// Break caught: a claimed token survives an irreversible history veto or ABA.
+#[test]
+fn recovery_claim_guard_revokes_at_history_fact() {
+    for veto in [
+        "lost",
+        "harness",
+        "pane",
+        "session",
+        "clear",
+        "down",
+        "retry",
+        "receipt",
+        "probable",
+        "conflict",
+        "failed",
+        "delivered",
+        "next_attempt",
+    ] {
+        let (mut f, scope) = recovery_ready();
+        let guard = f
+            .history
+            .claim_recovery(scope.clone(), false, false, at(3))
+            .unwrap();
+        assert!(guard.is_valid(), "{veto}: initial claim");
+        assert_eq!(f.history.recovery_registrations(), 1);
+        assert!(f
+            .history
+            .claim_recovery(scope.clone(), false, false, at(3))
+            .is_err());
+        match veto {
+            "lost" => f.record(HistoryUpdate::ObservationLost { recipient: agent() }, 4),
+            "harness" => {
+                let mut obs = observation(SessionStatus::Idle);
+                obs.session.as_mut().unwrap().harness = Harness::Codex;
+                f.observe(obs, 4);
+                f.observe(observation(SessionStatus::Idle), 5);
+            }
+            "pane" | "session" => {
+                f.apply(
+                    OrgEvent::AgentAdopted {
+                        agent_id: agent(),
+                        pane: if veto == "pane" { "%9" } else { "%1" }.into(),
+                        session_id: Some(if veto == "session" { "s2" } else { "s1" }.into()),
+                    },
+                    4,
+                );
+                f.apply(
+                    OrgEvent::AgentAdopted {
+                        agent_id: agent(),
+                        pane: "%1".into(),
+                        session_id: Some("s1".into()),
+                    },
+                    5,
+                );
+            }
+            "clear" => f.apply(OrgEvent::AgentClearRequested { agent_id: agent() }, 4),
+            "down" => f.apply(
+                OrgEvent::AgentDown {
+                    agent_id: agent(),
+                    reason: "fixture".into(),
+                },
+                4,
+            ),
+            "retry" => f.record(
+                HistoryUpdate::OwnerRetry {
+                    id: f.id,
+                    attempt_seq: scope.attempt_seq,
+                },
+                4,
+            ),
+            "receipt" | "probable" => f.record(
+                HistoryUpdate::Evidence {
+                    id: f.id,
+                    receipt: (veto == "receipt").then(|| DeliveryReceipt {
+                        session_id: "s1".into(),
+                        confirmation: "prompt_submit_exact_reference".into(),
+                    }),
+                    probably_landed: veto == "probable",
+                },
+                4,
+            ),
+            "conflict" => recovery_exit(
+                &mut f,
+                &scope,
+                EffectCertainty::Applied,
+                EffectCertainty::Unknown,
+                false,
+            ),
+            "failed" => f.apply(
+                OrgEvent::MessageDeliveryFailed {
+                    message_id: f.id,
+                    reason: "fixture".into(),
+                    final_failure: true,
+                },
+                4,
+            ),
+            "delivered" => f.apply(
+                OrgEvent::MessageDelivered {
+                    message_id: f.id,
+                    session_id: "s1".into(),
+                    confirmation: "prompt_submit_exact_reference".into(),
+                },
+                4,
+            ),
+            "next_attempt" => {
+                second_attempt(&mut f, &scope, 4);
+            }
+            _ => unreachable!(),
+        }
+        assert!(!guard.is_valid(), "{veto}: claimed guard survived");
+        f.history.deregister_recovery(f.id, &guard);
+        assert_eq!(f.history.recovery_registrations(), 0, "{veto}");
+        assert!(!guard.is_valid());
+    }
+}
+
+// Break caught: a stale/cancelled/receipt-bearing claim creates a usable token.
+#[test]
+fn recovery_claim_failure_registers_nothing() {
+    for (receipt, cancelled) in [(true, false), (false, true)] {
+        let (mut f, scope) = recovery_ready();
+        assert!(f
+            .history
+            .claim_recovery(scope, receipt, cancelled, at(3))
+            .is_err());
+        assert_eq!(f.history.recovery_registrations(), 0);
+    }
+    let (mut f, mut scope) = recovery_ready();
+    scope.attempt_seq += 1;
+    assert!(f
+        .history
+        .claim_recovery(scope, false, false, at(3))
+        .is_err());
+    assert_eq!(f.history.recovery_registrations(), 0);
 }

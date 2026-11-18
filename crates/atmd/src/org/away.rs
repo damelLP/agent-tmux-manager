@@ -1,4 +1,4 @@
-//! The away switch: its two methods, the settings read, and what the decision
+//! The away switch and relay designation: owner methods, settings, and what the decision
 //! bridge does while the owner is away.
 //!
 //! Policy stays in atm-org. This module only supplies its inputs (the caller,
@@ -30,8 +30,8 @@ use super::{
 };
 use crate::server::methods::{parse_params, CallContext, MethodError, MethodRouter};
 use atm_org::{
-    Address, AwayStep, AwayWait, Decision, DecisionStatus, MessageContent, MessageKind, OrgCommand,
-    OrgState, OwnerCommand, ProjectId,
+    Address, AgentId, AwayStep, AwayWait, Decision, DecisionStatus, MessageContent, MessageKind,
+    OrgCommand, OrgState, OwnerCommand, ProjectId,
 };
 use atm_protocol::error_code;
 use chrono::{DateTime, Utc};
@@ -46,6 +46,22 @@ mod tests;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwitchParams {}
+
+/// Empty shows the slot; a registered agent sets it; clear revokes it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayResult {
+    pub agent: Option<AgentId>,
+    pub changed: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AwayResult {
@@ -66,6 +82,8 @@ pub struct BackResult {
     pub away_since: Option<DateTime<Utc>>,
     pub provisional_count: usize,
     pub pending_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<super::return_digest::DigestPage>,
 }
 
 fn count(state: &OrgState, status: DecisionStatus) -> usize {
@@ -82,6 +100,47 @@ fn lane_error(error: AgentError) -> DecisionError {
 }
 
 impl DecisionHandle {
+    pub async fn relay(
+        &self,
+        params: RelayParams,
+        caller: CallContext,
+    ) -> Result<RelayResult, DecisionError> {
+        if params.agent.is_some() && params.clear {
+            return Err(DecisionError::InvalidParams(
+                "agent and clear conflict".into(),
+            ));
+        }
+        self.call(true, async {
+            let state = self.org.snapshot().await?;
+            let by = caller_address(&state, &caller)?;
+            if by != Address::Owner {
+                return Err(DecisionError::Refused(
+                    "only the owner may set or show the relay seat".into(),
+                ));
+            }
+            let changed = if params.agent.is_some() || params.clear {
+                !self
+                    .org
+                    .execute(
+                        OrgCommand::Owner(OwnerCommand::SetRelay {
+                            by,
+                            agent: params.agent,
+                        }),
+                        self.clock.now()?,
+                    )
+                    .await?
+                    .is_empty()
+            } else {
+                false
+            };
+            Ok(RelayResult {
+                agent: self.org.snapshot().await?.owner().relay.clone(),
+                changed,
+            })
+        })
+        .await
+    }
+
     /// The cap of every registered project, each read on the configuration lane.
     async fn stacking_caps(
         &self,
@@ -147,25 +206,7 @@ impl DecisionHandle {
         _params: SwitchParams,
         caller: CallContext,
     ) -> Result<BackResult, DecisionError> {
-        self.call(true, async {
-            let before = self.org.snapshot().await?;
-            let by = caller_address(&before, &caller)?;
-            let events = self
-                .org
-                .execute(
-                    OrgCommand::Owner(OwnerCommand::Back { by }),
-                    self.clock.now()?,
-                )
-                .await?;
-            let state = self.org.snapshot().await?;
-            Ok(BackResult {
-                changed: !events.is_empty(),
-                away_since: before.owner().away_since,
-                provisional_count: count(&state, DecisionStatus::TakenProvisionally),
-                pending_count: count(&state, DecisionStatus::Pending),
-            })
-        })
-        .await
+        self.call(true, self.prepare_back(_params, caller)).await
     }
 }
 
@@ -189,6 +230,8 @@ pub fn register_away_methods(
     }
     register!("owner.away", away);
     register!("owner.back", back);
+    register!("owner.digest", digest);
+    register!("owner.relay", relay);
     Ok(())
 }
 
@@ -235,7 +278,14 @@ fn notice(decision: &Decision, away: bool) -> Option<MessageContent> {
     let (kind, body) = match decision.status {
         DecisionStatus::TakenProvisionally => {
             let taken = decision.provisional.as_ref()?;
-            let body = if taken.by == decision.request.requester {
+            let body = if let Some(seat) = &taken.relayed_by {
+                let next = if decision.class() == atm_org::DecisionClass::Detail {
+                    " Carry on; he may still overrule it.".into()
+                } else {
+                    format!(" Finish your task in progress on this option. Start nothing further on it: a task built on it names {id} in rests_on and waits until the owner has confirmed {id}.")
+                };
+                format!("Decision {id} taken provisionally: {}\nRelayed by {seat} as the owner's spoken answer; he has not confirmed it himself.{next}", taken.option)
+            } else if taken.by == decision.request.requester {
                 format!(
                     "Decision {id} is yours to decide: recorded as {}, your recommended option.\nThe owner is away and sees it when he is back.",
                     taken.option
@@ -266,6 +316,7 @@ fn notice(decision: &Decision, away: bool) -> Option<MessageContent> {
         _ => return None,
     };
     Some(MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: decision.request.requester.clone(),
         kind,

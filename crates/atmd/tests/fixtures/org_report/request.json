@@ -1,0 +1,7 @@
+{
+  "protocol_version": {"major": 1, "minor": 1},
+  "type": "request",
+  "id": "golden",
+  "method": "org.report",
+  "params": {"project_id": null, "since": null, "until": null, "bucket": 5, "after": null, "limit": 100}
+}

@@ -1,0 +1,201 @@
+{
+  "provenance": "Synthetic: neutral canonical message rows and display facts, not a capture. Long-body cases expand to exactly 16384 bytes in tests.",
+  "long_body_bytes": 16384,
+  "rows": [
+    {
+      "message_id": "m9",
+      "content": {
+        "to": "owner",
+        "kind": "note",
+        "body": "earlier exchange",
+        "attachments": [],
+        "task": null,
+        "from": "alpha/chief"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "delivered",
+      "read_at": "2026-11-17T12:00:01Z",
+      "delivery": {
+        "phase": "delivered",
+        "reason": null,
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": "reference accepted",
+        "retry_at": null,
+        "blocked_by": null
+      }
+    },
+    {
+      "message_id": "m10",
+      "content": {
+        "to": "alpha/chief",
+        "kind": "note",
+        "body": "queued work",
+        "attachments": [],
+        "task": null,
+        "from": "owner"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "queued",
+      "read_at": null,
+      "delivery": {
+        "phase": "queued",
+        "reason": null,
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": null,
+        "retry_at": null,
+        "blocked_by": null
+      }
+    },
+    {
+      "message_id": "m11",
+      "content": {
+        "to": "alpha/chief",
+        "kind": "note",
+        "body": "held work",
+        "attachments": [],
+        "task": null,
+        "from": "owner"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "queued",
+      "read_at": null,
+      "delivery": {
+        "phase": "waiting",
+        "reason": "editor not empty",
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": null,
+        "retry_at": "2026-11-17T12:00:10Z",
+        "blocked_by": null
+      }
+    },
+    {
+      "message_id": "m12",
+      "content": {
+        "to": "alpha/chief",
+        "kind": "note",
+        "body": "in flight",
+        "attachments": [],
+        "task": null,
+        "from": "owner"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "delivering",
+      "read_at": null,
+      "delivery": {
+        "phase": "delivering",
+        "reason": null,
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": null,
+        "retry_at": null,
+        "blocked_by": null
+      }
+    },
+    {
+      "message_id": "m13",
+      "content": {
+        "to": "alpha/chief",
+        "kind": "note",
+        "body": "reference accepted, not execution",
+        "attachments": [],
+        "task": null,
+        "from": "owner"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "delivered",
+      "read_at": null,
+      "delivery": {
+        "phase": "delivered",
+        "reason": null,
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": "reference accepted",
+        "retry_at": null,
+        "blocked_by": null
+      }
+    },
+    {
+      "message_id": "m14",
+      "content": {
+        "to": "alpha/chief",
+        "kind": "note",
+        "body": "failed work",
+        "attachments": [],
+        "task": null,
+        "from": "owner"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "failed",
+      "read_at": null,
+      "delivery": {
+        "phase": "failed",
+        "reason": "recipient down",
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": null,
+        "retry_at": null,
+        "blocked_by": null
+      }
+    },
+    {
+      "message_id": "m15",
+      "content": {
+        "to": "owner",
+        "kind": "note",
+        "body": "latest answer λ 👋\ncontrols: \u001b[31m \u0007",
+        "attachments": [
+          "notes/brief.md",
+          "-literal.txt"
+        ],
+        "task": null,
+        "from": "alpha/chief"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "delivered",
+      "read_at": null,
+      "delivery": {
+        "phase": "delivered",
+        "reason": null,
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": "reference accepted",
+        "retry_at": null,
+        "blocked_by": null
+      }
+    },
+    {
+      "message_id": "m16",
+      "content": {
+        "to": "alpha/chief",
+        "kind": "note",
+        "body": "later FIFO work",
+        "attachments": [],
+        "task": null,
+        "from": "owner"
+      },
+      "sent_at": "2026-11-17T12:00:00Z",
+      "status": "queued",
+      "read_at": null,
+      "delivery": {
+        "phase": "blocked",
+        "reason": "predecessor waiting",
+        "attempt": 1,
+        "pane": "%99",
+        "session_id": "historical-session",
+        "confirmation": null,
+        "retry_at": null,
+        "blocked_by": "m10"
+      }
+    }
+  ]
+}

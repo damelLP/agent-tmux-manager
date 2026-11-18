@@ -596,6 +596,192 @@ fn delivery_policy_and_read_ownership() {
     assert!(run(&mut state, read, &mut seq).is_empty());
 }
 
+fn notice(source_message_id: MessageId, reason: &str) -> MessageContent {
+    MessageContent {
+        from: Address::System,
+        kind: MessageKind::Note,
+        delivery_notice: Some(DeliveryNotice {
+            source_message_id,
+            reason: reason.into(),
+        }),
+        ..content(Address::Owner)
+    }
+}
+
+#[test]
+fn notice_key_is_source_and_reason() {
+    let (mut state, mut seq) = setup();
+    let mut sources = Vec::new();
+    for _ in 0..2 {
+        run(
+            &mut state,
+            OrgCommand::SendMessage(content(Address::Owner)),
+            &mut seq,
+        );
+        sources.push(MessageId::new(seq));
+    }
+    let first = notice(sources[0], "focus");
+    assert_eq!(
+        run(&mut state, OrgCommand::SendMessage(first.clone()), &mut seq).len(),
+        1
+    );
+    let first_note = MessageId::new(seq);
+    let changed = MessageContent {
+        body: "Different diagnostics and followers: m99".into(),
+        attachments: vec!["different.md".into()],
+        task: Some("t99".parse().unwrap()),
+        ..first.clone()
+    };
+    assert_noop(&mut state, OrgCommand::SendMessage(changed), &mut seq);
+    assert_eq!(state.message(&first_note).unwrap().content, first);
+    for note in [
+        notice(sources[0], "blocked_draft"),
+        notice(sources[1], "focus"),
+    ] {
+        assert_eq!(
+            run(&mut state, OrgCommand::SendMessage(note), &mut seq).len(),
+            1
+        );
+    }
+    assert_eq!(
+        state
+            .messages()
+            .filter(|m| m.content.delivery_notice.is_some())
+            .count(),
+        3
+    );
+    let unkeyed = MessageContent {
+        delivery_notice: None,
+        ..first
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            run(
+                &mut state,
+                OrgCommand::SendMessage(unkeyed.clone()),
+                &mut seq
+            )
+            .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn notice_validation_is_atomic() {
+    let (mut state, mut seq) = setup();
+    run(&mut state, up(), &mut seq);
+    run(
+        &mut state,
+        OrgCommand::SendMessage(content(Address::Owner)),
+        &mut seq,
+    );
+    let source = MessageId::new(seq);
+    let valid = notice(source, "focus");
+    run(&mut state, OrgCommand::SendMessage(valid.clone()), &mut seq);
+    // Invalid requests must refuse even when their key was already committed.
+    let mut invalid = vec![
+        notice(MessageId::new(999), "focus"),
+        notice(source, ""),
+        MessageContent {
+            from: Address::Owner,
+            ..valid.clone()
+        },
+        MessageContent {
+            from: Address::Agent(id()),
+            ..valid.clone()
+        },
+        MessageContent {
+            to: Address::Agent(id()),
+            ..valid.clone()
+        },
+        MessageContent {
+            to: Address::System,
+            ..valid.clone()
+        },
+    ];
+    for kind in [
+        MessageKind::Brief,
+        MessageKind::Report,
+        MessageKind::Question,
+        MessageKind::Answer,
+        MessageKind::Review,
+    ] {
+        invalid.push(MessageContent {
+            kind,
+            ..valid.clone()
+        });
+    }
+    let before = state.clone();
+    let outcomes: Vec<_> = invalid
+        .into_iter()
+        .map(|note| {
+            let refused = state
+                .decide(&OrgCommand::SendMessage(note.clone()), time())
+                .is_err();
+            (note, refused)
+        })
+        .collect();
+    assert!(outcomes.iter().all(|(_, refused)| *refused), "{outcomes:?}");
+    assert_eq!(state, before);
+}
+
+#[test]
+fn serialized_notice_requests_write_once() {
+    // Both commands are pending before the writer starts. Exercise each serial
+    // order, with the first append applied before the second command decides.
+    for reverse in [false, true] {
+        let (mut state, mut seq) = setup();
+        run(
+            &mut state,
+            OrgCommand::SendMessage(content(Address::Owner)),
+            &mut seq,
+        );
+        let source = MessageId::new(seq);
+        let mut pending = [
+            notice(source, "focus"),
+            MessageContent {
+                body: "Changed diagnostics".into(),
+                ..notice(source, "focus")
+            },
+        ];
+        if reverse {
+            pending.reverse();
+        }
+        let expected = pending[0].clone();
+        let mut appended = Vec::new();
+        for note in pending {
+            appended.extend(run(&mut state, OrgCommand::SendMessage(note), &mut seq));
+        }
+        assert_eq!(appended, [OrgEvent::MessageSent(expected)]);
+        assert_eq!(
+            state
+                .messages()
+                .filter(|m| m.content.delivery_notice.is_some())
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn failed_notice_append_does_not_claim_key() {
+    let (mut state, mut seq) = setup();
+    run(
+        &mut state,
+        OrgCommand::SendMessage(content(Address::Owner)),
+        &mut seq,
+    );
+    let command = OrgCommand::SendMessage(notice(MessageId::new(seq), "unobserved"));
+    let before = state.clone();
+    let refused_append = state.decide(&command, time()).unwrap();
+    assert_eq!(refused_append.len(), 1);
+    drop(refused_append); // The writer did not append: there is no fact to apply.
+    assert_eq!(state, before);
+    assert_eq!(run(&mut state, command.clone(), &mut seq).len(), 1);
+    assert_noop(&mut state, command, &mut seq);
+}
+
 #[test]
 fn summary_deduplicates_but_control_audits_always_emit() {
     let (mut state, mut seq) = setup();

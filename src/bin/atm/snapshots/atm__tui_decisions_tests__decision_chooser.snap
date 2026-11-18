@@ -1,0 +1,18 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 101
+expression: "rendered(&mut chooser, 72, 14)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────────────────┐
+ │Waiting decisions — j/k: select, Enter: inspect, Esc: close         │
+ │> d41 from alpha/lead: Approve the smaller interface?               │
+ │  d42 from beta/lead: Approve the smaller interface?                │
+ │                                                                    │
+ │                                                                    │
+ │                                                                    │
+ │                                                                    │
+ │                                                                    │
+ │                                                                    │
+ │                                                                    │
+ └────────────────────────────────────────────────────────────────────┘

@@ -36,7 +36,10 @@ mod commands;
 mod git;
 mod handle;
 mod infra;
+mod inputs;
 
+#[cfg(test)]
+pub(crate) use actor::replay_support;
 pub use actor::{RegistryActor, MAX_SESSIONS};
 pub use commands::{
     AcceptedStart, PaneSession, RegistryCommand, RegistryError, RemovalReason, SessionEvent,

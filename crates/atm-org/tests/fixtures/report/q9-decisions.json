@@ -1,0 +1,131 @@
+{
+  "now": "2026-01-01T00:01:00Z",
+  "scope": {
+    "project_id": null,
+    "since": null,
+    "until": "2026-01-01T00:01:00Z",
+    "reader": "owner",
+    "sees": "all"
+  },
+  "tasks": [],
+  "projects": [
+    {
+      "project_id": null,
+      "tasks": {
+        "accepted": 0,
+        "cancelled": 0,
+        "open": 0,
+        "unknown": 0
+      },
+      "owner_step_ins": {
+        "total": 0,
+        "verdict": 0,
+        "redirect": 0,
+        "answer": 0,
+        "message": 0,
+        "redo": 0
+      },
+      "tasks_with_step_ins": 0,
+      "cost": null,
+      "cost_unknown_tasks": 0,
+      "over_budget": null,
+      "decisions": {
+        "taken_for_owner": 1,
+        "agent_decided": 0,
+        "relayed": 0,
+        "overruled": 0,
+        "tasks_redone": 0
+      },
+      "trend": {
+        "bucket": 5,
+        "buckets": [],
+        "direction": {
+          "turns": "none",
+          "peak_context_percent": "none",
+          "review_rounds": "none",
+          "changes_requested": "none",
+          "cost": "none"
+        }
+      }
+    },
+    {
+      "project_id": "alpha",
+      "tasks": {
+        "accepted": 0,
+        "cancelled": 0,
+        "open": 0,
+        "unknown": 0
+      },
+      "owner_step_ins": {
+        "total": 0,
+        "verdict": 0,
+        "redirect": 0,
+        "answer": 0,
+        "message": 0,
+        "redo": 0
+      },
+      "tasks_with_step_ins": 0,
+      "cost": null,
+      "cost_unknown_tasks": 0,
+      "over_budget": null,
+      "decisions": {
+        "taken_for_owner": 1,
+        "agent_decided": 0,
+        "relayed": 0,
+        "overruled": 1,
+        "tasks_redone": 0
+      },
+      "trend": {
+        "bucket": 5,
+        "buckets": [],
+        "direction": {
+          "turns": "none",
+          "peak_context_percent": "none",
+          "review_rounds": "none",
+          "changes_requested": "none",
+          "cost": "none"
+        }
+      }
+    },
+    {
+      "project_id": "beta",
+      "tasks": {
+        "accepted": 0,
+        "cancelled": 0,
+        "open": 0,
+        "unknown": 0
+      },
+      "owner_step_ins": {
+        "total": 0,
+        "verdict": 0,
+        "redirect": 0,
+        "answer": 0,
+        "message": 0,
+        "redo": 0
+      },
+      "tasks_with_step_ins": 0,
+      "cost": null,
+      "cost_unknown_tasks": 0,
+      "over_budget": null,
+      "decisions": {
+        "taken_for_owner": 0,
+        "agent_decided": 1,
+        "relayed": 0,
+        "overruled": 0,
+        "tasks_redone": 0
+      },
+      "trend": {
+        "bucket": 5,
+        "buckets": [],
+        "direction": {
+          "turns": "none",
+          "peak_context_percent": "none",
+          "review_rounds": "none",
+          "changes_requested": "none",
+          "cost": "none"
+        }
+      }
+    }
+  ],
+  "next_after": null
+}

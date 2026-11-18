@@ -1,7 +1,7 @@
 use super::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // Controlled receiver isolates the handle's admission/cancellation contract;
 // persistence and publication use real files in the other tests.
@@ -172,7 +172,7 @@ async fn exec_child_does_not_keep_the_stream_locked() {
     assert!(child.0.try_wait().unwrap().is_none());
     drop(log);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), live.recv())
+        tokio::time::timeout(Duration::from_secs(60), live.recv())
             .await
             .unwrap(),
         Err(broadcast::error::RecvError::Closed)
@@ -355,6 +355,11 @@ fn expire(path: &Path) {
 
 #[tokio::test]
 async fn raw_pruning_preserves_high_water_even_when_all_expire() {
+    if super::test_support::isolated(
+        "eventlog::tests::raw_pruning_preserves_high_water_even_when_all_expire",
+    ) {
+        return;
+    }
     for keep_older in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let old = segment(dir.path(), Stream::Raw, 1, &record(1));
@@ -368,7 +373,7 @@ async fn raw_pruning_preserves_high_water_even_when_all_expire() {
         assert_eq!(old.exists(), keep_older);
         let marker = dir.path().join("log/raw/00000003.jsonl");
         assert_eq!(fs::metadata(&marker).unwrap().len(), 0);
-        drop(log);
+        close(log).await;
         let log = reopen(dir.path(), Stream::Raw);
         assert_eq!(
             log.append(ts(), "continued", serde_json::Value::Null)
@@ -376,7 +381,7 @@ async fn raw_pruning_preserves_high_water_even_when_all_expire() {
                 .unwrap(),
             3
         );
-        drop(log);
+        close(log).await;
         let log = reopen(dir.path(), Stream::Raw);
         assert_eq!(
             log.append(ts(), "continued", serde_json::Value::Null)
@@ -492,16 +497,21 @@ fn replay_uses_numeric_names_and_can_start_within_a_segment() {
         .is_none());
 }
 
-#[test]
-fn format_marker_is_created_and_rejects_every_other_value() {
+#[tokio::test]
+async fn format_marker_is_created_and_rejects_every_other_value() {
+    if super::test_support::isolated(
+        "eventlog::tests::format_marker_is_created_and_rejects_every_other_value",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let log = EventLog::open(dir.path(), Stream::Events).unwrap();
     let marker = dir.path().join("log/format");
     assert_eq!(fs::read(&marker).unwrap(), b"1\n");
-    drop(log);
+    close(log).await;
     for contents in [b"2\n".as_slice(), b"1", b"1\n\n", b"", b"\xff"] {
         fs::write(&marker, contents).unwrap();
-        // A parallel fork can briefly retain the previous failed open's lock.
+        // Isolated failed opens release their lock synchronously.
         let error = reopen_result(dir.path(), Stream::Raw).unwrap_err();
         let text = error.to_string();
         assert!(text.contains("unsupported log format"), "{text}");
@@ -558,24 +568,71 @@ fn record(seq: u64) -> Vec<u8> {
         .into_bytes()
 }
 
+async fn close(log: EventLog) {
+    let mut closed = log.subscribe();
+    drop(log);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(60), closed.recv())
+            .await
+            .unwrap(),
+        Err(broadcast::error::RecvError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn last_handle_drop_waits_for_the_held_writer_to_close() {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    if std::env::var_os("ATM_TEST_HELD_CLOSE_CHILD").is_none() {
+        super::test_support::run_child(
+            "eventlog::tests::last_handle_drop_waits_for_the_held_writer_to_close",
+            |command| {
+                command.env("ATM_TEST_HELD_CLOSE_CHILD", "1");
+            },
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let log = EventLog::open(dir.path(), Stream::Raw).unwrap();
+    // Keeping only the private request sender holds the real writer in recv,
+    // even after its last public handle drops. It must still own the lock.
+    let held = log.requests.clone();
+    let mut closing = std::pin::pin!(close(log));
+    assert!(
+        poll_fn(|cx| Poll::Ready(closing.as_mut().poll(cx).is_pending())).await,
+        "last-handle drop was mistaken for writer completion"
+    );
+    assert!(matches!(
+        EventLog::open(dir.path(), Stream::Raw),
+        Err(EventLogError::Locked(_))
+    ));
+    drop(held);
+    closing.await;
+    let reopened = EventLog::open(dir.path(), Stream::Raw).unwrap();
+    assert_eq!(
+        reopened
+            .append(ts(), "after close", serde_json::Value::Null)
+            .await
+            .unwrap(),
+        1
+    );
+    close(reopened).await;
+}
+
 fn reopen(root: &Path, stream: Stream) -> EventLog {
     reopen_result(root, stream).unwrap_or_else(|e| panic!("reopen: {e}"))
 }
 
 fn reopen_result(root: &Path, stream: Stream) -> Result<EventLog, EventLogError> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match EventLog::open(root, stream) {
-            Err(EventLogError::Locked(_)) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5))
-            }
-            result => return result,
-        }
-    }
+    EventLog::open(root, stream)
 }
 
 #[tokio::test]
 async fn append_reopen_and_read_after() {
+    if super::test_support::isolated("eventlog::tests::append_reopen_and_read_after") {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     // open is deliberately called inside Tokio: its std startup receive must not panic.
     let log = EventLog::open(dir.path(), Stream::Events).unwrap();
@@ -597,7 +654,7 @@ async fn append_reopen_and_read_after() {
         .map(|r| r.unwrap().seq)
         .collect();
     assert_eq!(rows, [2, 3]);
-    drop(log);
+    close(log).await;
     let log = reopen(dir.path(), Stream::Events);
     assert_eq!(
         log.append(ts(), "next", serde_json::Value::Null)
@@ -614,8 +671,12 @@ async fn append_reopen_and_read_after() {
     );
 }
 
-#[test]
-fn exclusive_stream_lock_lasts_through_clones() {
+#[tokio::test]
+async fn exclusive_stream_lock_lasts_through_clones() {
+    if super::test_support::isolated("eventlog::tests::exclusive_stream_lock_lasts_through_clones")
+    {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let first = EventLog::open(dir.path(), Stream::Events).unwrap();
     let clone = first.clone();
@@ -624,7 +685,7 @@ fn exclusive_stream_lock_lasts_through_clones() {
         EventLog::open(dir.path(), Stream::Events),
         Err(EventLogError::Locked(_))
     ));
-    drop(clone);
+    close(clone).await;
     drop(reopen(dir.path(), Stream::Events));
 }
 
@@ -701,6 +762,11 @@ fn replay_rejects_cross_segment_regression_and_old_torn_tail() {
 
 #[tokio::test]
 async fn empty_high_water_segment_and_sequence_exhaustion() {
+    if super::test_support::isolated(
+        "eventlog::tests::empty_high_water_segment_and_sequence_exhaustion",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     segment(dir.path(), Stream::Events, u64::MAX, b"");
     let log = EventLog::open(dir.path(), Stream::Events).unwrap();
@@ -714,7 +780,7 @@ async fn empty_high_water_segment_and_sequence_exhaustion() {
         log.append(ts(), "overflow", serde_json::Value::Null).await,
         Err(EventLogError::SequenceExhausted)
     ));
-    drop(log);
+    close(log).await;
     let log = reopen(dir.path(), Stream::Events);
     assert!(matches!(
         log.append(ts(), "overflow", serde_json::Value::Null).await,

@@ -39,6 +39,8 @@ pub enum TreeNodeId {
     Worktree(String),
     /// A team node (placeholder for CC Agent Teams).
     Team(String),
+    /// A window group, keyed by its stable id (or a synthetic fallback id).
+    Window(String),
     /// An agent (session) node, keyed by session ID.
     Agent(SessionId),
 }
@@ -74,6 +76,12 @@ pub enum TreeNode {
         /// Child nodes (Agent).
         children: Vec<TreeNode>,
     },
+    /// A window groups the agents whose panes it contains.
+    Window {
+        id: String,
+        label: String,
+        children: Vec<TreeNode>,
+    },
     /// A single session (leaf node).
     Agent {
         /// The session view data.
@@ -89,7 +97,8 @@ impl TreeNode {
         match self {
             TreeNode::Project { children, .. }
             | TreeNode::Worktree { children, .. }
-            | TreeNode::Team { children, .. } => children.iter().map(|c| c.agent_count()).sum(),
+            | TreeNode::Team { children, .. }
+            | TreeNode::Window { children, .. } => children.iter().map(|c| c.agent_count()).sum(),
             TreeNode::Agent { subagents, .. } => {
                 1 + subagents.iter().map(|s| s.agent_count()).sum::<usize>()
             }
@@ -101,7 +110,8 @@ impl TreeNode {
         match self {
             TreeNode::Project { children, .. }
             | TreeNode::Worktree { children, .. }
-            | TreeNode::Team { children, .. } => children.iter().any(|c| c.needs_attention()),
+            | TreeNode::Team { children, .. }
+            | TreeNode::Window { children, .. } => children.iter().any(|c| c.needs_attention()),
             TreeNode::Agent { session, subagents } => {
                 session.needs_attention || subagents.iter().any(|s| s.needs_attention())
             }
@@ -114,6 +124,7 @@ impl TreeNode {
             TreeNode::Project { root, .. } => TreeNodeId::Project(root.clone()),
             TreeNode::Worktree { path, .. } => TreeNodeId::Worktree(path.clone()),
             TreeNode::Team { name, .. } => TreeNodeId::Team(name.clone()),
+            TreeNode::Window { id, .. } => TreeNodeId::Window(id.clone()),
             TreeNode::Agent { session, .. } => TreeNodeId::Agent(session.id.clone()),
         }
     }
@@ -137,6 +148,10 @@ pub enum TreeRowKind {
     },
     Team {
         name: String,
+    },
+    Window {
+        id: String,
+        label: String,
     },
     Agent {
         session: SessionView,
@@ -358,7 +373,8 @@ fn flatten_node(
     let has_children = match node {
         TreeNode::Project { children, .. }
         | TreeNode::Worktree { children, .. }
-        | TreeNode::Team { children, .. } => !children.is_empty(),
+        | TreeNode::Team { children, .. }
+        | TreeNode::Window { children, .. } => !children.is_empty(),
         TreeNode::Agent { subagents, .. } => !subagents.is_empty(),
     };
 
@@ -372,6 +388,10 @@ fn flatten_node(
             branch: branch.clone(),
         },
         TreeNode::Team { name, .. } => TreeRowKind::Team { name: name.clone() },
+        TreeNode::Window { id, label, .. } => TreeRowKind::Window {
+            id: id.clone(),
+            label: label.clone(),
+        },
         TreeNode::Agent { session, .. } => TreeRowKind::Agent {
             session: session.clone(),
         },
@@ -392,7 +412,8 @@ fn flatten_node(
         let children: &[TreeNode] = match node {
             TreeNode::Project { children, .. }
             | TreeNode::Worktree { children, .. }
-            | TreeNode::Team { children, .. } => children,
+            | TreeNode::Team { children, .. }
+            | TreeNode::Window { children, .. } => children,
             TreeNode::Agent { subagents, .. } => subagents,
         };
         for child in children {
@@ -413,7 +434,8 @@ pub fn all_node_ids(tree: &[TreeNode]) -> HashSet<TreeNodeId> {
         match node {
             TreeNode::Project { children, .. }
             | TreeNode::Worktree { children, .. }
-            | TreeNode::Team { children, .. } => {
+            | TreeNode::Team { children, .. }
+            | TreeNode::Window { children, .. } => {
                 for child in children {
                     collect(child, ids);
                 }
@@ -1014,6 +1036,67 @@ mod tests {
     // ------------------------------------------------------------------
     // Helper tests
     // ------------------------------------------------------------------
+
+    // Break caught: the additive window group loses its identity, folded counts,
+    // attention bubble, descendants or fold/expand behavior in a generic traversal.
+    #[test]
+    fn window_nodes_share_generic_tree_navigation_and_attention() {
+        let mut child = make_session("child");
+        child.needs_attention = true;
+        let tree = vec![TreeNode::Window {
+            id: "@7".into(),
+            label: "0 support".into(),
+            children: vec![TreeNode::Agent {
+                session: make_session("parent"),
+                subagents: vec![TreeNode::Agent {
+                    session: child,
+                    subagents: vec![],
+                }],
+            }],
+        }];
+        let window = TreeNodeId::Window("@7".into());
+        assert_eq!(tree[0].node_id(), window);
+        assert_eq!(tree[0].agent_count(), 2);
+        assert!(tree[0].needs_attention());
+        let folded = flatten_tree(&tree, &HashSet::new());
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].agent_count, 2);
+        assert!(folded[0].needs_attention);
+        assert!(folded[0].has_children);
+        assert!(
+            matches!(&folded[0].kind,TreeRowKind::Window{id,label} if id=="@7" && label=="0 support")
+        );
+        let ids = all_node_ids(&tree);
+        assert_eq!(
+            ids,
+            HashSet::from([
+                window,
+                TreeNodeId::Agent(SessionId::new("parent")),
+                TreeNodeId::Agent(SessionId::new("child"))
+            ])
+        );
+        let open = flatten_tree(&tree, &ids);
+        assert_eq!(
+            open.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(
+            matches!(&open[2].kind,TreeRowKind::Agent{session} if session.id.as_str()=="child")
+        );
+    }
+    #[test]
+    fn empty_window_is_a_non_attention_leaf() {
+        let tree = vec![TreeNode::Window {
+            id: "@0".into(),
+            label: "".into(),
+            children: vec![],
+        }];
+        let rows = flatten_tree(&tree, &all_node_ids(&tree));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_count, 0);
+        assert!(!rows[0].needs_attention);
+        assert!(!rows[0].has_children);
+    }
 
     #[test]
     fn test_extract_project_name() {

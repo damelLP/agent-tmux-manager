@@ -24,8 +24,16 @@
 //! | Armed | B immediately after evidence.arm, using the same scope |
 //! | Evidence | Recipient-slot holder immediately before each policy evaluation: A2 outside an attempt, B inside |
 //! | Consumed | Recipient-slot holder that evaluated the step |
-//! | Paste / Held | B |
+//! | Paste / Held / AttemptExited | B |
 //! | OwnerRetry | A2 |
+//! | RecoveryClaimed | Reserved Enter-only recovery executor |
+//!
+//! Recovery facts are process-local and never reconstructed from the log, a
+//! hold diagnostic or visible text. Restart is never eligible, even after an
+//! owner retry releases Restarted. A candidate/claim is only historical proof
+//! of this daemon's input outcomes, not authorization to send Enter. The
+//! executor revalidates identity, receipts, cancellation and every guard;
+//! a claimed atomic view can only be revoked, never rearm eligibility.
 //!
 //! B arms evidence first, then history, before any input. If either fails, no
 //! input is allowed; settle the committed attempt with definite no-effect evidence
@@ -48,7 +56,10 @@ use atm_org::{
 use chrono::{DateTime, TimeDelta, Utc};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, Weak,
+    },
 };
 use tokio::sync::watch;
 
@@ -77,9 +88,45 @@ pub enum EffectCertainty {
     Unknown,
 }
 
+/// Revocation-only view for the actor predicate; it never rechecks eligibility.
+#[derive(Debug, Clone)]
+pub(super) struct RecoveryGuard(Arc<AtomicBool>);
+
+impl RecoveryGuard {
+    /// A later veto cannot recall a key tmux already consumes: the ordinary
+    /// guarded-key predicate-to-effect race remains, not human-input exclusion.
+    pub(super) fn is_valid(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub(super) fn revoke(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
+    pub(super) fn registration(&self) -> Weak<AtomicBool> {
+        Arc::downgrade(&self.0)
+    }
+
+    pub(super) fn revoke_registration(registration: &Option<Weak<AtomicBool>>) {
+        if let Some(valid) = registration.as_ref().and_then(Weak::upgrade) {
+            valid.store(false, Ordering::Release);
+        }
+    }
+
+    pub(super) fn deregister(registration: &mut Option<Weak<AtomicBool>>, guard: &Self) {
+        if registration
+            .as_ref()
+            .is_some_and(|old| old.ptr_eq(&guard.registration()))
+        {
+            *registration = None;
+        }
+    }
+}
+
 /// Executor-only reasons for retaining a potentially applied attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutorHold {
+    #[cfg(test)]
     StagedMismatch,
     InputOutcomeUnknown,
     TokenVisible,
@@ -196,6 +243,20 @@ pub enum HistoryUpdate {
     /// For a delivered message this is a `Conflict`: evaluate again; its
     /// snapshot then answers `Complete`.
     OwnerRetry { id: MessageId, attempt_seq: u64 },
+    /// Input certainties from the stopped original attempt, not its hold wording.
+    AttemptExited {
+        id: MessageId,
+        attempt_seq: u64,
+        paste: EffectCertainty,
+        enter: EffectCertainty,
+        cancelled: bool,
+    },
+    /// Consume a historical candidate once; this update never dispatches input.
+    RecoveryClaimed {
+        scope: AttemptScope,
+        receipt: bool,
+        cancelled: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -243,8 +304,23 @@ impl RecipientHistory {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OriginalAttemptExit {
+    attempt_seq: u64,
+    paste: EffectCertainty,
+    enter: EffectCertainty,
+    cancelled: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct MessageContinuity {
+    recovery_guard: Option<Weak<AtomicBool>>,
+    original_exit: Option<OriginalAttemptExit>,
+    /// Per-attempt revocation; neither a duplicate exit nor re-arm clears it.
+    recovery_revoked: bool,
+    /// Message-lifetime one-shot and uncertainty, never cleared by retry/arm.
+    recovery_used: bool,
+    prior_attempt_unproven: bool,
     last_attempt_seq: Option<u64>,
     restarted: bool,
     scope: Option<AttemptScope>,
@@ -264,6 +340,11 @@ struct MessageContinuity {
 }
 
 impl MessageContinuity {
+    fn revoke_recovery(&mut self) {
+        self.recovery_revoked = true;
+        RecoveryGuard::revoke_registration(&self.recovery_guard);
+    }
+
     /// This message's own clocks and evidence, on top of its recipient's view.
     fn apply(&self, live: &mut RecipientLiveView) {
         live.hold_since = self.hold_since;
@@ -281,6 +362,56 @@ impl MessageContinuity {
             && self.no_effect_seq == self.last_attempt_seq;
         live.probably_landed = self.latch.is_some() && !untyped;
     }
+}
+
+/// Historical eligibility only: no screen match or hold diagnostic is proof.
+fn recovery_eligible(
+    message: &Message,
+    recipient: &Agent,
+    track: &MessageContinuity,
+    scope: &AttemptScope,
+    startup_high_water: u64,
+    receipt: bool,
+    cancelled: bool,
+) -> bool {
+    let Some(exit) = track.original_exit else {
+        return false;
+    };
+    !receipt
+        && !cancelled
+        && !exit.cancelled
+        && !track.recovery_revoked
+        && !track.recovery_used
+        && !track.prior_attempt_unproven
+        && !track.restarted
+        && scope.attempt_seq > startup_high_water
+        && track.last_attempt_seq == Some(scope.attempt_seq)
+        && track.scope.as_ref() == Some(scope)
+        && exit.attempt_seq == scope.attempt_seq
+        && exit.paste == EffectCertainty::Applied
+        && exit.enter == EffectCertainty::NotStarted
+        && message.id == scope.message_id
+        && message.content.to == Address::Agent(scope.recipient.clone())
+        && message.status == DeliveryStatus::Delivering
+        && message.receipt.is_none()
+        && track.receipt.is_none()
+        && message
+            .last_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.pane == scope.pane.as_str())
+        && recipient.id == scope.recipient
+        && recipient.status == AgentStatus::Ready
+        && recipient.pane.as_deref() == Some(scope.pane.as_str())
+        && recipient.session_id == scope.session_id
+        && scope.excluded_sessions.len() == usize::from(recipient.excluded_session_id.is_some())
+        && recipient
+            .excluded_session_id
+            .as_ref()
+            .is_none_or(|id| scope.excluded_sessions.contains(id))
+        && recipient
+            .role
+            .as_ref()
+            .is_none_or(|role| role.config.harness == scope.harness)
 }
 
 /// A recipient's open messages as any one of them sees the others.
@@ -363,9 +494,11 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         // Audits of a handover: they name an agent and change nothing in it.
         | OrgEvent::AgentSaveRequested { .. }
         | OrgEvent::AgentSaved { .. }
-        // The away switch names no agent.
+        // Owner policy changes no agent's continuity.
         | OrgEvent::OwnerAway(_)
-        | OrgEvent::OwnerBack(_) => None,
+        | OrgEvent::OwnerBack(_)
+        | OrgEvent::OwnerRelaySet(_)
+        | OrgEvent::OwnerDigestCreated(_) => None,
     }
 }
 
@@ -545,6 +678,72 @@ impl MessageHistory {
         })
     }
 
+    /// A historical prerequisite only, never permission to dispatch input.
+    pub fn recovery_candidate(
+        &self,
+        id: MessageId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AttemptScope>, MessageError> {
+        let snapshot = self.snapshot(id, now)?;
+        let Some(track) = self.messages.get(&id) else {
+            return Ok(None);
+        };
+        let Some(scope) = track.scope.as_ref() else {
+            return Ok(None);
+        };
+        Ok(recovery_eligible(
+            &snapshot.message,
+            &snapshot.recipient,
+            track,
+            scope,
+            self.startup_high_water,
+            false,
+            false,
+        )
+        .then(|| scope.clone()))
+    }
+
+    pub(super) fn claim_recovery(
+        &mut self,
+        scope: AttemptScope,
+        receipt: bool,
+        cancelled: bool,
+        now: DateTime<Utc>,
+    ) -> Result<RecoveryGuard, MessageError> {
+        let id = scope.message_id;
+        self.record(
+            HistoryUpdate::RecoveryClaimed {
+                scope,
+                receipt,
+                cancelled,
+            },
+            now,
+        )?;
+        let guard = RecoveryGuard(Arc::new(AtomicBool::new(true)));
+        self.track(id)?.recovery_guard = Some(guard.registration());
+        Ok(guard)
+    }
+
+    pub(super) fn deregister_recovery(&mut self, id: MessageId, guard: &RecoveryGuard) {
+        if let Some(track) = self.messages.get_mut(&id) {
+            RecoveryGuard::deregister(&mut track.recovery_guard, guard);
+        }
+    }
+
+    fn revoke_recoveries(&mut self) {
+        for track in self.messages.values_mut() {
+            track.revoke_recovery();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn recovery_registrations(&self) -> usize {
+        self.messages
+            .values()
+            .filter(|track| track.recovery_guard.is_some())
+            .count()
+    }
+
     /// All-or-nothing without copying the history: see the type's docs.
     pub fn record(
         &mut self,
@@ -599,6 +798,14 @@ impl MessageHistory {
             ));
         }
         Ok(track)
+    }
+
+    fn revoke_recovery(&mut self, recipient: &AgentId) {
+        for id in self.open.get(recipient).into_iter().flatten() {
+            if let Some(track) = self.messages.get_mut(id) {
+                track.revoke_recovery();
+            }
+        }
     }
 
     /// Restart the stale-blocker clocks of the recipient's open messages, and
@@ -673,6 +880,9 @@ impl MessageHistory {
     fn fold(&mut self, seq: u64, at: DateTime<Utc>, event: &OrgEvent) -> Result<(), MessageError> {
         let named = named_agent(event);
         let before = named.and_then(|id| self.state.agent(id)).map(agent_facts);
+        let before_harness = named
+            .and_then(|id| self.state.agent(id)?.role.as_ref())
+            .map(|role| role.config.harness);
         Arc::make_mut(&mut self.state)
             .apply(seq, at, event)
             .map_err(|error| MessageError::Internal(error.to_string()))?;
@@ -704,6 +914,15 @@ impl MessageHistory {
                 history.not_ready_since = None;
             }
             let status_changed = before.as_ref().is_some_and(|old| old.0 != after.0);
+            let harness_changed = before_harness
+                != self
+                    .state
+                    .agent(id)
+                    .and_then(|agent| agent.role.as_ref())
+                    .map(|role| role.config.harness);
+            if moved || status_changed || harness_changed {
+                self.revoke_recovery(id);
+            }
             if moved || status_changed {
                 self.reset_clocks(id, status_changed);
             }
@@ -743,6 +962,9 @@ impl MessageHistory {
         if message.status == DeliveryStatus::Delivered {
             // Terminal. A failed message keeps its continuity instead: a late
             // receipt may still confirm it.
+            if let Some(track) = self.messages.get_mut(&id) {
+                track.revoke_recovery();
+            }
             self.messages.remove(&id);
             return Ok(());
         }
@@ -755,9 +977,24 @@ impl MessageHistory {
                 ..MessageContinuity::default()
             });
         if matches!(event, OrgEvent::MessageDeliveryAttempted { .. }) {
+            track.revoke_recovery();
+            if let Some(previous) = track.last_attempt_seq {
+                track.prior_attempt_unproven |= track.original_exit.is_none_or(|exit| {
+                    exit.attempt_seq != previous
+                        || exit.cancelled
+                        || exit.paste != EffectCertainty::NotStarted
+                        || exit.enter != EffectCertainty::NotStarted
+                });
+            }
+            track.prior_attempt_unproven |= replayed;
+            track.original_exit = None;
+            track.recovery_revoked = false;
             track.last_attempt_seq = Some(seq);
             track.restarted = replayed;
             track.effect_possible |= replayed;
+        }
+        if matches!(event, OrgEvent::MessageDeliveryFailed { .. }) {
+            track.revoke_recovery();
         }
         Ok(())
     }
@@ -875,8 +1112,12 @@ impl MessageHistory {
                     agent.status,
                     now,
                 );
+                let revoke = !same_source || observation.presence != PanePresence::Alive;
                 history.observation = Some(observation);
                 let clocks = self.short_clocks(&recipient, &history, !same_status, now)?;
+                if revoke {
+                    self.revoke_recovery(&recipient);
+                }
                 self.recipients.insert(recipient, history);
                 self.set_short_clocks(clocks);
             }
@@ -893,6 +1134,7 @@ impl MessageHistory {
                 })?;
                 history.lose(status, now);
                 self.reset_clocks(&recipient, false);
+                self.revoke_recovery(&recipient);
             }
             HistoryUpdate::Activity {
                 session_id,
@@ -991,8 +1233,16 @@ impl MessageHistory {
                             MessageError::Conflict("message has no attempt that could land".into())
                         })?;
                     track.latch.get_or_insert(attempt);
+                    if track
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| Some(scope.attempt_seq) == track.last_attempt_seq)
+                    {
+                        track.revoke_recovery();
+                    }
                 }
                 if receipt.is_some() {
+                    track.revoke_recovery();
                     track.receipt = receipt;
                 }
             }
@@ -1070,8 +1320,53 @@ impl MessageHistory {
                 track.hold = Some(hold);
                 track.effect_possible = true;
             }
+            HistoryUpdate::AttemptExited {
+                id,
+                attempt_seq,
+                paste,
+                enter,
+                cancelled,
+            } => {
+                let track = self.matching_attempt(id, attempt_seq)?;
+                let exit = OriginalAttemptExit {
+                    attempt_seq,
+                    paste,
+                    enter,
+                    cancelled,
+                };
+                let conflicting = track.original_exit.is_some_and(|old| old != exit);
+                if cancelled || conflicting {
+                    track.revoke_recovery();
+                }
+                // The first exit stays retained, but conflicting input certainty
+                // must not disappear when a later attempt resets revocation.
+                track.prior_attempt_unproven |= conflicting;
+                track.original_exit.get_or_insert(exit);
+            }
+            HistoryUpdate::RecoveryClaimed {
+                scope,
+                receipt,
+                cancelled,
+            } => {
+                let snapshot = self.snapshot(scope.message_id, now)?;
+                let high_water = self.startup_high_water;
+                let track = self.track(scope.message_id)?;
+                if !recovery_eligible(
+                    &snapshot.message,
+                    &snapshot.recipient,
+                    track,
+                    &scope,
+                    high_water,
+                    receipt,
+                    cancelled,
+                ) {
+                    return Err(MessageError::Conflict("no retained recovery proof".into()));
+                }
+                track.recovery_used = true;
+            }
             HistoryUpdate::OwnerRetry { id, attempt_seq } => {
                 let track = self.matching_attempt(id, attempt_seq)?;
+                track.revoke_recovery();
                 track.restarted = false;
                 track.latch = None;
                 track.hold = None;
@@ -1094,6 +1389,21 @@ enum HistoryBackend {
         state: Box<Mutex<MessageHistory>>,
         cursor: watch::Sender<u64>,
     },
+}
+
+/// Poisoned state cannot leave an already-issued actor guard valid.
+fn history_state(
+    state: &Mutex<MessageHistory>,
+) -> Result<MutexGuard<'_, MessageHistory>, MessageError> {
+    match state.lock() {
+        Ok(state) => Ok(state),
+        Err(poisoned) => {
+            poisoned.into_inner().revoke_recoveries();
+            Err(MessageError::Unavailable(
+                "message history lock poisoned".into(),
+            ))
+        }
+    }
 }
 
 impl MessageHistoryHandle {
@@ -1148,10 +1458,75 @@ impl MessageHistoryHandle {
     ) -> Result<DeliverySnapshot, MessageError> {
         match self.inner.as_ref() {
             HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
-            HistoryBackend::Live { state, .. } => state
+            HistoryBackend::Live { state, .. } => history_state(state)?.snapshot(id, now),
+        }
+    }
+
+    /// Read-only retained-facts query; S5 must supply every fresh input guard.
+    pub fn recovery_candidate(
+        &self,
+        id: MessageId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AttemptScope>, MessageError> {
+        match self.inner.as_ref() {
+            HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
+            HistoryBackend::Live { state, .. } => history_state(state)?.recovery_candidate(id, now),
+        }
+    }
+
+    pub(super) fn claim_recovery(
+        &self,
+        scope: AttemptScope,
+        receipt: bool,
+        cancelled: bool,
+        now: DateTime<Utc>,
+    ) -> Result<RecoveryGuard, MessageError> {
+        match self.inner.as_ref() {
+            HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
+            HistoryBackend::Live { state, .. } => {
+                history_state(state)?.claim_recovery(scope, receipt, cancelled, now)
+            }
+        }
+    }
+
+    pub(super) fn deregister_recovery(&self, id: MessageId, guard: &RecoveryGuard) {
+        if let HistoryBackend::Live { state, .. } = self.inner.as_ref() {
+            let mut state = state
                 .lock()
-                .map_err(|_| MessageError::Unavailable("message history lock poisoned".into()))?
-                .snapshot(id, now),
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.deregister_recovery(id, guard);
+        }
+    }
+
+    pub(super) fn revoke_recovery(&self, id: MessageId) -> Result<(), MessageError> {
+        match self.inner.as_ref() {
+            HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
+            HistoryBackend::Live { state, .. } => {
+                if let Some(track) = history_state(state)?.messages.get_mut(&id) {
+                    track.revoke_recovery();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn revoke_recoveries(&self) -> Result<(), MessageError> {
+        match self.inner.as_ref() {
+            HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
+            HistoryBackend::Live { state, .. } => {
+                history_state(state)?.revoke_recoveries();
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn recovery_registrations(&self) -> Result<usize, MessageError> {
+        match self.inner.as_ref() {
+            HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
+            HistoryBackend::Live { state, .. } => {
+                Ok(history_state(state)?.recovery_registrations())
+            }
         }
     }
 
@@ -1159,13 +1534,69 @@ impl MessageHistoryHandle {
         match self.inner.as_ref() {
             HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
             HistoryBackend::Live { state, cursor } => {
-                let mut state = state.lock().map_err(|_| {
-                    MessageError::Unavailable("message history lock poisoned".into())
-                })?;
+                let mut state = history_state(state)?;
                 state.record(update, now)?;
                 cursor.send_replace(state.cursor());
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_lock_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_poisoned_handle_refuses_candidate() {
+        let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        let history = MessageHistoryHandle::new(0, now, DeliveryPolicy::default()).unwrap();
+        let HistoryBackend::Live { state, .. } = history.inner.as_ref() else {
+            panic!("expected live test history");
+        };
+        // Synthetic: isolate registry failure handling, not eligibility. Only
+        // the production claim method constructs a view for an input executor.
+        let view = RecoveryGuard(Arc::new(AtomicBool::new(true)));
+        state.lock().unwrap().messages.insert(
+            MessageId::new(1),
+            MessageContinuity {
+                recovery_guard: Some(view.registration()),
+                ..MessageContinuity::default()
+            },
+        );
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = state.lock().unwrap();
+            panic!("Synthetic: poison the history lock");
+        });
+        assert!(poisoned.is_err());
+        assert!(matches!(
+            history.recovery_candidate(MessageId::new(1), now),
+            Err(MessageError::Unavailable(_))
+        ));
+        assert!(
+            !view.is_valid(),
+            "a poisoned history left its actor guard valid"
+        );
+        history.deregister_recovery(MessageId::new(1), &view);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap_err()
+                .into_inner()
+                .recovery_registrations(),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_stale_deregister_preserves_other_token() {
+        let old = RecoveryGuard(Arc::new(AtomicBool::new(false)));
+        let current = RecoveryGuard(Arc::new(AtomicBool::new(true)));
+        let mut registration = Some(current.registration());
+        RecoveryGuard::deregister(&mut registration, &old);
+        assert!(registration.is_some());
+        assert!(current.is_valid());
+        RecoveryGuard::deregister(&mut registration, &current);
+        assert!(registration.is_none());
     }
 }

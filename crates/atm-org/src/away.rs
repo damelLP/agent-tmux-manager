@@ -36,7 +36,9 @@
 //! else may be built on it until the owner has answered it. The cap counts
 //! tasks. The task in progress when the decision was taken is the first; it is
 //! not linked to the decision, so it is counted without being named. Further
-//! tasks are those whose `rests_on` names the decision and that have started.
+//! tasks are recorded dependencies ever assigned: direct `rests_on`, children
+//! and judging reviews, including cancelled tasks. Reopening/cancelling never
+//! refunds a place; resuming the same task ID never spends another.
 //!
 //! [`stacking_step`] lets a further task start only while
 //! `1 + started < cap`, and only holds for a decision that is taken
@@ -50,9 +52,8 @@
 //! | pending, resolved, overruled, expired, withdrawn | start |
 //!
 //! With the default cap of one no further task starts. With a cap of N, N - 1
-//! may. Known limits: a task that does not declare `rests_on` is not seen, and
-//! chains (a child of a resting task, a second decision raised inside one) are
-//! not followed.
+//! may. Recorded parent/judges links inherit every governing decision, across
+//! projects. Work that declares no link is invisible; no original task is guessed.
 //!
 //! # The switch
 //!
@@ -72,8 +73,9 @@
 //! are refused.
 
 use crate::{
-    Address, Decision, DecisionClass, DecisionCommand, DecisionId, DecisionKind, DecisionStatus,
-    OrgEvent, OrgState, ProjectId, ProvisionalChoice, Refusal, Task, TaskId, TaskState,
+    Address, AgentId, Decision, DecisionClass, DecisionCommand, DecisionId, DecisionKind,
+    DecisionStatus, OrgEvent, OrgState, ProjectId, ProvisionalChoice, Refusal, Task, TaskId,
+    TaskState,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -203,13 +205,22 @@ pub struct OwnerBack {
     pub by: Address,
 }
 
-/// The away switch as folded from the log.
+/// Body of `owner.relay_set`: the designated recorder, or None to revoke it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerRelaySet {
+    pub by: Address,
+    pub agent: Option<AgentId>,
+}
+
+/// The owner's away switch and relay designation as folded from the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnerState {
     /// The time of the `owner.away` in force; `None` while the owner is present.
     pub away_since: Option<DateTime<Utc>>,
     /// The caps of the latest `owner.away`, kept after `owner.back`.
     pub stacking_caps: BTreeMap<ProjectId, u32>,
+    /// One owner-designated full agent ID; independent of the away switch.
+    pub relay: Option<AgentId>,
 }
 impl OwnerState {
     /// The cap for a project; the default for one not listed, and for a
@@ -233,6 +244,15 @@ pub enum OwnerCommand {
     },
     Back {
         by: Address,
+    },
+    SetRelay {
+        by: Address,
+        agent: Option<AgentId>,
+    },
+    /// Freeze the committed return view after the switch has been set back.
+    CreateDigest {
+        by: Address,
+        back_seq: Option<u64>,
     },
     /// Put this decision through the away table.
     ApplyAway {
@@ -262,11 +282,16 @@ impl OwnerCommand {
                 OrgEvent::OwnerAway(OwnerAway { by, stacking_caps })
             }
             Self::Back { by } => OrgEvent::OwnerBack(OwnerBack { by }),
+            Self::SetRelay { by, agent } => OrgEvent::OwnerRelaySet(OwnerRelaySet { by, agent }),
+            Self::CreateDigest { by, back_seq } => {
+                OrgEvent::OwnerDigestCreated(crate::OwnerDigestCreated { by, back_seq })
+            }
             Self::ApplyAway { decision_id } => {
                 OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
                     decision_id,
                     option: String::new(),
                     by: Address::System,
+                    relayed_by: None,
                 })
             }
         }
@@ -333,6 +358,20 @@ impl OrgState {
                 owner_only(by)?;
                 away
             }
+            OwnerCommand::SetRelay { by, agent } => {
+                owner_only(by)?;
+                self.owner.relay != *agent
+            }
+            OwnerCommand::CreateDigest { by, back_seq } => {
+                if *by != Address::Owner {
+                    return Err(Refusal::InvalidValue {
+                        field: "return digest",
+                        reason: "only the owner may create a return digest".into(),
+                    });
+                }
+                crate::return_digest::check_digest(self, *back_seq)?;
+                true
+            }
             OwnerCommand::ApplyAway { decision_id } => {
                 let decision = self.require_decision(decision_id)?;
                 if decision.status != DecisionStatus::Pending {
@@ -350,6 +389,7 @@ impl OrgState {
                     decision_id: decision.id,
                     option,
                     by,
+                    relayed_by: None,
                 };
                 // The decision policy stays the one place that lets a take through.
                 return self.decide_decision(
@@ -362,32 +402,40 @@ impl OrgState {
         Ok(if changed { vec![event] } else { vec![] })
     }
 
-    /// The stacking cap at the moment a task would start. Only a task that
-    /// has not started (it is open) is held; a missing or unknown `rests_on`
-    /// holds nothing.
+    /// Every inherited cap at a first assignment. Previously assigned IDs may
+    /// resume; current state changes never refund their exposure.
     pub(crate) fn stacking_hold(&self, task: &Task) -> Result<(), AwayRefusal> {
-        if task.state != TaskState::Open {
+        if task.state != TaskState::Open || self.task_was_assigned(&task.id) {
             return Ok(());
         }
-        let Some(decision) = task.rests_on.and_then(|id| self.decision(&id)) else {
-            return Ok(());
-        };
-        let started = self
-            .resting_tasks(decision.id)
-            .filter(|other| !matches!(other.state, TaskState::Open | TaskState::Cancelled))
-            .count();
-        let project = match &decision.request.requester {
-            Address::Agent(agent) => Some(&agent.project),
-            Address::Owner | Address::System => None,
-        };
-        let cap = self.owner.stacking_cap(project);
-        match stacking_step(decision.status, decision.class(), started, cap) {
-            StackingStep::Start => Ok(()),
-            StackingStep::Hold => Err(AwayRefusal::Held {
-                task_id: task.id.clone(),
-                decision_id: decision.id,
-                cap,
-            }),
+        for decision in self.decisions().filter(|d| {
+            d.status == DecisionStatus::TakenProvisionally
+                && d.class() == DecisionClass::ChangesIntent
+        }) {
+            let impact = crate::decision_impact(self, decision.id);
+            if !impact.contains(&task.id) {
+                continue;
+            }
+            let started = impact.started_count()
+                + impact
+                    .cancelled
+                    .iter()
+                    .filter(|id| self.task_was_assigned(id))
+                    .count();
+            let project = match &decision.request.requester {
+                Address::Agent(agent) => Some(&agent.project),
+                Address::Owner | Address::System => None,
+            };
+            let cap = self.owner.stacking_cap(project);
+            if stacking_step(decision.status, decision.class(), started, cap) == StackingStep::Hold
+            {
+                return Err(AwayRefusal::Held {
+                    task_id: task.id.clone(),
+                    decision_id: decision.id,
+                    cap,
+                });
+            }
         }
+        Ok(())
     }
 }

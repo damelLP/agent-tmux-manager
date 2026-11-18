@@ -45,6 +45,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+const LIFECYCLE_CAPACITY: usize = 32;
 const LIST_BUDGET: Duration = Duration::from_secs(5);
 // The list's read of the quarantined operations, inside `LIST_BUDGET`.
 const QUARANTINE_BUDGET: Duration = Duration::from_secs(1);
@@ -327,6 +328,21 @@ impl AgentHandle {
                 errors: watch::channel(BTreeMap::new()).1,
                 lifecycle: None,
             }),
+        }
+    }
+
+    /// Snapshot the sender held by this service, not a second admission lane.
+    pub(crate) fn lifecycle_health(&self) -> crate::server::health::LifecycleHealth {
+        use crate::server::health::{LifecycleHealth, LifecycleState};
+        let state = match self.inner.lifecycle.as_ref() {
+            None => LifecycleState::Absent,
+            Some(sender) if sender.is_closed() => LifecycleState::Stopped,
+            Some(sender) if sender.capacity() == 0 => LifecycleState::Full,
+            Some(_) => LifecycleState::Ok,
+        };
+        LifecycleHealth {
+            state,
+            capacity: LIFECYCLE_CAPACITY,
         }
     }
 
@@ -1005,6 +1021,7 @@ impl AgentRuntime {
                         .await?;
                 }
                 let content = atm_org::MessageContent {
+                    delivery_notice: None,
                     from: atm_org::Address::System,
                     to: atm_org::Address::Owner,
                     kind: atm_org::MessageKind::Note,
@@ -1278,7 +1295,11 @@ pub(super) fn harness(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> 
         })
 }
 
-fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentListEntry {
+pub(super) fn eligible_live_row<'a>(
+    state: &OrgState,
+    agent: &Agent,
+    rows: &'a [SessionView],
+) -> Option<&'a SessionView> {
     let expected = harness(state, agent, rows);
     let eligible: Vec<_> = rows
         .iter()
@@ -1286,14 +1307,18 @@ fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentLis
             matches_agent(agent, r) && !r.id.is_pending() && r.harness == expected.short_tag()
         })
         .collect();
-    let live = if eligible.len() == 1 {
+    if eligible.len() == 1 {
         eligible
             .first()
             .copied()
             .filter(|r| agent.session_id.as_ref() == Some(&r.id))
     } else {
         None
-    };
+    }
+}
+
+pub(super) fn list_entry(state: &OrgState, agent: &Agent, rows: &[SessionView]) -> AgentListEntry {
+    let live = eligible_live_row(state, agent, rows);
     let summaries = state.agent_sessions(&agent.id);
     let latest = summaries.last();
     let live_cost = live.and_then(|row| {
@@ -1384,7 +1409,7 @@ pub(super) fn spawn_agents_with(
     let (projects, project_task) = AgentProjects::spawn(rt.org.clone(), cancel.child_token());
     let (send, ready) = watch::channel(None);
     let (errors, error_state) = watch::channel(BTreeMap::new());
-    let (lifecycle, receive) = mpsc::channel(32);
+    let (lifecycle, receive) = mpsc::channel(LIFECYCLE_CAPACITY);
     let dispatcher = tokio::spawn(dispatch_lifecycle(receive, cancel.child_token()));
     let handle = AgentHandle {
         inner: Arc::new(AgentService {
@@ -1429,7 +1454,7 @@ async fn dispatch_lifecycle(mut requests: mpsc::Receiver<LifecycleJob>, cancel: 
                 let Some(job) = job else { break; };
                 let error = if active.contains(&job.agent) {
                     Some(AgentError::Conflict(format!("agent {} is busy; inspect agent list before retrying", job.agent)))
-                } else if active.len() >= 32 {
+                } else if active.len() >= LIFECYCLE_CAPACITY {
                     Some(AgentError::Unavailable("lifecycle admission is full".into()))
                 } else if Instant::now() >= job.deadline { Some(AgentError::Timeout) } else { None };
                 if let Some(error) = error { let _ = job.admitted.send(Err(error)); continue; }
@@ -1916,6 +1941,252 @@ async fn schedule(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod projection_join_tests {
+    use super::*;
+    use atm_core::SessionStatus;
+
+    // Break caught: org projections borrow context/activity from a row that
+    // agent.list rejects (or lose a valid row through a different fallback).
+    #[test]
+    fn eligible_live_row_matches_agent_list() {
+        let now = "2026-01-15T12:00:00Z".parse().unwrap();
+        let base = Agent {
+            id: "alpha/worker".parse().unwrap(),
+            role: Some(atm_org::parse_role("worker", "+++\nharness='pi'\n+++\n").unwrap()),
+            status: AgentStatus::Ready,
+            pane: Some("%7".into()),
+            session_id: Some("live".into()),
+            excluded_session_id: None,
+            reason: None,
+            updated_at: now,
+        };
+        let row = SessionView {
+            id: "live".into(),
+            tmux_pane: Some("%7".into()),
+            harness: "pi".into(),
+            model: "live-model".into(),
+            status: SessionStatus::AttentionNeeded,
+            context_percentage: 12.25,
+            ..Default::default()
+        };
+        let state = OrgState::default();
+        let check = |label: &str,
+                     state: &OrgState,
+                     agent: &Agent,
+                     rows: &[SessionView],
+                     want: Option<&str>| {
+            let live = eligible_live_row(state, agent, rows);
+            assert_eq!(live.map(|r| r.id.as_str()), want, "{label}");
+            let entry = list_entry(state, agent, rows);
+            assert_eq!(
+                entry.activity,
+                want.map(|_| SessionStatus::AttentionNeeded),
+                "{label}"
+            );
+            if want.is_some() {
+                assert_eq!(entry.model.as_deref(), Some("live-model"), "{label}");
+                assert_eq!(live.unwrap().context_percentage, 12.25, "{label}");
+            }
+        };
+        for status in [AgentStatus::Ready, AgentStatus::Down, AgentStatus::Stuck] {
+            let agent = Agent {
+                status,
+                ..base.clone()
+            };
+            check(
+                "durable state does not change eligibility",
+                &state,
+                &agent,
+                std::slice::from_ref(&row),
+                Some("live"),
+            );
+        }
+        for (label, agent) in [
+            (
+                "no pane",
+                Agent {
+                    pane: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "unpinned",
+                Agent {
+                    session_id: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "other pin",
+                Agent {
+                    session_id: Some("other".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "excluded",
+                Agent {
+                    excluded_session_id: Some("live".into()),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            check(label, &state, &agent, std::slice::from_ref(&row), None);
+        }
+        for (label, bad) in [
+            (
+                "wrong pane",
+                SessionView {
+                    tmux_pane: Some("%8".into()),
+                    ..row.clone()
+                },
+            ),
+            (
+                "no row pane",
+                SessionView {
+                    tmux_pane: None,
+                    ..row.clone()
+                },
+            ),
+            (
+                "child",
+                SessionView {
+                    parent_session_id: Some("parent".into()),
+                    ..row.clone()
+                },
+            ),
+            (
+                "wrong harness",
+                SessionView {
+                    harness: "codex".into(),
+                    ..row.clone()
+                },
+            ),
+            (
+                "pending",
+                SessionView {
+                    id: "pending-1".into(),
+                    ..row.clone()
+                },
+            ),
+        ] {
+            check(label, &state, &base, &[bad], None);
+        }
+        check(
+            "ambiguous",
+            &state,
+            &base,
+            &[
+                row.clone(),
+                SessionView {
+                    id: "other".into(),
+                    ..row.clone()
+                },
+            ],
+            None,
+        );
+        check(
+            "ineligible sibling",
+            &state,
+            &base,
+            &[
+                row.clone(),
+                SessionView {
+                    harness: "codex".into(),
+                    ..row.clone()
+                },
+            ],
+            Some("live"),
+        );
+        check("empty", &state, &base, &[], None);
+        let adopted = Agent {
+            role: None,
+            ..base.clone()
+        };
+        check(
+            "adopted unanimous live harness",
+            &state,
+            &adopted,
+            std::slice::from_ref(&row),
+            Some("live"),
+        );
+        check(
+            "adopted mixed live harness",
+            &state,
+            &adopted,
+            &[
+                row.clone(),
+                SessionView {
+                    harness: "codex".into(),
+                    ..row.clone()
+                },
+            ],
+            None,
+        );
+        let mut saved = OrgState::default();
+        saved
+            .apply(
+                1,
+                now,
+                &atm_org::OrgEvent::ProjectRegistered {
+                    project_id: base.id.project.clone(),
+                    root: "/alpha".into(),
+                },
+            )
+            .unwrap();
+        saved
+            .apply(
+                2,
+                now,
+                &atm_org::OrgEvent::AgentAdopted {
+                    agent_id: base.id.clone(),
+                    pane: "%7".into(),
+                    session_id: Some("live".into()),
+                },
+            )
+            .unwrap();
+        saved
+            .apply(
+                3,
+                now,
+                &atm_org::OrgEvent::SessionSummary(atm_org::SessionSummary {
+                    session_id: "saved".into(),
+                    pane: Some("%7".into()),
+                    agent_id: Some(base.id.clone()),
+                    harness: Harness::Pi,
+                    model: Some("saved-model".into()),
+                    cost: None,
+                    first_prompt: None,
+                    started: now,
+                    ended: None,
+                }),
+            )
+            .unwrap();
+        check(
+            "saved harness wins over mixed rows",
+            &saved,
+            &adopted,
+            &[
+                row.clone(),
+                SessionView {
+                    harness: "codex".into(),
+                    ..row
+                },
+            ],
+            Some("live"),
+        );
+        assert_eq!(
+            list_entry(&saved, &adopted, &[]).model.as_deref(),
+            Some("saved-model")
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "agent_health_tests.rs"]
+mod health_tests;
 
 #[cfg(test)]
 mod fence_tests {

@@ -93,6 +93,175 @@ fn inbox_facts(rig: &MessageRig, pane: Option<&StandInPane>) -> Value {
     json!({"unread_count":inbox["unread_count"],"messages":inbox["messages"].as_array().unwrap().iter().map(|m|json!({"message_id":m["message_id"],"content":m["content"],"status":m["status"],"sent_at":m["sent_at"],"read_at":m["read_at"]})).collect::<Vec<_>>()})
 }
 
+fn assert_restart_task(before: &Value, mut after: Value) {
+    let state = before["task"]["state"].as_str().unwrap();
+    if !matches!(state, "accepted" | "cancelled") {
+        // Only the running state's duration includes time at the read. All
+        // historical durations and state keys must still compare exactly.
+        let seconds = &before["usage"]["seconds_in_state"][state];
+        let later = after["usage"]["seconds_in_state"].get_mut(state).unwrap();
+        assert!(
+            later.as_u64().unwrap() >= seconds.as_u64().unwrap(),
+            "elapsed {state} seconds went backwards: {seconds} -> {later}"
+        );
+        *later = seconds.clone();
+
+        // A live deadline can cross between reads. Cost/turn crossings and the
+        // durable notification id cannot change; neither can terminal budgets.
+        if let Some(crossed) = after.pointer_mut("/budget_status/crossed") {
+            let earlier = before["budget_status"]["crossed"].as_array().unwrap();
+            let crossed = crossed.as_array_mut().unwrap();
+            let deadline = json!("deadline");
+            assert!(
+                !earlier.contains(&deadline) || crossed.contains(&deadline),
+                "deadline crossing went backwards"
+            );
+            if !earlier.contains(&deadline) && crossed.contains(&deadline) {
+                assert_eq!(crossed.pop(), Some(deadline));
+            }
+        }
+    }
+    // Retain the full response comparison, including persisted Task.cost,
+    // unknown/new fields and every usage value that is not clock-derived.
+    assert_eq!(after, *before);
+}
+
+// Synthetic: fixed event times exercise the real usage/budget projections,
+// without waiting for a second boundary or starting another daemon.
+fn task_snapshot_at(now: &str) -> Value {
+    let mut state = OrgState::default();
+    let mut stats = ReplayStats::default();
+    for (seq, ts, kind, body) in [
+        (
+            1,
+            "2026-01-01T00:00:00Z",
+            "task.created",
+            json!({"title":"Work","kind":"work","creator":"owner","measure":{"kind":"owner"},"budget":{"cost":{"microdollars":1000},"turns":40,"deadline":"2026-01-01T00:00:05Z"},"files":[{"path":"brief.md","kind":"brief"}]}),
+        ),
+        (
+            2,
+            "2026-01-01T00:00:02Z",
+            "task.state_changed",
+            json!({"task_id":"t1","state":"working","reason":null,"by":"owner"}),
+        ),
+    ] {
+        stats
+            .apply_parts(&mut state, seq, ts.parse().unwrap(), kind, &body)
+            .unwrap();
+    }
+    let task = state.task(&"t1".parse().unwrap()).unwrap();
+    let now = now.parse().unwrap();
+    let usage = state.task_cost(&task.id, now).unwrap();
+    serde_json::to_value(atmd::org::tasks::GetResult {
+        task: task.clone(),
+        budget_status: atm_org::budget::budget_status(&state, task, &usage, now),
+        usage,
+    })
+    .unwrap()
+}
+
+// Break caught: an exact task.get comparison rejects a later read of unchanged
+// persisted facts merely because a running state's elapsed seconds advanced.
+#[test]
+fn restart_comparison_allows_a_later_read_without_changing_durable_facts() {
+    let before = task_snapshot_at("2026-01-01T00:00:03Z");
+    let after = task_snapshot_at("2026-01-01T00:00:04Z");
+    assert_eq!(
+        before["usage"]["seconds_in_state"],
+        json!({"open":2,"working":1})
+    );
+    assert_eq!(
+        after["usage"]["seconds_in_state"],
+        json!({"open":2,"working":2})
+    );
+    assert_ne!(
+        after, before,
+        "the old exact comparison must reject this read"
+    );
+    assert_restart_task(&before, after);
+}
+
+// Break caught: a read-time deadline crossing is treated as lost persisted
+// budget data, even though the actual budget and notification are unchanged.
+#[test]
+fn restart_comparison_allows_a_live_deadline_to_cross_only_forward() {
+    let before = task_snapshot_at("2026-01-01T00:00:04Z");
+    let after = task_snapshot_at("2026-01-01T00:00:05Z");
+    assert_eq!(before["budget_status"]["crossed"], json!([]));
+    assert_eq!(after["budget_status"]["crossed"], json!(["deadline"]));
+    assert_restart_task(&before, after.clone());
+    let mut backwards = after.clone();
+    backwards["budget_status"]["crossed"] = json!([]);
+    assert!(std::panic::catch_unwind(|| assert_restart_task(&after, backwards)).is_err());
+}
+
+// Break caught: stripping usage or a whole response subtree hides replay loss.
+#[test]
+fn restart_comparison_rejects_every_non_clock_change() {
+    let before = task_snapshot_at("2026-01-01T00:00:03Z");
+    assert_restart_task(&before, before.clone());
+    for (path, value) in [
+        ("/task/files", json!([])),
+        ("/task/budget", Value::Null),
+        ("/task/changed_at", json!("2026-01-01T00:00:03Z")),
+        ("/task/cost", before["usage"].clone()),
+        ("/usage/turns", json!(1)),
+        ("/usage/review_rounds", json!(1)),
+        ("/usage/changes_requested", json!(1)),
+        ("/usage/cost", json!({"microdollars":1})),
+        ("/usage/peak_context_percent", json!(1)),
+        ("/usage/seconds_in_state/open", json!(3)),
+        ("/usage/seconds_in_state/working", json!(0)),
+        ("/usage/seconds_in_state", json!({"open":2})),
+        ("/usage/seconds_in_state", json!({"working":1})),
+        (
+            "/usage/seconds_in_state",
+            json!({"open":2,"working":1,"waiting":0}),
+        ),
+        ("/budget_status/crossed", json!(["cost"])),
+        ("/budget_status/crossed", json!(["turns"])),
+        ("/budget_status/crossed", json!(["deadline", "deadline"])),
+        ("/budget_status/notification", json!("m3")),
+    ] {
+        let mut after = before.clone();
+        let field = after.pointer_mut(path).unwrap();
+        assert_ne!(*field, value, "ineffective mutation: {path}");
+        *field = value;
+        assert!(
+            std::panic::catch_unwind(|| assert_restart_task(&before, after)).is_err(),
+            "restart comparison hid a change to {path}"
+        );
+    }
+    let mut after = before.clone();
+    after["unexpected_field"] = json!(true);
+    assert!(std::panic::catch_unwind(|| assert_restart_task(&before, after)).is_err());
+}
+
+// Synthetic: mark the projection terminal to exercise the comparison's frozen
+// branch. No duration or deadline is read-time-derived after a terminal state.
+#[test]
+fn restart_comparison_keeps_terminal_usage_and_budgets_exact() {
+    for state in ["accepted", "cancelled"] {
+        let mut before = task_snapshot_at("2026-01-01T00:00:03Z");
+        before["task"]["state"] = json!(state);
+        if state == "accepted" {
+            before["task"]["cost"] = before["usage"].clone();
+        }
+        assert_restart_task(&before, before.clone());
+        for (path, value) in [
+            ("/usage/seconds_in_state/working", json!(2)),
+            ("/budget_status/crossed", json!(["deadline"])),
+        ] {
+            let mut after = before.clone();
+            *after.pointer_mut(path).unwrap() = value;
+            assert!(
+                std::panic::catch_unwind(|| assert_restart_task(&before, after)).is_err(),
+                "{state} comparison hid a change to {path}"
+            );
+        }
+    }
+}
+
 // Break caught: tasks/attachments/budget/review effects are transient, or
 // replay sends fresh briefs/reports and loses message read state.
 #[test]
@@ -233,7 +402,7 @@ fn real_daemon_restart_preserves_tasks_reviews_messages_and_pending_decision() {
     let decision = seed_pending_decision(&mut rig, &worker.id);
     rig.test.rig.start_daemon();
     for (id, want) in ids.iter().zip(before) {
-        assert_eq!(call(&rig, None, "task.get", json!({"task_id":id})), want);
+        assert_restart_task(&want, call(&rig, None, "task.get", json!({"task_id":id})));
     }
     assert_eq!(call(&rig, None, "task.list", json!({})), list);
     let after = rig.atm_json(Some(&worker.pane), &["me", "--format", "json"]);

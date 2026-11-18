@@ -87,6 +87,7 @@ impl History {
     /// A task `creator` made, with `measure`.
     fn task(&mut self, creator: Address, measure: TaskMeasure) -> TaskId {
         let seq = self.push(OrgEvent::TaskCreated(TaskCreated {
+            project_id: None,
             title: "Work".into(),
             kind: TaskKind::Work,
             creator,
@@ -148,6 +149,7 @@ impl History {
     /// A queued message to `to`.
     fn mail(&mut self, to: &AgentId) -> MessageId {
         let seq = self.push(OrgEvent::MessageSent(MessageContent {
+            delivery_notice: None,
             from: Address::Owner,
             to: Address::Agent(to.clone()),
             kind: MessageKind::Note,
@@ -416,6 +418,7 @@ fn a_pending_decision_waits_for_the_owner_and_for_its_deadline() {
     let id = answered.decision(Address::Agent(worker()), None);
     assert_eq!(id, open);
     answered.push(OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+        relayed_by: None,
         decision_id: id,
         option: "a".into(),
         by: Address::System,

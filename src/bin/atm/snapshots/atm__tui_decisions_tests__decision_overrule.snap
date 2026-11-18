@@ -1,0 +1,20 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 403
+expression: "rendered(&mut view,80,16)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────────────────────────┐
+ │d41 overruled: "No" (recorded) (unchanged)                                  │
+ │No files are reverted.                                                      │
+ │Accepted again: 1/2; cancelled: 0                                           │
+ │Recorded redo tasks:                                                        │
+ │  t8                                                                        │
+ │  t9                                                                        │
+ │↑/↓: scroll; i: inspect; Esc: back                                          │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘

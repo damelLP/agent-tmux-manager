@@ -394,7 +394,7 @@ async fn agent_cli_too_old_never_sends_an_operation_or_falls_back() {
 }
 
 #[tokio::test]
-async fn agent_cli_broken_stdout_is_an_io_failure_after_one_rpc() {
+async fn agent_cli_broken_stdout_ends_quietly_after_one_rpc() {
     for json in [false, true] {
         let mut args = vec!["agent", "clear", "project/lead"];
         if json {
@@ -403,9 +403,9 @@ async fn agent_cli_broken_stdout_is_an_io_failure_after_one_rpc() {
         let output = scripted(&args, "agent.clear", |_| json!({"agent":"project/lead","timeout_ms":30000}),
             Some(json!({"type":"response","id":"r1","result":{"agent_id":"project/lead","session_id":null}})),
             Some(json!(["agent.clear"])), true).await;
-        assert_eq!(output.status.code(), Some(1), "json={json}: {output:?}");
+        assert_eq!(output.status.code(), Some(141), "json={json}: {output:?}");
         assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("Broken pipe"));
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 }
 

@@ -10,6 +10,10 @@ mod stand_in;
 #[allow(dead_code)] // this file uses a subset of the lifecycle rig
 #[path = "support/agent_lifecycle.rs"]
 mod support;
+use support as lifecycle;
+#[allow(dead_code)]
+#[path = "support/message_delivery.rs"]
+mod delivery_support;
 
 use std::time::Duration;
 
@@ -24,15 +28,15 @@ fn panes(test: &AgentRig) -> Vec<String> {
         .collect()
 }
 
-/// The log after `cursor`, once `found` is in it. An audit is written after
-/// the reply and the log has no subscription here: a bounded condition poll.
-fn log_with(test: &AgentRig, cursor: u64, found: impl Fn(&Value) -> bool) -> Vec<Value> {
-    let mut log = Vec::new();
-    test.rig.wait("the expected event in the log", || {
-        log = test.tail(cursor);
-        log.iter().any(&found)
-    });
-    log
+/// The log after `cursor`, fenced by a watch opened before the action.
+fn log_with(
+    test: &AgentRig,
+    watch: &mut delivery_support::Watch,
+    cursor: u64,
+    found: impl Fn(&Value) -> bool,
+) -> Vec<Value> {
+    watch.wait("the expected event in the log", found);
+    test.tail(cursor)
 }
 
 fn killed(pane: &str) -> impl Fn(&Value) -> bool + '_ {
@@ -55,6 +59,7 @@ fn kill_closes_the_sessions_pane_and_is_logged() {
     let other = test.shell_agent("other", &config);
     let other_row = test.complete_fixture_turn(&other);
     let cursor = test.cursor();
+    let mut watch = delivery_support::Watch::on(&test.rig, cursor);
 
     let said = checked(test.rig.atm(&["kill", row.id.as_str()]));
     assert_eq!(said, format!("Killed {}", pane.pane_id));
@@ -65,7 +70,7 @@ fn kill_closes_the_sessions_pane_and_is_logged() {
     assert!(left.contains(&other.pane_id), "{left:?}");
     assert_eq!(test.rig.pane_rows(&other)[0].id, other_row.id);
 
-    let log = log_with(&test, cursor, killed(&pane.pane_id));
+    let log = log_with(&test, &mut watch, cursor, killed(&pane.pane_id));
     let control: Vec<_> = log
         .iter()
         .filter(|event| event["kind"].as_str().unwrap().starts_with("control."))
@@ -90,12 +95,19 @@ fn killing_a_named_agents_pane_records_the_agent_down() {
     assert_eq!(adopted["state"], "ready", "{adopted}");
     let id = adopted["agent_id"].as_str().unwrap();
     let cursor = test.cursor();
+    let mut watch = delivery_support::Watch::on(&test.rig, cursor);
 
     let said = checked(test.rig.atm(&["kill", &pane.pane_id]));
     assert_eq!(said, format!("Killed {}", pane.pane_id));
-    let log = log_with(&test, cursor, |event| {
+    let mut log = log_with(&test, &mut watch, cursor, |event| {
         event["kind"] == "agent.down" && event["body"]["agent_id"] == id
     });
+    // Reconciliation and the control audit have independent committers. A
+    // down event alone cannot fence the kill audit asserted below.
+    if !log.iter().any(killed(&pane.pane_id)) {
+        watch.wait("the kill audit", killed(&pane.pane_id));
+        log = test.tail(cursor);
+    }
     let down = log.iter().find(|e| e["kind"] == "agent.down").unwrap();
     assert_eq!(
         down["body"]["reason"],

@@ -1,0 +1,17 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+expression: "rendered(&mut chooser, 80, 14)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────────────────────────┐
+ │Waiting decisions — j/k: select, Enter: inspect, Esc: close                 │
+ │> d41 from demo/builder: Approve the smaller interface? [relayed]           │
+ │  d42 from demo/chief: Approve the smaller interface?                       │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘

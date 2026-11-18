@@ -7,12 +7,20 @@
 //! composition failure or an unconfirmed enqueue can still leave a task without
 //! its automatic message; inspect the task and inbox before repairing it.
 //! Replay never re-emits old notifications.
+//!
+//! Known limit (crrv-B L1): the actor receipt owns only the before-image;
+//! composition reads a later snapshot. An A→B→A cycle can suppress A's loss
+//! notice, and independent workers can enqueue B's old brief after B's loss
+//! notice (or A's loss notice after A's new brief). A private post-state alone
+//! would not serialize fanout; ordered notification delivery needs its own design.
+//! Verdict answers retain current-state coalescing, not exact-at-verdict routing.
 //! Delivery itself belongs exclusively to the existing confirmed-message runtime.
 
 use super::{
     message_inbox::caller_address,
     message_methods::validate_send,
     messages::{MessageError, SendParams},
+    reporting_line::ReportingFiles,
     OrgHandle, OrgServiceError,
 };
 use crate::server::methods::{CallContext, MethodError};
@@ -30,6 +38,7 @@ use tokio::sync::Semaphore;
 #[path = "task_worker_tests.rs"]
 mod tests;
 
+pub(crate) use super::task_methods::register_task_methods_with_reporting;
 pub use super::task_methods::{
     register_task_methods, AssignParams, AttachParams, CreateParams, GetParams, ListParams,
     ReviewParams, SetStateParams, SubmitParams, VerdictParams,
@@ -121,15 +130,12 @@ pub struct GetResult {
 
 /// Canonical task sequence; legacy free-text message references are not task IDs.
 pub fn sequence(id: &TaskId) -> Result<u64, TaskError> {
-    let text = id.to_string();
-    text.strip_prefix('t')
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|seq| format!("t{seq}") == text)
-        .ok_or_else(|| {
-            TaskError::InvalidParams(format!(
-                "{text:?}: expected t followed by canonical u64 decimal"
-            ))
-        })
+    atm_org::task_seq(id).ok_or_else(|| {
+        let text = id.to_string();
+        TaskError::InvalidParams(format!(
+            "{text:?}: expected t followed by canonical u64 decimal"
+        ))
+    })
 }
 
 fn task<'a>(state: &'a OrgState, id: &TaskId) -> Result<&'a Task, TaskError> {
@@ -235,7 +241,14 @@ pub fn notification(
         }
         _ => return Ok(None),
     };
+    if matches!(kind, MessageKind::Brief | MessageKind::Report)
+        && from == to
+        && matches!(&from, Address::Agent(_))
+    {
+        return Ok(None);
+    }
     Ok(Some(MessageContent {
+        delivery_notice: None,
         from,
         to,
         kind,
@@ -247,6 +260,7 @@ pub fn notification(
 
 fn notice(id: &TaskId, by: &Address, to: Address, change: &str) -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: by.clone(),
         to,
         kind: MessageKind::Note,
@@ -388,9 +402,41 @@ pub(super) fn target(command: &TaskCommand) -> Option<TaskId> {
     }
 }
 
+async fn qualify_manager(
+    command: &mut TaskCommand,
+    state: OrgState,
+    files: &ReportingFiles,
+) -> Result<(), TaskError> {
+    let (id, by) = match command {
+        TaskCommand::Assign { task_id, by, .. }
+        | TaskCommand::StartReview { task_id, by, .. }
+        | TaskCommand::Verdict { task_id, by, .. }
+        | TaskCommand::SetState {
+            task_id,
+            by,
+            state: TaskState::Open | TaskState::Cancelled,
+            ..
+        } => (task_id, by),
+        _ => return Ok(()),
+    };
+    let Address::Agent(caller) = &by.who else {
+        return Ok(());
+    };
+    let task = task(&state, id)?;
+    if by.who == task.creator {
+        return Ok(());
+    }
+    let Some(assignee) = task.agent_id.clone().filter(|id| id != caller) else {
+        return Ok(());
+    };
+    by.manager_of = files.manager_of(state, caller.clone(), assignee).await?;
+    Ok(())
+}
+
 async fn execute_mutation<F, E, EF>(
     org: OrgHandle,
     caller: CallContext,
+    files: ReportingFiles,
     make: F,
     mut send: E,
 ) -> Result<MutationResult, TaskError>
@@ -401,8 +447,11 @@ where
 {
     let state = org.snapshot().await?;
     let who = caller_address(&state, &caller)?;
-    let lead = matches!(&who, Address::Agent(id) if id.name == "lead");
-    let command = make(TaskActor { who, lead });
+    let mut command = make(TaskActor {
+        who,
+        manager_of: None,
+    });
+    qualify_manager(&mut command, state, &files).await?;
     let id = target(&command);
     let review = match &command {
         TaskCommand::Verdict { review_task, .. } => review_task.clone(),
@@ -523,6 +572,7 @@ where
 #[derive(Debug, Clone)]
 pub struct TaskHandle {
     org: OrgHandle,
+    files: ReportingFiles,
     workers: Arc<Semaphore>,
 }
 impl TaskHandle {
@@ -530,8 +580,14 @@ impl TaskHandle {
     pub fn new(org: OrgHandle) -> Self {
         Self {
             org,
+            files: ReportingFiles::default(),
             workers: Arc::new(Semaphore::new(64)),
         }
+    }
+
+    pub(crate) fn with_reporting_files(mut self, files: ReportingFiles) -> Self {
+        self.files = files;
+        self
     }
 
     async fn run<T: Send + 'static>(
@@ -562,9 +618,13 @@ impl TaskHandle {
     ) -> Result<MutationResult, TaskError> {
         let org = self.org.clone();
         let sender = org.clone();
-        self.run(execute_mutation(org, caller, make, move |content| {
-            enqueue(sender.clone(), content)
-        }))
+        self.run(execute_mutation(
+            org,
+            caller,
+            self.files.clone(),
+            make,
+            move |content| enqueue(sender.clone(), content),
+        ))
         .await
     }
 
@@ -622,6 +682,11 @@ fn bounded(value: &impl Serialize) -> Result<(), TaskError> {
 }
 
 fn list(state: &OrgState, p: &ListParams) -> Result<ListResult, TaskError> {
+    if let Some(id) = &p.project_id {
+        if state.project(id).is_none() {
+            return Err(TaskError::NotFound(format!("unknown project {id}")));
+        }
+    }
     for id in p.agent_id.iter().chain(p.creator.iter().filter_map(|a| {
         if let Address::Agent(id) = a {
             Some(id)
@@ -641,6 +706,9 @@ fn list(state: &OrgState, p: &ListParams) -> Result<ListResult, TaskError> {
         .tasks()
         .filter(|t| {
             after.is_none_or(|after| sequence(&t.id).is_ok_and(|seq| seq > after))
+                && p.project_id
+                    .as_ref()
+                    .is_none_or(|id| t.project(t.agent_id.as_ref()) == Some(id))
                 && p.agent_id
                     .as_ref()
                     .is_none_or(|id| t.agent_id.as_ref() == Some(id))
@@ -682,4 +750,52 @@ fn list(state: &OrgState, p: &ListParams) -> Result<ListResult, TaskError> {
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::{sequence, TaskError};
+    use atm_org::TaskId;
+
+    // Break caught: the RPC wrapper rejects a canonical boundary sequence.
+    #[test]
+    fn accepts_canonical_task_sequences() {
+        for (text, seq) in [("t0", 0), ("t18446744073709551615", u64::MAX)] {
+            let id: TaskId = text.parse().unwrap();
+            assert_eq!(sequence(&id).unwrap(), seq);
+        }
+    }
+
+    // Break caught: shared parsing leaks a different error kind, wording or
+    // escaping at the daemon boundary.
+    #[test]
+    fn retains_invalid_task_diagnostics() {
+        for (text, expected) in [
+            (
+                "unit-7",
+                "invalid task parameters: \"unit-7\": expected t followed by canonical u64 decimal",
+            ),
+            (
+                "t01",
+                "invalid task parameters: \"t01\": expected t followed by canonical u64 decimal",
+            ),
+            (
+                "t+1",
+                "invalid task parameters: \"t+1\": expected t followed by canonical u64 decimal",
+            ),
+            (
+                "t18446744073709551616",
+                "invalid task parameters: \"t18446744073709551616\": expected t followed by canonical u64 decimal",
+            ),
+            (
+                "t1\n",
+                "invalid task parameters: \"t1\\n\": expected t followed by canonical u64 decimal",
+            ),
+        ] {
+            let id: TaskId = text.parse().unwrap();
+            let error = sequence(&id).unwrap_err();
+            assert!(matches!(error, TaskError::InvalidParams(_)), "{text:?}");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 }

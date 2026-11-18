@@ -204,7 +204,10 @@ impl Seed {
                     .map_or_else(|| "t999999".parse().unwrap(), |task| task.id.clone());
                 let by = TaskActor {
                     who: address(self.from),
-                    lead: self.flag,
+                    manager_of: state
+                        .task(&task_id)
+                        .filter(|_| self.flag)
+                        .and_then(|task| task.agent_id.clone()),
                 };
                 OrgCommand::Task(match self.pane {
                     0 => TaskCommand::Create(task_body(by.who, TaskKind::Work, None)),
@@ -219,7 +222,7 @@ impl Seed {
                         files: vec![],
                         by: TaskActor {
                             who: Address::Agent(agent_id),
-                            lead: false,
+                            manager_of: None,
                         },
                     },
                     _ => TaskCommand::Verdict {
@@ -249,7 +252,7 @@ impl Seed {
                     .get(self.value as usize % decisions.len().max(1))
                     .map(|decision| decision.id)
                     .unwrap_or(DecisionId::new(999_999));
-                OrgCommand::Owner(match self.to % 3 {
+                OrgCommand::Owner(match self.to % 4 {
                     0 => OwnerCommand::Away {
                         by: address(self.from),
                         stacking_caps: [(agent_id.project, self.value % 3)].into(),
@@ -257,7 +260,11 @@ impl Seed {
                     1 => OwnerCommand::Back {
                         by: address(self.from),
                     },
-                    _ => OwnerCommand::ApplyAway { decision_id },
+                    2 => OwnerCommand::ApplyAway { decision_id },
+                    _ => OwnerCommand::CreateDigest {
+                        by: address(self.from),
+                        back_seq: state.last_away_window().map(|w| w.back_seq),
+                    },
                 })
             }
         }
@@ -266,6 +273,7 @@ impl Seed {
 
 fn task_body(creator: Address, kind: TaskKind, judges: Option<TaskId>) -> TaskCreated {
     TaskCreated {
+        project_id: None,
         title: "Work".into(),
         kind,
         creator,
@@ -355,11 +363,11 @@ impl History {
     fn seed_tasks(&mut self) {
         let lead = TaskActor {
             who: Address::Agent(agent(0)),
-            lead: false,
+            manager_of: None,
         };
         let worker = TaskActor {
             who: Address::Agent(agent(1)),
-            lead: false,
+            manager_of: None,
         };
         let work = self.task(TaskCommand::Create(task_body(
             lead.who.clone(),
@@ -418,7 +426,7 @@ impl History {
                 note: None,
                 by: TaskActor {
                     who: Address::Owner,
-                    lead: false,
+                    manager_of: None,
                 },
             },
             TaskCommand::RecordCost {
@@ -710,6 +718,12 @@ impl History {
                 history.step(command).unwrap();
             }
         }
+        history
+            .step(OrgCommand::Owner(OwnerCommand::SetRelay {
+                by: Address::Owner,
+                agent: Some(agent(0)),
+            }))
+            .unwrap();
         // Every decision kind: overruled after a provisional choice, confirmed,
         // withdrawn, and expired at its deadline (the clock is the sequence).
         let mut request = decision_support::request();
@@ -731,6 +745,7 @@ impl History {
         };
         let overruled = run(&mut history, DecisionCommand::Request(request.clone()));
         let taken = DecisionCommand::TakeProvisionally(ProvisionalChoice {
+            relayed_by: None,
             decision_id: overruled,
             option: "a".into(),
             by: Address::System,
@@ -771,7 +786,18 @@ impl History {
         ] {
             assert_eq!(history.step(OrgCommand::Owner(command)).unwrap().len(), 1);
         }
-        assert_eq!(history.kinds.len(), 38);
+        let back_seq = history.state.last_away_window().map(|w| w.back_seq);
+        assert_eq!(
+            history
+                .step(OrgCommand::Owner(OwnerCommand::CreateDigest {
+                    by: Address::Owner,
+                    back_seq
+                }))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(history.kinds.len(), 40);
         assert_eq!(history.state.agents().count(), 3);
         assert_eq!(history.state.projects().count(), 2);
         history

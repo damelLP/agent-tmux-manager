@@ -1,5 +1,63 @@
 # Claude screen fixtures
 
+## Stage-only staged-reference contract (TR4 S0)
+
+Captured: Claude Code 2.1.326, 2026-11-17, sealed stage-only private tmux 3.8.
+Captured: Claude Code 2.1.325, 2026-11-17, sealed stage-only private tmux 3.8.
+
+`screen_tr4s0_<native|drawn>_<80x40|120x40|28x40>_<state>_<version>`
+has sequential `capture-pane -p -e -N` (`.styled.txt`) and `-p -N`
+(`.plain.txt`) observations: 34 pairs per version, 136 files in total.
+Only identifying private paths/fragments become equal-cell `/tmp/xxx…`
+placeholders; all original SGR, allocated padding and physical rows remain.
+The pair is not atomic. Tests remove only the provenance line.
+
+Each geometry/cursor starts a disposable stock CLI with no owner filesystem,
+credentials, configuration, connectors, plugins or skills. The unchanged safety
+watcher is ready before CLI launch; strict empty MCP and an empty tools list
+apply throughout. A separate pre-task `/mcp` check for each version reports
+`No MCP servers configured`. Network is loopback-only with a canned local API;
+**zero API requests, provider/model calls or tool executions** occurred. Automatic
+ATM start prompts are disabled. No staged reference or start line is submitted.
+Native and drawn cursor flags were recorded as 1 and 0 respectively.
+
+The ordinary reference is `[m123456] Read: atm inbox --id m123456`; the start
+literal is `[m123456] New session: run the shell command atm me`.
+References are pasted; Home moves the cursor without changing input. Human edits
+use literal keys: append ` edited by a human`, or change only the final command
+ID to `m123459` while the leading token remains `m123456`. Backspaces clear
+between drafts, not Ctrl-U/Escape or an assumed erase capability. `wrapped`
+appends nine copies of ` neutral human edit` to the reference: these are genuinely
+wrapped edited drafts at 80/120, not claims that the short canonical line wraps
+there. At 28 columns the canonical ordinary and start lines themselves wrap.
+
+`tests/staged_reference.rs` pins exact tri-state results, not just “not true”:
+
+| State | Styled 80/120 result against canonical candidate | Styled 28 | Plain |
+|---|---|---|---|
+| empty | None | None | None |
+| reference / reference-home | Some(true), except finding below | reference: None | None |
+| edited / wrong-id | Some(false), except finding below | not captured | None |
+| wrapped edited reference | None, including full edited-literal query | not captured | None |
+| start-line literal | Some(true) | None | None |
+
+**Closed finding, not repaired here:** 2.1.325 drawn 120-column `reference`,
+`reference-home`, `edited` and `wrong-id` return None despite legacy/control
+input Draft. Their real animated startup header has no avatar and all its text
+is indented. A Synthetic unindented history row, with the editor unchanged,
+restores the exact match: the completion-continuation veto owns this refusal.
+The later same-run start-line frame matches. This is phase-specific evidence,
+not proof of a release regression or a universally unmatchable drawn editor.
+No false positive was observed in this matrix. Narrow/wrapped refusal is
+intentional; turn/freshness may remain Unknown in these startup frames.
+
+Synthetic controls are labeled beside the tests: command-ID-only mutation,
+leading space, suffix, history-only reference with wrong/empty editor, and the
+avatarless-header diagnostic. Ordinary and start candidates are distinct.
+A match proves visible text only, not authorship, non-submission, readiness,
+safe Enter routing or erasure. No grammar, row joining or production fix is
+part of these fixtures.
+
 ## Above-editor completion without a startup header (stage 1)
 
 Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
@@ -337,7 +395,7 @@ terminal focus-out and focus-in, with the classic renderer, and without the
 launching shell's `CLAUDE*` variables. The U5b and P1 captures above came from
 offline clean configurations, where Claude draws its own inverse cursor.
 
-The later suggestion captures below establish the drawn-cursor case too.
+The later suggestion captures above establish the drawn-cursor case too.
 A genuine wrapped suggestion remains uncaptured; every two-row editor stays Draft.
 Custom status-line support is described above; unrelated footer layouts still
 refuse. Synthetic mutations are labelled in `tests/styled_screen.rs`.
@@ -542,3 +600,25 @@ The shared stand-in replays both sanitized sources at their original 144x80.
 Its shell counts are replayed UI values,
 not a claim that it spawned those background jobs. Native-geometry delivery
 and restart tests use the real private daemon and never invoke a model CLI.
+
+## Installed-update notice, alone and beside the clear-context hint
+
+Captured: Claude Code 2.1.325, 2026-11-17, read-only tmux capture-pane -p -e -N of an
+idle seat (supplied by the lead), redacted.
+
+- `screen_styled_update-installed_2.1.325.txt`: standalone
+  `✔ Update installed · /restart to apply` immediately above the editor.
+- `screen_styled_clear-update-installed_2.1.325.txt`: the same notice after
+  `new task? /clear to save 187k tokens · ` on that single row.
+
+The bodies preserve the supplied 184x11 viewport geometry and SGR; the first
+`Captured:` line is provenance, not a terminal row. Earlier transcript rows were
+blanked and the identifying custom-status prefix replaced with padded `[fixture]`.
+A redundant default-foreground SGR terminates padded rows for whitespace-safe
+storage; all captured cells and their attributes are retained.
+Both source views lack the mode footer and remain Unknown. `update_notice.rs`
+and atmd's adoption regression explicitly mark their appended, already-captured
+auto-mode footer as Synthetic; this isolates the notice grammar without treating
+a cropped viewport as safe. All altered counts, margins, statuses and drafts are
+Synthetic too. Only the exact two notice shapes at the existing two-cell right
+margin are skipped; they supply no turn, input or fresh-editor evidence.

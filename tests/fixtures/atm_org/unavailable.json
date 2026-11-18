@@ -1,0 +1,223 @@
+{
+  "generated_at": "2026-01-15T12:05:00Z",
+  "reporting": {
+    "state": "unavailable",
+    "reason": "role reader unavailable\ntry later\u001b"
+  },
+  "needs_owner": {
+    "away_since": null,
+    "owner_unread": 2,
+    "unnamed_attention": 1,
+    "items": [
+      {
+        "kind": "decision_pending",
+        "id": "d41",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_provisional",
+        "id": "d42",
+        "agent_id": "beta/lead",
+        "project": "beta",
+        "since": "2026-01-15T12:01:00Z"
+      },
+      {
+        "kind": "seat_stuck",
+        "id": "beta/stalled",
+        "agent_id": "beta/stalled",
+        "project": "beta",
+        "since": "2026-01-15T12:02:00Z"
+      },
+      {
+        "kind": "seat_attention",
+        "id": "alpha/worker",
+        "agent_id": "alpha/worker",
+        "project": "alpha",
+        "since": "2026-01-15T12:03:00Z"
+      },
+      {
+        "kind": "delivery_failed",
+        "id": "m43",
+        "agent_id": null,
+        "project": null,
+        "since": "2026-01-15T12:04:00Z"
+      }
+    ],
+    "items_total": 5
+  },
+  "projects": [
+    {
+      "id": "alpha",
+      "root": "/fixtures/repos/alpha",
+      "seats": [
+        {
+          "agent_id": "alpha/lead",
+          "state": "ready",
+          "activity": "idle",
+          "harness": "pi",
+          "model": "model-a",
+          "context_percentage": 42.5,
+          "pane": "%11",
+          "manager": null,
+          "line_error": null,
+          "tasks": [
+            "t11"
+          ]
+        },
+        {
+          "agent_id": "alpha/watch",
+          "state": "down",
+          "activity": null,
+          "harness": null,
+          "model": null,
+          "context_percentage": null,
+          "pane": null,
+          "manager": null,
+          "line_error": null,
+          "tasks": []
+        },
+        {
+          "agent_id": "alpha/worker",
+          "state": "ready",
+          "activity": "attention_needed",
+          "harness": "codex",
+          "model": "model-b",
+          "context_percentage": 74,
+          "pane": "%12",
+          "manager": null,
+          "line_error": null,
+          "tasks": [
+            "t12",
+            "t13"
+          ]
+        }
+      ],
+      "tasks_open": 3,
+      "tasks": [
+        {
+          "task_id": "t11",
+          "title": "Review plan",
+          "kind": "work",
+          "state": "working",
+          "agent_id": "alpha/lead",
+          "creator": "owner"
+        },
+        {
+          "task_id": "t12",
+          "title": "Check output",
+          "kind": "review",
+          "state": "assigned",
+          "agent_id": "alpha/worker",
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t13",
+          "title": "Gather notes",
+          "kind": "errand",
+          "state": "waiting",
+          "agent_id": "alpha/worker",
+          "creator": "alpha/lead"
+        }
+      ],
+      "decisions": {
+        "pending": 1,
+        "provisional": 0
+      }
+    },
+    {
+      "id": "beta",
+      "root": "/fixtures/repos/beta",
+      "seats": [
+        {
+          "agent_id": "beta/broken",
+          "state": "ready",
+          "activity": "idle",
+          "harness": "pi",
+          "model": "model-c",
+          "context_percentage": 10,
+          "pane": "%13",
+          "manager": null,
+          "line_error": null,
+          "tasks": []
+        },
+        {
+          "agent_id": "beta/lead",
+          "state": "ready",
+          "activity": null,
+          "harness": "codex",
+          "model": "model-b",
+          "context_percentage": null,
+          "pane": "%14",
+          "manager": null,
+          "line_error": null,
+          "tasks": [
+            "t14"
+          ]
+        },
+        {
+          "agent_id": "beta/stalled",
+          "state": "stuck",
+          "activity": null,
+          "harness": null,
+          "model": null,
+          "context_percentage": null,
+          "pane": null,
+          "manager": null,
+          "line_error": null,
+          "tasks": []
+        }
+      ],
+      "tasks_open": 1,
+      "tasks": [
+        {
+          "task_id": "t14",
+          "title": "Draft next step",
+          "kind": "plan",
+          "state": "blocked",
+          "agent_id": "beta/lead",
+          "creator": "owner"
+        }
+      ],
+      "decisions": {
+        "pending": 0,
+        "provisional": 1
+      }
+    },
+    {
+      "id": "gamma",
+      "root": "/fixtures/folders/gamma",
+      "seats": [
+        {
+          "agent_id": "gamma/chief",
+          "state": "ready",
+          "activity": "idle",
+          "harness": "pi",
+          "model": "model-a",
+          "context_percentage": 0,
+          "pane": "%15",
+          "manager": null,
+          "line_error": null,
+          "tasks": []
+        }
+      ],
+      "tasks_open": 0,
+      "tasks": [],
+      "decisions": {
+        "pending": 0,
+        "provisional": 0
+      }
+    }
+  ],
+  "unplaced_tasks": [
+    {
+      "task_id": "t15",
+      "title": "Triage queue",
+      "kind": "work",
+      "state": "open",
+      "agent_id": null,
+      "creator": "owner"
+    }
+  ]
+}

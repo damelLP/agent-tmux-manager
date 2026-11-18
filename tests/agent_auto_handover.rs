@@ -19,6 +19,10 @@ mod stand_in;
 #[allow(dead_code)] // this file uses a subset of the lifecycle rig
 #[path = "support/agent_lifecycle.rs"]
 mod support;
+use support as lifecycle;
+#[allow(dead_code)]
+#[path = "support/message_delivery.rs"]
+mod delivery_support;
 
 use atm_core::SessionStatus;
 use serde_json::{json, Value};
@@ -42,6 +46,7 @@ struct Seat {
     old: String,
     /// The audit cursor and the stand-in's event cursor at the start.
     cursor: u64,
+    watch: std::cell::RefCell<delivery_support::Watch>,
     after: u64,
 }
 
@@ -56,6 +61,7 @@ impl Seat {
         });
         test.rig.wait_ready(&started.pane, Some(row.id.as_str()));
         let cursor = test.cursor();
+        let watch = std::cell::RefCell::new(delivery_support::Watch::on(&test.rig, cursor));
         let after = test.rig.event_cursor(&started.pane);
         Self {
             config,
@@ -63,6 +69,7 @@ impl Seat {
             pane: started.pane,
             old: row.id.as_str().to_owned(),
             cursor,
+            watch,
             after,
             test,
         }
@@ -122,9 +129,10 @@ impl Seat {
         let accepted = self.test.rig.wait_event(&self.pane, after, |e| {
             e["kind"] == "accepted" && e["text"].as_str().is_some_and(|t| t.starts_with("[m"))
         });
-        self.test
-            .rig
-            .wait("the delivery's record", || self.count("msg.delivered") == 1);
+        self.watch
+            .borrow_mut()
+            .wait("the delivery's record", |e| e["kind"] == "msg.delivered");
+        assert_eq!(self.count("msg.delivered"), 1);
         let events = self.events();
         let requested = events
             .iter()
@@ -159,7 +167,9 @@ impl Seat {
     /// daemon types. Returns the new session's id.
     fn end_turn_and_clear(&self) -> String {
         let before_clear = self.test.rig.event_cursor(&self.pane);
-        self.advance(self.config.work_ms);
+        // Advance-then-wait is too late: completion can already trigger clear.
+        self.test
+            .finish_turn_at_ready_editor(&self.pane, || self.advance(self.config.work_ms));
         self.test.rig.wait_event(&self.pane, before_clear, |e| {
             e["kind"] == "rendered" && e["state"] == "clearing"
         });
@@ -183,15 +193,22 @@ fn handed_over_at_the_line(mode: StandInMode) {
     std::fs::write(seat.memory(), "what the next session needs").unwrap();
     let new = seat.end_turn_and_clear();
     assert_ne!(new, seat.old);
-    seat.test
-        .rig
-        .wait("the agent ready in its new session", || {
-            let agent = seat.test.agent(&seat.id);
-            agent["state"] == "ready" && agent["session_id"] == new.as_str()
+    seat.watch
+        .borrow_mut()
+        .wait("the agent bound in its new session", |e| {
+            e["kind"] == "agent.session_bound"
+                && e["body"]["agent_id"] == seat.id
+                && e["body"]["session_id"] == new
         });
-    seat.test
-        .rig
-        .wait("the note to the manager", || seat.count("msg.sent") == 2);
+    let agent = seat.test.agent(&seat.id);
+    assert_eq!(agent["state"], "ready");
+    assert_eq!(agent["session_id"], new.as_str());
+    seat.watch
+        .borrow_mut()
+        .wait("the note to the manager", |e| {
+            e["kind"] == "msg.sent" && e["body"]["to"] == "owner"
+        });
+    assert_eq!(seat.count("msg.sent"), 2);
     let events = seat.events();
     let note = events.iter().rfind(|e| e["kind"] == "msg.sent").unwrap();
     assert_eq!(note["body"]["from"], "system");
@@ -272,9 +289,10 @@ fn a_request_the_harness_does_not_take_clears_nothing_pi() {
     let rejected = seat.test.rig.wait_event(&seat.pane, after, |e| {
         e["kind"] == "rejected" && e["reason"] == "refuse_next_paste"
     });
-    seat.test.rig.wait("the request's record", || {
-        seat.count("agent.save_requested") == 1
+    seat.watch.borrow_mut().wait("the request's record", |e| {
+        e["kind"] == "agent.save_requested"
     });
+    assert_eq!(seat.count("agent.save_requested"), 1);
     let events = seat.events();
     let requested = events
         .iter()

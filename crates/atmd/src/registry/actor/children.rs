@@ -7,6 +7,7 @@ use atm_core::{
 
 use super::RegistryActor;
 use crate::registry::commands::RemovalReason;
+use crate::registry::inputs::stamp_new_session;
 
 impl RegistryActor {
     /// Child bookkeeping for an event received on `parent_pid`: learns
@@ -88,7 +89,10 @@ impl RegistryActor {
             return Some(*pid);
         }
         let (parent, _) = self.sessions_by_pid.get(&parent_pid)?;
-        let mut child = SessionDomain::new(child_id.clone(), agent_type, parent.model);
+        let mut child = stamp_new_session(
+            SessionDomain::new(child_id.clone(), agent_type, parent.model),
+            self.clock.as_ref(),
+        );
         child.harness = harness;
         child.model_display_override = parent.model_display_override.clone();
         child.tmux_pane = parent.tmux_pane.clone();
@@ -97,7 +101,7 @@ impl RegistryActor {
         child.worktree_path = parent.worktree_path.clone();
         child.worktree_branch = parent.worktree_branch.clone();
         child.parent_session_id = Some(parent.id.clone());
-        child.apply_lifecycle_event(&LifecycleEvent::WorkingStart);
+        child.apply_lifecycle_event_at(&LifecycleEvent::WorkingStart, self.clock.utc_now());
         // Without a real pid the registry assigns a synthetic one that
         // `set_pid` rejects, so `infra.pid` stays `None` and stale-process
         // cleanup never sweeps the child.
@@ -162,7 +166,10 @@ impl RegistryActor {
         if session.status != atm_core::SessionStatus::Idle {
             return;
         }
-        session.current_activity = Some(atm_core::ActivityDetail::with_context(&summary));
+        session.current_activity = Some(atm_core::ActivityDetail::with_context_at(
+            &summary,
+            self.clock.utc_now(),
+        ));
         self.publish_updated(pid);
     }
 

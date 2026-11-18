@@ -32,17 +32,19 @@ impl Server {
     }
 
     async fn with_services(mut services: MethodServices) -> Self {
-        let mock = atm_tmux::MockTmuxClient::new();
-        mock.set_next_raw_output("0 1\n");
-        mock.set_next_pane_id("%42");
-        mock.set_pane_cwd("%7", "/from/pane");
-        let (control, _) = atmd::control::service::spawn_control(
-            Box::new(mock),
-            services.registry.clone(),
-            services.org.clone(),
-            CancellationToken::new(),
-        );
-        services.control = Some(control);
+        if services.control.is_none() {
+            let mock = atm_tmux::MockTmuxClient::new();
+            mock.set_next_raw_output("0 1\n");
+            mock.set_next_pane_id("%42");
+            mock.set_pane_cwd("%7", "/from/pane");
+            let (control, _) = atmd::control::service::spawn_control(
+                Box::new(mock),
+                services.registry.clone(),
+                services.org.clone(),
+                CancellationToken::new(),
+            );
+            services.control = Some(control);
+        }
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let cancel = CancellationToken::new();
@@ -214,6 +216,263 @@ async fn replay_all_protocol_fixtures() {
         cancel.cancel();
         assert!(compared.is_ok(), "{}: {compared:?}", path.display());
     }
+}
+
+#[tokio::test]
+async fn spawn_prepare_largest_conforms_on_real_socket() {
+    use atm_tmux::{mock::MockCall, PaneInfo};
+    let state = tempfile::tempdir().unwrap();
+    let own = state.path().join("tmux.sock");
+    let foreign = state.path().join("foreign.sock");
+    std::fs::write(&own, "").unwrap();
+    std::fs::write(&foreign, "").unwrap();
+    let mock = atm_tmux::MockTmuxClient::new();
+    let mut services = MethodServices::new(spawn_registry());
+    let cancel = CancellationToken::new();
+    let (control, actor) = atmd::control::service::spawn_control(
+        Box::new(mock.clone()),
+        services.registry.clone(),
+        services.org.clone(),
+        cancel.clone(),
+    );
+    services.control = Some(control);
+    let server = Server::with_services(services).await;
+    let mut client = server.client().await;
+    let connected = client.connect().await;
+    assert!(connected["methods"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("session.spawn_prepare_largest")));
+    for (panes, caller, cwd, expected) in [
+        (
+            vec![],
+            None,
+            None,
+            Some(json!({"target_pane":"%0","cwd":null})),
+        ),
+        (
+            vec![],
+            Some("%999"),
+            None,
+            Some(json!({"target_pane":"%999","cwd":null})),
+        ),
+        (
+            vec![PaneInfo {
+                pane_id: "%7".into(),
+                session_name: "work".into(),
+                window_index: 1,
+                pane_pid: 1,
+                width: 100,
+                height: 60,
+                is_active: false,
+            }],
+            None,
+            Some("/selected".into()),
+            Some(json!({"target_pane":"%7","cwd":"/selected"})),
+        ),
+        (
+            vec![PaneInfo {
+                pane_id: "%7".into(),
+                session_name: "work".into(),
+                window_index: 1,
+                pane_pid: 1,
+                width: 100,
+                height: 60,
+                is_active: false,
+            }],
+            None,
+            Some("x".repeat(1_048_576)),
+            None,
+        ),
+    ] {
+        mock.set_panes(panes);
+        if let Some(cwd) = cwd {
+            mock.set_pane_cwd("%7", &cwd);
+        }
+        mock.set_next_raw_output(own.to_str().unwrap());
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"largest","method":"session.spawn_prepare_largest","params":{"caller_server":own,"caller_pane":caller},"from_pane":"%caller"})).await;
+        let response = client.recv().await;
+        if let Some(expected) = expected {
+            assert_eq!(response["result"], expected);
+        } else {
+            assert_eq!(response["error"]["code"], "refused");
+        }
+        assert!(serde_json::to_vec(&response).unwrap().len() < 1_048_576);
+        client.require_next_pong().await;
+    }
+    mock.clear_calls();
+    mock.set_next_raw_output(own.to_str().unwrap());
+    client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"foreign","method":"session.spawn_prepare_largest","params":{"caller_server":foreign,"caller_pane":"%7"}})).await;
+    assert_eq!(client.recv().await["error"]["code"], "refused");
+    assert_eq!(
+        mock.calls(),
+        vec![MockCall::RawCommand {
+            subcommand: "display-message".into(),
+            args: vec!["-p".into(), "#{socket_path}".into()]
+        }]
+    );
+    client.require_next_pong().await;
+    server.stop().await;
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+// Breaks if the advertised membership schema or full-frame refusal differs
+// on a real private socket (not just in the method/duplex unit tests).
+#[tokio::test]
+async fn session_panes_conforms_on_real_socket_including_oversize() {
+    use atm_tmux::PaneInfo;
+    let state = tempfile::tempdir().unwrap();
+    let own = state.path().join("tmux.sock");
+    std::fs::write(&own, "").unwrap();
+    let mock = atm_tmux::MockTmuxClient::new();
+    let pane = |id: String, name: &str| PaneInfo {
+        pane_id: id,
+        session_name: name.into(),
+        window_index: 0,
+        pane_pid: 1,
+        width: 80,
+        height: 24,
+        is_active: true,
+    };
+    let mut services = MethodServices::new(spawn_registry());
+    let cancel = CancellationToken::new();
+    let (control, actor) = atmd::control::service::spawn_control(
+        Box::new(mock.clone()),
+        services.registry.clone(),
+        services.org.clone(),
+        cancel.clone(),
+    );
+    services.control = Some(control);
+    let server = Server::with_services(services).await;
+    let mut client = server.client().await;
+    let connected = client.connect().await;
+    assert!(connected["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|name| name == "session.panes"));
+    for (panes, expected) in [
+        (
+            vec![
+                pane("%2".into(), "work"),
+                pane("%1".into(), "work-extra"),
+                pane("%0".into(), "work"),
+            ],
+            Some(json!({"pane_ids":["%0","%2"]})),
+        ),
+        (
+            vec![pane("%1".into(), "work-extra")],
+            Some(json!({"pane_ids":[]})),
+        ),
+        (
+            vec![pane(format!("%{}", "7".repeat(1_048_576)), "work")],
+            None,
+        ),
+    ] {
+        mock.set_panes(panes);
+        mock.set_next_raw_output(own.to_str().unwrap());
+        client
+            .send(
+                serde_json::to_value(ClientMessage::request(
+                    "panes".into(),
+                    "session.panes".into(),
+                    json!({"session_name":"work","caller_server":own}),
+                    Some("%9".into()),
+                ))
+                .unwrap(),
+            )
+            .await;
+        let response = client.recv().await;
+        if let Some(expected) = expected {
+            assert_eq!(response["result"], expected);
+        } else {
+            assert_eq!(response["error"]["code"], "refused");
+        }
+        assert!(serde_json::to_vec(&response).unwrap().len() < 1_048_576);
+        client.require_next_pong().await;
+    }
+    server.stop().await;
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+// Breaks if real wire role operations lose advertisement, serialize failures as
+// empty reads, or leak/write role data through a foreign equal pane id.
+#[tokio::test]
+async fn session_roles_conform_on_real_socket_including_oversize() {
+    let state = tempfile::tempdir().unwrap();
+    let own = state.path().join("tmux.sock");
+    let foreign = state.path().join("foreign.sock");
+    std::fs::write(&own, "").unwrap();
+    std::fs::write(&foreign, "").unwrap();
+    let mock = atm_tmux::MockTmuxClient::new();
+    let mut services = MethodServices::new(spawn_registry());
+    let cancel = CancellationToken::new();
+    let (control, actor) = atmd::control::service::spawn_control(
+        Box::new(mock.clone()),
+        services.registry.clone(),
+        services.org.clone(),
+        cancel.clone(),
+    );
+    services.control = Some(control);
+    let server = Server::with_services(services).await;
+    let mut client = server.client().await;
+    let connected = client.connect().await;
+    for method in ["session.roles", "session.role_set"] {
+        assert!(connected["methods"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(method)));
+    }
+    for (output, expected) in [
+        (
+            "%7\tcoordinator\n%2\tcoordinator\n%7\tcoordinator\n".into(),
+            Some(json!({"coordinator_panes":["%2","%7"]})),
+        ),
+        (
+            "%7\tunknown\n".into(),
+            Some(json!({"coordinator_panes":[]})),
+        ),
+        (format!("%{}\tcoordinator\n", "7".repeat(1_048_576)), None),
+    ] {
+        mock.set_next_raw_output(own.to_str().unwrap());
+        mock.set_next_raw_output(&output);
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"roles","method":"session.roles","params":{"caller_server":own}})).await;
+        let response = client.recv().await;
+        if let Some(expected) = expected {
+            assert_eq!(response["result"], expected);
+        } else {
+            assert_eq!(response["error"]["code"], "refused");
+        }
+        assert!(serde_json::to_vec(&response).unwrap().len() < 1_048_576);
+        client.require_next_pong().await;
+    }
+    for role in [json!("coordinator"), Value::Null, Value::Null] {
+        mock.set_next_raw_output(own.to_str().unwrap());
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"set","method":"session.role_set","params":{"caller_server":own,"pane":"%7","role":role}})).await;
+        assert_eq!(
+            client.recv().await["result"],
+            json!({"pane":"%7","role":role})
+        );
+        client.require_next_pong().await;
+    }
+    for method in ["session.roles", "session.role_set"] {
+        mock.clear_calls();
+        mock.set_next_raw_output(own.to_str().unwrap());
+        let params = if method == "session.roles" {
+            json!({"caller_server":foreign})
+        } else {
+            json!({"caller_server":foreign,"pane":"%7","role":"coordinator"})
+        };
+        client.send(json!({"protocol_version":{"major":1,"minor":1},"type":"request","id":"foreign","method":method,"params":params})).await;
+        assert_eq!(client.recv().await["error"]["code"], "refused");
+        assert_eq!(mock.call_count(), 1);
+        client.require_next_pong().await;
+    }
+    server.stop().await;
+    cancel.cancel();
+    actor.await.unwrap();
 }
 
 #[tokio::test]

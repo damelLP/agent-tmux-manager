@@ -17,8 +17,8 @@ fn lead() -> AgentId {
     "p/lead".parse().unwrap()
 }
 
-/// A flow that ended on a timeout told its caller the Stuck reason its
-/// cleanup recorded for `agent`, in the words of the owner's note.
+/// A flow that decided to stop or timed out told its caller the Stuck reason
+/// its cleanup recorded for `agent`, in the words of the owner's note.
 fn assert_told_stuck<T: std::fmt::Debug>(
     result: &Result<T, AgentError>,
     agent: &atm_org::Agent,
@@ -30,6 +30,24 @@ fn assert_told_stuck<T: std::fmt::Debug>(
         matches!(result, Err(AgentError::Refused(told)) if *told == expected),
         "{result:?}\nexpected: {expected}"
     );
+}
+
+#[test]
+fn a_decided_stop_is_answered_with_its_acknowledged_stuck_reason() {
+    // Break caught: a decided stop keeps its partial, pre-cleanup wording,
+    // or a failure with no acknowledged Stuck is presented as that record.
+    use crate::org::agent_lifecycle::deadline_answer;
+    const PARTIAL: &str = "agent p/lead: the start did not complete: a dialog atm must not answer is open";
+    const RECORDED: &str = "start did not complete: a dialog atm must not answer is open; inspect %1";
+    for (record, expected) in [
+        (Some(RECORDED.to_owned()), "agent p/lead: start did not complete: a dialog atm must not answer is open; inspect %1"),
+        (None, PARTIAL),
+    ] {
+        let error = deadline_answer(AgentError::Refused(PARTIAL.into()), &lead(), record);
+        let wire = crate::server::methods::MethodError::from(error).0;
+        assert_eq!(wire.code, "refused");
+        assert_eq!(wire.message, expected);
+    }
 }
 
 #[test]
@@ -1524,7 +1542,26 @@ async fn adopt_tag_whose_call_outlives_the_deadline_quarantines() {
     // would time out. So the clock is paused once tmux has the tag write:
     // from there only the deadline is left, and virtual time reaches it.
     use crate::control::reservation::ReservationError;
-    let adoption = Adoption::new().await;
+    let mut rig = Rig::new().await;
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let entered = std::sync::Mutex::new(Some(entered));
+    let client = crate::org::message_service_tests::ObservedTmux {
+        inner: rig.client.clone(),
+        on_raw: std::sync::Arc::new(move |subcommand, pending| {
+            // The scripted client records the tag before its stall's first
+            // await; observe that poll before pausing the real project I/O.
+            if subcommand == "set-option" && pending {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+            }
+        }),
+    };
+    let (control, _) = spawn_control_with_org(
+        Box::new(client), rig.registry.clone(), rig.org.clone(), rig.cancel.child_token(),
+    );
+    rig.control = control;
+    let adoption = Adoption::on(rig).await;
     adoption.rig.row("s1", "%1", false).await;
     *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
     adoption.script_untagged();
@@ -1533,7 +1570,7 @@ async fn adopt_tag_whose_call_outlives_the_deadline_quarantines() {
     adoption.script_tag();
     adoption.rig.client.stall_pane_effects(true);
     let (agents, project_root) = (adoption.agents.clone(), adoption.project.path().join("q"));
-    let call = tokio::spawn(async move {
+    let mut call = tokio::spawn(async move {
         agents
             .adopt(AdoptParams {
                 project_root,
@@ -1543,13 +1580,14 @@ async fn adopt_tag_whose_call_outlives_the_deadline_quarantines() {
             })
             .await
     });
-    while mutations(&adoption.rig).is_empty() {
-        // An adopt that ends before its tag never writes one: fail, don't spin.
-        if call.is_finished() {
-            panic!("the adopt ended before its tag: {:?}", call.await);
+    tokio::select! {
+        biased;
+        result = &mut call => panic!("the adopt ended before its tag: {result:?}"),
+        entered = tokio::time::timeout(std::time::Duration::from_secs(60), entry) => {
+            entered.unwrap().unwrap();
         }
-        tokio::task::yield_now().await;
     }
+    assert_eq!(mutations(&adoption.rig), ["set-option -p -t %1 @atm-agent q/lead"]);
     tokio::time::pause();
     let result = call.await.unwrap();
     assert!(

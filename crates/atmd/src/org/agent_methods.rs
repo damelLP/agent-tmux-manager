@@ -53,9 +53,10 @@ impl From<AgentError> for MethodError {
                 | ReservationError::InvalidObservation { .. } => error_code::REFUSED,
                 ReservationError::PaneGone { .. } => error_code::NOT_FOUND,
                 ReservationError::InvalidRequest { .. } => error_code::INVALID_PARAMS,
+                #[cfg(test)]
+                ReservationError::NotImplemented { .. } => error_code::UNAVAILABLE,
                 ReservationError::Unavailable
                 | ReservationError::PacingRefused { .. }
-                | ReservationError::NotImplemented { .. }
                 | ReservationError::Quarantined { .. } => error_code::UNAVAILABLE,
                 ReservationError::Timeout => error_code::TIMEOUT,
                 ReservationError::Control(control) => return control_error(control.into()),

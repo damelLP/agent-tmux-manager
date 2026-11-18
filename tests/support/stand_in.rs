@@ -9,16 +9,16 @@ use atm_core::{SessionId, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage};
 use serde_json::Value;
 
-#[path = "role.rs"]
-pub(crate) mod bounded;
+#[path = "control.rs"]
+pub mod control_support;
+pub(crate) use control_support::role as bounded;
 #[path = "stand_in/events.rs"]
 pub mod events;
 #[path = "stand_in/ownership.rs"]
 mod ownership;
 #[path = "stand_in/parent.rs"]
 pub mod parent;
-#[path = "stand_in/process.rs"]
-pub mod process;
+pub use bounded::process;
 #[path = "stand_in/rows.rs"]
 pub mod rows;
 
@@ -114,6 +114,61 @@ fn checked(output: Output) -> String {
 
 fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn shell_prompt_command() -> String {
+    format!(
+        "PS1=; python3 {}",
+        quote(&format!("{SOURCE}/shell_prompt.py"))
+    )
+}
+
+fn shell_ready_command(prompt: &str, ready: &Path) -> String {
+    format!(
+        "{prompt}; printf 'shell-ready\\n' >> {}; PROMPT_COMMAND={}",
+        quote(ready.to_str().unwrap()),
+        quote(prompt)
+    )
+}
+
+#[cfg(test)]
+pub mod shell_window_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    pub fn shell_ready_follows_held_prompt_setup() {
+        let ready = tempfile::NamedTempFile::new().unwrap();
+        let (read, write) = UnixStream::pair().unwrap();
+        read.set_read_timeout(Some(DEADLINE)).unwrap();
+        let mut child = Command::new("/bin/bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                &shell_ready_command("printf 'tty-setup-held\\n'; read -r release", ready.path()),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(OwnedFd::from(write)))
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut input = child.stdin.take().unwrap();
+        let child = process::OwnedChild::new(child);
+        let mut line = String::new();
+        BufReader::new(read).read_line(&mut line).unwrap();
+        assert_eq!(line, "tty-setup-held\n");
+        assert!(
+            std::fs::read(ready.path()).unwrap().is_empty(),
+            "shell readiness preceded terminal setup completion"
+        );
+        writeln!(input, "release").unwrap();
+        process::wait_exit(pid, DEADLINE).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+        assert_eq!(std::fs::read(ready.path()).unwrap(), b"shell-ready\n");
+    }
 }
 
 pub fn require_tools(path: &std::ffi::OsStr) {
@@ -245,11 +300,36 @@ impl StandInRig {
             self.daemon_pids().is_empty(),
             "private daemon already running"
         );
+        use std::io::{BufRead, BufReader, Seek, SeekFrom};
+        use std::os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        };
+
+        let path = self.root().join("daemon.log");
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.root().join("daemon.log"))
+            .open(&path)
             .unwrap();
+        // Install notification before launch and read only this incarnation's
+        // records: a restart must never reuse the previous listening line.
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        assert!(raw >= 0, "inotify: {}", std::io::Error::last_os_error());
+        let notifications = unsafe { OwnedFd::from_raw_fd(raw) };
+        let watched = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert!(
+            unsafe {
+                libc::inotify_add_watch(
+                    notifications.as_raw_fd(),
+                    watched.as_ptr(),
+                    libc::IN_MODIFY | libc::IN_CLOSE_WRITE,
+                )
+            } >= 0
+        );
+        let mut reader = std::fs::File::open(&path).unwrap();
+        reader.seek(SeekFrom::End(0)).unwrap();
+        let mut reader = BufReader::new(reader);
         self.daemon = Some(
             self.command(Path::new(env!("CARGO_BIN_EXE_atmd")))
                 .envs(&self.daemon_env)
@@ -259,13 +339,89 @@ impl StandInRig {
                 .spawn()
                 .expect("start private atmd"),
         );
-        self.wait("daemon request round trip", || {
+        let pid = self.daemon.as_ref().unwrap().id();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(
+            raw >= 0,
+            "daemon exited before readiness: {}",
+            std::io::Error::last_os_error()
+        );
+        let exited = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let deadline = Instant::now() + DEADLINE;
+        let mut line = String::new();
+        let socket = self.socket();
+        'ready: loop {
+            while reader.read_line(&mut line).unwrap() != 0 {
+                if line.ends_with('\n') {
+                    if line.contains("Daemon server listening")
+                        && line.contains(socket.to_str().unwrap())
+                    {
+                        break 'ready;
+                    }
+                    line.clear();
+                }
+            }
+            let mut events = [
+                libc::pollfd {
+                    fd: notifications.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: exited.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // A kernel-event wait, not a condition/RPC poll. The deadline is
+            // only a generous hang guard; either log activity or exit wakes it.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ready = unsafe {
+                libc::poll(
+                    events.as_mut_ptr(),
+                    events.len() as libc::nfds_t,
+                    i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX),
+                )
+            };
+            if ready < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            assert!(
+                ready > 0,
+                "daemon readiness event missing: {}",
+                self.diagnostics()
+            );
+            assert_eq!(
+                events[1].revents,
+                0,
+                "daemon exited before readiness: {}",
+                self.diagnostics()
+            );
+            let mut buffer = [0u8; 4096];
+            let read = unsafe {
+                libc::read(
+                    notifications.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            assert!(read > 0, "read daemon log notification");
+        }
+        assert!(
             matches!(
-                protocol_request(&self.socket(), ClientMessage::list_sessions(), DEADLINE),
+                protocol_request(&socket, ClientMessage::list_sessions(), DEADLINE),
                 Ok(DaemonMessage::SessionList { .. })
-            )
-        });
-        self.rows = Some(rows::Rows::connect(&self.socket()));
+            ),
+            "one readiness round trip: {}",
+            self.diagnostics()
+        );
+        self.rows = Some(rows::Rows::connect(&socket));
     }
 
     pub fn stop_daemon(&mut self) {
@@ -364,13 +520,7 @@ impl StandInRig {
             .env("ATM_STANDIN_ROOT", self.root())
             .env("ATM_STANDIN_EVENTS", self.events.path())
             .env("ATM_DEBUG", "0")
-            .env(
-                "PROMPT_COMMAND",
-                format!(
-                    "PS1=; python3 {}",
-                    quote(&format!("{SOURCE}/shell_prompt.py"))
-                ),
-            )
+            .env("PROMPT_COMMAND", shell_prompt_command())
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .current_dir(self.root());
         cmd
@@ -392,7 +542,51 @@ impl StandInRig {
         process::run(command)
     }
 
+    /// A fresh interactive shell, with its prompt parsed and prompt child reaped.
+    pub fn shell_window(&self, cwd: &Path) -> String {
+        let ready = tempfile::NamedTempFile::new_in(self.root()).unwrap();
+        let mut writes = control_support::LogEvents::new(ready.path());
+        let prompt = shell_prompt_command();
+        // Reuse the retained-shell cursor-report handshake for a fresh shell.
+        // Only this explicit launcher has no queued command to protect.
+        let startup = r#"printf '{"pane":"%s","shell_launch":true}\n' "$TMUX_PANE" > "$ATM_STANDIN_ROOT/shell-$TMUX_PANE.json"; exec /bin/bash --noprofile --norc"#;
+        let pane = checked(self.tmux(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-c",
+            cwd.to_str().unwrap(),
+            "-e",
+            &format!(
+                "PROMPT_COMMAND={}",
+                shell_ready_command(&prompt, ready.path())
+            ),
+            &format!("/bin/bash --noprofile --norc -c {}", quote(startup)),
+        ]));
+        // Bash's builtin write follows waitpid of the prompt helper, unlike
+        // the helper's socket event, which can precede its own process exit.
+        writes.wait_for("shell-ready", None).unwrap();
+        let screen = checked(self.tmux(&["capture-pane", "-p", "-t", &pane]));
+        assert!(screen.trim_end().ends_with("stand-in-shell$"), "{screen:?}");
+        pane
+    }
+
     pub fn launch(&mut self, config: &StandInConfig) -> StandInPane {
+        self.launch_with_job_control(config, false)
+    }
+
+    /// An adoptable foreground job, like a harness in an interactive shell.
+    pub fn launch_job_controlled(&mut self, config: &StandInConfig) -> StandInPane {
+        self.launch_with_job_control(config, true)
+    }
+
+    fn launch_with_job_control(
+        &mut self,
+        config: &StandInConfig,
+        job_control: bool,
+    ) -> StandInPane {
         self.serial += 1;
         let log = self.root().join(format!("pane-{}.jsonl", self.serial));
         let prefix = format!(
@@ -436,7 +630,11 @@ impl StandInRig {
             "-P",
             "-F",
             "#{pane_id}",
-            &format!("/bin/bash --noprofile --norc -c {}", quote(&command)),
+            &format!(
+                "/bin/bash --noprofile --norc{} -c {}",
+                if job_control { " -m" } else { "" },
+                quote(&command)
+            ),
         ]));
         let pane = self.observe_pane(pane_id, config.mode, log);
         self.wait_event(&pane, 0, |e| e["kind"] == "rendered");

@@ -16,12 +16,20 @@ mod lifecycle;
 #[cfg(test)]
 mod pane_tests;
 mod remove;
+#[cfg(test)]
+mod replay_commands;
+#[cfg(test)]
+mod replay_inputs;
+#[cfg(test)]
+pub(crate) mod replay_support;
+#[cfg(test)]
+mod replay_tests;
 mod status_line;
 #[cfg(test)]
 mod tests;
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
@@ -32,6 +40,7 @@ use atm_core::{ChildRef, SessionDomain, SessionId, SessionView};
 use super::commands::{PaneSession, RegistryCommand, RemovalReason, SessionEvent};
 use super::git::{GitContext, GitLookups, GitResult};
 use super::infra::SessionInfrastructure;
+use super::inputs::{Clock, ProcessInfo, SystemClock, SystemProcessInfo};
 
 // ============================================================================
 // Resource Limits (from RESOURCE_LIMITS.md)
@@ -95,6 +104,9 @@ pub struct RegistryActor {
 
     /// Where finished git-context lookups report back.
     git_results: mpsc::UnboundedReceiver<GitResult>,
+
+    clock: Arc<dyn Clock>,
+    process_info: Arc<dyn ProcessInfo>,
 }
 
 impl RegistryActor {
@@ -127,6 +139,8 @@ impl RegistryActor {
             ended_sessions: HashMap::new(),
             git_lookups,
             git_results,
+            clock: Arc::new(SystemClock),
+            process_info: Arc::new(SystemProcessInfo),
         }
     }
 
@@ -243,7 +257,7 @@ impl RegistryActor {
     fn publish_updated(&self, pid: u32) {
         if let Some((session, _)) = self.sessions_by_pid.get(&pid) {
             let _ = self.event_publisher.send(SessionEvent::Updated {
-                session: Box::new(SessionView::from_domain(session)),
+                session: Box::new(SessionView::from_domain_at(session, self.clock.utc_now())),
             });
         }
     }
@@ -260,14 +274,14 @@ impl RegistryActor {
         self.session_id_to_pid
             .get(session_id)
             .and_then(|pid| self.sessions_by_pid.get(pid))
-            .map(|(session, _)| SessionView::from_domain(session))
+            .map(|(session, _)| SessionView::from_domain_at(session, self.clock.utc_now()))
     }
 
     /// Handles getting all sessions.
     fn handle_get_all_sessions(&self) -> Vec<SessionView> {
         self.sessions_by_pid
             .values()
-            .map(|(session, _)| SessionView::from_domain(session))
+            .map(|(session, _)| SessionView::from_domain_at(session, self.clock.utc_now()))
             .collect()
     }
 
@@ -277,7 +291,7 @@ impl RegistryActor {
             .values()
             .filter(|(session, _)| session.tmux_pane.as_deref() == Some(pane))
             .map(|(session, infra)| PaneSession {
-                view: SessionView::from_domain(session),
+                view: SessionView::from_domain_at(session, self.clock.utc_now()),
                 pid: infra.pid,
                 start: infra.start.clone(),
             })
@@ -289,7 +303,7 @@ impl RegistryActor {
     /// Detects branch switches that happen without a working directory change
     /// (e.g., `git checkout other-branch` in the same directory).
     fn handle_refresh_git_info(&mut self) {
-        let now = Instant::now();
+        let now = self.clock.instant_now();
         let cwds: HashSet<&str> = self
             .sessions_by_pid
             .values()

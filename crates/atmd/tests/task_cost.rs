@@ -25,7 +25,7 @@ fn now() -> DateTime<Utc> {
 fn actor(who: &str) -> TaskActor {
     TaskActor {
         who: who.parse().unwrap(),
-        lead: false,
+        manager_of: None,
     }
 }
 async fn seed(org: &OrgHandle) -> TaskId {

@@ -1,0 +1,14 @@
+{"seq":1,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"alpha","root":"/fixtures/alpha"}}
+{"seq":2,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"beta","root":"/fixtures/beta"}}
+{"seq":3,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"alpha/build","pane":"%1","session_id":"s1"}}
+{"seq":4,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"beta/review","pane":"%2","session_id":"s2"}}
+{"seq":5,"ts":"2026-01-01T00:00:00Z","kind":"task.created","body":{"title":"Work","kind":"work","creator":"owner","parent":null,"judges":null,"measure":{"kind":"mechanical","command":"check"},"budget":{"turns":1,"cost":{"microdollars":100000},"deadline":"2026-01-01T00:00:04Z"},"files":[],"rests_on":null}}
+{"seq":6,"ts":"2026-01-01T00:00:01Z","kind":"task.assigned","body":{"task_id":"t5","agent_id":"alpha/build","by":"owner"}}
+{"seq":7,"ts":"2026-01-01T00:00:02Z","kind":"task.state_changed","body":{"task_id":"t5","state":"working","reason":null,"by":"alpha/build"}}
+{"seq":8,"ts":"2026-01-01T00:00:03Z","kind":"task.usage_observed","body":{"session_id":"s1","task_id":"t5","turn":true,"cumulative_cost":{"microdollars":100000},"context_percent":40}}
+{"seq":9,"ts":"2026-01-01T00:00:04Z","kind":"task.usage_observed","body":{"session_id":"s1","task_id":"t5","turn":true,"cumulative_cost":{"microdollars":400000},"context_percent":60}}
+{"seq":10,"ts":"2026-01-01T00:00:05Z","kind":"task.submitted","body":{"task_id":"t5","what":"result","files":[],"by":"alpha/build"}}
+{"seq":11,"ts":"2026-01-01T00:00:06Z","kind":"task.verdict","body":{"task_id":"t5","verdict":"accepted","review_task":null,"note":"PRIVATE_VERDICT","by":"owner"}}
+{"seq":12,"ts":"2026-01-01T00:00:06Z","kind":"task.cost_recorded","body":{"task_id":"t5","record":{"turns":2,"review_rounds":0,"changes_requested":0,"cost":{"microdollars":300000},"peak_context_percent":60,"seconds_in_state":{"open":1,"assigned":1,"working":3,"submitted":1}}}}
+{"seq":13,"ts":"2026-01-01T00:00:06Z","kind":"session.summary","body":{"session_id":"s1","pane":"%1","agent_id":"alpha/build","harness":"pi","model":"model-a","cost":{"microdollars":400000},"first_prompt":"PRIVATE_PROMPT","started":"2026-01-01T00:00:00Z","ended":"2026-01-01T00:00:06Z"}}
+{"seq":14,"ts":"2026-01-01T00:00:07Z","kind":"task.created","body":{"title":"Work","kind":"work","creator":"owner","parent":null,"judges":null,"measure":{"kind":"mechanical","command":"check"},"budget":{"turns":1,"cost":{"microdollars":1},"deadline":"2026-01-01T00:00:50Z"},"files":[],"rests_on":null}}

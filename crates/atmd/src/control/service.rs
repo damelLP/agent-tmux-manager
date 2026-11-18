@@ -10,6 +10,441 @@ mod tests {
     use atm_tmux::{mock::MockCall, MockTmuxClient};
 
     #[tokio::test]
+    async fn spawn_prepare_largest_actor_ignores_list_failure_and_closed_service_is_value() {
+        let mock = MockTmuxClient::new();
+        let cancel = CancellationToken::new();
+        let (control, task) = spawn_control(
+            Box::new(mock.clone()),
+            crate::registry::spawn_registry(),
+            OrgHandle::disabled("test"),
+            cancel.clone(),
+        );
+        for (caller, target) in [(Some("%7"), "%7"), (None, "%0")] {
+            for error in [
+                atm_tmux::TmuxError::NotFound,
+                atm_tmux::TmuxError::Timeout {
+                    command: "list-panes".into(),
+                    timeout: Duration::from_secs(5),
+                },
+            ] {
+                mock.clear_calls();
+                mock.set_next_error(error);
+                mock.set_pane_cwd(target, "/fallback-target");
+                let context = control
+                    .prepare_spawn_largest(caller.map(str::to_owned))
+                    .await
+                    .unwrap();
+                assert_eq!(context.target_pane, target);
+                assert_eq!(context.cwd.as_deref(), Some("/fallback-target"));
+                assert_eq!(
+                    mock.calls(),
+                    vec![
+                        MockCall::ListPanes,
+                        MockCall::GetPaneCwd {
+                            pane: target.into()
+                        }
+                    ]
+                );
+            }
+        }
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(matches!(
+            control.prepare_spawn_largest(None).await,
+            Err(ServiceError::Unavailable)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_prepare_largest_actor_budget_and_abandoned_admission() {
+        for abandoned in [false, true] {
+            let (sender, mut receive) = mpsc::channel(CAPACITY);
+            let control = ControlHandle {
+                windows: windows::Flights::default(),
+                server: Some("/unverified/server".into()),
+                sender,
+                audits: AuditQueue {
+                    sender: mpsc::channel(1).0,
+                    dropped: Arc::new(AtomicU64::new(0)),
+                },
+                caller: None,
+                work: CancellationToken::new(),
+            };
+            let call =
+                tokio::spawn(async move { control.prepare_spawn_largest(Some("%7".into())).await });
+            let pending = receive.recv().await.unwrap();
+            if abandoned {
+                call.abort();
+                assert!(call.await.unwrap_err().is_cancelled());
+            } else {
+                tokio::time::advance(Duration::from_secs(30)).await;
+                assert!(matches!(call.await.unwrap(), Err(ServiceError::Timeout)));
+            }
+            let mock = MockTmuxClient::new();
+            execute(&mock, pending).await;
+            assert!(
+                mock.calls().is_empty(),
+                "expired/abandoned preparation read identity or panes"
+            );
+        }
+    }
+
+    // Breaks if role I/O swallows tmux failures, retries, or uses any other
+    // control family. These in-process calls intentionally have no server guard.
+    #[tokio::test]
+    async fn session_roles_actor_errors_and_closed_service_are_values() {
+        let mock = MockTmuxClient::new();
+        let cancel = CancellationToken::new();
+        let (control, task) = spawn_control(
+            Box::new(mock.clone()),
+            crate::registry::spawn_registry(),
+            OrgHandle::disabled("test"),
+            cancel.clone(),
+        );
+        for write in [false, true] {
+            for (error, code) in [
+                (
+                    atm_tmux::TmuxError::CommandFailed {
+                        command: "role-command".into(),
+                        stderr: "no such pane".into(),
+                    },
+                    "internal",
+                ),
+                (
+                    atm_tmux::TmuxError::Timeout {
+                        command: "role-command".into(),
+                        timeout: Duration::from_secs(5),
+                    },
+                    "timeout",
+                ),
+            ] {
+                mock.clear_calls();
+                mock.set_next_error(error);
+                let result = if write {
+                    control.role_set("%7".into(), false).await
+                } else {
+                    control.roles().await.map(|_| ())
+                };
+                let error = crate::server::methods::control_error(result.unwrap_err());
+                assert_eq!(error.0.code, code);
+                assert!(error.0.message.contains("role-command"));
+                assert_eq!(mock.call_count(), 1, "role I/O retried");
+            }
+        }
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(matches!(
+            control.roles().await,
+            Err(ServiceError::Unavailable)
+        ));
+        assert!(matches!(
+            control.role_set("%7".into(), true).await,
+            Err(ServiceError::Unavailable)
+        ));
+    }
+
+    // Breaks if canceled/expired queued role operations read identity or tags,
+    // mutate a pane, or forget that the total budget includes queue time.
+    #[tokio::test(start_paused = true)]
+    async fn session_roles_actor_budget_and_abandoned_admission() {
+        for write in [false, true] {
+            for abandoned in [false, true] {
+                let (sender, mut receive) = mpsc::channel(CAPACITY);
+                let control = ControlHandle {
+                    windows: windows::Flights::default(),
+                    server: Some("/unverified/server".into()),
+                    sender,
+                    audits: AuditQueue {
+                        sender: mpsc::channel(1).0,
+                        dropped: Arc::new(AtomicU64::new(0)),
+                    },
+                    caller: None,
+                    work: CancellationToken::new(),
+                };
+                let call = tokio::spawn(async move {
+                    if write {
+                        control.role_set("%7".into(), true).await
+                    } else {
+                        control.roles().await.map(|_| ())
+                    }
+                });
+                let pending = receive.recv().await.unwrap();
+                if abandoned {
+                    call.abort();
+                    assert!(call.await.unwrap_err().is_cancelled());
+                } else {
+                    tokio::time::advance(Duration::from_secs(30)).await;
+                    assert!(matches!(call.await.unwrap(), Err(ServiceError::Timeout)));
+                }
+                let mock = MockTmuxClient::new();
+                execute(&mock, pending).await;
+                assert!(
+                    mock.calls().is_empty(),
+                    "abandoned/expired role request touched tmux"
+                );
+            }
+        }
+    }
+
+    mod role_caller_loss {
+        use super::*;
+        use atm_tmux::{PaneInfo, TmuxError};
+        type Call<'a, T> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, TmuxError>> + Send + 'a>>;
+        macro_rules! forward {
+            ($method:ident <$($lt:lifetime),*> ($($arg:ident : $ty:ty),*) -> $result:ty) => {
+                fn $method<'s, $($lt,)* 'async_trait>(&'s self, $($arg: $ty),*) -> Call<'async_trait, $result>
+                where 's: 'async_trait, $($lt: 'async_trait,)* Self: 'async_trait {
+                    Box::pin(self.mock.$method($($arg),*))
+                }
+            };
+        }
+        struct IdentityGate {
+            mock: MockTmuxClient,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Semaphore>,
+        }
+        impl TmuxClient for IdentityGate {
+            fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
+                &'s self,
+                command: &'c str,
+                args: &'a [&'v str],
+            ) -> Call<'async_trait, String>
+            where
+                's: 'async_trait,
+                'c: 'async_trait,
+                'a: 'async_trait,
+                'v: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(async move {
+                    if command == "display-message" {
+                        self.entered.notify_one();
+                        self.release.acquire().await.unwrap().forget();
+                    }
+                    self.mock.raw_command(command, args).await
+                })
+            }
+            forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());
+            forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
+            forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
+            forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
+            forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
+            forward!(kill_pane<'a>(pane: &'a str) -> ());
+            forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
+            forward!(list_panes<>() -> Vec<PaneInfo>);
+            forward!(display_popup<'a, 'b, 'c>(width: &'a str, height: &'b str, command: &'c str) -> ());
+            forward!(select_pane<'a>(pane: &'a str) -> ());
+            forward!(capture_pane<'a>(pane: &'a str) -> Vec<String>);
+            forward!(new_session<'a>(name: &'a str) -> String);
+        }
+
+        #[tokio::test]
+        async fn spawn_prepare_largest_caller_gone_during_identity_does_no_pane_io() {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                let dir = tempfile::tempdir().unwrap();
+                let own = dir.path().join("own.sock");
+                std::fs::write(&own, "").unwrap();
+                let mock = MockTmuxClient::new();
+                mock.set_next_raw_output(own.to_str().unwrap());
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let cancel = CancellationToken::new();
+                let (control, task) = spawn_control(
+                    Box::new(IdentityGate {
+                        mock: mock.clone(),
+                        entered: entered.clone(),
+                        release: release.clone(),
+                    }),
+                    crate::registry::spawn_registry(),
+                    OrgHandle::disabled("test"),
+                    cancel.clone(),
+                );
+                let handle = control
+                    .clone()
+                    .for_server(Some(own.to_str().unwrap().into()));
+                let call =
+                    tokio::spawn(
+                        async move { handle.prepare_spawn_largest(Some("%7".into())).await },
+                    );
+                entered.notified().await;
+                call.abort();
+                assert!(call.await.unwrap_err().is_cancelled());
+                release.add_permits(1);
+                control.flush_audits().await;
+                assert_eq!(
+                    mock.calls(),
+                    vec![MockCall::RawCommand {
+                        subcommand: "display-message".into(),
+                        args: vec!["-p".into(), "#{socket_path}".into()]
+                    }]
+                );
+                cancel.cancel();
+                task.await.unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        // Removing the second caller check would read/write after this gate.
+        #[tokio::test]
+        async fn session_roles_caller_gone_during_identity_does_no_role_io() {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                for write in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let own = dir.path().join("own.sock");
+                    std::fs::write(&own, "").unwrap();
+                    let mock = MockTmuxClient::new();
+                    mock.set_next_raw_output(own.to_str().unwrap());
+                    let entered = Arc::new(tokio::sync::Notify::new());
+                    let release = Arc::new(tokio::sync::Semaphore::new(0));
+                    let cancel = CancellationToken::new();
+                    let (control, task) = spawn_control(
+                        Box::new(IdentityGate {
+                            mock: mock.clone(),
+                            entered: entered.clone(),
+                            release: release.clone(),
+                        }),
+                        crate::registry::spawn_registry(),
+                        OrgHandle::disabled("test"),
+                        cancel.clone(),
+                    );
+                    let handle = control
+                        .clone()
+                        .for_server(Some(own.to_str().unwrap().into()));
+                    let call = tokio::spawn(async move {
+                        if write {
+                            handle.role_set("%7".into(), true).await
+                        } else {
+                            handle.roles().await.map(|_| ())
+                        }
+                    });
+                    entered.notified().await;
+                    call.abort();
+                    assert!(call.await.unwrap_err().is_cancelled());
+                    release.add_permits(1);
+                    control.flush_audits().await;
+                    assert_eq!(
+                        mock.calls(),
+                        vec![MockCall::RawCommand {
+                            subcommand: "display-message".into(),
+                            args: vec!["-p".into(), "#{socket_path}".into()]
+                        }]
+                    );
+                    cancel.cancel();
+                    task.await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    // Breaks if membership failures become empty success, lose their tmux
+    // cause, or enter another control family instead of the single list read.
+    #[tokio::test]
+    async fn session_panes_actor_propagates_failed_reads_and_closed_service() {
+        let mock = MockTmuxClient::new();
+        let cancel = CancellationToken::new();
+        let (control, task) = spawn_control(
+            Box::new(mock.clone()),
+            crate::registry::spawn_registry(),
+            OrgHandle::disabled("test"),
+            cancel.clone(),
+        );
+        for (error, code) in [
+            (
+                atm_tmux::TmuxError::CommandFailed {
+                    command: "list-panes".into(),
+                    stderr: "read failed".into(),
+                },
+                "internal",
+            ),
+            (
+                atm_tmux::TmuxError::Timeout {
+                    command: "list-panes".into(),
+                    timeout: Duration::from_secs(5),
+                },
+                "timeout",
+            ),
+        ] {
+            mock.clear_calls();
+            mock.set_next_error(error);
+            let failed = control.session_panes("work".into()).await.unwrap_err();
+            let mapped = crate::server::methods::control_error(failed);
+            assert_eq!(mapped.0.code, code);
+            assert!(mapped.0.message.contains("list-panes"));
+            assert_eq!(mock.calls(), vec![MockCall::ListPanes]);
+        }
+        assert!(control
+            .session_panes("missing".into())
+            .await
+            .unwrap()
+            .is_empty());
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(matches!(
+            control.session_panes("work".into()).await,
+            Err(ServiceError::Unavailable)
+        ));
+    }
+
+    // Breaks if queued timeout/caller loss still performs membership I/O.
+    // Only in-memory channels run on the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn session_panes_actor_budget_and_abandoned_admission() {
+        let (sender, mut receive) = mpsc::channel(CAPACITY);
+        let control = ControlHandle {
+            windows: windows::Flights::default(),
+            server: None,
+            sender,
+            audits: AuditQueue {
+                sender: mpsc::channel(1).0,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+            caller: None,
+            work: CancellationToken::new(),
+        };
+        let handle = control.clone();
+        let started = Instant::now();
+        let call = tokio::spawn(async move { handle.session_panes("work".into()).await });
+        let pending = receive.recv().await.unwrap();
+        tokio::time::advance(ACTION_TIMEOUT).await;
+        assert!(matches!(call.await.unwrap(), Err(ServiceError::Timeout)));
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        let mock = MockTmuxClient::new();
+        execute(&mock, pending).await;
+        assert!(mock.calls().is_empty());
+        for expired in [false, true] {
+            let (reply, response) = oneshot::channel();
+            if !expired {
+                drop(response);
+            }
+            execute(
+                &mock,
+                Pending {
+                    server: Some("/unverified/server".into()),
+                    caller: None,
+                    deadline: if expired {
+                        Instant::now()
+                    } else {
+                        Instant::now() + ACTION_TIMEOUT
+                    },
+                    request: Request::Panes {
+                        session_name: "work".into(),
+                        reply,
+                    },
+                },
+            )
+            .await;
+            assert!(
+                mock.calls().is_empty(),
+                "abandoned or expired read touched tmux"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn actions_use_owned_client_and_spawn_stages_do_not_type_early() {
         let mock = MockTmuxClient::new();
         mock.set_next_raw_output("0 1");
@@ -379,6 +814,7 @@ mod tests {
                     .unwrap();
             }
             let handle = ControlHandle {
+                windows: windows::Flights::default(),
                 server: None,
                 sender,
                 audits: AuditQueue {
@@ -431,7 +867,7 @@ mod dialog_request_tests;
 mod pane_request_tests;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -451,7 +887,7 @@ use super::{
         jobs::{Command, Jobs},
         ReservationError,
     },
-    ControlError, ReplyOutcome, SpawnContext,
+    windows, ControlError, ReplyOutcome, SpawnContext,
 };
 use crate::{org::OrgHandle, registry::RegistryHandle, server::methods::CallContext};
 
@@ -508,6 +944,10 @@ enum Request {
         text: String,
         reply: Reply<String>,
     },
+    PrepareLargest {
+        caller: Option<String>,
+        reply: Reply<SpawnContext>,
+    },
     Prepare {
         target: Option<String>,
         cwd: Option<String>,
@@ -546,6 +986,19 @@ enum Request {
         tail: Option<usize>,
         prompt: bool,
         reply: Reply<Vec<String>>,
+    },
+    Windows(windows::Flight),
+    Panes {
+        session_name: String,
+        reply: Reply<HashSet<String>>,
+    },
+    Roles {
+        reply: Reply<HashSet<String>>,
+    },
+    RoleSet {
+        pane: String,
+        on: bool,
+        reply: Reply<()>,
     },
 }
 
@@ -630,6 +1083,7 @@ impl AuditQueue {
 /// A bounded queue shared by RPC and in-process control clients.
 #[derive(Debug, Clone)]
 pub struct ControlHandle {
+    windows: windows::Flights,
     server: Option<String>,
     sender: mpsc::Sender<Pending>,
     audits: AuditQueue,
@@ -779,6 +1233,64 @@ impl ControlHandle {
             reply,
         })
         .await
+    }
+
+    /// Caller-independent facts, single-flight across every clone of this actor's handle.
+    pub(crate) async fn windows(&self) -> windows::WindowsSnapshot {
+        let Some(subscription) = self.windows.subscribe(Instant::now()) else {
+            return windows::unavailable(chrono::Utc::now(), "window reader unavailable");
+        };
+        if let Some(flight) = subscription.start {
+            if self
+                .sender
+                .try_send(Pending {
+                    server: None,
+                    caller: None,
+                    deadline: subscription.deadline,
+                    request: Request::Windows(flight),
+                })
+                .is_err()
+            {
+                return windows::unavailable(chrono::Utc::now(), "control service unavailable");
+            }
+        }
+        timeout_at(
+            subscription.deadline,
+            windows::receive(subscription.receive),
+        )
+        .await
+        .unwrap_or_else(|_| windows::unavailable(chrono::Utc::now(), "window read timed out"))
+    }
+
+    /// Read exact session membership without resolving a registry target or auditing.
+    pub async fn session_panes(
+        &self,
+        session_name: String,
+    ) -> Result<HashSet<String>, ServiceError> {
+        self.request(|reply| Request::Panes {
+            session_name,
+            reply,
+        })
+        .await
+    }
+
+    /// Read exact coordinator tags without registry classification or auditing.
+    pub async fn roles(&self) -> Result<HashSet<String>, ServiceError> {
+        self.request(|reply| Request::Roles { reply }).await
+    }
+
+    /// Set or clear pane-local metadata, independently of reserved input work.
+    pub async fn role_set(&self, pane: String, on: bool) -> Result<(), ServiceError> {
+        self.request(|reply| Request::RoleSet { pane, on, reply })
+            .await
+    }
+
+    pub async fn prepare_spawn_largest(
+        &self,
+        caller: Option<String>,
+    ) -> Result<SpawnContext, ServiceError> {
+        self.request(|reply| Request::PrepareLargest { caller, reply })
+            .await
     }
 
     pub async fn prepare_spawn(
@@ -1012,6 +1524,14 @@ where
                             }
                             jobs.dispatch(command, Instant::now(), work.is_cancelled(), &*client).await;
                         }
+                        self::Pending { request: Request::Windows(flight), deadline, .. } => {
+                            let value = if stopping {
+                                windows::unavailable(chrono::Utc::now(), "control service stopping")
+                            } else {
+                                windows::read(&*client, &registry, deadline).await
+                            };
+                            flight.finish(value);
+                        }
                         pending if pane_request::is_pane_request(&pending) => {
                             pane_request::dispatch(&*client, &registry, &mut jobs, pending, &audits).await;
                         }
@@ -1052,6 +1572,7 @@ where
     });
     (
         ControlHandle {
+            windows: windows::Flights::default(),
             server: None,
             sender,
             audits: handle_audits,
@@ -1209,6 +1730,15 @@ async fn execute(client: &dyn TmuxClient, pending: Pending) -> Option<Audit> {
     let deadline = pending.deadline;
     let expired = Instant::now() >= deadline;
     let caller = pending.caller.as_ref();
+    let abandoned = match &pending.request {
+        Request::Panes { reply, .. } | Request::Roles { reply } => reply.is_closed(),
+        Request::RoleSet { reply, .. } => reply.is_closed(),
+        Request::PrepareLargest { reply, .. } => reply.is_closed(),
+        _ => false,
+    };
+    if abandoned {
+        return None;
+    }
     if let Some(server) = pending.server {
         let operation = match &pending.request {
             Request::Prepare { target, caller, .. } => format!(
@@ -1219,6 +1749,10 @@ async fn execute(client: &dyn TmuxClient, pending: Pending) -> Option<Audit> {
                     .unwrap_or("the active pane")
             ),
             Request::Split { context, .. } => format!("spawn from {}", context.target_pane),
+            Request::Panes { session_name, .. } => format!("list panes for {session_name}"),
+            Request::Roles { .. } => "read pane roles".into(),
+            Request::RoleSet { pane, .. } => format!("set role on {pane}"),
+            Request::PrepareLargest { .. } => "prepare largest-pane spawn".into(),
             #[cfg(test)]
             Request::FlushAudit(_) => "flush audits".into(),
             _ => return None,
@@ -1228,7 +1762,13 @@ async fn execute(client: &dyn TmuxClient, pending: Pending) -> Option<Audit> {
                 Request::Split { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
-                Request::Prepare { reply, .. } => {
+                Request::Prepare { reply, .. } | Request::PrepareLargest { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+                Request::Panes { reply, .. } | Request::Roles { reply } => {
+                    let _ = reply.send(Err(error));
+                }
+                Request::RoleSet { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
                 #[cfg(test)]
@@ -1243,6 +1783,57 @@ async fn execute(client: &dyn TmuxClient, pending: Pending) -> Option<Audit> {
     let audit = match pending.request {
         #[cfg(test)]
         Request::FlushAudit(reply) => return Some(Audit::Barrier(reply)),
+        Request::Panes {
+            session_name,
+            reply,
+        } => {
+            let result = outcome(deadline, async {
+                if reply.is_closed() {
+                    return Err(ServiceError::Unavailable);
+                }
+                super::session_panes(client, &session_name)
+                    .await
+                    .map_err(|source| {
+                        ControlError::Tmux {
+                            context: format!("Failed to list panes for {session_name}"),
+                            source,
+                        }
+                        .into()
+                    })
+            })
+            .await;
+            respond(reply, result, |_| None)
+        }
+        Request::Roles { reply } => {
+            let result = outcome(deadline, async {
+                if reply.is_closed() {
+                    return Err(ServiceError::Unavailable);
+                }
+                Ok(super::roles::coordinator_panes(client).await?)
+            })
+            .await;
+            respond(reply, result, |_| None)
+        }
+        Request::RoleSet { pane, on, reply } => {
+            let result = outcome(deadline, async {
+                if reply.is_closed() {
+                    return Err(ServiceError::Unavailable);
+                }
+                Ok(super::roles::set_coordinator(client, &pane, on).await?)
+            })
+            .await;
+            respond(reply, result, |_| None)
+        }
+        Request::PrepareLargest { caller, reply } => {
+            let result = outcome(deadline, async {
+                if reply.is_closed() {
+                    return Err(ServiceError::Unavailable);
+                }
+                Ok(super::prepare_spawn_largest(client, caller.as_deref()).await)
+            })
+            .await;
+            respond(reply, result, |_| None)
+        }
         Request::Prepare {
             target,
             cwd,

@@ -2,7 +2,7 @@
 
 async fn deadline_task(rig: &Rig, creator: Address, deadline: i64) -> TaskId {
     let made = rig.run(OrgCommand::Task(TaskCommand::Create(TaskCreated {
-        title: "Budgeted work".into(), kind: TaskKind::Work, creator,
+        project_id: None, title: "Budgeted work".into(), kind: TaskKind::Work, creator,
         parent: None, judges: None, measure: TaskMeasure::Owner,
         budget: Some(atm_org::TaskBudget { cost: None, turns: None, deadline: Some(at(deadline)) }),
         files: vec![], rests_on: None,
@@ -13,6 +13,96 @@ async fn deadline_task(rig: &Rig, creator: Address, deadline: i64) -> TaskId {
 fn budgets_only(rig: &Rig) -> tokio::task::JoinHandle<()> {
     let off = parse_reminder_settings("[reminder]\nenabled=false").unwrap();
     tokio::spawn(run(rig.org.clone(), rig.rows.subscribe(), off, rig.clock(), rig.cancel.clone()))
+}
+
+// Break caught: the main commit receive ignores a decision overrule that
+// reopens accepted work, leaving its budget deadline without a timer.
+#[tokio::test(start_paused = true)]
+async fn budget_overrule_rearms_an_accepted_tasks_deadline() {
+    overrule_deadline(false).await;
+}
+
+// Break caught: a ready registry row selects the commit-drain path, where
+// ignoring the same overrule would also leave the deadline unscheduled.
+#[tokio::test(start_paused = true)]
+async fn budget_overrule_rearms_with_a_ready_registry_row() {
+    overrule_deadline(true).await;
+}
+
+async fn overrule_deadline(registry_ready: bool) {
+    use atm_org::{DecisionCommand, DecisionId, DecisionKind, DecisionRequest,
+        DecisionResolution, ProvisionalChoice, TaskSubmission, TaskVerdict};
+
+    let mut rig = Rig::new().await;
+    let requested = rig.run(OrgCommand::Decision(DecisionCommand::Request(DecisionRequest {
+        requester: Address::Agent(agent("lead")), kind: DecisionKind::Policy,
+        title: "Choose the approach".into(), context: String::new(), files: vec![],
+        options: vec!["small".into(), "large".into()], recommended: Some("small".into()),
+        may_be_undone: true, changes_intent: true, deadline: None,
+    }))).await;
+    let decision = DecisionId::new(requested.first().unwrap().seq);
+    let made = rig.run(OrgCommand::Task(TaskCommand::Create(TaskCreated {
+        project_id: None, title: "Accepted budgeted work".into(), kind: TaskKind::Work, creator: Address::Owner,
+        parent: None, judges: None, measure: TaskMeasure::Owner,
+        budget: Some(atm_org::TaskBudget { cost: None, turns: None, deadline: Some(at(30)) }),
+        files: vec![], rests_on: Some(decision),
+    }))).await;
+    let task: TaskId = format!("t{}", made.first().unwrap().seq).parse().unwrap();
+    let owner = TaskActor { who: Address::Owner, manager_of: None };
+    rig.run(OrgCommand::Task(TaskCommand::Assign {
+        task_id: task.clone(), agent_id: agent("build"), by: owner.clone(),
+    })).await;
+    rig.run(OrgCommand::Task(TaskCommand::Submit {
+        task_id: task.clone(), what: TaskSubmission::Result, files: vec![],
+        by: TaskActor { who: Address::Agent(agent("build")), manager_of: None },
+    })).await;
+    rig.run(OrgCommand::Task(TaskCommand::Verdict {
+        task_id: task.clone(), verdict: TaskVerdict::Accepted, review_task: None,
+        note: None, by: owner,
+    })).await;
+    rig.run(OrgCommand::Decision(DecisionCommand::TakeProvisionally(ProvisionalChoice {
+        decision_id: decision, option: "small".into(), by: Address::System, relayed_by: None,
+    }))).await;
+    assert_eq!(rig.state().await.task(&task).unwrap().state, TaskState::Accepted);
+    assert_eq!(rig.now(), at(0));
+
+    let scheduler = run(rig.org.clone(), rig.rows.subscribe(), None::<ReminderSettings>,
+        rig.clock(), rig.cancel.clone());
+    tokio::pin!(scheduler);
+    // Reading this row proves startup reconciliation finished with no wake.
+    // Keep the future unpolled while the real actor commits the overrule, so
+    // both selection paths can be exercised without a scheduling race.
+    tokio::select! {
+        biased;
+        () = &mut scheduler => panic!("scheduler stopped before startup"),
+        () = rig.report(working("s1")) => {}
+    }
+    let overruled = rig.run(OrgCommand::Decision(DecisionCommand::Resolve(DecisionResolution {
+        decision_id: decision, option: "large".into(), by: Address::Owner,
+        note: None, standing_rule: false,
+    }))).await;
+    assert_eq!(overruled.len(), 1);
+    let overruled = overruled.first().unwrap();
+    assert_eq!(overruled.kind, "decision.overruled");
+    assert_eq!(rig.state().await.task(&task).unwrap().state, TaskState::Open);
+    if registry_ready {
+        rig.rows.send(working("s1")).unwrap();
+    }
+    let (_, note, when) = tokio::select! {
+        biased;
+        () = &mut scheduler => panic!("scheduler stopped before the budget note"),
+        sent = rig.sent() => sent,
+    };
+    assert_eq!(when, at(30));
+    assert_eq!(note.task, Some(task));
+    assert_eq!(note.to, Address::Owner);
+    assert!(note.body.contains("crossed a budget limit"));
+    assert_eq!(rig.count("msg.sent"), 1);
+    assert_eq!(rig.count("task.reminded"), 0);
+    assert!(rig.log.lock().unwrap().iter()
+        .filter(|event| event.seq > overruled.seq)
+        .all(|event| !event.kind.starts_with("task.")),
+        "no later task event may repair the missing overrule wake");
 }
 
 // Break caught: deadlines depend on a registry turn end instead of their timer.
@@ -72,7 +162,7 @@ async fn budget_and_reminder_keep_their_independent_wakes() {
         let task = deadline_task(&rig, Address::Owner, deadline).await;
         rig.run(OrgCommand::Task(TaskCommand::Assign {
             task_id: task.clone(), agent_id: agent("build"),
-            by: TaskActor { who: Address::Owner, lead: false },
+            by: TaskActor { who: Address::Owner, manager_of: None },
         })).await;
         rig.schedule();
         rig.turn("s1").await;
@@ -109,7 +199,7 @@ async fn budget_restart_retains_queued_delivered_read_and_failed_latches() {
             rig.run(OrgCommand::DeliveryFailed { message_id, reason: "gave up".into(), final_failure: true }).await;
         }
         rig.run(OrgCommand::Task(TaskCommand::Assign {
-            task_id: task, agent_id: agent("build"), by: TaskActor { who: Address::Owner, lead: false },
+            task_id: task, agent_id: agent("build"), by: TaskActor { who: Address::Owner, manager_of: None },
         })).await;
         let state = rig.state().await;
         rig.cancel.cancel();
@@ -177,6 +267,12 @@ async fn budget_lost_enqueue_reply_is_resnapshotted_before_retry() {
                     }
                     if let Ok(state) = actor.snapshot().await { let _ = reply.send(state); }
                 },
+                super::super::Request::SnapshotAt(reply) => {
+                    let _ = reply.send(actor.snapshot_at().await);
+                },
+                super::super::Request::ReportSnapshot(reply) => {
+                    if let Ok(snapshot) = actor.report_snapshot().await { let _ = reply.send(snapshot); }
+                },
                 super::super::Request::Execute { command, now, caller_pane, reply } => {
                     let lose = held_reply.is_none() && matches!(command.as_ref(), OrgCommand::SendMessage(_));
                     let result = actor.execute_receipt(*command, now, caller_pane).await;
@@ -207,7 +303,7 @@ async fn budget_early_finish_stays_quiet_and_alerted_tasks_can_keep_working() {
     let early = deadline_task(&rig, Address::Owner, 30).await;
     rig.run(OrgCommand::Task(TaskCommand::SetState {
         task_id: early, state: TaskState::Cancelled, reason: None,
-        by: TaskActor { who: Address::Owner, lead: false },
+        by: TaskActor { who: Address::Owner, manager_of: None },
     })).await;
     let due = deadline_task(&rig, Address::Owner, 60).await;
     budgets_only(&rig);
@@ -216,7 +312,7 @@ async fn budget_early_finish_stays_quiet_and_alerted_tasks_can_keep_working() {
     assert_eq!(when, at(60));
     rig.run(OrgCommand::Task(TaskCommand::Assign {
         task_id: due.clone(), agent_id: agent("build"),
-        by: TaskActor { who: Address::Owner, lead: false },
+        by: TaskActor { who: Address::Owner, manager_of: None },
     })).await;
     rig.set(&due, TaskState::Working, None, "build").await;
     assert_eq!(rig.state().await.task(&due).unwrap().state, TaskState::Working);

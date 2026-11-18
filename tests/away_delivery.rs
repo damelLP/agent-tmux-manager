@@ -187,15 +187,36 @@ fn a_decision_asked_while_away_is_taken_told_capped_and_survives_a_restart() {
     assert_eq!(assign(&rig, &second, &seat).unwrap_err(), held);
 
     // Back is not an answer: the second task still waits.
-    let back = rig.atm_json(None, &["back", "--format", "json"]);
+    let mut back = rig.atm_json(None, &["back", "--format", "json"]);
+    let digest = back.as_object_mut().unwrap().remove("digest").unwrap();
+    assert_eq!(digest["counts"]["during_absence"], 1);
+    assert_eq!(digest["counts"]["waiting_tasks"], 1);
+    assert_eq!(digest["rows"].as_array().unwrap().len(), 4);
+    assert_eq!(digest["absence"]["since"], since);
     assert_eq!(
         back,
         json!({"changed":true,"away_since":since,"provisional_count":1,"pending_count":0})
     );
     assert_eq!(assign(&rig, &second, &seat).unwrap_err(), held);
+    let seconds = |value: &Value| {
+        chrono::DateTime::parse_from_rfc3339(value.as_str().unwrap())
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
     assert_eq!(
         String::from_utf8(rig.atm(None, &["back"]).stdout).unwrap(),
-        "Not away.\n"
+        format!("Not away. Showing the last absence: {since} to {until}.\n\
+Relay seat: none\n\
+Decided for you while away (1):\n\
+{decision} Which interface = yes [taken_provisionally; by=system]\n  Recorded work: 1 started (0 accepted), 1 not started.\n  Overruling would reopen 1 task.\n  redo: {first} [assigned; direct] First on it\n  not started: {second} [open; direct] Second on it\n  Answer: atm decide {decision} <option>\n\
+Relayed spoken answers: none.\n\
+Earlier provisional decisions: none.\n\
+Still waiting (1):\n\
+{second} Second on it [open; stacking cap on {decision}]\n\
+Numbers (all recorded time): 1 decision taken for you; 0 overruled.\n\
+Tasks redone per overrule: none.\n\
+Recorded links only: unlinked work and an unlinked task in progress are not included.\n",
+            since=seconds(&since), until=seconds(&digest["absence"]["until"]), first=first.as_str().unwrap(), second=second.as_str().unwrap())
     );
     assert!(!status(&rig).contains("away"), "{:?}", status(&rig));
 

@@ -52,7 +52,8 @@
 //! emits the synthetic `atm_needs_input_open` / `atm_needs_input_resolved`
 //! events around the dialog. They translate to
 //! [`atm_core::NeedsInputReason::Notification`] (kind `PermissionPrompt`)
-//! and back to `WorkingStart`. The adapter still maps a `tool_call`
+//! and back to Idle when final closure measures idle=true, otherwise
+//! `WorkingStart`. The adapter still maps a `tool_call`
 //! with `needs_user_input: true` to
 //! [`atm_core::NeedsInputReason::PermissionGate`], but no pi-atm version
 //! sends that flag. A passive observer cannot detect this state; only
@@ -135,9 +136,9 @@
 //! consumed an interactive input, original pi-atm and a private real atmd.
 //! Pi emitted session-start and input, but no agent-start or agent-end:
 //! pi was idle while atmd showed Working. No model was called. Payload
-//! thinning cannot fix an event that never fires. This handled-input gap,
-//! heartbeat and restart resynchronization remain unchanged. Neither probe
-//! verified the reported live cause.
+//! thinning cannot fix an event that never fires. This handled-input gap
+//! remains; eligible idle reconnect recovery below is separate, not a
+//! heartbeat. Neither probe verified the reported live cause.
 //!
 //! ## Final settlement (pi 1.5.2+ forwarder)
 //!
@@ -147,7 +148,7 @@
 //! measured ctx idle/pending alongside (not inside) payloads. Session ids
 //! and private paths are anonymized. It covers continuation, skills, Esc,
 //! manual and automatic compaction, overflow recovery, new/reload, and the
-//! still-unfixed handled-input, standalone-dialog and idle-reconnect gaps.
+//! then-unfixed handled-input, standalone-dialog and idle-reconnect gaps.
 //! Additional `late-failure/queued-failure` projection. Captured: pi 1.5.2,
 //! 2026-11-16, sealed interactive PTY/private atmd, an owned
 //! loopback fake HTTP provider held open and an earlier async failure
@@ -183,6 +184,56 @@
 //! automatic handover. That correction is reverted for 0.4.1; atomic
 //! primary-plus-derived publication is deferred to stage 2. A later input
 //! consumer can therefore still leave the row Working without an agent run.
+//!
+//! ## Idle reconnect registration (pi 1.5.2)
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed interactive CLI/private tmux and
+//! real atmd recording proxy; `tests/fixtures/pi_reconnect_1.5.2.jsonl`.
+//! Startup, daemon restart, /new and /reload emitted idle snapshots with
+//! zero input, agent-start or provider calls. Discovery's pending row could
+//! not bind; recovery upgraded its real identity/model/Idle, and existing
+//! adoption policy then bound it without fabricated start proof. IDs/PIDs
+//! and pane attribution in the fixture are anonymized.
+//!
+//! The same fixture's held-input trace was captured with a sealed real SDK
+//! session/private receiver. The actual socket connect callback and a later
+//! input handler were held: ctx reported idle=true, pending=false before
+//! agent_start. A local request-preparation fault ended the subsequent real
+//! run before any provider call. The input veto suppresses the reconnect
+//! snapshot in that window; settlement permits the next reconnect snapshot.
+//!
+//! `atm_idle` maps only real nonpending identity + nonzero pid to Idle and
+//! optional model metadata, never start/input/end/usage or an exact receipt.
+//! One snapshot follows each handshake and fully drained bounded FIFO, using
+//! current live context and vetoing busy/pending/native UI/wrapped selects.
+//! The factory owns sockets and unref'ed retry/connect timers, and shutdown
+//! disposes them even when the imported module or UI object is reused.
+//! A failed predicate is consumed, not polled. Interactive input latches a
+//! veto until genuine agent_start/agent_settled/session_start; input consumed
+//! or rejected without a run therefore withholds recovery until that boundary.
+//! No busy/attention/usage replay, periodic heartbeat or stronger PID policy.
+//!
+//! ## Select-dialog closure (pi 1.5.2)
+//!
+//! Captured: pi 1.5.2, 2026-11-16, sealed interactive PTY/local slash command,
+//! changed pi-atm and private real atmd recording proxy;
+//! `tests/fixtures/pi_dialog_1.5.2.jsonl`. Enter selected Alpha and Esc
+//! cancelled; both closed with measured idle=true/pending=false and the
+//! row returned NeedsInput -> Idle, with zero provider/input/agent-start calls.
+//! Session ids/PIDs are anonymized; no conversation or screens are retained.
+//!
+//! Overlapping wrapped selects emit one outer open/final-resolved pair.
+//! Final completion (including error) samples the live owner's ctx.isIdle,
+//! never the opening state. Only boolean measurements are sent; payload.idle
+//! is optional and strictly boolean/null on receipt. Only resolved dialogs
+//! consume it: true -> Idle; false/missing/null -> legacy WorkingStart.
+//! Interactive input's conservative latch also withholds this measurement
+//! until genuine agent_start/agent_settled/session_start; consumed input can
+//! therefore still leave Working until that boundary. Missing getters omit
+//! the measurement; stale throwing ctx or disposed owners suppress reporting
+//! without changing the original select result/error. No prompt, start, usage
+//! or WorkingEnd is manufactured. Historical input idle correction stays
+//! reverted; its fixtures still map to a single PromptSubmit.
 //!
 //! ## Cost and tokens
 //!
@@ -260,9 +311,10 @@
 //!   running sessions. pi's registry entry therefore matches a bare `pi`
 //!   as argv0. A pi already running when atmd starts gets a
 //!   `pending-<pid>` row, without its model, cost or session id until
-//!   pi-atm's next event. Before that match existed, such a pi had no
-//!   row until that event. Checked with a stand-in of that shape running
-//!   pi-atm; a real pi across a daemon restart is unverified.
+//!   pi-atm's next event or eligible idle reconnect snapshot. Before that
+//!   match existed, such a pi had no row until an event. A real pi across a
+//!   private-daemon restart now verifies idle identity/model recovery as
+//!   documented above; cost/usage replay remains out of scope.
 //! - `/new`, `/resume`, `/fork` and `/reload` replace the session in the
 //!   same process. pi (0.65.0 and later) loads pi-atm afresh, so
 //!   `session_shutdown` comes from the old instance and `session_start`
@@ -270,9 +322,10 @@
 //!   starts a new one. That includes `/reload`, which keeps the id, so
 //!   the row's cost resets (the original check went from fake-b at
 //!   $0.0033 to Unknown at $0; complete translation now restores the
-//!   model from the snapshot). The old instance's connection stays open
-//!   until atmd closes it after 300 s idle. Over rpc, `new_session` and `clone` fired
-//!   `session_start` twice; the TUI's `/new` fired it once.
+//!   model from the snapshot). With older forwarders, the old instance's
+//!   connection stays open until atmd closes it after 300 s idle. Over rpc,
+//!   `new_session` and `clone` fired `session_start` twice; the TUI's `/new`
+//!   fired it once.
 //! - atmd renames a row from `pending-<pid>` to a real id on any event.
 //!   A `session_start` with another real id ends the session the pid's row
 //!   held, as its `session_shutdown` would, and starts a fresh row. So if

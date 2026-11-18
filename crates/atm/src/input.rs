@@ -34,6 +34,9 @@ pub enum Event {
     /// Full session list received from daemon (replace all sessions).
     SessionListReplace(Vec<SessionView>),
 
+    /// An optional control-plane update; it does not affect session rendering.
+    Control(crate::control::ControlNotice),
+
     /// Connection to the daemon was lost, with the reason when the daemon
     /// rejected it.
     DaemonDisconnected(Option<String>),
@@ -70,10 +73,13 @@ pub enum Event {
 // ============================================================================
 
 /// Commands that can be sent to the daemon client from the main loop.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ClientCommand {
     /// Request session discovery from the daemon.
     Discover,
+
+    /// Optional control operation, created through the daemon control handle.
+    Control(crate::daemon::ControlCommand),
 }
 
 // ============================================================================

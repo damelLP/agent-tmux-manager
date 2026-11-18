@@ -1,0 +1,41 @@
+Captured: pi 1.5.2, 2026-11-17, sealed stage-only tmux capture-pane -p -e -N.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[2m────────────────────────────
+[0;7m [0m      
+[2m────────────────────────────
+/tmp/xxxxxxxxxxxxxxxxxxxxxx…
+0.0%/128k (auto)  neutral-fi

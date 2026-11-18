@@ -11,26 +11,33 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
+use std::future::{poll_fn, Future};
 use std::path::PathBuf;
+use std::task::Poll;
 use std::time::Duration;
 
 use atm_core::{AgentType, Model, SessionDomain, SessionId};
 use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
-use atmd::registry::spawn_registry;
+use atmd::registry::{spawn_registry_with_cancel, RegistryHandle, RegistryTasks};
 use atmd::server::DaemonServer;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::time::{sleep, timeout};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
-const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(100);
+const EVENT_GUARD: Duration = Duration::from_secs(30);
+
+async fn guarded<F: Future>(future: F) -> F::Output {
+    timeout(EVENT_GUARD, future)
+        .await
+        .expect("test event did not complete")
+}
 
 // ============================================================================
 // Test Helpers
@@ -39,6 +46,10 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(100);
 struct TestServer {
     socket_path: PathBuf,
     cancel_token: CancellationToken,
+    running: JoinHandle<Result<(), atmd::server::ServerError>>,
+    registry_cancel: CancellationToken,
+    registry: RegistryHandle,
+    registry_tasks: RegistryTasks,
     _temp_dir: TempDir,
 }
 
@@ -47,34 +58,39 @@ impl TestServer {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let socket_path = temp_dir.path().join("test.sock");
 
-        let registry = spawn_registry();
+        let registry_cancel = CancellationToken::new();
+        let (registry, registry_tasks) = spawn_registry_with_cancel(registry_cancel.clone());
         let cancel_token = CancellationToken::new();
 
-        let server = DaemonServer::new(socket_path.clone(), registry, cancel_token.clone());
-
-        tokio::spawn(async move {
-            let _ = server.run().await;
-        });
-
-        let start = tokio::time::Instant::now();
-        while start.elapsed() < SOCKET_WAIT_TIMEOUT {
-            if socket_path.exists() {
-                break;
-            }
-            sleep(SOCKET_POLL_INTERVAL).await;
-        }
+        let server = DaemonServer::new(socket_path.clone(), registry.clone(), cancel_token.clone());
+        let mut running = Box::pin(async move { server.run().await });
+        // run() binds synchronously before its first Pending accept; poll it
+        // first instead of racing socket creation or a readiness connection.
+        poll_fn(|cx| {
+            assert!(
+                running.as_mut().poll(cx).is_pending(),
+                "server exited at bind"
+            );
+            Poll::Ready(())
+        })
+        .await;
 
         assert!(socket_path.exists(), "Server socket did not appear");
+        let running = tokio::spawn(running);
 
         TestServer {
             socket_path,
             cancel_token,
+            running,
+            registry_cancel,
+            registry,
+            registry_tasks,
             _temp_dir: temp_dir,
         }
     }
 
     async fn connect(&self) -> TestClient {
-        let stream = UnixStream::connect(&self.socket_path)
+        let stream = guarded(UnixStream::connect(&self.socket_path))
             .await
             .expect("connect to server");
         TestClient::new(stream)
@@ -87,16 +103,33 @@ impl TestServer {
         BufReader<tokio::net::unix::OwnedReadHalf>,
         tokio::net::unix::OwnedWriteHalf,
     ) {
-        let stream = UnixStream::connect(&self.socket_path)
+        let stream = guarded(UnixStream::connect(&self.socket_path))
             .await
             .expect("connect to server");
         let (reader, writer) = stream.into_split();
         (BufReader::new(reader), writer)
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(mut self) {
         self.cancel_token.cancel();
-        sleep(SHUTDOWN_GRACE_PERIOD).await;
+        guarded(&mut self.running)
+            .await
+            .expect("server task panicked")
+            .expect("server failed");
+        self.registry_cancel.cancel();
+        guarded(&mut self.registry_tasks.actor)
+            .await
+            .expect("registry task panicked");
+        for task in &mut self.registry_tasks.maintenance {
+            guarded(task).await.expect("maintenance task panicked");
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        self.registry_cancel.cancel();
     }
 }
 
@@ -116,19 +149,25 @@ impl TestClient {
 
     async fn send(&mut self, msg: ClientMessage) {
         let json = serde_json::to_string(&msg).unwrap();
-        self.writer.write_all(json.as_bytes()).await.unwrap();
-        self.writer.write_all(b"\n").await.unwrap();
-        self.writer.flush().await.unwrap();
+        guarded(async {
+            self.writer.write_all(json.as_bytes()).await.unwrap();
+            self.writer.write_all(b"\n").await.unwrap();
+            self.writer.flush().await.unwrap();
+        })
+        .await;
     }
 
     async fn send_raw(&mut self, data: &[u8]) {
-        self.writer.write_all(data).await.unwrap();
-        self.writer.flush().await.unwrap();
+        guarded(async {
+            self.writer.write_all(data).await.unwrap();
+            self.writer.flush().await.unwrap();
+        })
+        .await;
     }
 
     async fn recv(&mut self) -> DaemonMessage {
         let mut line = String::new();
-        self.reader.read_line(&mut line).await.unwrap();
+        guarded(self.reader.read_line(&mut line)).await.unwrap();
         serde_json::from_str(&line).unwrap()
     }
 
@@ -142,6 +181,17 @@ impl TestClient {
         {
             Ok(Some(msg)) => Some(msg),
             _ => None,
+        }
+    }
+
+    async fn expect_closed(&mut self) {
+        let mut line = String::new();
+        match guarded(self.reader.read_line(&mut line)).await {
+            Ok(0) => {}
+            // Closing an oversized frame leaves unread bytes in the Unix
+            // socket; the kernel reports reset instead of EOF in that case.
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => panic!("expected old-peer closure, got {result:?}, {line:?}"),
         }
     }
 
@@ -168,6 +218,31 @@ fn create_test_session(id: &str) -> SessionDomain {
 // ============================================================================
 
 #[tokio::test]
+async fn test_new_peer_handshake_does_not_fence_a_stalled_peer() {
+    let server = TestServer::spawn().await;
+    let (stream, stalled_peer) = UnixStream::pair().unwrap();
+    let mut old_client = TestClient::new(stream);
+
+    let mut new_client = server.connect().await;
+    new_client.handshake(None).await;
+
+    let closed = old_client.expect_closed();
+    tokio::pin!(closed);
+    poll_fn(|cx| {
+        assert!(
+            closed.as_mut().poll(cx).is_pending(),
+            "a new-peer handshake cannot complete the old peer's EOF fence"
+        );
+        Poll::Ready(())
+    })
+    .await;
+
+    drop(stalled_peer);
+    closed.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_malformed_json_handled_gracefully() {
     let server = TestServer::spawn().await;
     let mut client = server.connect().await;
@@ -175,9 +250,9 @@ async fn test_malformed_json_handled_gracefully() {
     // Send invalid JSON
     client.send_raw(b"this is not valid json\n").await;
 
-    // Should receive error (connection may close after)
-    // The key point is daemon doesn't crash
-    sleep(Duration::from_millis(50)).await;
+    // A malformed handshake closes this peer; a new handshake alone cannot
+    // prove that the malformed frame was processed.
+    client.expect_closed().await;
 
     // Server should still be accepting connections
     let mut client2 = server.connect().await;
@@ -194,8 +269,7 @@ async fn test_empty_line_handled() {
     // Send empty line
     client.send_raw(b"\n").await;
 
-    // Small delay to let server process
-    sleep(Duration::from_millis(50)).await;
+    client.expect_closed().await;
 
     // Server should still work
     let mut client2 = server.connect().await;
@@ -206,18 +280,75 @@ async fn test_empty_line_handled() {
 
 #[tokio::test]
 async fn test_partial_json_handled() {
+    use atmd::server::{methods::MethodRouter, ConnectionHandler};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::Context;
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+    use tokio::sync::oneshot;
+
+    // The handler boundary exposes a read-consumed event without instrumenting
+    // production: only acknowledge Pending after the prefix has been read.
+    struct PartialRead<R> {
+        inner: R,
+        saw_prefix: bool,
+        waiting: Option<oneshot::Sender<()>>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for PartialRead<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if matches!(result, Poll::Ready(Ok(()))) {
+                self.saw_prefix |= buf.filled().len() > before;
+            } else if result.is_pending() && self.saw_prefix {
+                if let Some(waiting) = self.waiting.take() {
+                    let _ = waiting.send(());
+                }
+            }
+            result
+        }
+    }
+
     let server = TestServer::spawn().await;
+    let (transport, mut peer) = tokio::io::duplex(1024);
+    let (read, write) = tokio::io::split(transport);
+    let (waiting, read_pending) = oneshot::channel();
+    let handler = ConnectionHandler::new(
+        PartialRead {
+            inner: read,
+            saw_prefix: false,
+            waiting: Some(waiting),
+        },
+        write,
+        server.registry.clone(),
+        Default::default(),
+        0,
+        server.cancel_token.child_token(),
+        Arc::new(MethodRouter::default()),
+    );
+    let handler = tokio::spawn(handler.run());
+    guarded(peer.write_all(b"{\"protocol_version\""))
+        .await
+        .unwrap();
+    guarded(read_pending)
+        .await
+        .expect("handler buffered prefix");
+    guarded(peer.write_all(b"\n")).await.unwrap();
+    assert_eq!(guarded(peer.read(&mut [0])).await.unwrap(), 0);
+    guarded(handler)
+        .await
+        .expect("partial-frame handler panicked");
+
+    // Retain the real bind/accept/handler path as well as the controlled read.
     let mut client = server.connect().await;
-
-    // Send partial JSON (no newline, incomplete object)
     client.send_raw(b"{\"protocol_version\"").await;
-
-    // Send the rest on a new line (should parse as separate message)
-    sleep(Duration::from_millis(50)).await;
     client.send_raw(b"\n").await;
-
-    // Server should still be functional
-    sleep(Duration::from_millis(50)).await;
+    client.expect_closed().await;
 
     let mut client2 = server.connect().await;
     let id = client2.handshake(None).await;
@@ -243,9 +374,7 @@ async fn test_unknown_message_type_handled() {
     client.send_raw(unknown.as_bytes()).await;
     client.send_raw(b"\n").await;
 
-    // Should receive an error or connection may close
-    // The key is daemon doesn't crash
-    sleep(Duration::from_millis(100)).await;
+    client.expect_closed().await;
 
     // Server should still be working for new connections
     let mut client2 = server.connect().await;
@@ -271,12 +400,13 @@ async fn test_oversized_message_rejected() {
 
     // The daemon closes the connection after MAX_MESSAGE_SIZE bytes, so the
     // rest of the write may fail.
-    let _ = client.writer.write_all(large_json.as_bytes()).await;
-    let _ = client.writer.write_all(b"\n").await;
+    guarded(async {
+        let _ = client.writer.write_all(large_json.as_bytes()).await;
+        let _ = client.writer.write_all(b"\n").await;
+    })
+    .await;
 
-    // Connection should be closed or error received
-    // The key is daemon doesn't crash
-    sleep(Duration::from_millis(100)).await;
+    client.expect_closed().await;
 
     // Server should still accept new connections
     let mut client2 = server.connect().await;
@@ -305,7 +435,7 @@ async fn test_endless_line_is_cut_off_at_max_message_size() {
         sent
     });
 
-    let sent = timeout(Duration::from_secs(10), streamer)
+    let sent = timeout(EVENT_GUARD, streamer)
         .await
         .expect("daemon kept reading a line past MAX_MESSAGE_SIZE")
         .unwrap();
@@ -324,15 +454,18 @@ async fn test_rapid_connect_disconnect() {
     let server = TestServer::spawn().await;
 
     // Rapidly connect and disconnect 20 times
+    let mut disconnecting = Vec::new();
     for i in 0..20 {
         let mut client = server.connect().await;
         client.handshake(Some(format!("rapid-{i}"))).await;
         client.send(ClientMessage::disconnect()).await;
-        // Don't wait, just move on
+        disconnecting.push(client);
     }
 
-    // Small settle time
-    sleep(Duration::from_millis(100)).await;
+    // Every old peer must finish; the final handshake is not their fence.
+    for mut client in disconnecting {
+        client.expect_closed().await;
+    }
 
     // Server should still work
     let mut final_client = server.connect().await;
@@ -351,7 +484,7 @@ async fn test_many_concurrent_connections() {
     for i in 0..20 {
         let socket_path = server.socket_path.clone();
         let handle = tokio::spawn(async move {
-            let stream = UnixStream::connect(&socket_path).await.unwrap();
+            let stream = guarded(UnixStream::connect(&socket_path)).await.unwrap();
             let mut client = TestClient::new(stream);
             let id = client.handshake(Some(format!("concurrent-{i}"))).await;
             assert_eq!(id, format!("concurrent-{i}"));
@@ -371,7 +504,9 @@ async fn test_many_concurrent_connections() {
 
     // All should complete successfully
     for handle in handles {
-        handle.await.expect("concurrent connection should succeed");
+        guarded(handle)
+            .await
+            .expect("concurrent connection should succeed");
     }
 
     server.shutdown().await;
@@ -410,9 +545,7 @@ async fn test_rapid_status_updates() {
         client.send(msg).await;
     }
 
-    // Small settle time
-    sleep(Duration::from_millis(100)).await;
-
+    // The same-stream SessionList reply fences all preceding updates.
     // Query to verify state is consistent
     client.send(ClientMessage::list_sessions()).await;
     match client.recv().await {
@@ -461,8 +594,7 @@ async fn test_multiple_sessions_rapid_updates() {
         }
     }
 
-    sleep(Duration::from_millis(100)).await;
-
+    // The same-stream SessionList reply fences all preceding updates.
     // Verify all sessions exist
     client.send(ClientMessage::list_sessions()).await;
     match client.recv().await {
@@ -531,8 +663,10 @@ async fn test_multiple_errors_dont_break_connection() {
         };
         client.send(msg).await;
 
-        // Drain error response
-        let _ = client.recv_timeout(Duration::from_millis(100)).await;
+        match client.recv().await {
+            DaemonMessage::Error { .. } => {}
+            other => panic!("Expected Error, got {other:?}"),
+        }
     }
 
     // Connection should still work
@@ -589,7 +723,7 @@ async fn test_subscriber_receives_session_updates() {
     updater.send(msg).await;
 
     // Subscriber should receive the update event
-    let event = subscriber.recv_timeout(Duration::from_secs(2)).await;
+    let event = subscriber.recv_timeout(EVENT_GUARD).await;
     assert!(event.is_some(), "Subscriber should receive update event");
 
     match event.unwrap() {
@@ -689,9 +823,7 @@ async fn test_empty_session_id() {
     };
     client.send(msg).await;
 
-    // Should handle gracefully (either error or create session with empty id)
-    // The key is daemon doesn't crash
-    sleep(Duration::from_millis(50)).await;
+    // The following same-stream reply fences the status frame.
 
     client.send(ClientMessage::ping(99)).await;
     match client.recv().await {

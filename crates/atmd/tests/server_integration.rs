@@ -16,23 +16,17 @@ use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 use atmd::registry::spawn_registry;
 use atmd::server::{DaemonServer, MAX_TUI_CLIENTS};
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/// Maximum time to wait for server socket to appear
-const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Interval between socket existence checks
-const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Grace period for server shutdown
-const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(100);
+/// Outer hang guard for bind and owned-task completion, never a settle delay.
+const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ============================================================================
 // Test Helpers
@@ -58,19 +52,23 @@ impl TestServer {
 
         let server = DaemonServer::new(socket_path.clone(), registry, cancel_token.clone());
 
-        // Spawn server in background
+        let (ready, started) = tokio::sync::oneshot::channel();
         let run_task = tokio::spawn(async move {
-            let _ = server.run().await;
-        });
-
-        // Wait for socket to be ready with timeout
-        let start = tokio::time::Instant::now();
-        while start.elapsed() < SOCKET_WAIT_TIMEOUT {
-            if socket_path.exists() {
-                break;
+            let run = server.run();
+            tokio::pin!(run);
+            // The default server binds synchronously before its first Pending
+            // accept. Keep that exact future alive after registering readiness.
+            tokio::select! {
+                biased;
+                result = &mut run => panic!("server exited before binding: {result:?}"),
+                _ = std::future::ready(()) => { let _ = ready.send(()); }
             }
-            sleep(SOCKET_POLL_INTERVAL).await;
-        }
+            run.await.expect("server run");
+        });
+        timeout(SOCKET_WAIT_TIMEOUT, started)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Fail fast if socket didn't appear
         assert!(
@@ -109,14 +107,17 @@ impl TestServer {
     /// Shuts down the server gracefully.
     async fn shutdown(self) {
         self.cancel_token.cancel();
-        sleep(SHUTDOWN_GRACE_PERIOD).await;
+        timeout(Duration::from_secs(60), self.run_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 
 /// Test client connection with protocol helpers.
-struct TestClient {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+struct TestClient<R = tokio::net::unix::OwnedReadHalf, W = tokio::net::unix::OwnedWriteHalf> {
+    reader: BufReader<R>,
+    writer: W,
 }
 
 impl TestClient {
@@ -126,6 +127,20 @@ impl TestClient {
             reader: BufReader::new(reader),
             writer,
         }
+    }
+}
+
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> TestClient<R, W> {
+    async fn applied(&mut self, seq: u64) {
+        timeout(Duration::from_secs(60), async {
+            self.send(ClientMessage::ping(seq)).await;
+            match self.recv().await {
+                DaemonMessage::Pong { seq: got } if got == seq => {}
+                other => panic!("expected Pong {seq}, got {other:?}"),
+            }
+        })
+        .await
+        .expect("same-stream apply fence");
     }
 
     /// Sends a message to the server.
@@ -162,6 +177,211 @@ impl TestClient {
         self.send(msg).await;
         self.recv().await
     }
+}
+
+type MemoryClient = TestClient<
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+>;
+
+struct HandlerServer {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HandlerServer {
+    fn new(registry: atmd::registry::RegistryHandle) -> (Self, MemoryClient) {
+        let (stream, peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(stream);
+        let methods = atmd::server::methods::router(atmd::server::methods::MethodServices::new(
+            registry.clone(),
+        ))
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let handler = atmd::server::ConnectionHandler::new(
+            reader,
+            writer,
+            registry,
+            Default::default(),
+            1,
+            cancel.clone(),
+            std::sync::Arc::new(methods),
+        );
+        let task = tokio::spawn(async move {
+            handler.run().await;
+        });
+        let (reader, writer) = tokio::io::split(peer);
+        (
+            Self { cancel, task },
+            TestClient {
+                reader: BufReader::new(reader),
+                writer,
+            },
+        )
+    }
+
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        timeout(Duration::from_secs(60), self.task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn same_stream_fence_waits_for_a_held_registry_apply() {
+    use atmd::registry::RegistryCommand;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let (commands, mut received) = tokio::sync::mpsc::channel(16);
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let registry = atmd::registry::RegistryHandle::new(commands, events);
+    let (server, mut client) = HandlerServer::new(registry);
+    client.handshake(None).await;
+    {
+        let mut applied = std::pin::pin!(send_applied(
+            &mut client,
+            7,
+            ClientMessage::hook_event(hook_event_json(
+                "held",
+                "PreToolUse",
+                serde_json::json!({"tool_name":"Bash"})
+            ))
+        ));
+        let command = timeout(Duration::from_secs(60), async {
+            tokio::select! {
+                biased;
+                _ = &mut applied => panic!("frame send returned before registry apply"),
+                command = received.recv() => command.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        let RegistryCommand::ApplyLifecycleEvent { respond_to, .. } = command else {
+            panic!("expected lifecycle apply")
+        };
+        assert!(poll_fn(|cx| Poll::Ready(applied.as_mut().poll(cx).is_pending())).await);
+        respond_to.send(Ok(())).unwrap();
+        timeout(Duration::from_secs(60), applied).await.unwrap();
+    }
+    server.shutdown().await;
+}
+
+async fn drain_failed_writer<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    failure: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> String {
+    timeout(Duration::from_secs(60), failure.recv())
+        .await
+        .expect("writer did not fail")
+        .expect("writer failure observer closed");
+    let mut output = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        output.push_str(&line);
+    }
+    output
+}
+
+#[tokio::test]
+async fn failed_writer_fence_retains_partial_output_and_blocks_early_drain() {
+    use std::future::{poll_fn, Future};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::task::{Context, Poll};
+    struct Probe {
+        read: tokio::io::DuplexStream,
+        calls: Arc<AtomicUsize>,
+    }
+    impl AsyncRead for Probe {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::pin::Pin::new(&mut self.read).poll_read(cx, bytes)
+        }
+    }
+    let (read, mut write) = tokio::io::duplex(64);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut reader = BufReader::new(Probe {
+        read,
+        calls: calls.clone(),
+    });
+    let (failed, mut failure) = tokio::sync::mpsc::unbounded_channel();
+    write.write_all(b"partial frame").await.unwrap();
+    let mut drain = std::pin::pin!(drain_failed_writer(&mut reader, &mut failure));
+    assert!(poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "reader relieved backpressure before writer failed"
+    );
+    failed.send(()).unwrap();
+    drop(write);
+    assert_eq!(drain.await, "partial frame");
+
+    // A failure delivered before the waiter must be retained too.
+    let (mut write, read) = tokio::io::duplex(64);
+    write.write_all(b"already failed\n").await.unwrap();
+    drop(write);
+    let (failed, mut failure) = tokio::sync::mpsc::unbounded_channel();
+    failed.send(()).unwrap();
+    assert_eq!(
+        drain_failed_writer(&mut BufReader::new(read), &mut failure).await,
+        "already failed\n"
+    );
+}
+
+/// Observe the existing failed-write event on this current-thread test runtime.
+/// Registration precedes server spawn, so an early failure remains queued.
+fn failed_writer_events() -> (
+    tracing::dispatcher::DefaultGuard,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    use tracing_subscriber::prelude::*;
+    #[derive(Default)]
+    struct Fields {
+        message: String,
+        error: String,
+    }
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "message" => self.message = format!("{value:?}"),
+                "error" => self.error = format!("{value:?}"),
+                _ => {}
+            }
+        }
+    }
+    struct Failed(tokio::sync::mpsc::UnboundedSender<()>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Failed {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            // Both ordinary and error replies propagate failed writes to run().
+            // The error-reply branch does not log a second handler error.
+            if fields.message == "Connection closed" && fields.error == "Write timeout" {
+                let _ = self.0.send(());
+            }
+        }
+    }
+    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(Failed(send)));
+    (tracing::dispatcher::set_default(&dispatch), receive)
 }
 
 /// Helper to create a test session.
@@ -518,8 +738,8 @@ async fn test_graceful_shutdown() {
     // Trigger shutdown
     server.cancel_token.cancel();
 
-    // Wait for server to shutdown
-    sleep(SHUTDOWN_GRACE_PERIOD).await;
+    // Join the owned server before observing its cleanup.
+    server.shutdown().await;
 
     // Socket should be removed
     assert!(
@@ -677,10 +897,11 @@ async fn test_shutdown_completes_while_a_subscriber_is_stuck() {
 
 /// A reply that hits WRITE_TIMEOUT may have left half a line on the
 /// socket, so the server closes the connection rather than replying again
-/// and carrying on. Time is paused, so the timeout elapses as soon as the
-/// pong writes block.
-#[tokio::test(start_paused = true)]
+/// and carrying on. Real sockets use an unpaused clock; do not drain until
+/// the failed-writer event proves the real write timeout happened.
+#[tokio::test]
 async fn test_connection_closes_after_a_write_timeout() {
+    let (_trace, mut failure) = failed_writer_events();
     let server = TestServer::spawn().await;
     let mut client = server.connect().await;
     client.handshake(None).await;
@@ -690,7 +911,7 @@ async fn test_connection_closes_after_a_write_timeout() {
     // write half stays open afterwards: closing it would send EOF and let
     // the server close for that reason instead.
     let mut writer = client.writer;
-    tokio::spawn(async move {
+    let producer = tokio::spawn(async move {
         for seq in 0..20_000 {
             let json = serde_json::to_string(&ClientMessage::ping(seq)).unwrap();
             if writer
@@ -703,22 +924,17 @@ async fn test_connection_closes_after_a_write_timeout() {
         }
         std::future::pending::<()>().await;
     });
-    sleep(Duration::from_secs(30)).await;
-
-    let drained = timeout(Duration::from_secs(60), async {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if client.reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-                break;
-            }
-        }
-    })
+    let drained = timeout(
+        Duration::from_secs(60),
+        drain_failed_writer(&mut client.reader, &mut failure),
+    )
     .await;
     assert!(
         drained.is_ok(),
         "connection stayed open after a write timeout"
     );
+    producer.abort();
+    let _ = producer.await;
 
     server.shutdown().await;
 }
@@ -726,9 +942,11 @@ async fn test_connection_closes_after_a_write_timeout() {
 /// The error reply to a bad message can hit WRITE_TIMEOUT too, and may also
 /// leave half a line, so it closes the connection like any failed reply.
 /// The bad messages lack a session_id, so each one fails in the handler
-/// and gets an error reply. Time is paused, as above.
-#[tokio::test(start_paused = true)]
+/// and gets an error reply. Wait for the failed-writer event without reading
+/// early or pausing a clock over real socket I/O.
+#[tokio::test]
 async fn test_connection_closes_when_an_error_reply_times_out() {
+    let (_trace, mut failure) = failed_writer_events();
     let server = TestServer::spawn().await;
     let mut client = server.connect().await;
     client.handshake(None).await;
@@ -741,7 +959,7 @@ async fn test_connection_closes_when_an_error_reply_times_out() {
     };
     let line = format!("{}\n", serde_json::to_string(&bad).unwrap());
     let mut writer = client.writer;
-    tokio::spawn(async move {
+    let producer = tokio::spawn(async move {
         for _ in 0..20_000 {
             if writer.write_all(line.as_bytes()).await.is_err() {
                 break;
@@ -749,22 +967,17 @@ async fn test_connection_closes_when_an_error_reply_times_out() {
         }
         std::future::pending::<()>().await;
     });
-    sleep(Duration::from_secs(30)).await;
-
-    let drained = timeout(Duration::from_secs(60), async {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if client.reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-                break;
-            }
-        }
-    })
+    let drained = timeout(
+        Duration::from_secs(60),
+        drain_failed_writer(&mut client.reader, &mut failure),
+    )
     .await;
     assert!(
         drained.is_ok(),
         "connection stayed open after an error reply timed out"
     );
+    producer.abort();
+    let _ = producer.await;
 
     server.shutdown().await;
 }
@@ -774,8 +987,8 @@ async fn test_connection_closes_when_an_error_reply_times_out() {
 /// instantly once the runtime is otherwise idle.
 #[tokio::test(start_paused = true)]
 async fn test_handshake_deadline_closes_silent_client() {
-    let server = TestServer::spawn().await;
-    let mut client = server.connect().await;
+    // Handler owns the handshake deadline; paused clocks need in-memory I/O.
+    let (server, mut client) = HandlerServer::new(spawn_registry());
 
     let mut line = String::new();
     let read = timeout(Duration::from_secs(60), client.reader.read_line(&mut line)).await;
@@ -789,11 +1002,11 @@ async fn test_handshake_deadline_closes_silent_client() {
 
 /// A subscribed TUI sends nothing after `Subscribe`, so the idle read
 /// timeout must not drop it. Time is paused, so READ_TIMEOUT (300s)
-/// passes instantly while the server waits on the socket.
+/// passes instantly while the handler waits on in-memory duplex input.
 #[tokio::test(start_paused = true)]
 async fn test_subscribed_client_stays_connected_past_read_timeout() {
-    let server = TestServer::spawn().await;
-    let mut client = server.connect().await;
+    // Handler owns subscribed idle exemption; paused clocks need in-memory I/O.
+    let (server, mut client) = HandlerServer::new(spawn_registry());
     client.handshake(None).await;
     client.send(ClientMessage::subscribe(None)).await;
     assert!(matches!(
@@ -822,8 +1035,8 @@ async fn test_subscribed_client_stays_connected_past_read_timeout() {
 /// READ_TIMEOUT.
 #[tokio::test(start_paused = true)]
 async fn test_unsubscribed_client_times_out_when_idle() {
-    let server = TestServer::spawn().await;
-    let mut client = server.connect().await;
+    // Handler owns the idle deadline; paused clocks need in-memory I/O.
+    let (server, mut client) = HandlerServer::new(spawn_registry());
     client.handshake(None).await;
 
     let mut line = String::new();
@@ -839,8 +1052,8 @@ async fn test_unsubscribed_client_times_out_when_idle() {
 /// Unsubscribing puts the idle read timeout back.
 #[tokio::test(start_paused = true)]
 async fn test_unsubscribed_after_subscribe_times_out_when_idle() {
-    let server = TestServer::spawn().await;
-    let mut client = server.connect().await;
+    // Handler restores idle timeout on Unsubscribe; paused clocks need in-memory I/O.
+    let (server, mut client) = HandlerServer::new(spawn_registry());
     client.handshake(None).await;
     client.send(ClientMessage::subscribe(None)).await;
     assert!(matches!(
@@ -1072,8 +1285,8 @@ async fn test_e2e_pre_tool_use_translates_to_tool_call_start() {
         )))
         .await;
 
-    // Give the actor a tick to apply the event.
-    sleep(Duration::from_millis(50)).await;
+    // Same-stream Pong follows the awaited registry apply, not a settle delay.
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -1111,7 +1324,7 @@ async fn test_e2e_pre_tool_use_interactive_translates_to_needs_input() {
         )))
         .await;
 
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -1147,7 +1360,7 @@ async fn test_e2e_stop_translates_to_idle() {
             serde_json::json!({"tool_name": "Bash"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     client
         .send(ClientMessage::hook_event(hook_event_json(
@@ -1156,7 +1369,7 @@ async fn test_e2e_stop_translates_to_idle() {
             serde_json::json!({}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -1191,7 +1404,7 @@ async fn test_e2e_session_end_removes_session() {
             serde_json::json!({"reason": "clear"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     assert!(
         registry.get_session(session_id.clone()).await.is_none(),
@@ -1223,7 +1436,7 @@ async fn test_e2e_notification_permission_prompt_becomes_needs_input() {
             serde_json::json!({"notification_type": "permission_prompt"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -1261,7 +1474,7 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
             serde_json::json!({"tool_name": "Bash"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
     let working = registry.get_session(teammate.clone()).await;
     assert_eq!(
         working.map(|view| view.status_label),
@@ -1280,7 +1493,7 @@ async fn test_e2e_tmux_teammate_idle_from_own_session_adds_no_child() {
         "team_name": "session-ae223ce3"
     });
     client.send(ClientMessage::hook_event(payload)).await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let ids: Vec<String> = registry
         .get_all_sessions()
@@ -1344,13 +1557,13 @@ fn captured_claude_calls() -> Vec<(String, serde_json::Value)> {
 /// Sends one message, then a ping, and returns once the Pong arrives.
 /// atmd handles one connection's messages in order and awaits the
 /// registry for each, so the Pong means the message has been applied.
-async fn send_applied(client: &mut TestClient, seq: u64, message: ClientMessage) {
+async fn send_applied<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    client: &mut TestClient<R, W>,
+    seq: u64,
+    message: ClientMessage,
+) {
     client.send(message).await;
-    client.send(ClientMessage::ping(seq)).await;
-    match client.recv().await {
-        DaemonMessage::Pong { seq: got } if got == seq => {}
-        other => panic!("expected Pong {seq}, got {other:?}"),
-    }
+    client.applied(seq).await;
 }
 
 #[test]
@@ -2175,6 +2388,205 @@ async fn pi_1_5_2_terminal_sequences() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn pi_1_5_2_idle_registration() {
+    // Synthetic until the changed-forwarder zero-provider proof is captured.
+    use atmd::server::{methods::MethodRouter, ConnectionHandler};
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::RwLock;
+    timeout(Duration::from_secs(30), async {
+        let registry = spawn_registry();
+        let pid = std::process::id();
+        registry
+            .register_discovered(
+                SessionId::pending_from_pid(pid),
+                pid,
+                std::env::temp_dir(),
+                Some("%7".into()),
+                atm_core::Harness::Pi,
+            )
+            .await
+            .unwrap();
+        let (server, client) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(server);
+        let cancel = CancellationToken::new();
+        let handler = ConnectionHandler::new(
+            read,
+            write,
+            registry.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            1,
+            cancel.clone(),
+            Arc::new(MethodRouter::default()),
+        );
+        let task = tokio::spawn(handler.run());
+        let mut peer = BufReader::new(client);
+        async fn send(peer: &mut BufReader<tokio::io::DuplexStream>, frame: ClientMessage) {
+            peer.get_mut()
+                .write_all((serde_json::to_string(&frame).unwrap() + "\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        async fn recv(peer: &mut BufReader<tokio::io::DuplexStream>) -> serde_json::Value {
+            let mut line = String::new();
+            assert_ne!(peer.read_line(&mut line).await.unwrap(), 0);
+            serde_json::from_str(&line).unwrap()
+        }
+        send(&mut peer, ClientMessage::connect(None)).await;
+        assert_eq!(recv(&mut peer).await["type"], "connected");
+        for id in ["recovered-session", "other-real-session"] {
+            send(
+                &mut peer,
+                ClientMessage::pi_event(serde_json::json!({
+                    "event":"atm_idle", "payload":{}, "session_id":id, "pid":pid,
+                    "tmux_pane":"%7", "model":{"id":"probe", "provider":"synthetic"}
+                })),
+            )
+            .await;
+            send(&mut peer, ClientMessage::list_sessions()).await;
+            let response = recv(&mut peer).await;
+            let rows = response["sessions"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            let row = rows.first().unwrap();
+            assert_eq!(
+                row["id"], "recovered-session",
+                "upgrade pending, never replace a real id"
+            );
+            assert_eq!(row["status"], "idle");
+            assert_eq!(row["model"], "probe");
+            assert!(row["first_prompt"].is_null());
+        }
+        let rows = registry.pane_sessions("%7").await.unwrap();
+        assert!(rows.first().unwrap().start.is_none());
+        cancel.cancel();
+        task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pi_1_5_2_dialog_idle_resolution() {
+    // Synthetic: proposed dialog measurements, busy/legacy/input-latched twins.
+    // Same-stream replies prove processing; no TestServer sleeps or polling.
+    use atmd::{
+        org::{
+            message_evidence::{AttemptScope, MessageEvidence},
+            messages::MessageClock,
+        },
+        server::{methods::MethodRouter, ConnectionHandler},
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::RwLock;
+
+    async fn send(peer: &mut BufReader<tokio::io::DuplexStream>, frame: ClientMessage) {
+        peer.get_mut()
+            .write_all((serde_json::to_string(&frame).unwrap() + "\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    async fn recv(peer: &mut BufReader<tokio::io::DuplexStream>) -> serde_json::Value {
+        let mut line = String::new();
+        assert_ne!(peer.read_line(&mut line).await.unwrap(), 0);
+        serde_json::from_str(&line).unwrap()
+    }
+    timeout(Duration::from_secs(30), async {
+        let registry = spawn_registry();
+        let pid = std::process::id();
+        let session = SessionId::new("dialog-session");
+        registry.register_discovered(session.clone(), pid, std::env::temp_dir(), Some("%7".into()), Harness::Pi).await.unwrap();
+        let evidence = MessageEvidence::new(MessageClock::new(
+            tokio::time::Instant::now(), chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        ));
+        let message_id = "m123".parse().unwrap();
+        let reference = "[m123] Read: atm inbox --id m123";
+        evidence.register(message_id, reference.into()).unwrap();
+        evidence.arm(AttemptScope {
+            message_id, attempt_seq: 124, recipient: "alpha/worker".parse().unwrap(),
+            pane: atmd::control::reservation::PaneId::parse("%7").unwrap(),
+            harness: Harness::Pi, session_id: Some(session.clone()), excluded_sessions: Default::default(),
+        }).unwrap();
+        let (server, client) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(server);
+        let cancel = CancellationToken::new();
+        let handler = ConnectionHandler::new(read, write, registry.clone(), Arc::new(RwLock::new(HashMap::new())),
+            1, cancel.clone(), Arc::new(MethodRouter::default()))
+            .with_message_evidence(Some(evidence.clone()), None);
+        let task = tokio::spawn(handler.run());
+        let mut peer = BufReader::new(client);
+        send(&mut peer, ClientMessage::connect(None)).await;
+        assert_eq!(recv(&mut peer).await["type"], "connected");
+        let mut cases = Vec::new();
+        for (event, payload, expected) in [
+            ("atm_needs_input_open", serde_json::json!({"title":reference}), "attention_needed"),
+            ("atm_needs_input_resolved", serde_json::json!({"idle":true}), "idle"),
+            ("agent_start", serde_json::json!({}), "working"),
+            ("atm_needs_input_open", serde_json::json!({"title":reference}), "attention_needed"),
+            ("atm_needs_input_resolved", serde_json::json!({"idle":false}), "working"),
+            ("model_select", serde_json::json!({"model":{"id":"probe"}}), "working"),
+            ("agent_settled", serde_json::json!({}), "idle"),
+            ("atm_needs_input_open", serde_json::json!({"title":reference}), "attention_needed"),
+            // Missing idle is also the forwarder's input-latched projection.
+            ("atm_needs_input_resolved", serde_json::json!({}), "working"),
+            ("agent_settled", serde_json::json!({}), "idle"),
+            ("atm_needs_input_open", serde_json::json!({"title":reference}), "attention_needed"),
+            ("atm_needs_input_resolved", serde_json::json!({"idle":null}), "working"),
+            ("agent_settled", serde_json::json!({}), "idle"),
+        ] {
+            let data = serde_json::json!({"event":event,"payload":payload,"session_id":session.as_str(),
+                "pid":pid,"tmux_pane":"%7","model":{"id":"probe","provider":"synthetic"}});
+            cases.push((data, expected));
+        }
+        let adapter = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../atm-pi-adapter");
+        if adapter.join("Cargo.toml").exists() {
+            // Captured: pi 1.5.2, 2026-11-16, sealed PTY/private-atmd proxy,
+            // Enter and Esc. Synthetic: attribution to this registry/pane.
+            // Published atmd packages omit sibling adapter fixtures.
+            let text = std::fs::read_to_string(adapter.join("tests/fixtures/pi_dialog_1.5.2.jsonl")).unwrap();
+            let mut captured = 0;
+            for line in text.lines() {
+                let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+                let mut data = frame["data"].clone();
+                let expected = match data["event"].as_str().unwrap() {
+                    "atm_needs_input_open" => "attention_needed",
+                    "atm_needs_input_resolved" => "idle",
+                    _ => continue,
+                };
+                data["session_id"] = session.as_str().into();
+                data["pid"] = pid.into();
+                data["tmux_pane"] = "%7".into();
+                cases.push((data, expected));
+                captured += 1;
+            }
+            assert_eq!(captured, 4);
+        }
+        for (data, expected) in cases {
+            let event = data["event"].as_str().unwrap().to_owned();
+            let payload = data["payload"].clone();
+            let raw: atm_pi_adapter::RawPiEvent = serde_json::from_value(data.clone()).unwrap();
+            for lifecycle in raw.to_lifecycle_events() {
+                assert!(atm_org::TaskUsageObservation::from_lifecycle(session.clone(), Some("%7".into()), &lifecycle).is_none());
+            }
+            assert!(raw.accounting_usage().is_none());
+            send(&mut peer, ClientMessage::pi_event(data)).await;
+            send(&mut peer, ClientMessage::list_sessions()).await;
+            let response = recv(&mut peer).await;
+            let rows = response["sessions"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            let row = rows.first().unwrap();
+            assert_eq!(row["id"], session.as_str());
+            assert_eq!(row["status"], expected, "{event} {payload}: {response}");
+            if event == "atm_needs_input_open" { assert_eq!(row["activity_detail"], payload["title"]); }
+            assert!(row["first_prompt"].is_null());
+            assert_eq!(row["cost_usd"], 0.0);
+            assert!(registry.pane_sessions("%7").await.unwrap().first().unwrap().start.is_none());
+            assert!(evidence.receipt(message_id).unwrap().is_none(), "dialog title is not prompt evidence");
+        }
+        assert!(evidence.snapshot(message_id).unwrap().probably_landed, "ordinary proven activity still reaches evidence");
+        cancel.cancel(); task.await.unwrap();
+    }).await.unwrap();
+}
+
 fn pi_event_json(event: &str, payload: serde_json::Value) -> serde_json::Value {
     // No pid — the test session is registered with a synthetic PID;
     // the registry resolves via `session_id_to_pid`. (Production traffic
@@ -2211,7 +2623,7 @@ async fn test_e2e_pi_tool_call_translates_to_tool_call_start() {
             }),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2250,7 +2662,7 @@ async fn test_e2e_pi_permission_gate_becomes_needs_input() {
             }),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2281,7 +2693,7 @@ async fn test_e2e_pi_agent_end_translates_to_idle() {
             serde_json::json!({"type":"agent_start"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     client
         .send(ClientMessage::pi_event(pi_event_json(
@@ -2289,7 +2701,7 @@ async fn test_e2e_pi_agent_end_translates_to_idle() {
             serde_json::json!({"type":"agent_end"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2343,7 +2755,7 @@ async fn test_e2e_pi_context_event_drives_cost_and_token_display() {
             }),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2380,7 +2792,7 @@ async fn test_e2e_pi_atm_needs_input_open_drives_attention_needed() {
             serde_json::json!({"title": "Allow `rm -rf /tmp/junk`?"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2395,7 +2807,7 @@ async fn test_e2e_pi_atm_needs_input_open_drives_attention_needed() {
             serde_json::json!({}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2424,7 +2836,7 @@ async fn test_e2e_pi_session_shutdown_removes_session() {
             serde_json::json!({"type":"session_shutdown","reason":"quit"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     assert!(
         registry.get_session(session_id.clone()).await.is_none(),
@@ -2464,7 +2876,7 @@ async fn test_e2e_pi_suppressed_event_does_not_panic_or_disrupt() {
             }),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let after = registry
         .get_session(session_id.clone())
@@ -2505,27 +2917,10 @@ fn captured_pi_events(fixture: &str) -> Option<Vec<serde_json::Value>> {
     Some(events)
 }
 
-/// Polls the registry until `done` holds for its sessions, for up to 2 s,
-/// and returns the last snapshot.
-async fn sessions_when(
-    registry: &atmd::registry::RegistryHandle,
-    done: impl Fn(&[SessionView]) -> bool,
-) -> Vec<SessionView> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let sessions = registry.get_all_sessions().await;
-        if done(&sessions) || tokio::time::Instant::now() >= deadline {
-            return sessions;
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Waits for the registry to hold one session with a real (not pending)
-/// id, and returns it.
+/// Read one snapshot after the caller's same-stream apply fence, retaining
+/// the exact one-real-session assertions instead of polling snapshots.
 async fn only_session(registry: &atmd::registry::RegistryHandle) -> SessionView {
-    let mut sessions =
-        sessions_when(registry, |s| matches!(s, [one] if !one.id.is_pending())).await;
+    let mut sessions = registry.get_all_sessions().await;
     assert_eq!(sessions.len(), 1, "expected one session, got {sessions:?}");
     let session = sessions.remove(0);
     assert!(
@@ -2536,9 +2931,9 @@ async fn only_session(registry: &atmd::registry::RegistryHandle) -> SessionView 
     session
 }
 
-/// Waits for the registry to hold no sessions.
+/// Assert one post-fence snapshot holds no sessions.
 async fn assert_no_sessions(registry: &atmd::registry::RegistryHandle) {
-    let sessions = sessions_when(registry, <[SessionView]>::is_empty).await;
+    let sessions = registry.get_all_sessions().await;
     assert!(
         sessions.is_empty(),
         "expected no sessions, got {sessions:?}"
@@ -2578,6 +2973,7 @@ async fn test_e2e_pi_captured_run_upgrades_pending_session() {
     for event in rest {
         client.send(ClientMessage::pi_event(event.clone())).await;
     }
+    client.applied(0).await;
 
     let session = only_session(&registry).await;
     assert_eq!(Some(session.id.as_str()), rest[0]["session_id"].as_str());
@@ -2585,21 +2981,17 @@ async fn test_e2e_pi_captured_run_upgrades_pending_session() {
     assert!(registry.get_session(pending).await.is_none());
 
     // The context window comes from pi-atm's model snapshot (fake-b's
-    // 32000), not the unknown model's 200K default. Wait for the final
-    // display: the first `context` frame already shows `0.0% (0/32K)`.
+    // 32000), not the unknown model's 200K default. The same-stream fence
+    // covers the final context frame, not just its initial `0.0% (0/32K)`.
     let expected = "3.2% (1.0K/32K)";
-    let sessions = sessions_when(
-        &registry,
-        |s| matches!(s, [one] if one.context_display == expected),
-    )
-    .await;
+    let sessions = registry.get_all_sessions().await;
     let displays: Vec<&str> = sessions
         .iter()
         .map(|s| s.context_display.as_str())
         .collect();
     assert_eq!(displays, [expected]);
 
-    client.send(ClientMessage::pi_event(last.clone())).await;
+    send_applied(&mut client, 1, ClientMessage::pi_event(last.clone())).await;
     assert_no_sessions(&registry).await;
 
     server.shutdown().await;
@@ -2622,21 +3014,21 @@ async fn test_e2e_pi_captured_new_session_replaces_session() {
 
     let mut old = server.connect().await;
     old.handshake(None).await;
-    old.send(ClientMessage::pi_event(start.clone())).await;
+    send_applied(&mut old, 1, ClientMessage::pi_event(start.clone())).await;
     let old_id = only_session(&registry).await.id;
     assert_eq!(Some(old_id.as_str()), start["session_id"].as_str());
 
-    old.send(ClientMessage::pi_event(end_old.clone())).await;
+    send_applied(&mut old, 2, ClientMessage::pi_event(end_old.clone())).await;
     assert_no_sessions(&registry).await;
 
     let mut new = server.connect().await;
     new.handshake(None).await;
-    new.send(ClientMessage::pi_event(start_new.clone())).await;
+    send_applied(&mut new, 1, ClientMessage::pi_event(start_new.clone())).await;
     let new_id = only_session(&registry).await.id;
     assert_eq!(Some(new_id.as_str()), start_new["session_id"].as_str());
     assert_ne!(new_id, old_id);
 
-    new.send(ClientMessage::pi_event(end.clone())).await;
+    send_applied(&mut new, 2, ClientMessage::pi_event(end.clone())).await;
     assert_no_sessions(&registry).await;
 
     server.shutdown().await;
@@ -2748,7 +3140,7 @@ async fn test_e2e_codex_session_start_applies_model() {
         )))
         .await;
 
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2795,7 +3187,7 @@ async fn test_e2e_codex_event_applies_transcript_token_usage() {
         )))
         .await;
 
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2831,7 +3223,7 @@ async fn test_e2e_codex_pre_tool_use_translates_to_tool_call_start() {
         )))
         .await;
 
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2881,7 +3273,7 @@ async fn test_e2e_codex_permission_request_becomes_needs_input() {
         )))
         .await;
 
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2914,7 +3306,7 @@ async fn test_e2e_codex_stop_translates_to_idle() {
             serde_json::json!({"tool_name": "Bash"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     client
         .send(ClientMessage::codex_event(codex_event_json(
@@ -2923,7 +3315,7 @@ async fn test_e2e_codex_stop_translates_to_idle() {
             serde_json::json!({"stop_hook_active": false, "last_assistant_message": "done"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let view = registry
         .get_session(session_id.clone())
@@ -2958,7 +3350,7 @@ async fn test_e2e_codex_session_end_removes_session() {
             serde_json::json!({"reason": "other"}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     assert!(
         registry.get_session(session_id.clone()).await.is_none(),
@@ -2995,7 +3387,7 @@ async fn test_e2e_codex_malformed_tool_event_is_suppressed() {
             serde_json::json!({}),
         )))
         .await;
-    sleep(Duration::from_millis(50)).await;
+    client.applied(0).await;
 
     let after = registry
         .get_session(session_id.clone())

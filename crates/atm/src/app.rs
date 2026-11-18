@@ -6,13 +6,27 @@
 //! All code follows the panic-free policy: no `.unwrap()`, `.expect()`,
 //! `panic!()`, `unreachable!()`, `todo!()`, or direct indexing `[i]`.
 
-use crate::beads::BeadsTask;
+use crate::{
+    beads::BeadsTask,
+    work::{build_work_tree, WorkEffect, WorkInput, WorkState, NO_WINDOW},
+};
 use atm_core::{
     all_node_ids, build_tree, flatten_tree, SessionId, SessionView, TreeNode, TreeNodeId, TreeRow,
     TreeRowKind,
 };
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
+
+/// Sessions remains the initial view; Work uses the same rows and actions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AppView {
+    #[default]
+    Sessions,
+    Work,
+}
 
 // ============================================================================
 // Application State
@@ -52,6 +66,13 @@ pub struct App {
     /// Current connection state to the daemon.
     pub state: AppState,
 
+    /// Current grouping, independent of the session data and selection identity.
+    pub view: AppView,
+    /// Pure Work caches and generation bookkeeping; only the binary executes effects.
+    pub work: WorkState,
+    /// Monotonic frame time injected by the event loop for Work freshness.
+    pub work_now: Duration,
+
     /// All active sessions indexed by their ID.
     pub sessions: HashMap<SessionId, SessionView>,
 
@@ -60,9 +81,6 @@ pub struct App {
 
     /// Flag indicating the application should quit.
     pub should_quit: bool,
-
-    /// Timestamp of the last data update from the daemon.
-    pub last_update: DateTime<Utc>,
 
     /// Wall-clock time of the frame being drawn. The event loop sets it
     /// before each draw, so rendering never reads the clock itself.
@@ -112,6 +130,9 @@ pub struct App {
     /// Panes tagged as coordinators on the TUI's tmux server.
     pub coordinator_panes: HashSet<String>,
 
+    /// Server-projected named panes with a visible waiting owner decision.
+    pub decision_panes: HashSet<String>,
+
     /// Compact mode: vertical layout optimized for narrow sidebar panes.
     pub compact: bool,
 
@@ -130,6 +151,11 @@ pub struct App {
     /// started before any tree was built, so there is no fold state to keep.
     pre_filter_expanded: Option<Option<HashSet<TreeNodeId>>>,
 
+    /// Inactive view folds; None means it has never been built, not collapsed-all.
+    inactive_expanded: Option<HashSet<TreeNodeId>>,
+    inactive_pre_filter_expanded: Option<Option<HashSet<TreeNodeId>>>,
+    inactive_filter_query: String,
+
     /// Row selected before the last rebuild that had one, so ending a filter
     /// keeps the cursor even when the filtered tree was left with no rows.
     last_selected_node: Option<TreeNodeId>,
@@ -146,10 +172,12 @@ impl App {
     pub fn new() -> Self {
         Self {
             state: AppState::Connecting,
+            view: AppView::Sessions,
+            work: WorkState::default(),
+            work_now: Duration::ZERO,
             sessions: HashMap::new(),
             selected_index: 0,
             should_quit: false,
-            last_update: Utc::now(),
             now: Utc::now(),
             blink_visible: true,
             tick_count: 0,
@@ -165,13 +193,92 @@ impl App {
             tmux_session_filter: None,
             filter_pane_ids: HashSet::new(),
             coordinator_panes: HashSet::new(),
+            decision_panes: HashSet::new(),
             compact: false,
             filter_query: String::new(),
             search_active: false,
             filter_matches: None,
             pre_filter_expanded: None,
+            inactive_expanded: None,
+            inactive_pre_filter_expanded: None,
+            inactive_filter_query: String::new(),
             last_selected_node: None,
         }
+    }
+
+    /// Switches grouping without changing a selected agent's identity or the other view's folds.
+    #[must_use]
+    pub fn toggle_work_view(&mut self, now: Duration) -> Vec<WorkEffect> {
+        let selected = self
+            .selected_session()
+            .map(|session| TreeNodeId::Agent(session.id.clone()));
+        let query_changed = self.inactive_filter_query != self.filter_query;
+        self.inactive_filter_query.clone_from(&self.filter_query);
+        let saved = self
+            .inactive_expanded
+            .replace(std::mem::take(&mut self.expanded));
+        std::mem::swap(
+            &mut self.pre_filter_expanded,
+            &mut self.inactive_pre_filter_expanded,
+        );
+        self.view = match self.view {
+            AppView::Sessions => AppView::Work,
+            AppView::Work => AppView::Sessions,
+        };
+        if !self.filter_query.is_empty() && self.pre_filter_expanded.is_none() {
+            self.pre_filter_expanded = Some(saved.clone());
+        }
+        self.rebuild_tree();
+        self.expanded = saved.unwrap_or_else(|| all_node_ids(&self.tree));
+        if query_changed && !self.filter_query.is_empty() {
+            self.expanded.extend(all_node_ids(&self.tree));
+        }
+        self.restore_node(selected.as_ref());
+        self.reduce_work(
+            match self.view {
+                AppView::Work => WorkInput::Shown,
+                AppView::Sessions => WorkInput::Hidden,
+            },
+            now,
+        )
+    }
+
+    /// Reduces one terminal reply/event without rebuilding Sessions for hidden Work I/O.
+    #[must_use]
+    pub fn reduce_work(&mut self, input: WorkInput, now: Duration) -> Vec<WorkEffect> {
+        self.work_now = now;
+        let rebuild =
+            self.view == AppView::Work && matches!(&input, WorkInput::WindowsReply { .. });
+        let effects = self.work.reduce(input, now);
+        if rebuild {
+            self.rebuild_tree();
+        }
+        effects
+    }
+
+    /// Counts the full filtered Work tree, not just currently unfolded rows.
+    #[must_use]
+    pub fn work_counts(&self) -> (usize, usize) {
+        (
+            self.tree
+                .iter()
+                .filter(|node| matches!(node, TreeNode::Window {id,..} if id != NO_WINDOW))
+                .count(),
+            self.tree.iter().map(TreeNode::agent_count).sum(),
+        )
+    }
+
+    fn restore_node(&mut self, selected: Option<&TreeNodeId>) {
+        if let Some(path) = selected.and_then(|id| ancestor_ids(&self.tree, id)) {
+            self.expanded.extend(path);
+        }
+        self.reflatten();
+        if let Some(pos) =
+            selected.and_then(|id| self.tree_rows.iter().position(|row| &row.node_id == id))
+        {
+            self.selected_index = pos;
+        }
+        self.clamp_selection();
     }
 
     /// Creates a new App with pick mode enabled (exit after jump).
@@ -254,7 +361,6 @@ impl App {
             self.sessions.insert(session.id.clone(), session);
         }
         self.state = AppState::Connected;
-        self.last_update = Utc::now();
         self.rebuild_tree();
     }
 
@@ -267,7 +373,6 @@ impl App {
             self.sessions.insert(session.id.clone(), session);
         }
         self.state = AppState::Connected;
-        self.last_update = Utc::now();
         self.rebuild_tree();
     }
 
@@ -316,11 +421,19 @@ impl App {
             sessions.retain(|s| selection.visible.contains(&s.id));
             Some(selection.matched)
         };
-        let previous_tree = std::mem::replace(&mut self.tree, build_tree(&sessions));
+        let built = match self.view {
+            AppView::Sessions => build_tree(&sessions),
+            AppView::Work => build_work_tree(&sessions, self.work.windows()),
+        };
+        let previous_tree = std::mem::replace(&mut self.tree, built);
         crate::role::coordinators_first(&mut self.tree, &self.coordinator_panes);
 
         // On first build, expand everything so the tree starts open
-        if self.expanded.is_empty() && !self.tree.is_empty() {
+        if self.view == AppView::Work {
+            let previous_ids = all_node_ids(&previous_tree);
+            self.expanded
+                .extend(all_node_ids(&self.tree).difference(&previous_ids).cloned());
+        } else if self.expanded.is_empty() && !self.tree.is_empty() {
             self.expanded = all_node_ids(&self.tree);
         }
 
@@ -341,8 +454,13 @@ impl App {
             }
         }
 
-        self.reflatten();
-        self.clamp_selection();
+        if self.view == AppView::Work {
+            let selected = self.last_selected_node.clone();
+            self.restore_node(selected.as_ref());
+        } else {
+            self.reflatten();
+            self.clamp_selection();
+        }
     }
 
     /// Opens the `/` search prompt, keeping any existing query for editing.
@@ -384,6 +502,11 @@ impl App {
     /// selected row and the groups around it open (like vim after a search).
     /// No-op when no filter is active.
     fn end_filter(&mut self) {
+        // The query is global, so ending it also restores the hidden view's saved folds.
+        self.inactive_filter_query.clear();
+        if let Some(saved) = self.inactive_pre_filter_expanded.take() {
+            self.inactive_expanded = saved;
+        }
         let Some(saved) = self.pre_filter_expanded.take() else {
             return;
         };
@@ -611,6 +734,7 @@ impl App {
     ///
     /// Sessions are ordered by their `started_at` field in descending order,
     /// so the most recently started sessions appear first.
+    #[cfg(test)]
     pub fn sessions_sorted(&self) -> Vec<&SessionView> {
         let mut sessions: Vec<&SessionView> = self.sessions.values().collect();
         // Sort by started_at descending (newest first)
@@ -665,6 +789,7 @@ impl App {
     }
 
     /// Navigates to the next row (downward), wrapping around if needed.
+    #[cfg(test)]
     pub fn select_next(&mut self) {
         let row_count = self.tree_rows.len();
         if row_count == 0 {
@@ -675,6 +800,7 @@ impl App {
     }
 
     /// Navigates to the previous row (upward), wrapping around if needed.
+    #[cfg(test)]
     pub fn select_previous(&mut self) {
         let row_count = self.tree_rows.len();
         if row_count == 0 {
@@ -728,9 +854,18 @@ impl App {
         self.select_up(distance);
     }
 
-    /// Moves the cursor to the next (`forward`) or previous agent that needs
-    /// attention, in tree order, wrapping around. Agents hidden in collapsed
-    /// folds count: their enclosing groups are opened. No-op if none match.
+    /// Whether this named-session leaf, not a pane-sharing child, waits for the owner.
+    #[must_use]
+    pub fn has_waiting_decision(&self, session: &SessionView) -> bool {
+        session.parent_session_id.is_none()
+            && session
+                .tmux_pane
+                .as_ref()
+                .is_some_and(|pane| self.decision_panes.contains(pane))
+    }
+
+    /// Moves to the next (`forward`) or previous agent needing input or an owner
+    /// decision, wrapping in tree order. Opens collapsed ancestors; respects filters.
     pub fn select_attention(&mut self, forward: bool) {
         let all_rows = flatten_tree(&self.tree, &all_node_ids(&self.tree));
         let current = self
@@ -748,7 +883,7 @@ impl App {
                 }
             })
             .filter_map(|i| all_rows.get(i))
-            .find(|r| matches!(&r.kind, TreeRowKind::Agent { session } if session.needs_attention))
+            .find(|r| matches!(&r.kind, TreeRowKind::Agent { session } if session.needs_attention || self.has_waiting_decision(session)))
             .map(|r| r.node_id.clone());
         let Some(target) = target else {
             return;
@@ -830,7 +965,8 @@ fn ancestor_ids(tree: &[TreeNode], target: &TreeNodeId) -> Option<Vec<TreeNodeId
         let children = match node {
             TreeNode::Project { children, .. }
             | TreeNode::Worktree { children, .. }
-            | TreeNode::Team { children, .. } => children,
+            | TreeNode::Team { children, .. }
+            | TreeNode::Window { children, .. } => children,
             TreeNode::Agent { subagents, .. } => subagents,
         };
         let mut path = ancestor_ids(children, target)?;
@@ -846,6 +982,259 @@ fn ancestor_ids(tree: &[TreeNode], target: &TreeNodeId) -> Option<Vec<TreeNodeId
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn work_app() -> App {
+        let mut app = App::new();
+        let mut parent = role_session("parent", Some("%1"), None, "2");
+        parent.project_root = Some("/fixtures/alpha".into());
+        parent.worktree_path = parent.project_root.clone();
+        parent.worktree_branch = Some("main".into());
+        let child = SessionView {
+            id: "child".into(),
+            id_short: "child".into(),
+            parent_session_id: Some(parent.id.clone()),
+            ..parent.clone()
+        };
+        let mut other = role_session("other", Some("%2"), None, "1");
+        other.project_root = Some("/fixtures/beta".into());
+        other.worktree_path = other.project_root.clone();
+        app.update_sessions(vec![parent, child, other]);
+        select(&mut app, "parent");
+        app
+    }
+    fn work_windows(moved: bool) -> crate::work::WorkWindows {
+        serde_json::from_value(serde_json::json!({"state":"ok","windows":[
+            {"id":"@1","name":"alpha","links":[{"session":"work","index":0}],"panes": if moved {vec!["%2"]} else {vec!["%1"]}},
+            {"id":"@2","name":"beta","links":[{"session":"work","index":1}],"panes": if moved {vec!["%1"]} else {vec!["%2"]}}
+        ]})).unwrap()
+    }
+    fn work_reply(app: &mut App, effects: Vec<crate::work::WorkEffect>, moved: bool) {
+        let generation = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                crate::work::WorkEffect::RequestWindows(generation) => Some(generation),
+                _ => None,
+            })
+            .unwrap();
+        let _ = app.reduce_work(
+            crate::work::WorkInput::WindowsReply {
+                generation,
+                result: Ok(work_windows(moved)),
+            },
+            std::time::Duration::ZERO,
+        );
+    }
+    fn list_buffer(app: &App) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::session_list::render_session_list(frame, frame.area(), app))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    // Break caught: toggling changes SessionView identity, Sessions order/folds, or its rendered buffer.
+    #[test]
+    fn work_toggle_twice_restores_sessions_rows() {
+        use crate::keybinding::{InputHandler, UiAction};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = work_app();
+        let rows = format!("{:?}", app.tree_rows);
+        let buffer = list_buffer(&app);
+        let folds = app.expanded.clone();
+        let mut handler = InputHandler::new();
+        for i in 0..2 {
+            assert_eq!(
+                handler.handle(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                Some(UiAction::ToggleWorkView)
+            );
+            let effects = app.toggle_work_view(std::time::Duration::ZERO);
+            if i == 0 {
+                work_reply(&mut app, effects, false);
+                assert_eq!(app.view, AppView::Work);
+                assert_eq!(app.work_counts(), (2, 3));
+                let cloned = app.clone();
+                assert_eq!(cloned.work.windows().len(), 2);
+            }
+            assert_eq!(app.selected_session().unwrap().id.as_str(), "parent");
+        }
+        assert_eq!(app.view, AppView::Sessions);
+        assert_eq!(format!("{:?}", app.tree_rows), rows);
+        assert_eq!(app.expanded, folds);
+        assert_eq!(list_buffer(&app), buffer);
+    }
+
+    // Break caught: an intentionally empty zM set is confused with an uninitialized view.
+    #[test]
+    fn work_folds_are_per_view_including_empty_sets() {
+        let mut app = work_app();
+        app.collapse_all();
+        let sessions = format!("{:?}", app.tree_rows);
+        let effects = app.toggle_work_view(std::time::Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        app.collapse_all();
+        assert!(app.expanded.is_empty());
+        let _ = app.toggle_work_view(std::time::Duration::ZERO);
+        assert_eq!(format!("{:?}", app.tree_rows), sessions);
+        let effects = app.toggle_work_view(std::time::Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        assert!(app.expanded.is_empty());
+        assert_eq!(app.tree_rows.len(), 2);
+        // A periodic successful reply must not silently unfold Work's zM.
+        let effects = app.reduce_work(crate::work::WorkInput::Refresh, std::time::Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        assert!(app.expanded.is_empty());
+        assert_eq!(app.tree_rows.len(), 2);
+    }
+
+    // Break caught: ending a global filter in one view loses the other's pre-filter folds.
+    #[test]
+    fn work_folds_keep_per_view_filter_snapshots() {
+        let mut app = work_app();
+        let effects = app.toggle_work_view(std::time::Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        app.collapse_all();
+        let _ = app.toggle_work_view(std::time::Duration::ZERO);
+        app.collapse_all();
+        app.start_search();
+        for c in "parent".chars() {
+            app.push_search_char(c);
+        }
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "parent");
+        let _ = app.toggle_work_view(std::time::Duration::ZERO);
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "parent");
+        app.clear_filter();
+        assert!(!app.expanded.contains(&TreeNodeId::Window("@2".into())));
+        let _ = app.toggle_work_view(std::time::Duration::ZERO);
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "parent");
+        assert!(app
+            .tree_rows
+            .iter()
+            .any(|r| matches!(&r.kind, TreeRowKind::Project {name,..} if name == "beta")));
+        assert!(!app
+            .expanded
+            .contains(&TreeNodeId::Project("/fixtures/beta".into())));
+    }
+
+    // Break caught: sorting/regrouping leaves the cursor at an unrelated numeric row.
+    #[test]
+    fn work_regrouping_keeps_agent_selection() {
+        let mut app = work_app();
+        let effects = app.toggle_work_view(std::time::Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        let effects = app.reduce_work(crate::work::WorkInput::Refresh, std::time::Duration::ZERO);
+        work_reply(&mut app, effects, true);
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "parent");
+        assert!(app.expanded.contains(&TreeNodeId::Window("@2".into())));
+        app.remove_session("parent");
+        assert!(app.selected_index < app.tree_rows.len());
+        assert_eq!(
+            role_row_ids(&app)
+                .iter()
+                .filter(|id| **id == "child")
+                .count(),
+            1
+        );
+    }
+
+    // Break caught: a hidden reply rebuilds Sessions (including a still-active filter/cursor).
+    #[test]
+    fn work_hidden_replies_do_not_rebuild_sessions() {
+        let mut app = work_app();
+        let effects = app.toggle_work_view(std::time::Duration::ZERO);
+        let _ = app.toggle_work_view(std::time::Duration::ZERO);
+        app.start_search();
+        app.push_search_char('p');
+        let rows = format!("{:?}", app.tree_rows);
+        let folds = app.expanded.clone();
+        work_reply(&mut app, effects, false);
+        assert_eq!(format!("{:?}", app.tree_rows), rows);
+        assert_eq!(app.expanded, folds);
+        assert!(app.work.windows().is_empty());
+    }
+
+    // Break caught: Work invents a second row/action model or folded counts omit subagents.
+    #[test]
+    fn work_window_enter_folds_and_agents_keep_action_identity() {
+        let mut app = work_app();
+        let effects = app.toggle_work_view(std::time::Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        app.select_go_to(0);
+        assert!(app.selected_session().is_none());
+        app.toggle_fold();
+        assert!(!app.tree_rows.first().unwrap().is_expanded);
+        assert_eq!(app.tree_rows.first().unwrap().agent_count, 2);
+        assert_eq!(app.work_counts(), (2, 3));
+        app.open_fold();
+        select(&mut app, "child");
+        assert_eq!(
+            app.selected_session().unwrap().tmux_pane.as_deref(),
+            Some("%1")
+        );
+        assert_eq!(
+            app.selected_session()
+                .unwrap()
+                .parent_session_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "parent"
+        );
+        let _ = app.toggle_work_view(std::time::Duration::ZERO);
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "child");
+    }
+
+    // Break caught: a query edited in Work leaves its new matches hidden behind Sessions' old folds.
+    #[test]
+    fn work_filter_edits_open_new_matches_in_the_other_view_only_when_changed() {
+        let mut app = work_app();
+        let arriving = app.sessions.get(&SessionId::new("other")).unwrap().clone();
+        app.remove_session("other");
+        app.collapse_all();
+        app.start_search();
+        for c in "/fixtures/a".chars() {
+            app.push_search_char(c);
+        }
+        app.confirm_search();
+        let effects = app.toggle_work_view(Duration::ZERO);
+        work_reply(&mut app, effects, false);
+        // A new project arrives while Sessions is hidden and the old query excludes it.
+        app.update_sessions(vec![arriving]);
+        app.start_search();
+        app.pop_search_char();
+        app.push_search_char('b');
+        app.confirm_search();
+        assert_eq!(app.selected_session().unwrap().id.as_str(), "other");
+        app.close_fold();
+        assert!(app.selected_session().is_none());
+        let _ = app.toggle_work_view(Duration::ZERO);
+        assert_eq!(
+            role_row_ids(&app),
+            ["other"],
+            "the current filter's new match must be visible"
+        );
+        app.collapse_all();
+        let _ = app.toggle_work_view(Duration::ZERO);
+        let _ = app.toggle_work_view(Duration::ZERO);
+        assert!(
+            role_row_ids(&app).is_empty(),
+            "an unchanged query must preserve deliberate folds"
+        );
+        let _ = app.toggle_work_view(Duration::ZERO);
+        app.clear_filter();
+        app.start_search();
+        for c in "/fixtures/b".chars() {
+            app.push_search_char(c);
+        }
+        app.confirm_search();
+        app.close_fold();
+        let _ = app.toggle_work_view(Duration::ZERO);
+        assert_eq!(
+            role_row_ids(&app),
+            ["other"],
+            "a restarted query must also reveal its matches"
+        );
+    }
 
     fn create_test_session(id: &str, started_at: &str) -> SessionView {
         SessionView {
@@ -1889,6 +2278,43 @@ mod tests {
 
     fn selected_id(app: &App) -> Option<&str> {
         app.selected_session().map(|s| s.id.as_str())
+    }
+
+    // Break caught: waiting decisions do not participate in n/N, mark shared-pane
+    // subagents, escape a filter, or lose the selection when marks refresh.
+    #[test]
+    fn waiting_decision_navigation_opens_folds_and_excludes_shared_pane_children() {
+        let mut app = App::new();
+        app.update_sessions(vec![
+            role_session("parent", Some("%7"), None, "1"),
+            role_session("child", Some("%7"), Some("parent"), "2"),
+            role_session("other", Some("%8"), None, "3"),
+        ]);
+        app.decision_panes.insert("%7".into());
+        app.collapse_all();
+        app.select_attention(true);
+        assert_eq!(selected_id(&app), Some("parent"));
+        let before = app.selected_index;
+        app.select_attention(true);
+        app.select_attention(false);
+        assert_eq!(selected_id(&app), Some("parent"));
+        assert_eq!(before, app.selected_index);
+        assert!(!app.has_waiting_decision(app.sessions.get(&SessionId::new("child")).unwrap()));
+        app.decision_panes.clear();
+        app.select_attention(true);
+        assert_eq!(before, app.selected_index);
+        app.decision_panes.insert("%7".into());
+        app.start_search();
+        for c in "other".chars() {
+            app.push_search_char(c);
+        }
+        app.confirm_search();
+        let filtered = app.selected_index;
+        app.select_attention(true);
+        assert_eq!(filtered, app.selected_index);
+        assert!(!app.tree_rows.iter().any(
+            |row| matches!(&row.kind, TreeRowKind::Agent {session} if session.id.as_str()=="parent")
+        ));
     }
 
     #[test]

@@ -1,8 +1,5 @@
 //! Applying status lines to stored sessions.
 
-use std::time::Instant;
-
-use chrono::Utc;
 use tracing::{debug, info};
 
 use atm_core::{SessionDomain, SessionId, StatusLineData};
@@ -10,6 +7,7 @@ use atm_core::{SessionDomain, SessionId, StatusLineData};
 use super::RegistryActor;
 use crate::registry::commands::RegistryError;
 use crate::registry::git::GitLookups;
+use crate::registry::inputs::{stamp_new_session, Clock};
 
 impl RegistryActor {
     /// Handles status line update.
@@ -34,7 +32,14 @@ impl RegistryActor {
         // Fallback: lookup by session_id (when no PID available)
         if let Some(&pid) = self.session_id_to_pid.get(&session_id) {
             if let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) {
-                apply_status_line(session, &data, &session_id, pid, &mut self.git_lookups);
+                apply_status_line(
+                    session,
+                    &data,
+                    &session_id,
+                    pid,
+                    &mut self.git_lookups,
+                    self.clock.as_ref(),
+                );
 
                 debug!(
                     session_id = %session_id,
@@ -68,7 +73,7 @@ impl RegistryActor {
         data: StatusLineData,
         harness: atm_core::Harness,
     ) -> Result<(), RegistryError> {
-        if self.ended_in(&session_id, pid, Utc::now()) {
+        if self.ended_in(&session_id, pid, self.clock.utc_now()) {
             debug!(
                 session_id = %session_id,
                 pid = pid,
@@ -90,7 +95,14 @@ impl RegistryActor {
 
         if let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) {
             let log_id = session.id.clone();
-            apply_status_line(session, &data, &log_id, pid, &mut self.git_lookups);
+            apply_status_line(
+                session,
+                &data,
+                &log_id,
+                pid,
+                &mut self.git_lookups,
+                self.clock.as_ref(),
+            );
 
             debug!(
                 session_id = %session_id,
@@ -102,7 +114,10 @@ impl RegistryActor {
             self.publish_updated(pid);
         } else {
             // Session doesn't exist - create it
-            let mut session = SessionDomain::from_status_line(&data);
+            let mut session =
+                stamp_new_session(SessionDomain::from_status_line(&data), self.clock.as_ref());
+            // from_status_line samples separately for creation and update.
+            session.last_activity = self.clock.utc_now();
             session.harness = harness;
 
             self.insert_new_session(pid, session)?;
@@ -129,8 +144,11 @@ fn apply_status_line(
     log_id: &SessionId,
     pid: u32,
     git_lookups: &mut GitLookups,
+    clock: &dyn Clock,
 ) {
     let cwd_changed = session.update_from_status_line(data);
+    // Discard only the legacy operation's timestamp, before publication.
+    session.last_activity = clock.utc_now();
 
     // Resolve project/worktree if not yet set, or if cwd changed
     if session.project_root.is_none() || cwd_changed {
@@ -143,7 +161,7 @@ fn apply_status_line(
                     "Working directory changed, re-resolving git info"
                 );
             }
-            git_lookups.request(cwd, Instant::now());
+            git_lookups.request(cwd, clock.instant_now());
         }
     }
 }

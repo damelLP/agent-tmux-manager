@@ -21,6 +21,8 @@ def runtime():
     r.prefix = "test"
     r.prompt = None
     r.pending_renders = []
+    r.render_hold = False
+    r.held_render = None
     r.render_sequence = 0
     r.draft_dirty = False
     r.manual_clock = True
@@ -46,6 +48,57 @@ def journal(r):
 
 
 class ControlTests(unittest.TestCase):
+    # Break caught: an acknowledged renderer hold still paints/submits the draft.
+    def test_render_hold_keeps_real_draft_until_event_release(self):
+        for mode in ["claude", "pi"]:
+            with self.subTest(mode=mode):
+                r = runtime()
+                r.mode, r.model = mode, make(mode)
+                r.forward = lambda data: self.fail("a render control submitted input")
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.render())
+                    r.input(b"\x1b[1;1R")
+                    r.control({"id": 1, "command": "hold_next_render"})
+                self.assertNotIn("error", journal(r)[-1])
+                with redirect_stdout(io.StringIO()) as output:
+                    r.input(b"\x1b[200~[m3] Read: atm inbox --id m3\x1b[201~")
+                    r.control({"id": 2, "command": "barrier"})
+                    r.input(b" human edit")
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(r.parser.draft, b"[m3] Read: atm inbox --id m3 human edit")
+                self.assertTrue(any(e["kind"] == "render_held" for e in journal(r)))
+                self.assertEqual(r.render_sequence, 1)
+                with redirect_stdout(io.StringIO()) as output:
+                    r.control({"id": 3, "command": "release_render"})
+                self.assertTrue(output.getvalue().endswith("\x1b[6n"))
+                self.assertNotIn("error", journal(r)[-1])
+                with redirect_stdout(io.StringIO()):
+                    r.input(b"\x1b[1;1R")
+                self.assertEqual(journal(r)[-1]["draft"], "[m3] Read: atm inbox --id m3 human edit")
+                self.assertFalse(any(e["kind"] == "accepted" for e in journal(r)))
+
+    def test_invalid_render_controls_preserve_arm_and_draft(self):
+        r = runtime()
+        with redirect_stdout(io.StringIO()):
+            r.effects(r.model.render())
+            r.input(b"\x1b[1;1R")
+            r.control({"id": 1, "command": "release_render"})
+            self.assertIn("error", journal(r)[-1])
+            r.control({"id": 2, "command": "hold_next_render"})
+            self.assertNotIn("error", journal(r)[-1])
+            for command in ["hold_next_render", "release_render"]:
+                r.control({"id": 3, "command": command})
+                self.assertIn("error", journal(r)[-1])
+            r.input(b"\x1b[200~keep me\x1b[201~")
+            r.control({"id": 4, "command": "hold_next_render"})
+            self.assertIn("error", journal(r)[-1])
+            self.assertEqual(r.parser.draft, b"keep me")
+            r.control({"id": 5, "command": "release_render"})
+            self.assertNotIn("error", journal(r)[-1])
+            r.control({"id": 6, "command": "release_render"})
+            self.assertIn("error", journal(r)[-1])
+        self.assertEqual(r.parser.draft, b"keep me")
+
     # Synthetic: acknowledging but ignoring the control would forward the paste.
     def test_refuse_next_paste_never_reaches_model_and_next_paste_works(self):
         for mode in ["claude", "codex", "pi"]:
@@ -268,6 +321,34 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(journal(r)[-1]["kind"], "rendered")
         self.assertEqual(journal(r)[-1]["state"], "source-replay")
         self.assertFalse(any(e["kind"] == "ready" for e in journal(r)))
+
+    # Break caught: holding a replay contaminates later ordinary editor renders.
+    def test_source_replay_after_hold_keeps_ordinary_editor_render(self):
+        for held in [False, True]:
+            with self.subTest(held=held):
+                r = runtime()
+                forwarded = []
+                r.forward = forwarded.append
+                with redirect_stdout(io.StringIO()):
+                    r.effects(r.model.render())
+                    r.input(b"\x1b[1;1R")
+                    if held:
+                        r.control({"id": 1, "command": "hold_next_render"})
+                    r.input(b"draft")
+                    r.control({"id": 2, "command": "render_source", "key": "claude.permission.u5"})
+                    if held:
+                        r.control({"id": 3, "command": "release_render"})
+                    r.input(b"\x1b[1;1R")
+                with redirect_stdout(io.StringIO()) as output:
+                    r.input(b" more")
+                self.assertIn("draft more", output.getvalue())
+                self.assertNotIn("Do you want to proceed?", output.getvalue())
+                last = next(e for e in reversed(journal(r)) if e["kind"] == "render")
+                self.assertEqual(last["state"], "idle")
+                self.assertNotIn("replay_spec", last)
+                self.assertEqual(r.model.state, "idle")
+                self.assertEqual(r.parser.draft, b"draft more")
+                self.assertEqual(forwarded, [])
 
     def test_source_replay_during_fragmented_paste_cannot_replace_lifecycle(self):
         r = runtime()

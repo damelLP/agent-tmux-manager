@@ -17,6 +17,7 @@ fn with_message() -> (OrgState, MessageId) {
             role: role(),
         },
         OrgEvent::MessageSent(MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to: Address::Agent(id()),
             kind: MessageKind::Note,

@@ -1,0 +1,4428 @@
+{
+  "frames": 10,
+  "label": "SEALED REPLAY",
+  "raw_dropped": 0,
+  "source": "pi_tool_run_0.73.1",
+  "turns": [
+    {
+      "action": {
+        "command": {
+          "cwd": "$SEALED/repo",
+          "harness": "pi",
+          "kind": "discovered",
+          "pid": 900001,
+          "session_id": "pending-900001",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "171310",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "pending-900001": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "pending-900001",
+              "last_activity": "2026-11-17T06:21:48.664611577Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "pending-900001",
+              "id_short": "pending-",
+              "last_activity": "2026-11-17T06:21:48.664611577+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.664841336Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.664611577Z"
+          },
+          {
+            "kind": "instant",
+            "value": 171310
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.664789196Z"
+          }
+        ],
+        "processes": {
+          "parent:Pi:900001": [
+            null
+          ],
+          "start:900001": [
+            80493690
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "git": {
+          "context": [
+            "$SEALED/repo",
+            "$SEALED/repo",
+            "main"
+          ],
+          "cwd": "$SEALED/repo"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "pending-900001": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "pending-900001",
+              "last_activity": "2026-11-17T06:21:48.664611577Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "pending-900001",
+              "id_short": "pending-",
+              "last_activity": "2026-11-17T06:21:48.664611577+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.665170686Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.665137386Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "source": "startup",
+            "type": "session_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.665432996Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.665432996+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.665461616Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.665432996Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.665444886Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-a",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.665583525Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-a",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.665583525+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-a",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.665595695Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.665583525Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.665589295Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.665944635Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.665944635+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.665973425Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.665944635Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.665957635Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "prompt": "Read note.txt and reply.",
+            "type": "prompt_submit"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.666251784Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.666251784+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.666273024Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666251784Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666260614Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.666382634Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.666382634+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.666393714Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666382634Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666387394Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "type": "working_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.666594184Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.666594184+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.666611694Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666594184Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666601144Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.666710814Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.666710814+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.666720814Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666710814Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666714564Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 32000,
+            "cost_usd": null,
+            "tokens": null,
+            "type": "context_update"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.666938583Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/32K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.666938583+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.666956933Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666938583Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.666946143Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.667054883Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/32K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.667054883+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.667064663Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667054883Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667058713Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "input": {
+              "path": "note.txt"
+            },
+            "name": "read",
+            "tool_use_id": "call_f3probe",
+            "type": "tool_call_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.667256443Z",
+                "tool_name": "read"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.667256443Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": "read",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/32K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.667256443+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.667273533Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667256443Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667262773Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.667256443Z",
+                "tool_name": "read"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.667378543Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": "read",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/32K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.667378543+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.667388663Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667378543Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667382353Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "is_error": false,
+            "name": "read",
+            "tool_use_id": "call_f3probe",
+            "type": "tool_call_end"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Thinking",
+                "started_at": "2026-11-17T06:21:48.667586832Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.667586832Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": "Thinking",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/32K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.667586832+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.667603122Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667586832Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667593052Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Thinking",
+                "started_at": "2026-11-17T06:21:48.667586832Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.667705952Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": "Thinking",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/32K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.667705952+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.667715582Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667705952Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667709572Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 32000,
+            "cost_usd": 0.0033,
+            "tokens": 1020,
+            "type": "context_update"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 1020,
+                "current_output_tokens": 0,
+                "total_input_tokens": 1020,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0033,
+              "current_activity": {
+                "context": "Thinking",
+                "started_at": "2026-11-17T06:21:48.667586832Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.667956312Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": "Thinking",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "3.2% (1.0K/32K)",
+              "context_percentage": 3.1875,
+              "context_warning": false,
+              "cost_display": "$0.0033",
+              "cost_usd": 0.0033,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.667956312+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.667979192Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667956312Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.667963852Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 1020,
+                "current_output_tokens": 0,
+                "total_input_tokens": 1020,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0033,
+              "current_activity": {
+                "context": "Thinking",
+                "started_at": "2026-11-17T06:21:48.667586832Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.668083102Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": "Thinking",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "3.2% (1.0K/32K)",
+              "context_percentage": 3.1875,
+              "context_warning": false,
+              "cost_display": "$0.0033",
+              "cost_usd": 0.0033,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.668083102+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.668093512Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.668083102Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.668086992Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "type": "working_end"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 1020,
+                "current_output_tokens": 0,
+                "total_input_tokens": 1020,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0033,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.668331391Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "3.2% (1.0K/32K)",
+              "context_percentage": 3.1875,
+              "context_warning": false,
+              "cost_display": "$0.0033",
+              "cost_usd": 0.0033,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.668331391+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.668349491Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.668331391Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.668337521Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-b",
+            "provider": "atmfake",
+            "type": "provider_model_change"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f2a-1686-763b-9a72-a25b2d29742c": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 32000,
+                "current_input_tokens": 1020,
+                "current_output_tokens": 0,
+                "total_input_tokens": 1020,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0033,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "last_activity": "2026-11-17T06:21:48.668444201Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-b",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.664611577Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "3.2% (1.0K/32K)",
+              "context_percentage": 3.1875,
+              "context_warning": false,
+              "cost_display": "$0.0033",
+              "cost_usd": 0.0033,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Read note.txt and reply.",
+              "harness": "pi",
+              "id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+              "id_short": "01a16f2a",
+              "last_activity": "2026-11-17T06:21:48.668444201+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-b",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.664611577+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.668453831Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.668444201Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.668447731Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "reason": "quit",
+            "type": "session_end"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f2a-1686-763b-9a72-a25b2d29742c",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {},
+        "ids": {},
+        "rows": {}
+      },
+      "comparison": "2026-11-17T06:21:48.668689481Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.668667381Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "source": "startup",
+            "type": "session_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "continued": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.669129480Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.669033930Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.669129480+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669033930+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.669145170Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669033930Z"
+          },
+          {
+            "kind": "instant",
+            "value": 4564063
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669129480Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669132970Z"
+          }
+        ],
+        "processes": {
+          "cwd:900001": [
+            "$SEALED/repo"
+          ],
+          "parent:Pi:900001": [
+            null
+          ],
+          "start:900001": [
+            80493690
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": {
+              "agent_type": "general_purpose",
+              "reference": {
+                "name": "worker"
+              }
+            }
+          },
+          "event": {
+            "type": "working_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "continued": 900001,
+          "worker@continued": 2147483648
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "worker@continued",
+              "last_activity": "2026-11-17T06:21:48.669319210Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.669275160Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "worker@continued",
+              "id_short": "worker@c",
+              "last_activity": "2026-11-17T06:21:48.669319210+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669275160+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "worker@continued"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.669129480Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.669033930Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "worker@continued"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.669129480+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669033930+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.669331770Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669275160Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669278780Z"
+          },
+          {
+            "kind": "instant",
+            "value": 4807713
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669308110Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669313760Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669319210Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669321900Z"
+          }
+        ],
+        "processes": {
+          "start:2147483648": [
+            null
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": {
+              "id": "child-id",
+              "name": "worker"
+            },
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "id": "child-id",
+            "role": null,
+            "type": "child_session_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.669523529Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669523529+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.669550369Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.669033930Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.669550369+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669033930+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.669562139Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669507079Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669523529Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669526379Z"
+          },
+          {
+            "kind": "instant",
+            "value": 5054052
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669540479Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669545319Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669550369Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669553019Z"
+          }
+        ],
+        "processes": {
+          "start:2147483648": [
+            null
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "get",
+          "session_id": "continued"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.669523529Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669523529+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.669550369Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.669033930Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.669550369+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669033930+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.669735519Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669729329Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "all"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.669523529Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669523529+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.669550369Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.669033930Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.669550369+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669033930+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.669887779Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669877029Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.669882109Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "pane",
+          "pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.669523529Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.669526379+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669523529+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.669550369Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.669033930Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.669550369+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669033930+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.670036258Z",
+      "continuation": "alias",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670026238Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670031108Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": {
+              "agent_type": "general_purpose",
+              "reference": {
+                "name": "worker"
+              }
+            }
+          },
+          "event": {
+            "type": "working_end"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.670185888Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.669523529Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.670185888+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669523529+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.669550369Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.669033930Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.669550369+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.669033930+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.670195838Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670185888Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670188908Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "source": "clear",
+            "type": "session_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "replacement",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.670339038Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.670405198Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.670365038Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.670405198+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.670365038+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.670415628Z",
+      "continuation": "ended",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670339038Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670365038Z"
+          },
+          {
+            "kind": "instant",
+            "value": 5892211
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670405198Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670407938Z"
+          }
+        ],
+        "processes": {
+          "cwd:900001": [
+            "$SEALED/repo"
+          ],
+          "parent:Pi:900001": [
+            null
+          ],
+          "start:900001": [
+            80493690
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "data": {
+            "api_duration_ms": 0,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "context_window_size": 0,
+            "cost_usd": 0.0,
+            "current_input_tokens": 0,
+            "current_output_tokens": 0,
+            "cwd": null,
+            "lines_added": 0,
+            "lines_removed": 0,
+            "model_display_name": null,
+            "model_id": "",
+            "session_id": "continued",
+            "total_duration_ms": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "version": null
+          },
+          "harness": "pi",
+          "kind": "status",
+          "pid": 900001,
+          "session_id": "continued"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.670339038Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.670405198Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.670365038Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.670405198+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.670365038+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.670556288Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670549778Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "refresh"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.670339038Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4564063",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.670405198Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.670365038Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.670405198+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.670365038+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.670652538Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "instant",
+            "value": 6161641
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "git": {
+          "context": [
+            "$SEALED/repo",
+            "$SEALED/repo",
+            "main"
+          ],
+          "cwd": "$SEALED/repo"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.670339038Z"
+          ]
+        ],
+        "git": {},
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.670405198Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.670365038Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493690
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.670405198+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.670365038+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.670799247Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670785897Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "cleanup"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.670339038Z"
+          ]
+        ],
+        "git": {},
+        "ids": {},
+        "rows": {}
+      },
+      "comparison": "2026-11-17T06:21:48.671000087Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.670967657Z"
+          }
+        ],
+        "processes": {
+          "alive:80493690:900001": [
+            false
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "register",
+          "session": {
+            "agent_type": "general_purpose",
+            "context": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 0,
+              "context_window_size": 200000,
+              "current_input_tokens": 0,
+              "current_output_tokens": 0,
+              "total_input_tokens": 0,
+              "total_output_tokens": 0
+            },
+            "cost": 0.0,
+            "duration": {
+              "api_ms": 0,
+              "total_ms": 0
+            },
+            "harness": "unknown",
+            "id": "supplied",
+            "last_activity": "2026-11-17T06:21:48.671016347Z",
+            "lines_changed": {
+              "added": 0,
+              "removed": 0
+            },
+            "model": "unknown",
+            "started_at": "2026-11-17T06:21:48.671016347Z",
+            "status": "idle"
+          }
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.670339038Z"
+          ]
+        ],
+        "git": {},
+        "ids": {
+          "supplied": 2147483648
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "unknown",
+              "id": "supplied",
+              "last_activity": "2026-11-17T06:21:48.671016347Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.671016347Z",
+              "status": "idle"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "?",
+              "id": "supplied",
+              "id_short": "supplied",
+              "last_activity": "2026-11-17T06:21:48.671016347+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.671016347+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": null,
+              "working_directory": null
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.671037657Z",
+      "inputs": {
+        "clocks": [],
+        "processes": {
+          "start:2147483648": [
+            null
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "remove",
+          "session_id": "supplied"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f2a-1686-763b-9a72-a25b2d29742c",
+            900001,
+            "2026-11-17T06:21:48.668667381Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.670339038Z"
+          ]
+        ],
+        "git": {},
+        "ids": {},
+        "rows": {}
+      },
+      "comparison": "2026-11-17T06:21:48.671115497Z",
+      "inputs": {
+        "clocks": [],
+        "processes": {}
+      }
+    }
+  ]
+}

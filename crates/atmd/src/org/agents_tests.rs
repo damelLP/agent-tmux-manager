@@ -4933,6 +4933,77 @@ mod reconciliation {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn op7_list_final_tick_omits_even_a_healthy_quarantine_read() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        use tokio::time::Duration;
+
+        // Break caught: a late quarantine read consumes the list's reserved
+        // final tick; the adjacent healthy-read case must still show its reason.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            for (earlier_ms, expected) in [(4_998, Some(QUARANTINED_DOWN)), (4_999, None)] {
+                let (gate, mut entered) = mpsc::channel(1);
+                let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
+                rig.agent("lead", Some("%1"), Some("s1")).await;
+                rig.row("s1", "%1", false).await;
+                rig.frame("%1", "p/lead", IDLE);
+                let (agents, _) = rig.start();
+                agents.reconciled().await.unwrap();
+                down_whose_cleanup(&agents, true).await;
+                assert_eq!(
+                    listed_reason(&agents).await.as_deref(),
+                    Some(QUARANTINED_DOWN)
+                );
+                let org = rig.org.clone();
+                let write = tokio::spawn(async move {
+                    org.execute(
+                        OrgCommand::Clear {
+                            agent_id: "p/lead".parse().unwrap(),
+                        },
+                        chrono::Utc::now(),
+                    )
+                    .await
+                });
+                let release = entered.recv().await.unwrap();
+                let mut list = Box::pin(agents.list(ListParams::default()));
+                poll_fn(|cx| {
+                    assert!(list.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                tokio::time::advance(Duration::from_millis(earlier_ms)).await;
+                release.send(()).unwrap();
+                let entries = list.await.unwrap();
+                write.await.unwrap().unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].agent_id.to_string(), "p/lead");
+                assert_eq!(entries[0].state, AgentStatus::Clearing);
+                assert_eq!(
+                    entries[0].reason.as_deref(),
+                    expected,
+                    "earlier_ms={earlier_ms}"
+                );
+                // No control operation was stalled: a fresh-budget list still
+                // reads the same quarantine, with no pane observation needed.
+                assert_eq!(
+                    listed_reason(&agents).await.as_deref(),
+                    Some(QUARANTINED_DOWN)
+                );
+                assert_eq!(
+                    rig.client
+                        .pending_reads(&PaneId::parse("%1").unwrap())
+                        .unwrap(),
+                    0
+                );
+            }
+        })
+        .await
+        .expect("healthy quarantine boundary exceeded its hang guard");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn list_answers_without_quarantines_when_control_stalls() {
         use crate::control::reservation::ReservationKind;
         use std::{

@@ -1,0 +1,14 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 111
+expression: "rendered(&mut empty, 60, 10)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────┐
+ │No waiting decisions visible to this caller.            │
+ │Esc: close                                              │
+ │                                                        │
+ │                                                        │
+ │                                                        │
+ │                                                        │
+ └────────────────────────────────────────────────────────┘

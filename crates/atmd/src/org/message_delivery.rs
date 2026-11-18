@@ -13,7 +13,10 @@
 //! the same guard, and the attempt waits for the session's own prompt event
 //! until the confirmation window that began at the attempt's event ends.
 //! Cleanup settles by [`disposition`] over what work left behind, whatever
-//! stopped it.
+//! stopped it. Before release it retains the stopped original attempt's input
+//! certainties in process-local history. A historically eligible held draft
+//! may later consume one claim under a new Delivery reservation: fresh guards
+//! authorize one Enter only, never another paste/attempt or confirmation window.
 
 use super::agent_screen::{AgentScreen, PaneBaseline};
 use super::agents::{AgentError, Recipient};
@@ -57,6 +60,7 @@ pub fn inbox_reference(id: MessageId) -> String {
 }
 
 /// Transient cleanup progress, never a durable message status.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptPhase {
     Waiting,
@@ -91,8 +95,9 @@ pub fn paste_certainty(result: &Result<(), ReservationError>) -> EffectCertainty
 /// classified.
 fn certainty(error: &ReservationError) -> EffectCertainty {
     match error {
-        ReservationError::NotImplemented { .. }
-        | ReservationError::InvalidRequest { .. }
+        #[cfg(test)]
+        ReservationError::NotImplemented { .. } => EffectCertainty::NotStarted,
+        ReservationError::InvalidRequest { .. }
         | ReservationError::Busy { .. }
         | ReservationError::StaleReservation
         | ReservationError::ScreenChanged { .. }
@@ -448,6 +453,24 @@ fn guard_facts(
     }
 }
 
+/// Retain only an accounted original attempt, never infer input from its hold.
+fn attempt_exit_update(
+    id: MessageId,
+    progress: Progress,
+    cancelled: bool,
+) -> Option<HistoryUpdate> {
+    if progress.attempt != AttemptCommit::Committed {
+        return None;
+    }
+    Some(HistoryUpdate::AttemptExited {
+        id,
+        attempt_seq: progress.seq?,
+        paste: progress.paste,
+        enter: progress.enter,
+        cancelled,
+    })
+}
+
 impl Attempt {
     fn progress(&self) -> Result<Progress, MessageError> {
         (self.progress.lock().map(|progress| *progress))
@@ -485,9 +508,9 @@ impl Attempt {
         }
     }
 
-    /// One audit record for the attempt's Enter, with the time the call
-    /// returned. The queue never waits: when it is full or stalled the record
-    /// is dropped with a warning, and nothing is typed again for it.
+    /// One audit record for the attempt's Enter, when its call returns or
+    /// recovery cancellation abandons its reply. The queue never waits: when
+    /// full or stalled the record is dropped with a warning. Input is not repeated.
     fn audit(&self, attempt: u32, entered: &Result<(), ReservationError>) {
         let Ok(now) = self.rt.clock.now() else {
             return;
@@ -769,6 +792,115 @@ impl Attempt {
         }
     }
 
+    /// One claimed recovery, never another paste/attempt or guarded-key retry.
+    async fn recovery_work(
+        &self,
+        r: &Reservation,
+        scope: &AttemptScope,
+    ) -> Result<(), MessageError> {
+        let rt = &self.rt;
+        let snapshot = rt.history.snapshot(self.id, rt.clock.now()?)?;
+        if snapshot.blocked_by.is_some() || r.agent() != &scope.recipient {
+            return Err(MessageError::Conflict(
+                "recovery is not the recipient's FIFO head".into(),
+            ));
+        }
+        let number = snapshot
+            .message
+            .last_attempt
+            .as_ref()
+            .ok_or_else(|| MessageError::Conflict("recovery has no original attempt".into()))?
+            .attempt;
+        // Claim BEFORE the fresh guards. Holding evidence through registration
+        // closes receive→history delay; every later veto revokes this handle.
+        let claim = rt.evidence.claim_recovery(
+            &rt.history,
+            scope.clone(),
+            rt.cancel.is_cancelled(),
+            rt.clock.now()?,
+        )?;
+        self.set(|progress| {
+            progress.attempt = AttemptCommit::Committed;
+            progress.seq = Some(scope.attempt_seq);
+            progress.number = number;
+            progress.paste = EffectCertainty::Applied;
+        })?;
+        let recipient = rt
+            .agents
+            .recipient(&scope.recipient)
+            .await
+            .map_err(agent_error)?;
+        self.still_armed(claim.scope()).await?;
+        let screen = recipient.screen;
+        let format = screen.capture_format();
+        let reference = delivery_line(self.id, &snapshot.message.content);
+        let (baseline, view) = (recipient.baseline, claim.guard());
+        let allows = move |capture: &PaneCapture| {
+            guard_allows_input(&guard_facts(
+                GuardedInput::Enter,
+                capture,
+                screen,
+                &baseline,
+                &reference,
+            )) && view.is_valid()
+        };
+        let first = tokio::select! {
+            biased;
+            () = rt.cancel.cancelled() => return Err(shutting_down()),
+            captured = r.capture(&self.pane, format) => captured?,
+        };
+        if !allows(&first) {
+            return Err(MessageError::Refused(
+                "recovery draft or guard is not positively safe".into(),
+            ));
+        }
+        self.still_armed(scope).await?;
+        self.set(|progress| progress.enter = EffectCertainty::Unknown)?;
+        let entered = tokio::select! {
+            biased;
+            () = rt.cancel.cancelled() => {
+                self.audit(number, &Err(ReservationError::Unavailable));
+                return Err(shutting_down());
+            },
+            entered = r.keys_guarded(&self.pane, scope.recipient.clone(), PaneKey::Enter, format, allows) => entered,
+        };
+        let sent = paste_certainty(&entered);
+        self.set(|progress| progress.enter = sent)?;
+        self.audit(number, &entered);
+        entered?;
+        // No fresh confirmation window. Drop invalidates and deregisters the
+        // claim even if an actor predicate clone survives a timed-out call.
+        Ok(())
+    }
+
+    /// Recovery never overwrites the original exit or releases its FIFO veto.
+    async fn recovery_settle(&self, _r: &Reservation) -> Result<(), MessageError> {
+        let rt = &self.rt;
+        let limit = Instant::now() + ATTEMPT_CLEANUP_BUDGET - SETTLE_MARGIN;
+        if let Some(receipt) = rt.evidence.receipt(self.id).ok().flatten() {
+            let _ = self.delivered(&receipt, limit).await;
+            return Ok(());
+        }
+        let progress = self.progress()?;
+        let Some(seq) = progress.seq else {
+            return Ok(());
+        };
+        let snapshot = rt.history.snapshot(self.id, rt.clock.now()?)?;
+        // A proven no-Enter recovery adds no uncertainty or new notice reason.
+        if snapshot.message.status == atm_org::DeliveryStatus::Delivered
+            || (progress.enter == EffectCertainty::NotStarted && snapshot.hold.is_some())
+        {
+            return Ok(());
+        }
+        if self.hold(Some(seq), ExecutorHold::InputOutcomeUnknown) == Settled::Held {
+            Ok(())
+        } else {
+            Err(MessageError::Internal(
+                "recovery could not retain the original hold".into(),
+            ))
+        }
+    }
+
     /// The attempt's reply was lost. The writer answers a snapshot after
     /// every command it accepted before, so after one, and the fold of what
     /// is committed, an attempt of this message past the cursor noted before
@@ -919,6 +1051,20 @@ impl Attempt {
             }
             _ => Settled::Neither,
         };
+        // Work has stopped and no more input can change these certainties.
+        // Delivered drops continuity; every other accounted exit retains facts
+        // before the reservation is released. Failure never grants recovery.
+        if decided != AttemptDisposition::Deliver {
+            if let Some(update) = attempt_exit_update(id, progress, rt.cancel.is_cancelled()) {
+                if let Err(error) = rt
+                    .clock
+                    .now()
+                    .and_then(|now| rt.history.record(update, now))
+                {
+                    tracing::warn!(%id, %error, "Original input outcome not retained for recovery");
+                }
+            }
+        }
         let _ = self.set(|progress| progress.settled = Some(settled));
         if cleanup_succeeds(decided, settled) {
             Ok(())
@@ -964,6 +1110,8 @@ pub async fn deliver(
         return Err(shutting_down());
     }
     let snapshot = rt.history.snapshot(id, rt.clock.now()?)?;
+    let recovery = rt.history.recovery_candidate(id, rt.clock.now()?)?;
+    let recovering = recovery.is_some();
     let recipient = snapshot.recipient;
     let Some(pane) = recipient.pane.as_deref() else {
         return Err(MessageError::Refused(format!(
@@ -1002,8 +1150,19 @@ pub async fn deliver(
     let ran = control
         .run_reserved(
             request,
-            move |r| async move { work.work(&r).await },
-            move |r, _| async move { cleanup.settle(&r).await },
+            move |r| async move {
+                match recovery {
+                    Some(scope) => work.recovery_work(&r, &scope).await,
+                    None => work.work(&r).await,
+                }
+            },
+            move |r, _| async move {
+                if recovering {
+                    cleanup.recovery_settle(&r).await
+                } else {
+                    cleanup.settle(&r).await
+                }
+            },
         )
         .await;
     match attempt.progress() {

@@ -1,13 +1,11 @@
 //! One-call entry point for a named agent, independent of its model or harness.
 
 use super::msg::{escaped, output, MessageFormat};
+use super::output::stdout;
 use anyhow::{Context, Result};
 use atmd::org::agent_context::AgentContext;
 use clap::Args;
-use std::{
-    io::{self, Write},
-    time::Duration,
-};
+use std::{io::Write, time::Duration};
 
 #[derive(Debug, Args)]
 pub struct MeArgs {
@@ -98,16 +96,16 @@ pub async fn cmd_me(args: MeArgs) -> Result<()> {
     .await?;
     let context: AgentContext =
         serde_json::from_value(raw.clone()).context("invalid agent context from daemon")?;
-    let mut out = io::stdout().lock();
-    match args.format {
-        MessageFormat::Text => render_context(&context, &mut out),
-        MessageFormat::Json => output(&raw, args.format, "", &mut out),
-    }
+    stdout(|out| match args.format {
+        MessageFormat::Text => render_context(&context, out),
+        MessageFormat::Json => output(&raw, args.format, "", out),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     fn context() -> AgentContext {
         serde_json::from_str(include_str!("../../../tests/fixtures/atm_me/context.json")).unwrap()

@@ -1,6 +1,6 @@
 //! CLI commands that act on a session: kill, interrupt, send, role, list, reply, peek and status.
 
-use std::time::Duration;
+use std::{io::Write, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -12,14 +12,14 @@ use atm_tmux::RealTmuxClient;
 use atm_tui::{daemon, role};
 use atmd::control::{resolve_pane_id, ReplyOutcome};
 
-use super::{spawn::non_empty_env, ListFormat};
+use super::{output::stdout, spawn::non_empty_env, ListFormat};
 
 // ============================================================================
 // CLI Command Implementations
 // ============================================================================
 
 /// Fetches the current session list from the daemon via one-shot connection.
-async fn fetch_sessions() -> Result<Vec<SessionView>> {
+async fn fetch_sessions() -> Result<(Vec<SessionView>, bool)> {
     let socket_path = atm_tui::client::resolve_socket_path();
 
     // One deadline bounds every step of this one-shot exchange.
@@ -57,6 +57,7 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
 
     // Step 2: Read Connected response, then send ListSessions
     let sessions;
+    let mut roles_capable = false;
     let mut line = String::new();
 
     loop {
@@ -72,7 +73,15 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
 
         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(line.trim()) {
             match msg {
-                DaemonMessage::Connected { .. } => {
+                DaemonMessage::Connected {
+                    protocol_version,
+                    methods,
+                    ..
+                } => {
+                    roles_capable = protocol_version.major
+                        == atm_protocol::ProtocolVersion::CURRENT.major
+                        && protocol_version.minor >= 1
+                        && methods.iter().any(|name| name == "session.roles");
                     // Now request the session list
                     send(&mut writer, &ClientMessage::list_sessions(), deadline).await?;
                     continue;
@@ -97,11 +106,11 @@ async fn fetch_sessions() -> Result<Vec<SessionView>> {
     // Send disconnect
     let _ = send(&mut writer, &ClientMessage::disconnect(), deadline).await;
 
-    Ok(sessions)
+    Ok((sessions, roles_capable))
 }
 
-/// Starts the daemon if needed, then fetches its session list.
-async fn daemon_sessions() -> Result<Vec<SessionView>> {
+/// Starts the daemon if needed, then fetches sessions and role-read capability.
+async fn daemon_sessions() -> Result<(Vec<SessionView>, bool)> {
     daemon::ensure_daemon_running().map_err(|e| anyhow::anyhow!("Failed to start daemon: {e}"))?;
     fetch_sessions().await
 }
@@ -109,7 +118,8 @@ async fn daemon_sessions() -> Result<Vec<SessionView>> {
 /// Fetches the daemon's session list, then resolves a CLI target in it with
 /// `resolve_pane_id` (which returns a `%` pane ID as is).
 async fn pane_for_target(target: &str) -> Result<String> {
-    Ok(resolve_pane_id(&daemon_sessions().await?, target)?)
+    let (sessions, _) = daemon_sessions().await?;
+    Ok(resolve_pane_id(&sessions, target)?)
 }
 
 pub(super) async fn cmd_role(target: Option<String>, on: bool) -> Result<()> {
@@ -141,14 +151,12 @@ async fn pane_request(method: &str, target: String) -> Result<String> {
 
 pub(super) async fn cmd_kill(target: String) -> Result<()> {
     let pane_id = pane_request("session.kill", target).await?;
-    println!("Killed {pane_id}");
-    Ok(())
+    stdout(|out| Ok(writeln!(out, "Killed {pane_id}")?))
 }
 
 pub(super) async fn cmd_interrupt(target: String) -> Result<()> {
     let pane_id = pane_request("session.interrupt", target).await?;
-    println!("Interrupted {pane_id}");
-    Ok(())
+    stdout(|out| Ok(writeln!(out, "Interrupted {pane_id}")?))
 }
 
 pub(super) async fn cmd_send(target: String, text: String) -> Result<()> {
@@ -162,8 +170,7 @@ pub(super) async fn cmd_send(target: String, text: String) -> Result<()> {
         .get("pane")
         .and_then(serde_json::Value::as_str)
         .context("Invalid session.send response: missing pane")?;
-    println!("Sent to {pane} by tmux paste");
-    Ok(())
+    stdout(|out| Ok(writeln!(out, "Sent to {pane} by tmux paste")?))
 }
 
 /// CLI-only metadata: the daemon's SessionView and wire format stay unchanged.
@@ -179,7 +186,7 @@ pub(super) async fn cmd_list(
     status_filter: Option<String>,
     project_filter: Option<String>,
 ) -> Result<()> {
-    let sessions = daemon_sessions().await?;
+    let (sessions, roles_capable) = daemon_sessions().await?;
 
     // Apply filters
     let filtered: Vec<&SessionView> = sessions
@@ -227,16 +234,31 @@ pub(super) async fn cmd_list(
                     format!("{project}/{branch}")
                 };
                 let pane = s.tmux_pane.as_deref().unwrap_or("-");
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    s.id_short, status, ctx, model, project_display, pane
-                );
+                stdout(|out| {
+                    Ok(writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        s.id_short, status, ctx, model, project_display, pane
+                    )?)
+                })?;
             }
         }
         ListFormat::Json => {
-            let panes = role::coordinator_panes(&RealTmuxClient::new())
+            let panes = if roles_capable {
+                super::rpc::call(
+                    "session.roles",
+                    serde_json::json!({}),
+                    Duration::from_secs(5),
+                )
                 .await
-                .unwrap_or_default();
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value(value.get("coordinator_panes")?.clone()).ok()
+                })
+                .unwrap_or_default()
+            } else {
+                Default::default()
+            };
             let rows: Vec<_> = filtered
                 .iter()
                 .map(|session| {
@@ -256,11 +278,11 @@ pub(super) async fn cmd_list(
                 .collect();
             let json =
                 serde_json::to_string_pretty(&rows).context("Failed to serialize sessions")?;
-            println!("{json}");
+            stdout(|out| Ok(writeln!(out, "{json}")?))?;
         }
         ListFormat::Ids => {
             for s in &filtered {
-                println!("{}", s.id_short);
+                stdout(|out| Ok(writeln!(out, "{}", s.id_short)?))?;
             }
         }
     }
@@ -282,12 +304,16 @@ pub(super) async fn cmd_reply(
     .await?;
     let outcome: ReplyOutcome =
         serde_json::from_value(result).context("Invalid session.reply response")?;
-    match outcome {
-        ReplyOutcome::Escape { pane } => println!("Sent Escape to {pane}"),
-        ReplyOutcome::Enter { pane } => println!("Sent Enter to {pane}"),
-        ReplyOutcome::Selected { pane, option } => println!("Selected option {option} on {pane}"),
-    }
-    Ok(())
+    stdout(|out| {
+        match outcome {
+            ReplyOutcome::Escape { pane } => writeln!(out, "Sent Escape to {pane}")?,
+            ReplyOutcome::Enter { pane } => writeln!(out, "Sent Enter to {pane}")?,
+            ReplyOutcome::Selected { pane, option } => {
+                writeln!(out, "Selected option {option} on {pane}")?
+            }
+        }
+        Ok(())
+    })
 }
 
 pub(super) async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) -> Result<()> {
@@ -302,14 +328,16 @@ pub(super) async fn cmd_peek(target: String, tail: Option<usize>, prompt: bool) 
         .context("Invalid session.capture response: missing lines")?;
     let output: Vec<String> =
         serde_json::from_value(lines.clone()).context("Invalid session.capture response: lines")?;
-    for line in output {
-        println!("{line}");
-    }
-    Ok(())
+    stdout(|out| {
+        for line in output {
+            writeln!(out, "{line}")?;
+        }
+        Ok(())
+    })
 }
 
 pub(super) async fn cmd_status() -> Result<()> {
-    let sessions = daemon_sessions().await?;
+    let (sessions, _) = daemon_sessions().await?;
 
     let active = sessions
         .iter()
@@ -372,10 +400,7 @@ pub(super) async fn cmd_status() -> Result<()> {
             eprintln!("decision count unavailable: {error}");
         }
     }
-    use std::io::Write;
-    writeln!(std::io::stdout().lock(), "{}", parts.join(" "))?;
-
-    Ok(())
+    stdout(|out| Ok(writeln!(out, "{}", parts.join(" "))?))
 }
 
 #[cfg(test)]

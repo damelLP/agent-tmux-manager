@@ -42,6 +42,11 @@ use atm_core::{
     ScreenInput, ScreenTextFormat, TurnState,
 };
 
+#[cfg(test)]
+thread_local! {
+    static DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Requires attributes and retained grid spaces (`capture-pane -p -e -N`).
 pub const SCREEN_TEXT_FORMAT: ScreenTextFormat = ScreenTextFormat::Styled;
 
@@ -94,6 +99,8 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
     let (text, styled) = match input {
         ScreenInput::Plain(text) if cursor.is_none() => (text, None),
         ScreenInput::Styled(text) => {
+            #[cfg(test)]
+            DECODE_COUNT.with(|count| count.set(count.get() + 1));
             let Ok(screen) = StyledScreen::parse(text) else {
                 return Default::default();
             };
@@ -105,6 +112,10 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
     if text.chars().any(|c| c.is_control() && c != '\n') {
         return Default::default();
     }
+    inspect_prepared(text, styled)
+}
+
+fn inspect_prepared(text: &str, styled: Option<&StyledScreen>) -> (ScreenFacts, Option<String>) {
     let mut lines: Vec<_> = text
         .lines()
         .map(|line| {
@@ -144,8 +155,11 @@ pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bo
         return None;
     }
     let (_, draft) = inspect(input, None);
-    let draft = draft?;
-    Some(draft.trim_end_matches(' ') == expected)
+    draft_matches(draft.as_deref(), expected)
+}
+
+fn draft_matches(draft: Option<&str>, expected: &str) -> Option<bool> {
+    Some(draft?.trim_end_matches(' ') == expected)
 }
 
 fn nonblank<'a>(lines: &[&'a str]) -> Vec<&'a str> {

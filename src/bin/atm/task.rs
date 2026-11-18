@@ -1,8 +1,9 @@
 //! One-shot task commands. The daemon owns identity, transitions and notifications.
-use super::msg::{escaped, output, MessageFormat};
+use super::msg::{escaped, output, status_text as word, MessageFormat};
+use super::output::stdout;
 use anyhow::{Context, Result};
 use atm_org::{
-    Address, AgentId, DecisionId, TaskBudget, TaskFile, TaskFileKind, TaskId, TaskKind,
+    Address, AgentId, DecisionId, ProjectId, TaskBudget, TaskFile, TaskFileKind, TaskId, TaskKind,
     TaskMeasure, TaskState, TaskSubmission, TaskVerdict,
 };
 use atmd::org::tasks::{
@@ -13,10 +14,7 @@ use atmd::org::tasks::{
 use clap::{Args, Subcommand};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::{
-    io::{self, Write},
-    time::Duration,
-};
+use std::{io::Write, time::Duration};
 
 const MUTATION_BUDGET: Duration = Duration::from_secs(35);
 const READ_BUDGET: Duration = Duration::from_secs(15);
@@ -34,6 +32,9 @@ pub enum TaskAction {
     /// Create an open task; structured flags take the existing method JSON objects
     Create {
         title: String,
+        /// Intended registered project; defaults to the named caller's project
+        #[arg(long = "project")]
+        project_id: Option<ProjectId>,
         /// Task kind: work, review, plan, errand, drift_check
         #[arg(long, default_value = "work", value_parser = parse_word::<TaskKind>)]
         kind: TaskKind,
@@ -111,6 +112,8 @@ pub enum TaskAction {
     },
     /// List a single page, optionally filtered; agent addresses must be full ids
     List {
+        #[arg(long = "project")]
+        project_id: Option<ProjectId>,
         #[arg(long = "agent")]
         agent_id: Option<AgentId>,
         #[arg(long)]
@@ -175,6 +178,7 @@ fn command(action: TaskAction) -> Result<(&'static str, Value)> {
     Ok(match action {
         TaskAction::Create {
             title,
+            project_id,
             kind,
             parent,
             judges,
@@ -186,7 +190,7 @@ fn command(action: TaskAction) -> Result<(&'static str, Value)> {
             "task.create",
             serde_json::to_value(CreateParams {
                 title,
-                project_id: None,
+                project_id,
                 kind,
                 parent,
                 judges,
@@ -261,6 +265,7 @@ fn command(action: TaskAction) -> Result<(&'static str, Value)> {
             })?,
         ),
         TaskAction::List {
+            project_id,
             agent_id,
             creator,
             state,
@@ -272,6 +277,7 @@ fn command(action: TaskAction) -> Result<(&'static str, Value)> {
         } => (
             "task.list",
             serde_json::to_value(ListParams {
+                project_id,
                 agent_id,
                 creator,
                 state,
@@ -288,12 +294,6 @@ fn command(action: TaskAction) -> Result<(&'static str, Value)> {
 
 fn decode<T: DeserializeOwned>(raw: &Value) -> Result<T> {
     serde_json::from_value(raw.clone()).context("invalid task result from daemon")
-}
-fn word(value: impl Serialize) -> Result<String> {
-    Ok(serde_json::to_value(value)?
-        .as_str()
-        .unwrap_or("unknown")
-        .into())
 }
 fn render_summary(task: &TaskSummary, out: &mut impl Write) -> Result<()> {
     writeln!(
@@ -439,10 +439,9 @@ pub async fn cmd_task(args: TaskArgs) -> Result<()> {
     let raw = super::rpc::call(method, params, request_budget(method))
         .await
         .map_err(|error| request_error(method, error))?;
-    let mut out = io::stdout().lock();
-    match args.format {
+    stdout(|out| match args.format {
         // JSON is the raw daemon answer, independent of this build's text schema.
-        MessageFormat::Json => output(&raw, args.format, "", &mut out),
+        MessageFormat::Json => output(&raw, args.format, "", out),
         MessageFormat::Text => {
             let mut text = Vec::new();
             render(method, &raw, &mut text).map_err(|error| {
@@ -455,7 +454,7 @@ pub async fn cmd_task(args: TaskArgs) -> Result<()> {
             })?;
             Ok(out.write_all(&text)?)
         }
-    }
+    })
 }
 
 #[cfg(test)]

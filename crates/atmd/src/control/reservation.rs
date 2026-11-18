@@ -491,6 +491,15 @@ impl ControlHandle {
             .await
     }
 
+    /// One coherent, read-only admission snapshot through the sole actor.
+    pub(crate) async fn reservation_health(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::server::health::ReservationHealth, ReservationError> {
+        self.reservation_request(deadline, |reply| jobs::Command::Health { reply })
+            .await
+    }
+
     /// Run one daemon-owned job with exclusive agent/pane ownership.
     ///
     /// Admission is bounded (32); no task is spawned per unadmitted waiter.
@@ -861,7 +870,7 @@ impl Reservation {
 ///
 /// | Variant | One guarded paste/key call | General pane operation |
 /// |---|---|---|
-/// | NotImplemented | Before effect | Before effect |
+/// | NotImplemented (test-only) | Before effect | Before effect |
 /// | InvalidRequest | Before effect | May follow a split effect |
 /// | Busy | Before effect (admission) | Before effect (admission) |
 /// | StaleReservation | Before effect | Before effect |
@@ -885,6 +894,7 @@ impl Reservation {
 /// was undone or that retrying cannot duplicate input.
 #[derive(Debug, thiserror::Error)]
 pub enum ReservationError {
+    #[cfg(test)]
     /// Before effect: the unsupported operation was not executed.
     #[error("reserved control operation '{operation}' is not implemented")]
     NotImplemented { operation: &'static str },

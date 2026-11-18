@@ -6,6 +6,267 @@ use atm_org::{TaskCreated, TaskMeasure, TaskVerdict, TaskVerdictGiven};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+// Each independent worker probe gets a reader; shared-slot behavior is tested
+// through TaskHandle clones above the same real retained mutation worker.
+async fn execute_mutation<F, E, EF>(
+    org: OrgHandle,
+    caller: CallContext,
+    make: F,
+    send: E,
+) -> Result<MutationResult, TaskError>
+where
+    F: FnOnce(TaskActor) -> TaskCommand,
+    E: FnMut(MessageContent) -> EF,
+    EF: Future<Output = Result<MessageId, TaskError>>,
+{
+    super::execute_mutation(org, caller, ReportingFiles::default(), make, send).await
+}
+
+async fn reporting_org() -> (tempfile::TempDir, OrgHandle, TaskId, CancellationToken) {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().join("state"), cancel.clone()).await;
+    for project in ["alpha", "beta", "gamma"] {
+        let root = dir.path().join(project);
+        std::fs::create_dir_all(root.join(".atm/roles")).unwrap();
+        std::fs::write(root.join(".atm/project.toml"), format!("id='{project}'\n")).unwrap();
+        org.execute(
+            OrgCommand::RegisterProject {
+                project_id: project.parse().unwrap(),
+                root: root.to_str().unwrap().into(),
+                move_root: false,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    for (id, pane, manager) in [
+        ("alpha/worker", "%1", "lead"),
+        ("alpha/lead", "%2", "gamma/chief"),
+        ("gamma/chief", "%3", "owner"),
+        ("beta/worker", "%4", "owner"),
+    ] {
+        org.execute(
+            OrgCommand::Adopt {
+                agent_id: id.parse().unwrap(),
+                pane: pane.into(),
+                session_id: None,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let (project, name) = id.split_once('/').unwrap();
+        std::fs::write(
+            dir.path()
+                .join(project)
+                .join(format!(".atm/roles/{name}.md")),
+            format!("+++\nharness='pi'\nmanager='{manager}'\n+++\nFixture\n"),
+        )
+        .unwrap();
+    }
+    // Gamma is a non-repository project folder, not a department.
+    assert!(!dir.path().join("gamma/.git").exists());
+    let events = org
+        .execute(
+            OrgCommand::Task(TaskCommand::Create(created("Work".into()))),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let id: TaskId = format!("t{}", events.first().unwrap().seq).parse().unwrap();
+    org.execute(
+        OrgCommand::Task(TaskCommand::Assign {
+            task_id: id.clone(),
+            agent_id: "alpha/worker".parse().unwrap(),
+            by: TaskActor {
+                who: Address::Owner,
+                manager_of: None,
+            },
+        }),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    (dir, org, id, cancel)
+}
+
+// Break caught: a manager fact read for one assignee authorizes a later holder.
+#[tokio::test]
+async fn manager_grant_does_not_follow_reassignment() {
+    let (_dir, org, id, cancel) = reporting_org().await;
+    let forward = org.clone();
+    let task_id = id.clone();
+    let result = execute_mutation(
+        org.clone(),
+        CallContext {
+            from_pane: Some(CallerPane("%2".into())),
+            ..caller()
+        },
+        move |by| {
+            let (reply, _) = oneshot::channel();
+            forward
+                .submit(crate::org::Request::Execute {
+                    command: Box::new(OrgCommand::Task(TaskCommand::Assign {
+                        task_id: task_id.clone(),
+                        agent_id: "beta/worker".parse().unwrap(),
+                        by: TaskActor {
+                            who: Address::Owner,
+                            manager_of: None,
+                        },
+                    })),
+                    now: chrono::Utc::now(),
+                    caller_pane: None,
+                    reply,
+                })
+                .unwrap();
+            TaskCommand::SetState {
+                task_id,
+                state: TaskState::Cancelled,
+                reason: None,
+                by,
+            }
+        },
+        |_| async { panic!("refused manager mutation must not enqueue") },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(TaskError::Organisation(OrgServiceError::Refused(
+            atm_org::Refusal::Task(atm_org::TaskRefusal::NotAllowed { .. })
+        )))
+    ));
+    let state = org.snapshot().await.unwrap();
+    let task = state.task(&id).unwrap();
+    assert_eq!(task.agent_id, Some("beta/worker".parse().unwrap()));
+    assert_eq!(task.state, TaskState::Assigned);
+    assert_eq!(state.messages().count(), 0);
+    cancel.cancel();
+}
+
+// Break caught: cancelled/hung readers multiply threads or prevent owner/creator mutations.
+#[tokio::test]
+async fn reporting_reader_slot_is_retained_and_shared_without_blocking_owner_or_creator() {
+    use super::super::agent_context::detached_read;
+    use std::{future::Future, task::Poll};
+    let (dir, org, id, cancel) = reporting_org().await;
+    let tasks = TaskHandle::new(org.clone());
+    let files = tasks.files.clone();
+    let slot = files.slot.clone();
+    let (entered, entry) = oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let path = dir.path().join("alpha/.atm/roles/worker.md");
+    let held = tokio::spawn(async move {
+        detached_read(slot, &path, move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Ok(())
+        })
+        .await
+    });
+    entry.await.unwrap();
+    held.abort();
+    assert!(held.await.unwrap_err().is_cancelled());
+    assert!(
+        files.slot.try_acquire().is_err(),
+        "cancelled future released hung worker's slot"
+    );
+    let state = org.snapshot().await.unwrap();
+    let first_files = tasks.clone().files;
+    let second_files = tasks.clone().files;
+    assert!(Arc::ptr_eq(&files.slot, &first_files.slot));
+    assert!(Arc::ptr_eq(&files.slot, &second_files.slot));
+    let mut first = Box::pin(first_files.manager_of(
+        state.clone(),
+        "alpha/lead".parse().unwrap(),
+        "alpha/worker".parse().unwrap(),
+    ));
+    let mut second = Box::pin(second_files.manager_of(
+        state,
+        "alpha/lead".parse().unwrap(),
+        "alpha/worker".parse().unwrap(),
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(first.as_mut().poll(cx).is_pending());
+        assert!(second.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let owner = tasks
+        .mutate(owner_caller(), move |by| TaskCommand::SetState {
+            task_id: id,
+            state: TaskState::Cancelled,
+            reason: None,
+            by,
+        })
+        .await
+        .unwrap();
+    assert!(owner.changed);
+    let mut own = created("Creator task".into());
+    own.creator = Address::Agent("alpha/lead".parse().unwrap());
+    let events = org
+        .execute(
+            OrgCommand::Task(TaskCommand::Create(own)),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let id: TaskId = format!("t{}", events.first().unwrap().seq).parse().unwrap();
+    org.execute(
+        OrgCommand::Task(TaskCommand::Assign {
+            task_id: id.clone(),
+            agent_id: "alpha/worker".parse().unwrap(),
+            by: TaskActor {
+                who: Address::Owner,
+                manager_of: None,
+            },
+        }),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tasks
+            .mutate(
+                CallContext {
+                    from_pane: Some(CallerPane("%2".into())),
+                    ..caller()
+                },
+                move |by| TaskCommand::SetState {
+                    task_id: id,
+                    state: TaskState::Cancelled,
+                    reason: None,
+                    by
+                }
+            )
+            .await
+            .unwrap()
+            .changed
+    );
+    // Only in-memory slot waiters are live while the clock is paused.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(matches!(first.await, Err(TaskError::Refused(_))));
+    assert!(matches!(second.await, Err(TaskError::Refused(_))));
+    assert!(files.slot.try_acquire().is_err());
+    tokio::time::resume();
+    release.send(()).unwrap();
+    drop(files.slot.acquire().await.unwrap());
+    assert_eq!(
+        files
+            .manager_of(
+                org.snapshot().await.unwrap(),
+                "alpha/lead".parse().unwrap(),
+                "alpha/worker".parse().unwrap()
+            )
+            .await
+            .unwrap(),
+        Some("alpha/worker".parse().unwrap())
+    );
+    cancel.cancel();
+}
+
 fn caller() -> CallContext {
     CallContext {
         client_id: CallerId("worker-test".into()),
@@ -14,6 +275,7 @@ fn caller() -> CallContext {
 }
 fn created(title: String) -> TaskCreated {
     TaskCreated {
+        project_id: None,
         title,
         kind: TaskKind::Work,
         creator: Address::Owner,
@@ -27,12 +289,18 @@ fn created(title: String) -> TaskCreated {
 }
 async fn org() -> (tempfile::TempDir, OrgHandle, CancellationToken) {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".atm/roles")).unwrap();
+    std::fs::write(
+        dir.path().join(".atm/roles/worker.md"),
+        "+++\nharness='pi'\nmanager='lead'\n+++\nSynthetic role\n",
+    )
+    .unwrap();
     let cancel = CancellationToken::new();
     let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
     for command in [
         OrgCommand::RegisterProject {
             project_id: "p".parse().unwrap(),
-            root: "/p".into(),
+            root: dir.path().to_str().unwrap().into(),
             move_root: false,
         },
         OrgCommand::Adopt {
@@ -52,7 +320,7 @@ fn assign(_: TaskActor) -> TaskCommand {
         agent_id: "p/worker".parse().unwrap(),
         by: TaskActor {
             who: Address::Owner,
-            lead: false,
+            manager_of: None,
         },
     }
 }
@@ -77,7 +345,7 @@ async fn verdict_org() -> (tempfile::TempDir, OrgHandle, CancellationToken) {
     for command in [
         assign(TaskActor {
             who: Address::Owner,
-            lead: false,
+            manager_of: None,
         }),
         TaskCommand::Submit {
             task_id: "t3".parse().unwrap(),
@@ -85,7 +353,7 @@ async fn verdict_org() -> (tempfile::TempDir, OrgHandle, CancellationToken) {
             files: vec![],
             by: TaskActor {
                 who: "p/worker".parse().unwrap(),
-                lead: false,
+                manager_of: None,
             },
         },
     ] {
@@ -389,7 +657,7 @@ async fn ownership_routing_uses_actor_beforeimage() {
     real.execute(
         OrgCommand::Task(assign(TaskActor {
             who: Address::Owner,
-            lead: false,
+            manager_of: None,
         })),
         chrono::Utc::now(),
     )
@@ -433,7 +701,7 @@ async fn ownership_routing_uses_actor_beforeimage() {
             agent_id: "p/middle".parse().unwrap(),
             by: TaskActor {
                 who: Address::Owner,
-                lead: false,
+                manager_of: None,
             },
         }),
         chrono::Utc::now(),
@@ -463,6 +731,237 @@ async fn ownership_routing_uses_actor_beforeimage() {
     cancel.cancel();
 }
 
+// Characterizes crrv-B L1: comparing only before/post images cannot order
+// independent fanouts. Moving composition to commit time would change the
+// late-snapshot row, but would still leave the early-snapshot row's stale notes.
+#[tokio::test]
+async fn reassign_cycle_can_enqueue_old_brief_after_loss_notice() {
+    use crate::org::Request;
+
+    for compose_before_return in [true, false] {
+        let (_dir, real, cancel) = org().await;
+        for command in [
+            OrgCommand::Adopt {
+                agent_id: "p/next".parse().unwrap(),
+                pane: "%2".into(),
+                session_id: None,
+            },
+            OrgCommand::Task(assign(TaskActor {
+                who: Address::Owner,
+                manager_of: None,
+            })),
+        ] {
+            real.execute(command, chrono::Utc::now()).await.unwrap();
+        }
+        let (requests, mut receive) = mpsc::channel(8);
+        let proxy = OrgHandle {
+            requests,
+            ..real.clone()
+        };
+        let (snapshot_entered, snapshot_entry) = oneshot::channel();
+        let (snapshot_release, snapshot_gate) = oneshot::channel();
+        let forward = real.clone();
+        let forwarding = tokio::spawn(async move {
+            let mut snapshots = 0;
+            let mut pause = Some((snapshot_entered, snapshot_gate));
+            while let Some(request) = receive.recv().await {
+                if matches!(&request, Request::Snapshot(_)) {
+                    snapshots += 1;
+                    if snapshots == 2 {
+                        let (entered, gate) = pause.take().unwrap();
+                        entered.send(()).unwrap();
+                        gate.await.unwrap();
+                    }
+                }
+                forward.submit(request).unwrap();
+            }
+        });
+        let (send_entered, send_entry) = oneshot::channel();
+        let (send_release, send_gate) = oneshot::channel();
+        let mut pause = Some((send_entered, send_gate));
+        let sender = real.clone();
+        let first = tokio::spawn(execute_mutation(
+            proxy,
+            owner_caller(),
+            |by| TaskCommand::Assign {
+                task_id: "t3".parse().unwrap(),
+                agent_id: "p/next".parse().unwrap(),
+                by,
+            },
+            move |content| {
+                let pause = pause.take();
+                let sender = sender.clone();
+                async move {
+                    if let Some((entered, gate)) = pause {
+                        entered.send(content.clone()).unwrap();
+                        gate.await.unwrap();
+                    }
+                    enqueue(sender, content).await
+                }
+            },
+        ));
+        snapshot_entry.await.unwrap(); // A→B is applied; composition has not read its snapshot.
+        assert_eq!(real.status().unwrap(), 6);
+        let mut snapshot_release = Some(snapshot_release);
+        let mut send_entry = Some(send_entry);
+        if compose_before_return {
+            snapshot_release.take().unwrap().send(()).unwrap();
+            assert_eq!(
+                send_entry.take().unwrap().await.unwrap().to,
+                "p/next".parse().unwrap()
+            ); // The complete first fanout is composed, but no message is enqueued.
+        }
+        let sender = real.clone();
+        let second = execute_mutation(
+            real.clone(),
+            owner_caller(),
+            |by| TaskCommand::Assign {
+                task_id: "t3".parse().unwrap(),
+                agent_id: "p/worker".parse().unwrap(),
+                by,
+            },
+            move |content| enqueue(sender.clone(), content),
+        )
+        .await
+        .unwrap();
+        assert!(second.changed);
+        assert!(matches!(
+            second.notification,
+            Some(Notification::Queued { message_id }) if message_id == MessageId::new(8)
+        ));
+        if !compose_before_return {
+            snapshot_release.take().unwrap().send(()).unwrap();
+            assert_eq!(
+                send_entry.take().unwrap().await.unwrap().to,
+                "p/next".parse().unwrap()
+            ); // Composition now sees A again and suppresses A's lost-binding note.
+        }
+        send_release.send(()).unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert!(first.changed);
+        assert!(matches!(
+            first.notification,
+            Some(Notification::Queued { message_id }) if message_id == MessageId::new(10)
+        ));
+        forwarding.await.unwrap();
+        let state = real.snapshot().await.unwrap();
+        let task = state.task(&"t3".parse().unwrap()).unwrap();
+        assert_eq!(task.agent_id, Some("p/worker".parse().unwrap()));
+        assert_eq!(task.state, TaskState::Assigned);
+
+        let brief = "Task t3 assigned: Work\nInspect the task: atm task get t3\nNo brief file is attached; inspect the task before starting.";
+        let note = "Task t3 changed: assigned.\nInspect current state and assignee: atm task get t3\nDo not continue obsolete work or resume/clear on this note alone.";
+        let mut expected = vec![
+            ("p/worker", MessageKind::Brief, brief),
+            ("p/next", MessageKind::Note, note),
+            ("p/next", MessageKind::Brief, brief),
+        ];
+        if compose_before_return {
+            expected.push(("p/worker", MessageKind::Note, note));
+        }
+        let messages: Vec<_> = state.messages().collect();
+        assert_eq!(messages.len(), expected.len());
+        for (message, (to, kind, body)) in messages.into_iter().zip(expected) {
+            assert_eq!(
+                message.content,
+                MessageContent {
+                    delivery_notice: None,
+                    from: Address::Owner,
+                    to: to.parse().unwrap(),
+                    kind,
+                    body: body.into(),
+                    attachments: vec![],
+                    task: Some("t3".parse().unwrap()),
+                },
+                "compose_before_return={compose_before_return}"
+            );
+        }
+        cancel.cancel();
+    }
+}
+
+// Break caught: automatic self messages unnecessarily queue another turn.
+#[test]
+fn automatic_self_brief_and_report_are_suppressed() {
+    let now = "2026-01-15T12:00:00Z".parse().unwrap();
+    for creator in ["alpha/worker", "owner", "system"] {
+        let mut state = OrgState::default();
+        for (seq, project) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            state
+                .apply(
+                    seq as u64 + 1,
+                    now,
+                    &OrgEvent::ProjectRegistered {
+                        project_id: project.parse().unwrap(),
+                        root: format!("/{project}"),
+                    },
+                )
+                .unwrap();
+        }
+        state
+            .apply(
+                4,
+                now,
+                &OrgEvent::AgentAdopted {
+                    agent_id: "alpha/worker".parse().unwrap(),
+                    pane: "%1".into(),
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let mut body = created("Task".into());
+        body.creator = creator.parse().unwrap();
+        body.files = vec![atm_org::TaskFile {
+            path: "brief.md".into(),
+            kind: TaskFileKind::Brief,
+            note: None,
+        }];
+        state.apply(5, now, &OrgEvent::TaskCreated(body)).unwrap();
+        let assigned = OrgEvent::TaskAssigned(atm_org::TaskAssigned {
+            task_id: "t5".parse().unwrap(),
+            agent_id: "alpha/worker".parse().unwrap(),
+            by: if creator == "alpha/worker" {
+                creator.parse().unwrap()
+            } else {
+                Address::Owner
+            },
+        });
+        state.apply(6, now, &assigned).unwrap();
+        let brief = notification(&assigned, &state).unwrap();
+        let submitted = OrgEvent::TaskSubmitted(atm_org::TaskSubmitted {
+            task_id: "t5".parse().unwrap(),
+            what: TaskSubmission::Result,
+            files: vec![atm_org::TaskFile {
+                path: "report.md".into(),
+                kind: TaskFileKind::Report,
+                note: None,
+            }],
+            by: "alpha/worker".parse().unwrap(),
+        });
+        state.apply(7, now, &submitted).unwrap();
+        let report = notification(&submitted, &state).unwrap();
+        if creator == "alpha/worker" {
+            assert!(brief.is_none(), "self brief was composed: {brief:?}");
+            assert!(report.is_none(), "self report was composed: {report:?}");
+        } else {
+            let brief = brief.unwrap();
+            let report = report.unwrap();
+            assert_eq!(
+                (brief.from.to_string(), brief.to.to_string(), brief.kind),
+                ("owner".into(), "alpha/worker".into(), MessageKind::Brief)
+            );
+            assert_eq!(brief.attachments, ["brief.md"]);
+            assert_eq!(
+                (report.from.to_string(), report.to.to_string(), report.kind),
+                ("alpha/worker".into(), "owner".into(), MessageKind::Report)
+            );
+            assert_eq!(report.attachments, ["report.md"]);
+            assert_eq!(brief.task, Some("t5".parse().unwrap()));
+            assert_eq!(report.task, brief.task);
+        }
+    }
+}
+
 // Break caught: partial fanout stops early/lies about queued truth, or waiter loss drops worker ownership.
 #[tokio::test]
 async fn partial_fanout_retains_worker_and_committed_truth() {
@@ -485,7 +984,7 @@ async fn partial_fanout_retains_worker_and_committed_truth() {
             org.execute(
                 OrgCommand::Task(assign(TaskActor {
                     who: Address::Owner,
-                    lead: false,
+                    manager_of: None,
                 })),
                 chrono::Utc::now(),
             )
@@ -608,7 +1107,7 @@ async fn fanout_preserves_first_error_and_every_failed_audience() {
     org.execute(
         OrgCommand::Task(assign(TaskActor {
             who: Address::Owner,
-            lead: false,
+            manager_of: None,
         })),
         chrono::Utc::now(),
     )
@@ -683,7 +1182,7 @@ async fn notice_only_prefix_and_completed_replay_do_not_fabricate_messages() {
         org.execute(
             OrgCommand::Task(assign(TaskActor {
                 who: Address::Owner,
-                lead: false,
+                manager_of: None,
             })),
             chrono::Utc::now(),
         )
@@ -1171,6 +1670,7 @@ fn verdict_answer_reads_note_and_review_by_reference() {
                 assert_eq!(
                     answer,
                     MessageContent {
+                        delivery_notice: None,
                         from: Address::Owner,
                         to: "p/worker".parse().unwrap(),
                         kind: MessageKind::Answer,

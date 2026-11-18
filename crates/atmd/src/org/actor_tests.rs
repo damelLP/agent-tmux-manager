@@ -49,6 +49,247 @@ where
     )
 }
 
+// Break caught: data and cursor are sampled in different actor turns, or
+// replay loses the sequence high-water of an unknown event.
+#[tokio::test]
+async fn snapshot_at_matches_fold_and_replay_cursor() {
+    if crate::eventlog::test_support::isolated(
+        "org::actor::tests::snapshot_at_matches_fold_and_replay_cursor",
+    ) {
+        return;
+    }
+    let mut seq = 0;
+    let (org, cancel, task) = spawn(move |_| {
+        seq += 1;
+        std::future::ready(Ok(seq))
+    });
+    org.execute(project(), now()).await.unwrap();
+    let (before, cursor) = org.snapshot_at().await.unwrap();
+    assert_eq!(cursor, 1);
+    assert_eq!(before.projects().count(), 1);
+    org.execute(
+        OrgCommand::Adopt {
+            agent_id: "demo/worker".parse().unwrap(),
+            pane: "%7".into(),
+            session_id: None,
+        },
+        now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before.agents().count(), 0);
+    let (after, cursor) = org.snapshot_at().await.unwrap();
+    assert_eq!(cursor, 2);
+    assert_eq!(after.agents().count(), 1);
+    cancel.cancel();
+    task.await.unwrap();
+    assert!(org.snapshot_at().await.is_err());
+    assert!(OrgHandle::disabled("unavailable")
+        .snapshot_at()
+        .await
+        .is_err());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_owned();
+    let log = crate::org::storage::detached_open(Duration::from_secs(60), move || {
+        crate::eventlog::EventLog::open(&path, crate::eventlog::Stream::Events)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap();
+    log.append(
+        now(),
+        "project.registered",
+        serde_json::json!({"project_id":"demo","root":"/demo"}),
+    )
+    .await
+    .unwrap();
+    log.append(now(), "future.event", serde_json::json!({"ignored":true}))
+        .await
+        .unwrap();
+    let mut closed = log.subscribe();
+    drop(log);
+    // Last-handle Drop only asks the detached writer to stop. Closed fences
+    // this writer releasing its stream fd; the isolated child excludes
+    // unrelated forks holding inherited copies.
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(60), closed.recv())
+            .await
+            .unwrap(),
+        Err(broadcast::error::RecvError::Closed)
+    ));
+    let cancel = CancellationToken::new();
+    let org = OrgHandle::open(dir.path().into(), cancel.clone()).await;
+    let (state, cursor) = org.snapshot_at().await.unwrap();
+    assert_eq!(state.projects().count(), 1);
+    assert_eq!(cursor, 2);
+    cancel.cancel();
+}
+
+// Break caught: reporting reads status and state in separate turns, or exposes
+// a cursor for an append before the corresponding state has been applied.
+#[tokio::test]
+async fn report_snapshot_pairs_the_committed_cursor_and_state_in_one_actor_turn() {
+    let (entered, mut entry) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let mut seq = 0;
+    let (org, cancel, task) = spawn(move |_| {
+        seq += 1;
+        let seq = seq;
+        let entered = entered.clone();
+        let gate = gate.clone();
+        async move {
+            entered.send(seq).unwrap();
+            gate.acquire().await.unwrap().forget();
+            Ok(seq)
+        }
+    });
+    let caller = org.clone();
+    let first = tokio::spawn(async move { caller.execute(project(), now()).await });
+    assert_eq!(entry.recv().await, Some(1));
+    let mut response = Box::pin(org.report_snapshot());
+    std::future::poll_fn(|cx| {
+        use std::{future::Future, task::Poll};
+        assert!(response.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let caller = org.clone();
+    let second = tokio::spawn(async move {
+        caller
+            .execute(
+                OrgCommand::RegisterProject {
+                    project_id: "other".parse().unwrap(),
+                    root: "/other".into(),
+                    move_root: false,
+                },
+                now(),
+            )
+            .await
+    });
+    release.add_permits(1);
+    assert_eq!(entry.recv().await, Some(2)); // snapshot reply has already been sent
+    assert_eq!(org.status().unwrap(), 1);
+    first.await.unwrap().unwrap();
+    release.add_permits(1);
+    second.await.unwrap().unwrap();
+    // Consume the queued snapshot only AFTER the next command commits. Reading
+    // status on either side of a separate snapshot now gives the wrong cursor.
+    let (seq, state) = response.await.unwrap();
+    assert_eq!(seq, 1);
+    assert_eq!(
+        state
+            .projects()
+            .map(|p| p.id.to_string())
+            .collect::<Vec<_>>(),
+        ["demo"]
+    );
+    let (seq, state) = org.report_snapshot().await.unwrap();
+    assert_eq!(seq, 2);
+    assert_eq!(state.projects().count(), 2);
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+// Characterization: accepted parent accounting is inserted before review closure.
+// A reporting fold that assumes adjacent verdicts would count two owner step-ins.
+#[tokio::test]
+async fn parent_verdict_accounting_precedes_the_paired_review_closure() {
+    use atm_org::{TaskActor, TaskCommand, TaskSubmission, TaskVerdict};
+    use serde_json::json;
+    let mut seq = 0;
+    let (org, cancel, actor) = spawn(move |_| {
+        seq += 1;
+        std::future::ready(Ok(seq))
+    });
+    org.execute(project(), now()).await.unwrap();
+    for (id, pane) in [("demo/worker", "%1"), ("demo/reviewer", "%2")] {
+        org.execute(
+            OrgCommand::Adopt {
+                agent_id: id.parse().unwrap(),
+                pane: pane.into(),
+                session_id: None,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    }
+    let by = |who: &str| TaskActor {
+        who: who.parse().unwrap(),
+        manager_of: None,
+    };
+    for (kind, judges, id, agent) in [
+        ("work", None, "t4", "demo/worker"),
+        ("review", Some("t4"), "t7", "demo/reviewer"),
+    ] {
+        let created = serde_json::from_value(json!({"title":"Work", "kind":kind, "creator":"owner", "judges":judges, "measure":{"kind":"owner"}, "files":[]})).unwrap();
+        org.execute_task(TaskCommand::Create(created), now())
+            .await
+            .unwrap();
+        org.execute_task(
+            TaskCommand::Assign {
+                task_id: id.parse().unwrap(),
+                agent_id: agent.parse().unwrap(),
+                by: by("owner"),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        org.execute_task(
+            TaskCommand::Submit {
+                task_id: id.parse().unwrap(),
+                what: TaskSubmission::Result,
+                files: vec![],
+                by: by(agent),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    }
+    org.execute_task(
+        TaskCommand::StartReview {
+            task_id: "t4".parse().unwrap(),
+            review_task: "t7".parse().unwrap(),
+            by: by("owner"),
+        },
+        now(),
+    )
+    .await
+    .unwrap();
+    let receipt = org
+        .execute_task(
+            TaskCommand::Verdict {
+                task_id: "t4".parse().unwrap(),
+                verdict: TaskVerdict::Accepted,
+                review_task: Some("t7".parse().unwrap()),
+                note: None,
+                by: by("owner"),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt
+            .events
+            .iter()
+            .map(|e| (e.kind.as_str(), e.body["task_id"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [
+            ("task.verdict", "t4"),
+            ("task.cost_recorded", "t4"),
+            ("task.verdict", "t7"),
+            ("task.cost_recorded", "t7")
+        ]
+    );
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
 // Break caught: task receipts capture a post-state, omit a no-op before-image, or alter public execute.
 #[tokio::test]
 async fn task_receipt_captures_the_deciding_actor_before_image() {
@@ -88,7 +329,7 @@ async fn task_receipt_captures_the_deciding_actor_before_image() {
         agent_id: "demo/worker".parse().unwrap(),
         by: TaskActor {
             who: "owner".parse().unwrap(),
-            lead: false,
+            manager_of: None,
         },
     };
     let receipt = org.execute_task(command.clone(), now()).await.unwrap();
@@ -538,7 +779,7 @@ async fn failed_accepted_cost_append_preserves_verdict_prefix() {
         note: None,
         by: atm_org::TaskActor {
             who: atm_org::Address::Owner,
-            lead: false,
+            manager_of: None,
         },
     });
     let (health, status) = watch::channel(Ok(7));
@@ -568,6 +809,245 @@ async fn failed_accepted_cost_append_preserves_verdict_prefix() {
     assert!(status.borrow().is_err());
 }
 
+// Characterizes crrv-B L4: a known-unwritten second append does not roll back
+// the verdict, retry its cost, or finish the review. Only startup repairs cost.
+#[tokio::test]
+async fn second_append_timeout_leaves_verdict_without_cost_or_review_closure() {
+    reviewed_verdict_timeout_prefix(2).await;
+}
+
+// The third append is the review verdict, after the judged task's cost record.
+// A retry/startup must not be mistaken for recovery of that missing review close.
+#[tokio::test]
+async fn third_append_timeout_leaves_recorded_cost_without_review_closure() {
+    reviewed_verdict_timeout_prefix(3).await;
+}
+
+async fn reviewed_verdict_timeout_prefix(failed_append: usize) {
+    use crate::eventlog::{read_from, Stream};
+    use atm_org::{Address, TaskActor, TaskCommand, TaskState, TaskSubmission, TaskVerdict};
+
+    let dir = tempfile::tempdir().unwrap();
+    let segment = dir.path().join("log/events/00000001.jsonl");
+    std::fs::create_dir_all(segment.parent().unwrap()).unwrap();
+    let prefix = include_str!("../../../atm-org/tests/fixtures/task_cost_log.jsonl")
+        .lines()
+        .take(7)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&segment, prefix).unwrap();
+    let ready = crate::org::storage::open(dir.path().into()).await.unwrap();
+    let (requests, receive) = mpsc::channel(64);
+    let (health, status) = watch::channel(Ok(7));
+    let (committed, _) = broadcast::channel(1024);
+    let cancel = CancellationToken::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let (attempted, mut attempts) = mpsc::unbounded_channel();
+    let actor = tokio::spawn(run(
+        ready.state,
+        receive,
+        health,
+        committed.clone(),
+        cancel.clone(),
+        move |envelope| {
+            let call = count.fetch_add(1, Ordering::SeqCst) + 1;
+            attempted.send(envelope.clone()).unwrap();
+            let disk = ready.log.clone();
+            async move {
+                if call == 5 + failed_append {
+                    Err(EventLogError::TimeoutBeforeHandover)
+                } else {
+                    disk.append(envelope.ts, &envelope.kind, envelope.body)
+                        .await
+                }
+            }
+        },
+    ));
+    let org = OrgHandle {
+        requests,
+        health: status,
+        committed,
+        reads: None,
+    };
+    let owner = TaskActor {
+        who: Address::Owner,
+        manager_of: None,
+    };
+    let work: atm_org::TaskId = "t3".parse().unwrap();
+    let review: atm_org::TaskId = "t9".parse().unwrap();
+    let at: DateTime<Utc> = "2026-01-01T00:00:04Z".parse().unwrap();
+    for command in [
+        OrgCommand::Adopt {
+            agent_id: "p/review".parse().unwrap(),
+            pane: "%2".into(),
+            session_id: None,
+        },
+        OrgCommand::Task(TaskCommand::Create(
+            serde_json::from_value(serde_json::json!({
+                "title": "review", "kind": "review", "creator": "owner",
+                "judges": "t3", "measure": {"kind": "owner"}, "files": []
+            }))
+            .unwrap(),
+        )),
+        OrgCommand::Task(TaskCommand::Assign {
+            task_id: review.clone(),
+            agent_id: "p/review".parse().unwrap(),
+            by: owner.clone(),
+        }),
+        OrgCommand::Task(TaskCommand::StartReview {
+            task_id: work.clone(),
+            review_task: review.clone(),
+            by: owner.clone(),
+        }),
+        OrgCommand::Task(TaskCommand::Submit {
+            task_id: review.clone(),
+            what: TaskSubmission::Result,
+            files: vec![],
+            by: TaskActor {
+                who: "p/review".parse().unwrap(),
+                manager_of: None,
+            },
+        }),
+    ] {
+        org.execute(command, at).await.unwrap();
+        attempts.try_recv().unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_eq!(org.status().unwrap(), 12);
+    let mut published = org.committed.subscribe();
+    let accepted_at = at + chrono::Duration::seconds(1);
+    let command = TaskCommand::Verdict {
+        task_id: work.clone(),
+        verdict: TaskVerdict::Accepted,
+        review_task: Some(review.clone()),
+        note: Some("accepted after review".into()),
+        by: owner,
+    };
+    assert!(matches!(
+        org.execute_task(command.clone(), accepted_at).await,
+        Err(OrgServiceError::Timeout)
+    ));
+    let wanted = [
+        ("task.verdict", "t3"),
+        ("task.cost_recorded", "t3"),
+        ("task.verdict", "t9"),
+    ];
+    for (kind, task_id) in wanted.into_iter().take(failed_append) {
+        let attempt = attempts.try_recv().unwrap();
+        assert_eq!(attempt.kind, kind);
+        assert_eq!(attempt.body["task_id"], task_id);
+    }
+    assert!(matches!(
+        attempts.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    let fence = 12 + failed_append as u64 - 1;
+    assert_eq!(org.status().unwrap(), fence, "known prefix remains healthy");
+    let prefix = org.snapshot().await.unwrap();
+    let judged = prefix.task(&work).unwrap();
+    assert_eq!(judged.state, TaskState::Accepted);
+    assert_eq!(judged.changed_at, accepted_at);
+    assert_eq!(judged.cost.is_some(), failed_append == 3);
+    assert!(
+        judged.review_task.is_none(),
+        "acceptance clears the live review link"
+    );
+    assert_eq!(judged.reason.as_deref(), Some("accepted after review"));
+    assert_eq!(prefix.task(&review).unwrap().state, TaskState::Submitted);
+    assert!(prefix.task(&review).unwrap().cost.is_none());
+    let durable: Vec<_> = read_from(dir.path(), Stream::Events, 12)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(durable.len(), failed_append - 1);
+    for envelope in &durable {
+        assert_eq!(published.try_recv().unwrap().as_ref(), envelope);
+    }
+    assert!(matches!(
+        published.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+
+    let retry = org
+        .execute_task(command.clone(), accepted_at)
+        .await
+        .unwrap();
+    assert!(
+        retry.events.is_empty(),
+        "a verdict retry does not resume its suffix"
+    );
+    assert_eq!(retry.before.as_ref(), prefix.task(&work));
+    assert_eq!(calls.load(Ordering::SeqCst), 5 + failed_append);
+    assert_eq!(org.snapshot().await.unwrap(), prefix);
+    assert_eq!(org.status().unwrap(), fence);
+    assert!(matches!(
+        published.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    cancel.cancel();
+    actor.await.unwrap();
+
+    // Replay a copy of the acknowledged disk prefix: no flock-release polling,
+    // and no hand-built repaired state. The real startup actor must repair it.
+    let restart = tempfile::tempdir().unwrap();
+    let restarted_segment = restart.path().join("log/events/00000001.jsonl");
+    std::fs::create_dir_all(restarted_segment.parent().unwrap()).unwrap();
+    std::fs::copy(&segment, &restarted_segment).unwrap();
+    let stop = CancellationToken::new();
+    let reopened = OrgHandle::open(restart.path().into(), stop.clone()).await;
+    let repaired = reopened.snapshot().await.unwrap();
+    assert_eq!(reopened.status().unwrap(), 14);
+    let record = repaired.task(&work).unwrap().cost.as_ref().unwrap();
+    assert_eq!(
+        record.cost,
+        Some(atm_core::Money::from_microdollars(25_000))
+    );
+    assert_eq!(record.turns, Some(1));
+    assert_eq!(record.review_rounds, Some(1));
+    assert_eq!(record.seconds_in_state.values().sum::<u64>(), 5);
+    let mut expected = prefix;
+    // All fields other than the missing cost must still come from replay.
+    let repaired_records: Vec<_> = read_from(restart.path(), Stream::Events, 12)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(repaired_records.len(), 2);
+    let cost = repaired_records.last().unwrap();
+    assert_eq!(cost.kind, "task.cost_recorded");
+    assert_eq!(cost.seq, 14);
+    assert_eq!(
+        cost.ts, accepted_at,
+        "repair retains the verdict's timestamp"
+    );
+    assert_eq!(cost.body["task_id"], "t3");
+    if failed_append == 2 {
+        expected
+            .apply(
+                14,
+                cost.ts,
+                &OrgEvent::from_parts(&cost.kind, &cost.body)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+    } else {
+        assert_eq!(repaired_records, durable);
+    }
+    assert_eq!(
+        repaired, expected,
+        "startup repairs cost, not the missing review verdict"
+    );
+    assert!(reopened
+        .execute_task(command, accepted_at)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+    assert_eq!(reopened.status().unwrap(), 14);
+    assert_eq!(reopened.snapshot().await.unwrap(), repaired);
+    stop.cancel();
+}
+
 // Break caught: publication or command acknowledgement crosses a still-pending
 // cost append. Only the disk boundary is stalled; decide/apply/publication run.
 #[tokio::test]
@@ -595,7 +1075,7 @@ async fn accepted_cost_waits_for_its_append_before_publication_and_reply() {
         note: None,
         by: atm_org::TaskActor {
             who: atm_org::Address::Owner,
-            lead: false,
+            manager_of: None,
         },
     });
     let (health, status) = watch::channel(Ok(7));

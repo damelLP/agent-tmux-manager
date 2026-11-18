@@ -1,0 +1,17 @@
+Back. You were away since 2026-11-16T08:00:00Z.
+Relay seat: none
+Decided for you while away (1):
+d11 Choose cache = small [taken_provisionally; by=alpha/builder]
+  Recorded work: 1 started (1 accepted), 1 not started.
+  Overruling would reopen 1 task.
+  redo: t14 [accepted; direct] Write cache
+  not started: t18 [open; inherited] Integrate cache
+  Answer: atm decide d11 <option>
+Relayed spoken answers: none.
+Earlier provisional decisions: none.
+Still waiting (1):
+d20 Publish build [irreversible]
+  Answer: atm decide d20 <option>
+Numbers (all recorded time): 1 decision taken for you; 0 overruled.
+Tasks redone per overrule: none.
+Recorded links only: unlinked work and an unlinked task in progress are not included.

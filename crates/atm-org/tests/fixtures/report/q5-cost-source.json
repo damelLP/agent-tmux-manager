@@ -1,0 +1,151 @@
+{
+  "now": "2026-01-01T00:01:00Z",
+  "scope": {
+    "project_id": null,
+    "since": null,
+    "until": "2026-01-01T00:01:00Z",
+    "reader": "owner",
+    "sees": "all"
+  },
+  "tasks": [
+    {
+      "task_id": "t5",
+      "title": "Work",
+      "kind": "work",
+      "measure": {
+        "kind": "mechanical",
+        "command": "check"
+      },
+      "project_id": "alpha",
+      "agent_id": "alpha/build",
+      "state": "accepted",
+      "outcome": "accepted",
+      "created_at": "2026-01-01T00:00:00Z",
+      "started_at": "2026-01-01T00:00:01Z",
+      "ended_at": "2026-01-01T00:00:06Z",
+      "turns": 2,
+      "review_rounds": 0,
+      "changes_requested": 0,
+      "cost": {
+        "microdollars": 300000
+      },
+      "peak_context_percent": 60,
+      "seconds_in_state": {
+        "open": 1,
+        "assigned": 1,
+        "working": 3,
+        "submitted": 1
+      },
+      "submissions": 1,
+      "reminders": 0,
+      "flags": 0,
+      "redone": 0,
+      "owner_step_ins": {
+        "total": 1,
+        "verdict": 1,
+        "redirect": 0,
+        "answer": 0,
+        "message": 0,
+        "redo": 0
+      },
+      "context_percent_at_submit": 60,
+      "cost_source": {
+        "label": "harness_reported",
+        "harnesses": [
+          "pi"
+        ],
+        "models": [
+          "model-a"
+        ]
+      },
+      "over_budget": null
+    },
+    {
+      "task_id": "t14",
+      "title": "Work",
+      "kind": "work",
+      "measure": {
+        "kind": "mechanical",
+        "command": "check"
+      },
+      "project_id": "alpha",
+      "agent_id": null,
+      "state": "open",
+      "outcome": "open",
+      "created_at": "2026-01-01T00:00:07Z",
+      "started_at": null,
+      "ended_at": null,
+      "turns": 0,
+      "review_rounds": 0,
+      "changes_requested": 0,
+      "cost": null,
+      "peak_context_percent": null,
+      "seconds_in_state": {
+        "open": 53
+      },
+      "submissions": 0,
+      "reminders": 0,
+      "flags": 0,
+      "redone": 0,
+      "owner_step_ins": {
+        "total": 0,
+        "verdict": 0,
+        "redirect": 0,
+        "answer": 0,
+        "message": 0,
+        "redo": 0
+      },
+      "context_percent_at_submit": null,
+      "cost_source": {
+        "label": "unknown",
+        "harnesses": [],
+        "models": []
+      },
+      "over_budget": null
+    }
+  ],
+  "projects": [
+    {
+      "project_id": "alpha",
+      "tasks": {
+        "accepted": 1,
+        "cancelled": 0,
+        "open": 1,
+        "unknown": 0
+      },
+      "owner_step_ins": {
+        "total": 1,
+        "verdict": 1,
+        "redirect": 0,
+        "answer": 0,
+        "message": 0,
+        "redo": 0
+      },
+      "tasks_with_step_ins": 1,
+      "cost": {
+        "microdollars": 300000
+      },
+      "cost_unknown_tasks": 1,
+      "over_budget": null,
+      "decisions": {
+        "relayed": 0,
+        "taken_for_owner": 0,
+        "agent_decided": 0,
+        "overruled": 0,
+        "tasks_redone": 0
+      },
+      "trend": {
+        "bucket": 5,
+        "buckets": [],
+        "direction": {
+          "turns": "none",
+          "peak_context_percent": "none",
+          "review_rounds": "none",
+          "changes_requested": "none",
+          "cost": "none"
+        }
+      }
+    }
+  ],
+  "next_after": null
+}

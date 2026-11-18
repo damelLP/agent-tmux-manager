@@ -15,6 +15,9 @@
 //! | `agent_settled`         | `WorkingEnd`                                  |
 //! | `agent_end` (legacy forwarders only) | `WorkingEnd`                        |
 //! | `input` (interactive)   | `PromptSubmit { prompt: text }`               |
+//! | `atm_idle`              | `Idle` (real id and nonzero pid required)     |
+//! | `atm_needs_input_open`  | `NeedsInput` with the select title           |
+//! | `atm_needs_input_resolved` | `Idle` iff payload.idle=true, else `WorkingStart` |
 //! | `tool_execution_start`  | (suppressed — `tool_call` is the canonical signal) |
 //! | `tool_call`             | `ToolCallStart` *or* `NeedsInput{PermissionGate}` |
 //! | `tool_execution_end`    | `ToolCallEnd { is_error }`                    |
@@ -89,7 +92,8 @@ fn extract_context_usage(messages: Option<&Value>) -> (Option<u64>, Option<f64>)
                 // Fallback: input + output if totalTokens missing.
                 let i = usage.get("input").and_then(Value::as_u64).unwrap_or(0);
                 let o = usage.get("output").and_then(Value::as_u64).unwrap_or(0);
-                let sum = i + o;
+                // Oversized legacy counts must not panic or wrap.
+                let sum = i.saturating_add(o);
                 if sum > 0 {
                     Some(sum)
                 } else {
@@ -161,8 +165,8 @@ impl RawPiEvent {
     ///    `atm_needs_input_open{title}` / `atm_needs_input_resolved`
     ///    around the dialog — translated to
     ///    `NeedsInputReason::Notification{ kind: PermissionPrompt,
-    ///    label }` on open and `LifecycleEvent::WorkingStart` on
-    ///    resolve. This is the path actually exercised by today's
+    ///    label }` on open, then Idle for measured idle=true or WorkingStart
+    ///    otherwise on resolve. This is the path actually exercised by today's
     ///    extension.
     /// 2. **Inline flag (still supported).** When a `tool_call`
     ///    payload arrives with `needs_user_input: true`, it
@@ -239,6 +243,16 @@ impl RawPiEvent {
                 LifecycleEvent::Idle
             }
 
+            PiEventType::AtmIdle => {
+                // Registration is real identity only; never take legacy PID
+                // attribution's pending-id fallback for this new event.
+                let id = atm_core::SessionId::new(self.session_id.as_ref()?.clone());
+                if id.as_str().is_empty() || id.is_pending() || self.pid.unwrap_or(0) == 0 {
+                    return None;
+                }
+                LifecycleEvent::Idle
+            }
+
             PiEventType::ModelSelect => LifecycleEvent::ProviderModelChange {
                 provider: p.model.as_ref().and_then(|m| m.provider.clone()),
                 model: p.model.as_ref().map(|m| m.id.clone()),
@@ -261,10 +275,15 @@ impl RawPiEvent {
                     label: p.title.clone(),
                 },
             },
-            // When the dialog closes, pi resumes work. WorkingStart
-            // transitions out of NeedsInput; the next agent_end /
-            // tool_call will drive further state.
-            PiEventType::AtmNeedsInputResolved => LifecycleEvent::WorkingStart,
+            // Only affirmative closure-time measurement clears work. Missing
+            // measurements (older forwarders or input veto) retain the fallback.
+            PiEventType::AtmNeedsInputResolved => {
+                if p.idle == Some(true) {
+                    LifecycleEvent::Idle
+                } else {
+                    LifecycleEvent::WorkingStart
+                }
+            }
 
             PiEventType::Context | PiEventType::TurnEnd => {
                 // pi-atm's usage snapshot carries the session's totals.
@@ -324,6 +343,79 @@ impl RawPiEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pi_1_5_2_idle_registration() {
+        // Synthetic: proposed registration framing; real changed-forwarder
+        // capture is required before claiming vendor capture provenance.
+        let frame = serde_json::json!({
+            "event": "atm_idle", "payload": {}, "session_id": "real-session", "pid": 123,
+            "model": {"id":"probe", "provider":"synthetic", "contextWindow":8192},
+            "usage": {"tokens":42, "cost":1.0, "contextTokens":10}
+        });
+        let raw: crate::RawPiEvent = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(
+            raw.to_lifecycle_events(),
+            vec![
+                atm_core::LifecycleEvent::Idle,
+                atm_core::LifecycleEvent::ProviderModelChange {
+                    provider: Some("synthetic".into()),
+                    model: Some("probe".into()),
+                },
+            ]
+        );
+        assert!(raw.accounting_usage().is_none());
+        let mut no_model = frame.clone();
+        no_model.as_object_mut().unwrap().remove("model");
+        assert_eq!(
+            serde_json::from_value::<crate::RawPiEvent>(no_model)
+                .unwrap()
+                .to_lifecycle_events(),
+            vec![atm_core::LifecycleEvent::Idle]
+        );
+        for (field, bad) in [
+            ("session_id", serde_json::Value::Null),
+            ("session_id", serde_json::json!("")),
+            ("session_id", serde_json::json!("pending-123")),
+            ("pid", serde_json::Value::Null),
+            ("pid", serde_json::json!(0)),
+        ] {
+            let mut malformed = frame.clone();
+            malformed[field] = bad;
+            assert!(
+                serde_json::from_value::<crate::RawPiEvent>(malformed)
+                    .unwrap()
+                    .to_lifecycle_events()
+                    .is_empty(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_1_5_2_idle_registration_capture() {
+        // Captured: pi 1.5.2, 2026-11-16, sealed CLI/private tmux/atmd proxy
+        // plus held-input SDK probe; details in crate docs. IDs/PIDs redacted.
+        let mut snapshots = 0;
+        for line in include_str!("../tests/fixtures/pi_reconnect_1.5.2.jsonl").lines() {
+            let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+            let raw: crate::RawPiEvent = serde_json::from_value(frame["data"].clone()).unwrap();
+            if raw.event != PiEventType::AtmIdle {
+                continue;
+            }
+            assert!(matches!(
+                raw.to_lifecycle_events().as_slice(),
+                [
+                    LifecycleEvent::Idle,
+                    LifecycleEvent::ProviderModelChange { .. }
+                ]
+            ));
+            assert!(raw.usage.is_none());
+            assert!(raw.accounting_usage().is_none());
+            snapshots += 1;
+        }
+        assert_eq!(snapshots, 6);
+    }
+
     #[test]
     fn legacy_per_request_usage_is_not_a_cumulative_accounting_sample() {
         // Synthetic: old extension frame, deliberately without the usage snapshot.
@@ -448,6 +540,87 @@ mod tests {
         assert_eq!(e.to_lifecycle_event(), None);
     }
 
+    #[test]
+    fn legacy_context_usage_overflow_saturates_tokens() {
+        // Synthetic: unbounded legacy JSON counters must not panic or wrap.
+        let e = frame(serde_json::json!({
+            "event": "context",
+            "payload": {"messages": [
+                {"role": "assistant", "usage": {"input": u64::MAX, "output": 1}}
+            ]},
+        }));
+        assert_eq!(
+            e.to_lifecycle_event(),
+            Some(LifecycleEvent::ContextUpdate {
+                tokens: Some(u64::MAX),
+                current_tokens: None,
+                context_window_size: None,
+                cost_usd: None,
+            })
+        );
+        assert_eq!(e.accounting_usage(), None);
+    }
+
+    #[test]
+    fn legacy_context_usage_fallback_boundaries() {
+        // Synthetic: saturating addition preserves ordinary, missing and zero counts.
+        for (mut usage, tokens) in [
+            (
+                serde_json::json!({"input": u64::MAX, "output": u64::MAX}),
+                Some(u64::MAX),
+            ),
+            (
+                serde_json::json!({"input": u64::MAX, "output": 0}),
+                Some(u64::MAX),
+            ),
+            (
+                serde_json::json!({"input": 0, "output": u64::MAX}),
+                Some(u64::MAX),
+            ),
+            (serde_json::json!({"input": 1088, "output": 55}), Some(1143)),
+            (serde_json::json!({"input": 0, "output": 0}), None),
+            (serde_json::json!({"input": 1088}), Some(1088)),
+            (serde_json::json!({"output": 55}), Some(55)),
+            (serde_json::json!({}), None),
+        ] {
+            usage["cost"] = serde_json::json!({"total": 0.25});
+            let messages = serde_json::json!([{"role": "assistant", "usage": usage}]);
+            assert_eq!(
+                extract_context_usage(Some(&messages)),
+                (tokens, Some(0.25)),
+                "{messages}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_context_total_tokens_precedes_overflowing_parts() {
+        // Synthetic: an explicit total, including zero, must bypass the fallback.
+        for total in [7_u64, 0] {
+            let messages = serde_json::json!([
+                {"role": "assistant", "usage": {
+                    "totalTokens": total, "input": u64::MAX, "output": 1
+                }}
+            ]);
+            assert_eq!(extract_context_usage(Some(&messages)), (Some(total), None));
+        }
+    }
+
+    #[test]
+    fn legacy_context_usage_keeps_latest_cost() {
+        // Synthetic: an oversized latest sample must not fall back to older usage.
+        let messages = serde_json::json!([
+            {"role": "assistant", "usage": {"totalTokens": 3, "cost": {"total": 0.1}}},
+            {"role": "assistant", "usage": {
+                "input": u64::MAX, "output": 1, "cost": {"total": 0.25}
+            }}
+        ]);
+        assert_eq!(
+            extract_context_usage(Some(&messages)),
+            (Some(u64::MAX), Some(0.25))
+        );
+    }
+
     /// A pi-atm frame's `data`, parsed as atmd parses it.
     fn frame(data: Value) -> RawPiEvent {
         serde_json::from_value(data).expect("pi_event data")
@@ -557,6 +730,93 @@ mod tests {
             }));
             assert_eq!(e.to_lifecycle_event(), None, "usage {usage}");
         }
+    }
+
+    #[test]
+    fn pi_1_5_2_dialog_idle_resolution() {
+        // Synthetic: proposed dialog payload and compatibility/attribution twins.
+        let open = frame(serde_json::json!({
+            "event":"atm_needs_input_open", "payload":{"title":"Neutral selection"}
+        }));
+        assert_eq!(
+            open.to_lifecycle_events(),
+            vec![LifecycleEvent::NeedsInput {
+                reason: NeedsInputReason::Notification {
+                    kind: atm_core::NotificationKind::PermissionPrompt,
+                    label: Some("Neutral selection".into()),
+                },
+            }]
+        );
+        for (payload, expected) in [
+            (serde_json::json!({"idle":true}), LifecycleEvent::Idle),
+            (
+                serde_json::json!({"idle":false}),
+                LifecycleEvent::WorkingStart,
+            ),
+            (serde_json::json!({}), LifecycleEvent::WorkingStart),
+            (
+                serde_json::json!({"idle":null}),
+                LifecycleEvent::WorkingStart,
+            ),
+        ] {
+            for model in [
+                serde_json::Value::Null,
+                serde_json::json!({"id":"probe","provider":"sealed"}),
+            ] {
+                let raw = frame(serde_json::json!({
+                    "event":"atm_needs_input_resolved", "payload":payload, "model":model,
+                    "usage":{"tokens":42,"contextTokens":10,"cost":1.0}
+                }));
+                let mut batch = vec![expected.clone()];
+                if !model.is_null() {
+                    batch.push(LifecycleEvent::ProviderModelChange {
+                        provider: Some("sealed".into()),
+                        model: Some("probe".into()),
+                    });
+                }
+                assert_eq!(raw.to_lifecycle_events(), batch, "payload {payload}");
+                assert!(raw.accounting_usage().is_none());
+            }
+        }
+        for (event, payload, expected) in [
+            (
+                "input",
+                serde_json::json!({"source":"interactive","text":"neutral","idle":true}),
+                vec![LifecycleEvent::PromptSubmit {
+                    prompt: Some("neutral".into()),
+                }],
+            ),
+            (
+                "agent_end",
+                serde_json::json!({}),
+                vec![LifecycleEvent::WorkingEnd],
+            ),
+            ("future_pi_event", serde_json::json!({"idle":true}), vec![]),
+        ] {
+            assert_eq!(
+                frame(serde_json::json!({"event":event,"payload":payload})).to_lifecycle_events(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pi_1_5_2_dialog_idle_resolution_capture() {
+        // Captured: pi 1.5.2, 2026-11-16, sealed interactive PTY/local select
+        // command, changed forwarder and private real atmd recording proxy.
+        let mut closed = 0;
+        for line in include_str!("../tests/fixtures/pi_dialog_1.5.2.jsonl").lines() {
+            let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+            let raw: RawPiEvent = serde_json::from_value(frame["data"].clone()).unwrap();
+            if raw.event == PiEventType::AtmNeedsInputResolved {
+                assert_eq!(raw.payload.idle, Some(true));
+                assert_eq!(raw.to_lifecycle_events(), vec![LifecycleEvent::Idle]);
+                assert!(raw.accounting_usage().is_none());
+                assert!(raw.usage.is_none());
+                closed += 1;
+            }
+        }
+        assert_eq!(closed, 2, "Enter completion and Esc cancellation");
     }
 
     #[test]

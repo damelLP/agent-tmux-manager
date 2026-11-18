@@ -229,6 +229,27 @@ fn until(seq: u64) -> OrgState {
     folded(&rows)
 }
 
+// Break caught: new bodies lose project_id while old golden bodies remain unchanged.
+#[test]
+fn recorded_project_has_an_additive_golden_body() {
+    let mut body = task_rows().remove(0).2;
+    body["project_id"] = json!("p");
+    let event = OrgEvent::from_parts("task.created", &body)
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.to_body(), body);
+    let mut state = until(4);
+    state.apply(12, ts(12), &event).unwrap();
+    assert_eq!(
+        state.task(&tid(12)).unwrap().project_id,
+        Some("p".parse().unwrap())
+    );
+    assert_eq!(
+        serde_json::to_value(state.task(&tid(12)).unwrap()).unwrap()["project_id"],
+        "p"
+    );
+}
+
 #[test]
 fn task_decision_references_round_trip_without_requiring_a_decision() {
     for (text, seq) in [("d0", 0), ("d7", 7), ("d18446744073709551615", u64::MAX)] {
@@ -352,6 +373,7 @@ fn the_golden_log_folds_to_the_expected_state() {
 
     let lead: Address = "p/lead".parse().unwrap();
     let work = Task {
+        project_id: None,
         id: tid(12),
         title: "Task state machine".into(),
         kind: TaskKind::Work,
@@ -395,6 +417,7 @@ fn the_golden_log_folds_to_the_expected_state() {
         changed_at: ts(27),
     };
     let review = Task {
+        project_id: None,
         id: tid(20),
         title: "Review the plan of t12".into(),
         kind: TaskKind::Review,

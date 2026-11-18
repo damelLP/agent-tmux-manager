@@ -32,7 +32,6 @@ use tracing::{error, info};
 static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 use tracing_subscriber::EnvFilter;
 
-use atm_tmux::RealTmuxClient;
 use atm_tui::app::App;
 use atm_tui::client::DaemonClient;
 use atm_tui::daemon;
@@ -43,14 +42,25 @@ use atm_tui::tmux;
 mod agent;
 mod agent_target;
 mod away;
+mod chat;
+mod chat_entry;
 mod cli;
 mod decide;
 mod me;
 mod msg;
+mod org;
+mod output;
+mod relay;
+mod report;
 pub mod rpc;
 mod spawn;
 mod task;
 mod tui;
+mod tui_decision_popup;
+mod tui_decisions;
+#[cfg(test)]
+mod tui_decisions_tests;
+mod tui_work;
 mod workspace;
 use cli::{cmd_interrupt, cmd_kill, cmd_list, cmd_peek, cmd_reply, cmd_role, cmd_send, cmd_status};
 use spawn::cmd_spawn;
@@ -106,6 +116,15 @@ mod agent_contract_tests {
             args.extend(operands);
             assert!(Args::try_parse_from(args).is_ok(), "{action}");
         }
+    }
+
+    #[test]
+    fn clear_help_shows_timeout_range_and_default() {
+        let help = Args::try_parse_from(["atm", "agent", "clear", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("5000..=120000"), "{text}");
+        assert!(text.contains("[default: 30000]"), "{text}");
     }
 
     #[test]
@@ -267,10 +286,16 @@ mod agent_contract_tests {
 enum Command {
     /// Show your identity, instructions, handover, unread work and reporting command
     Me(me::MeArgs),
+    /// Show the organisation, reporting lines, open work and what needs you
+    Org(org::OrgArgs),
+    /// Evaluate task outcomes, time, owner step-ins, cost and change trends
+    Report(report::ReportArgs),
     /// Create, assign, inspect and review durable tasks
     Task(task::TaskArgs),
     /// Record the owner's answer to a decision
     Decide(decide::DecideArgs),
+    /// Show, set or clear the designated recorder of provisional spoken answers
+    Relay(relay::RelayArgs),
     /// List, request or withdraw durable decisions
     Decisions(decide::DecisionsArgs),
     /// Tell the daemon you will not answer: agents go on under the away rules
@@ -284,6 +309,8 @@ enum Command {
     },
     /// Read messages without marking them read
     Inbox(msg::InboxArgs),
+    /// Talk and read durable messages in a separate terminal screen
+    Chat(chat_entry::ChatArgs),
     /// Manage durable named agents through the daemon
     Agent {
         #[command(subcommand)]
@@ -500,19 +527,36 @@ fn create_log_file() -> Option<std::fs::File> {
 // ============================================================================
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<std::process::ExitCode> {
+    match run().await {
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<output::StdoutClosed>()) =>
+        {
+            Ok(std::process::ExitCode::from(141))
+        }
+        result => result.map(|()| std::process::ExitCode::SUCCESS),
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Handle subcommands first (before TUI initialization)
     match args.command {
         Some(Command::Me(args)) => return me::cmd_me(args).await,
+        Some(Command::Org(args)) => return org::cmd_org(args).await,
+        Some(Command::Report(args)) => return report::cmd_report(args).await,
         Some(Command::Task(args)) => return task::cmd_task(args).await,
         Some(Command::Decide(args)) => return decide::cmd_decide(args).await,
+        Some(Command::Relay(args)) => return relay::cmd_relay(args).await,
         Some(Command::Decisions(args)) => return decide::cmd_decisions(args).await,
         Some(Command::Away(args)) => return away::cmd_away(args).await,
         Some(Command::Back(args)) => return away::cmd_back(args).await,
         Some(Command::Msg { action }) => return msg::cmd_msg(action).await,
         Some(Command::Inbox(args)) => return msg::cmd_inbox(args).await,
+        Some(Command::Chat(args)) => return chat_entry::cmd_chat(args).await,
         Some(Command::Agent { action }) => return agent::cmd_agent(action).await,
         Some(Command::Setup) => {
             return Ok(setup::setup()?);
@@ -656,6 +700,7 @@ async fn main() -> Result<()> {
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
     let (command_tx, command_rx) = mpsc::unbounded_channel::<ClientCommand>();
+    let control = daemon::ControlHandle::new(command_tx.clone());
     let cancel_token = CancellationToken::new();
 
     let mut terminal = match setup_terminal() {
@@ -683,16 +728,18 @@ async fn main() -> Result<()> {
 
     let keyboard_handle = spawn_keyboard_task(event_tx.clone(), cancel_token.clone());
 
-    let role_handle = spawn_role_task(
-        RealTmuxClient::new(),
-        event_tx.clone(),
-        cancel_token.clone(),
-    );
+    let role_handle = spawn_role_task(control.clone(), event_tx.clone(), cancel_token.clone());
 
     // Spawn filter task if --tmux-session is set
-    let filter_handle = args
-        .tmux_session
-        .map(|session| spawn_filter_task(session, event_tx.clone(), cancel_token.clone()));
+    let filter_handle = args.tmux_session.map(|session| {
+        spawn_filter_task(
+            session,
+            control.clone(),
+            event_tx.clone(),
+            cancel_token.clone(),
+            rpc::CallerContext::from_env,
+        )
+    });
 
     // Spawn the Beads read task; its preview only shows in compact mode
     let (beads_dir_tx, beads_dir_rx) = tokio::sync::watch::channel(None::<String>);
@@ -703,7 +750,7 @@ async fn main() -> Result<()> {
     // Create watch channel for selected pane ID and spawn capture polling task
     let (capture_pane_tx, capture_pane_rx) = tokio::sync::watch::channel(None::<String>);
     let capture_handle = spawn_capture_task(
-        RealTmuxClient::new(),
+        control.clone(),
         event_tx,
         cancel_token.clone(),
         capture_pane_rx,
@@ -714,6 +761,7 @@ async fn main() -> Result<()> {
         &mut app,
         &mut event_rx,
         &command_tx,
+        &control,
         &cancel_token,
         &capture_pane_tx,
         &beads_dir_tx,

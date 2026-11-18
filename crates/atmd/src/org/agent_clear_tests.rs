@@ -675,6 +675,63 @@ async fn draft_appears_before_guarded_paste_sends_nothing() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn op7_draft_through_clear_deadline_sends_nothing_and_safe_wake_recovers() {
+    // Break caught: a refused paste guard sends input, or a no-effect clear
+    // deadline prevents recovery on the next eligible, safe session wake.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+        clearing.frame(CLAUDE_CONVERSATION);
+        // More draft captures than the five-second work budget can consume.
+        // Unread captures below prove the flow ended at its deadline, not
+        // because its observation script ran out.
+        for _ in 0..32 {
+            clearing.frame(CLAUDE_DRAFT);
+        }
+        let result = clearing
+            .agents
+            .clear(ClearParams {
+                agent: lead(),
+                timeout_ms: 5_000,
+            })
+            .await;
+        assert_told_stuck(&result, &clearing.agent().await);
+        assert!(clearing.sent().is_empty(), "the draft was never changed");
+        clearing
+            .assert_stuck("the editor stopped being safe before the clear command was typed")
+            .await;
+        assert!(!quarantined(&clearing.rig, "p/lead").await);
+        let remaining = clearing.unread();
+        assert!(remaining > 0 && remaining < 32 * 3, "{remaining}");
+        assert_eq!(remaining % 3, 0);
+        // Discard only the unused fake observations, through the real read-only
+        // actor API; no production input or state transition clears a draft.
+        for _ in 0..remaining / 3 {
+            let capture = clearing
+                .rig
+                .control
+                .observe(&pane("%1"), CaptureFormat::Ansi)
+                .await
+                .unwrap();
+            assert_eq!(capture.text, body(CLAUDE_DRAFT));
+        }
+        clearing
+            .rig
+            .frame_of("%1", "p/lead", body(CLAUDE_CLEARED), "claude");
+        clearing.follow_up();
+        clearing.follow_up();
+        clearing.session_start("new", Some("clear")).await;
+        clearing.settled().await;
+        let agent = clearing.agent().await;
+        assert_eq!(agent.status, AgentStatus::Ready);
+        assert_eq!(agent.session_id, Some(SessionId::new("new")));
+        assert_eq!(agent.reason, None);
+        assert!(clearing.sent().is_empty(), "recovery does not send the clear");
+    })
+    .await
+    .expect("draft deadline and recovery exceeded their hang guard");
+}
+
+#[tokio::test(start_paused = true)]
 async fn refused_paste_guard_until_the_pane_is_unreadable_is_stuck_with_nothing_sent() {
     let clearing = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
     clearing.frame(CLAUDE_CONVERSATION);
@@ -701,7 +758,9 @@ async fn modal_between_capture_and_enter_sends_no_key() {
     clearing.frame(CLAUDE_TRUST);
     // Never read: the flow has stopped.
     clearing.frame(CLAUDE_STAGED);
-    match clearing.clear().await {
+    let result = clearing.clear().await;
+    assert_told_stuck(&result, &clearing.agent().await);
+    match result {
         Err(AgentError::Refused(refusal)) => {
             assert!(
                 refusal.contains("a dialog opened before the command was submitted"),
@@ -913,6 +972,46 @@ async fn clear_ended_at_its_deadline_with_one_failed_write(
     clearing.rig.client.stall_pane_effects(true);
     let result = call.await.unwrap();
     (clearing, result)
+}
+
+#[tokio::test(start_paused = true)]
+async fn op7_late_stuck_commit_keeps_timeout_without_a_note_and_quarantines() {
+    // Break caught: retaining a Stuck reason before its append is acknowledged
+    // falsely turns this call's timeout into a refusal naming an unproven write.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let (gate, mut entered) = mpsc::channel(1);
+        let rig = Rig::gated(Some(("agent.stuck", gate))).await;
+        let mut clearing = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+        clearing.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+        let call = clearing.start();
+        progress(&mut clearing.events, "clear_submitting", Some("p/lead")).await;
+        clearing.rig.client.stall_pane_effects(true);
+        let release = entered.recv().await.unwrap();
+        // The append gate witnesses cleanup entry. Advance past the org reply
+        // cap while keeping the append itself held: no real-I/O timing is used.
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        let result = call.await.unwrap();
+        assert!(
+            matches!(result, Err(AgentError::Reservation(
+                crate::control::reservation::ReservationError::Timeout
+            ))),
+            "{result:?}"
+        );
+        assert!(quarantined(&clearing.rig, "p/lead").await);
+        // A FIFO snapshot after release sees the late durable write, but the
+        // abandoned cleanup cannot send its note or revise the caller's answer.
+        release.send(()).unwrap();
+        let state = clearing.rig.org.snapshot().await.unwrap();
+        let agent = state.agent(&lead()).unwrap();
+        assert_eq!(agent.status, AgentStatus::Stuck);
+        assert_eq!(agent.reason.as_deref(), Some(
+            "clear did not complete: the clear command was being submitted and may have reached the harness; inspect %1"
+        ));
+        assert_eq!(state.messages().count(), 0);
+        assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+    })
+    .await
+    .expect("late Stuck append exceeded its hang guard");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1468,7 +1567,8 @@ async fn worktree_uncertain_key_is_not_retried() {
                 "answering the worktree choice failed, and whether it reached the pane is unknown",
             )
             .await;
-        assert_eq!(clearing.unread(), 12, "no further observation after uncertainty");
+        // Only the failed capture's diagnostic metadata read was consumed.
+        assert_eq!(clearing.unread(), 11, "no further capture after uncertainty");
     })
     .await
     .expect("clear must finish even if the worktree key fails");

@@ -48,6 +48,84 @@ async fn cleanup(_: Reservation, _: Completion) -> Result<(), ReservationError> 
 }
 
 #[tokio::test(start_paused = true)]
+async fn capture_uses_one_raw_command_for_a_complete_observation() {
+    let client = testing::ScriptedTmuxClient::new();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(client.clone()),
+        atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("compound capture"),
+        cancel.clone(),
+    );
+    let expected = frame("%1", Some(false));
+    client.script_observe(&expected).unwrap();
+    let actual = control
+        .observe(&pane("%1"), CaptureFormat::Ansi)
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        client.mock().call_count(),
+        1,
+        "one tmux process per successful look"
+    );
+    assert_eq!(client.pending_reads(&pane("%1")).unwrap(), 0);
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+// Review focus 5: old observations never authorize fresh guarded input.
+#[tokio::test(start_paused = true)]
+async fn compound_observation_never_replaces_guarded_input() {
+    let client = testing::ScriptedTmuxClient::new();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(client.clone()),
+        atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("compound fresh guard"),
+        cancel.clone(),
+    );
+    client.script_observe(&frame("%1", Some(false))).unwrap();
+    control
+        .observe(&pane("%1"), CaptureFormat::Ansi)
+        .await
+        .unwrap();
+    let mut changed = frame("%1", Some(false));
+    changed.inspection.local_agent_tag = Some("beta/seat0".into());
+    client.script_capture(&changed).unwrap();
+    let error = control
+        .run_reserved(
+            request(),
+            |r| async move {
+                r.keys_guarded(
+                    &pane("%1"),
+                    r.agent().clone(),
+                    PaneKey::Enter,
+                    CaptureFormat::Ansi,
+                    |_| true,
+                )
+                .await
+            },
+            cleanup,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ReservationError::TagMismatch { .. }));
+    assert_eq!(
+        client.mock().call_count(),
+        2,
+        "both looks must be fresh single-process captures"
+    );
+    assert!(client
+        .mock()
+        .calls()
+        .iter()
+        .all(|call| matches!(call, MockCall::RawCommand { .. })));
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn observe_is_read_only_and_does_not_acquire_or_wait_for_a_reservation() {
     let client = testing::ScriptedTmuxClient::new();
     let cancel = CancellationToken::new();

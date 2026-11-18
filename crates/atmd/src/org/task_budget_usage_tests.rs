@@ -3,7 +3,7 @@
 
 async fn usage_task(rig: &Rig, cost: Option<i64>, turns: Option<u32>) -> TaskId {
     let made = rig.run(OrgCommand::Task(TaskCommand::Create(TaskCreated {
-        title: "Metered work".into(), kind: TaskKind::Work, creator: Address::Owner,
+        project_id: None, title: "Metered work".into(), kind: TaskKind::Work, creator: Address::Owner,
         parent: None, judges: None, measure: TaskMeasure::Owner,
         budget: Some(atm_org::TaskBudget {
             cost: cost.map(atm_core::Money::from_microdollars), turns, deadline: None,
@@ -12,7 +12,7 @@ async fn usage_task(rig: &Rig, cost: Option<i64>, turns: Option<u32>) -> TaskId 
     let task_id: TaskId = format!("t{}", made.first().unwrap().seq).parse().unwrap();
     rig.run(OrgCommand::Task(TaskCommand::Assign {
         task_id: task_id.clone(), agent_id: agent("build"),
-        by: TaskActor { who: Address::Owner, lead: false },
+        by: TaskActor { who: Address::Owner, manager_of: None },
     })).await;
     task_id
 }
@@ -97,12 +97,12 @@ async fn budget_usage_crossing_is_caught_after_immediate_acceptance() {
     usage_sample(&rig, Some(1), true).await;
     rig.run(OrgCommand::Task(TaskCommand::Submit {
         task_id: task.clone(), what: atm_org::TaskSubmission::Result, files: vec![],
-        by: TaskActor { who: Address::Agent(agent("build")), lead: false },
+        by: TaskActor { who: Address::Agent(agent("build")), manager_of: None },
     })).await;
     rig.run(OrgCommand::Task(TaskCommand::Verdict {
         task_id: task.clone(), verdict: atm_org::TaskVerdict::Accepted,
         review_task: None, note: None,
-        by: TaskActor { who: Address::Owner, lead: false },
+        by: TaskActor { who: Address::Owner, manager_of: None },
     })).await;
     budgets_only(&rig);
     let (_, note, _) = rig.sent().await;

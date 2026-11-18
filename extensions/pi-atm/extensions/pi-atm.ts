@@ -21,6 +21,12 @@
  * pi keeps working". All failures are swallowed (and optionally logged
  * when ATM_DEBUG=1).
  *
+ * Idle recovery is conservative: an interactive input blocks snapshots
+ * and idle dialog-resolution measurements until a genuine run/session
+ * boundary. Input consumed or rejected by a later handler without a run
+ * therefore withholds recovery until that boundary; reading isIdle=true
+ * or a timer cannot clear the veto.
+ *
  * Tracks beads agent-tmux-manager-6dx.
  */
 
@@ -79,216 +85,147 @@ function logDebug(msg: string): void {
 }
 
 /**
- * Persistent socket connection to atmd for the lifetime of this pi-atm
- * instance (pi 0.65+ loads a new instance, with its own connection, for
- * each session). Lazily opened on the first `send()`; after a drop (e.g.
- * atmd restarts), the next forwarded event after backoff reconnects it.
- * Idle sessions do not reconnect or re-register. One handshake per connection
- * instead of one per event keeps the daemon log quiet and avoids
- * thousands of short-lived connections in long pi sessions.
- *
- * `pendingSocket` is the in-flight connection while we wait for the
- * `connect` event; events that fire during the connect race are
- * buffered in `outbox` and flushed on connect.
+ * Factory-owned transport: pi 1.5.2 reuses the imported module across
+ * session factories. Open lazily; retry without another pi event. A
+ * successful connection observes idle once, only after handshake/FIFO
+ * backpressure clears. Already-written frames remain best-effort, without
+ * acknowledgements/replay. The 256-frame cap bounds count, not bytes.
  */
-let activeSocket: net.Socket | null = null;
-let pendingSocket: net.Socket | null = null;
-let reconnectScheduled = false;
-/**
- * `true` while the active socket's internal buffer has exceeded its
- * `highWaterMark` — i.e. `socket.write()` returned `false` and we
- * haven't yet seen the `'drain'` event.
- *
- * Without this, large event payloads against a slow atmd reader
- * silently grow Node's heap (write() always succeeds in the API
- * sense; the buffering happens inside Node). Honouring the
- * write-result keeps backpressure scoped to the bounded outbox
- * instead of spilling into the heap.
- */
-let socketPaused = false;
+function createTransport(getIdleEnvelope: () => unknown | undefined): {
+	send(envelope: unknown): void;
+	close(terminal?: unknown): void;
+} {
+	let alive = true;
+	let activeSocket: net.Socket | null = null;
+	let pendingSocket: net.Socket | null = null;
+	let retryTimer: ReturnType<typeof setTimeout> | undefined;
+	let connectTimer: ReturnType<typeof setTimeout> | undefined;
+	let socketPaused = false;
+	let snapshotPending = false;
+	const outbox: string[] = [];
+	let dropped = 0;
 
-/**
- * Drains as much of `outbox` as the socket can absorb without
- * triggering backpressure. Stops on the first `write` that returns
- * `false` — `'drain'` will resume the flush. Used by both `connect`
- * (to flush events queued during the handshake race) and `'drain'`
- * (to flush events queued while paused).
- */
-function flushOutboxTo(sock: net.Socket): void {
-	while (outbox.length > 0 && activeSocket === sock) {
-		const line = outbox.shift();
-		if (line === undefined) break;
-		if (!sock.write(line)) {
-			socketPaused = true;
-			break;
-		}
+	function scheduleRetry(): void {
+		if (!alive || retryTimer || activeSocket || pendingSocket) return;
+		retryTimer = setTimeout(() => {
+			retryTimer = undefined;
+			if (alive) openSocket();
+		}, 1000);
+		retryTimer.unref();
 	}
-}
-
-/**
- * Bounded FIFO of outgoing event lines waiting for a usable socket.
- *
- * The cap exists so that an extended atmd outage in a long pi session
- * doesn't grow this array without limit. Other event bodies, such as
- * tool results, can still be large; this cap bounds event count, not bytes.
- *
- * Drop-oldest: when full, the *oldest* queued line is discarded so
- * the most recent state survives. Recent events are more useful for
- * "what is this session doing now" than stale ones from minutes ago.
- * Delivery remains best-effort: reconnect does not acknowledge or replay
- * frames already written.
- *
- * 256 bounds the number of events retained during an outage.
- */
-const OUTBOX_MAX = 256;
-const outbox: string[] = [];
-let outboxDropped = 0;
-
-function enqueue(line: string): void {
-	outbox.push(line);
-	while (outbox.length > OUTBOX_MAX) {
-		outbox.shift();
-		outboxDropped++;
-		// Log on each power-of-two boundary so chronic drops surface
-		// without spamming the log on every overflow.
-		if ((outboxDropped & (outboxDropped - 1)) === 0) {
-			logDebug(`outbox over cap: dropped ${outboxDropped} event(s) total`);
-		}
+	function clearConnectTimer(): void {
+		if (connectTimer) clearTimeout(connectTimer);
+		connectTimer = undefined;
 	}
-}
-
-function openSocket(): void {
-	if (activeSocket || pendingSocket) return;
-	if (!fs.existsSync(SOCKET)) {
-		logDebug(`socket not found: ${SOCKET}`);
-		return;
+	function disconnect(sock: net.Socket): void {
+		if (activeSocket !== sock && pendingSocket !== sock) return;
+		clearConnectTimer();
+		activeSocket = pendingSocket = null;
+		socketPaused = snapshotPending = false;
+		sock.destroy();
+		scheduleRetry();
 	}
-
-	const sock = net.createConnection({ path: SOCKET });
-	pendingSocket = sock;
-
-	sock.on("connect", () => {
-		logDebug("socket connected");
-		pendingSocket = null;
-		activeSocket = sock;
-		socketPaused = false;
-		// Send the protocol handshake once for this connection.
-		const connectMsg = {
-			protocol_version: { major: 1, minor: 0 },
-			type: "connect",
-			client_id: `pi-atm-${process.pid}`,
-		};
-		if (!sock.write(`${JSON.stringify(connectMsg)}\n`)) {
-			socketPaused = true;
-		}
-		// Drain anything that queued while we were connecting.
-		flushOutboxTo(sock);
-	});
-
-	sock.on("drain", () => {
-		// Stale event from a closed socket: ignore.
-		if (activeSocket !== sock) return;
-		socketPaused = false;
-		flushOutboxTo(sock);
-	});
-
-	sock.on("error", (err) => {
-		logDebug(`socket error: ${err.message}`);
-	});
-
-	sock.on("close", () => {
-		logDebug("socket closed");
-		if (pendingSocket === sock) pendingSocket = null;
-		if (activeSocket === sock) {
-			activeSocket = null;
-			socketPaused = false;
-		}
-		// Don't reconnect aggressively — let the next send() trigger
-		// it, with a small backoff to avoid flapping.
-		if (!reconnectScheduled) {
-			reconnectScheduled = true;
-			setTimeout(() => {
-				reconnectScheduled = false;
-			}, 1000);
-		}
-	});
-
-	// Daemon may keep this socket open indefinitely; no read timeout.
-	// We only write; if the daemon disconnects, `close` fires.
-	sock.on("data", () => {
-		// We don't expect responses to fire-and-forget pi events. Drain
-		// any frames the daemon sends back.
-	});
-}
-
-/**
- * Sends a single PiEvent envelope to atmd.
- *
- * Fire-and-forget: pi's flow doesn't wait. If the socket is open the
- * event lands immediately; if it's mid-connect or down, the event is
- * queued in `outbox` and flushed on connect (or dropped if connect
- * fails — daemon observability is best-effort, never gate pi's flow
- * on it).
- */
-function send(envelope: unknown): void {
-	const dataMsg = {
-		protocol_version: { major: 1, minor: 0 },
-		type: "pi_event",
-		data: envelope,
-	};
-	// JSON.stringify can throw on circular references or unsupported
-	// values (BigInt, etc). Pi event payloads shouldn't contain
-	// either, but the wrapping handler in the event subscription
-	// promises send() never throws — honour that here so a
-	// surprising payload doesn't crash pi's flow.
-	let line: string;
-	try {
-		line = `${JSON.stringify(dataMsg)}\n`;
-	} catch (e) {
-		logDebug(`stringify failed, dropping event: ${(e as Error).message}`);
-		return;
-	}
-
-	if (activeSocket) {
-		if (socketPaused) {
-			// Socket is up but back-pressured (a previous write exceeded
-			// `highWaterMark` and `'drain'` hasn't fired yet). Queue
-			// instead of writing — `flushOutboxTo` will drain on drain.
-			enqueue(line);
-			return;
-		}
+	function encode(envelope: unknown): string | undefined {
 		try {
-			// `socket.write` returns `false` when the internal buffer
-			// is past `highWaterMark`. Subsequent writes still
-			// "succeed" but spill into Node's heap; the convention is
-			// to stop writing until `'drain'` fires. With large event
-			// payloads against a slow atmd reader, ignoring
-			// this would let one wedged daemon eat the pi process's
-			// heap.
-			if (!activeSocket.write(line)) {
-				socketPaused = true;
-			}
-			return;
+			return `${JSON.stringify({ protocol_version: { major: 1, minor: 0 }, type: "pi_event", data: envelope })}\n`;
 		} catch (e) {
-			logDebug(`write threw: ${(e as Error).message}`);
-			activeSocket = null;
-			socketPaused = false;
+			logDebug(`stringify failed, dropping event: ${(e as Error).message}`);
+			return undefined;
 		}
 	}
-
-	if (pendingSocket) {
-		// Queue until connect fires.
-		enqueue(line);
-		return;
+	function flushOutboxTo(sock: net.Socket): void {
+		if (!alive || activeSocket !== sock || socketPaused) return;
+		while (outbox.length > 0 && activeSocket === sock && !socketPaused) {
+			const line = outbox.shift();
+			if (line === undefined) break;
+			try {
+				socketPaused = !sock.write(line);
+			} catch {
+				outbox.unshift(line);
+				disconnect(sock);
+				return;
+			}
+		}
+		if (activeSocket === sock && !socketPaused && outbox.length === 0 && snapshotPending) {
+			snapshotPending = false; // A failed predicate is consumed too; never a heartbeat.
+			try {
+				const envelope = getIdleEnvelope();
+				if (envelope !== undefined) send(envelope);
+			} catch {
+				// Stale/missing context must not interrupt pi or imply idle.
+			}
+		}
 	}
-
-	if (!reconnectScheduled) {
-		enqueue(line);
-		openSocket();
+	function openSocket(): void {
+		if (!alive || activeSocket || pendingSocket) return;
+		let sock: net.Socket;
+		try {
+			if (!fs.existsSync(SOCKET)) { scheduleRetry(); return; }
+			sock = net.createConnection({ path: SOCKET });
+		} catch {
+			scheduleRetry();
+			return;
+		}
+		pendingSocket = sock;
+		sock.unref();
+		connectTimer = setTimeout(() => {
+			if (alive && pendingSocket === sock) disconnect(sock);
+		}, 10000);
+		connectTimer.unref();
+		sock.on("connect", () => {
+			if (!alive || pendingSocket !== sock) return;
+			clearConnectTimer();
+			pendingSocket = null;
+			activeSocket = sock;
+			snapshotPending = true;
+			try {
+				socketPaused = !sock.write(`${JSON.stringify({
+					protocol_version: { major: 1, minor: 0 }, type: "connect", client_id: `pi-atm-${process.pid}`,
+				})}\n`);
+			} catch { disconnect(sock); return; }
+			flushOutboxTo(sock);
+		});
+		sock.on("drain", () => {
+			if (!alive || activeSocket !== sock) return;
+			socketPaused = false;
+			flushOutboxTo(sock);
+		});
+		sock.on("error", () => disconnect(sock));
+		sock.on("close", () => disconnect(sock));
+		// Drain unsolicited daemon responses; established idle sockets have no timeout.
+		sock.on("data", () => {});
 	}
-	// If reconnect is back-off-pending, drop on the floor — the next
-	// send() after the back-off clears will trigger a fresh
-	// openSocket() and the bounded outbox covers buffering from then.
+	function send(envelope: unknown): void {
+		if (!alive) return;
+		const line = encode(envelope);
+		if (line === undefined) return;
+		outbox.push(line);
+		if (outbox.length > 256) {
+			outbox.shift();
+			dropped++;
+			if ((dropped & (dropped - 1)) === 0) logDebug(`outbox over cap: dropped ${dropped} event(s) total`);
+		}
+		if (activeSocket) flushOutboxTo(activeSocket);
+		else if (!retryTimer) openSocket();
+	}
+	function close(terminal?: unknown): void {
+		if (!alive) return;
+		alive = false;
+		// Never reopen/queue to deliver shutdown, or bypass older queued frames.
+		if (terminal !== undefined && activeSocket && !socketPaused && outbox.length === 0) {
+			const line = encode(terminal);
+			if (line !== undefined) { try { activeSocket.write(line); } catch { /* best-effort */ } }
+		}
+		if (retryTimer) clearTimeout(retryTimer);
+		retryTimer = undefined;
+		clearConnectTimer();
+		outbox.length = 0;
+		activeSocket?.destroy();
+		pendingSocket?.destroy();
+		activeSocket = pendingSocket = null;
+		socketPaused = snapshotPending = false;
+	}
+	return { send, close };
 }
 
 /**
@@ -435,7 +372,8 @@ function withPickedModels(eventName: string, payload: unknown): unknown {
  * The patch:
  *   1. Emits `atm_needs_input_open` to atmd → session shows "Needs input"
  *   2. Awaits the original `select` (pi blocks; user picks)
- *   3. Emits `atm_needs_input_resolved` → session resumes work
+ *   3. After the last overlapping select closes, reports measured idle
+ *      unless interactive input is pending; otherwise resumes work.
  *
  * If patching fails (different pi version, future API change), we log
  * and proceed — the rest of the extension still works.
@@ -445,43 +383,35 @@ function withPickedModels(eventName: string, payload: unknown): unknown {
  * by a previous call). Returns `false` when `ctx.ui.select` isn't yet
  * available — the caller should keep retrying on later events.
  */
-function patchUiSelectOnce(
-	ctx: unknown,
-	getSessionId: () => string | undefined,
-): boolean {
-	const ctxAny = ctx as { ui?: { select?: unknown; __atmPatched?: boolean } };
-	const ui = ctxAny.ui;
-	if (!ui || typeof ui.select !== "function") {
-		logDebug("patchUiSelectOnce: no ui.select to patch");
-		return false;
-	}
-	if (ui.__atmPatched) return true; // already wrapped
+type SelectObserver = { emit(event: string, payload: unknown): void; span(delta: number): number };
+function patchUiSelectOnce(ctx: unknown, observer: SelectObserver): boolean {
+	const ui = (ctx as { ui?: { select?: unknown; __atmPatched?: SelectObserver } }).ui;
+	if (!ui || typeof ui.select !== "function") return false;
+	if (ui.__atmPatched) { ui.__atmPatched = observer; return true; }
 	const originalSelect = ui.select.bind(ui) as (
-		title: string,
-		options: string[],
-		opts?: unknown,
+		title: string, options: string[], opts?: unknown,
 	) => Promise<string | undefined>;
-
-	// Note: `getSessionId` is a getter, not a value. It is read on every
-	// `select` call so synthetic events still carry the correct session
-	// id even when patching happens before the id is cached.
-	ui.select = async function patchedSelect(
-		title: string,
-		options: string[],
-		opts?: unknown,
-	): Promise<string | undefined> {
-		logDebug(`ui.select intercepted: ${title.slice(0, 80)}`);
-		void send(buildEnvelope("atm_needs_input_open", { title }, getSessionId()));
+	ui.__atmPatched = observer;
+	ui.select = async (title: string, options: string[], opts?: unknown): Promise<string | undefined> => {
+		// Capture this call's owner: a late old finally cannot emit into a
+		// replacement instance, even when pi reuses the shared UI object.
+		const owner = ui.__atmPatched;
+		if (owner?.span(1) === 1) owner.emit("atm_needs_input_open", { title });
 		try {
 			return await originalSelect(title, options, opts);
 		} finally {
-			void send(buildEnvelope("atm_needs_input_resolved", {}, getSessionId()));
+			if (owner?.span(-1) === 0) owner.emit("atm_needs_input_resolved", {});
 		}
 	};
-	ui.__atmPatched = true;
-	logDebug("patchUiSelectOnce: ui.select wrapped");
 	return true;
 }
+
+type LiveContext = UsageContext & {
+	sessionManager?: { getSessionId?: () => string };
+	model?: unknown;
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
+};
 
 export default function (pi: ExtensionAPI): void {
 	logDebug(`pi-atm starting, socket=${SOCKET}`);
@@ -496,6 +426,37 @@ export default function (pi: ExtensionAPI): void {
 	// has here.
 	let cachedSessionId: string | undefined;
 	let uiPatched = false;
+	let alive = true;
+	let latestCtx: LiveContext | undefined;
+	let nativeUiOpen = false;
+	let selectDepth = 0;
+	let inputPending = false;
+	const transport = createTransport(() => {
+		if (!alive || inputPending || nativeUiOpen || selectDepth > 0) return undefined;
+		const ctx = latestCtx;
+		if (ctx?.isIdle?.() !== true || ctx.hasPendingMessages?.() !== false) return undefined;
+		const id = ctx.sessionManager?.getSessionId?.();
+		if (typeof id !== "string" || id.length === 0 || id.startsWith("pending-")) return undefined;
+		return buildEnvelope("atm_idle", {}, id, pickModel(ctx.model));
+	});
+	const selectObserver: SelectObserver = {
+		emit(event, payload) {
+			if (!alive) return;
+			try {
+				// Sample only at final closure. A pending input may still run next.
+				const idle = event === "atm_needs_input_resolved" && !inputPending ? latestCtx?.isIdle?.() : undefined;
+				transport.send(buildEnvelope(event, typeof idle === "boolean" ? { idle } : payload, cachedSessionId));
+			} catch { /* best-effort UI reporting, including invalidated context */ }
+		},
+		span(delta) { if (alive) selectDepth = Math.max(0, selectDepth + delta); return selectDepth; },
+	};
+	for (const name of ["ui_prompt_start", "ui_prompt_end"] as const) {
+		pi.on(name as any, (_payload: unknown, ctx: unknown) => {
+			if (!alive) return;
+			latestCtx = ctx as LiveContext;
+			nativeUiOpen = name === "ui_prompt_start";
+		});
+	}
 
 	for (const eventName of FORWARDED_EVENTS) {
 		// pi.on takes a string-typed name. The TS type union it expects is
@@ -505,15 +466,16 @@ export default function (pi: ExtensionAPI): void {
 		// arbitrary names at runtime.
 		// biome-ignore lint/suspicious/noExplicitAny: see comment above
 		pi.on(eventName as any, async (payload: unknown, ctx: unknown) => {
+			if (!alive) return;
+			let terminal: unknown;
 			try {
+				if (eventName === "input" && (payload as { source?: unknown } | null)?.source === "interactive") inputPending = true;
+				if (eventName === "session_start" || eventName === "agent_start" || eventName === "agent_settled") inputPending = false;
+				latestCtx = ctx as LiveContext;
 				logDebug(`event fired: ${eventName}`);
 				// Duck-typed guard: if ctx lacks `getSessionId`, the event
 				// still goes out, with the last id read.
-				const ctxAny = ctx as UsageContext & {
-					sessionManager?: { getSessionId?: () => string };
-					model?: unknown;
-					isIdle?: () => boolean;
-				};
+				const ctxAny = ctx as LiveContext;
 				cachedSessionId = ctxAny.sessionManager?.getSessionId?.() || cachedSessionId;
 				// Only pi's model_select carries the model, and never at
 				// startup, so each event's frame snapshots it (atmd takes the
@@ -524,10 +486,9 @@ export default function (pi: ExtensionAPI): void {
 					// with `ui` bound. Early events can fire before the runner
 					// attaches `ui`, so retry on each event until the patch
 					// actually takes — `patchUiSelectOnce` returns `false`
-					// when there's nothing to patch yet. Pass a getter so the
-					// patched closure reads the *current* `cachedSessionId`,
-					// even if patching ran before the id was discovered.
-					uiPatched = patchUiSelectOnce(ctx, () => cachedSessionId);
+					// when there's nothing to patch yet. Reporting belongs to
+					// this instance, not the imported module or a later session.
+					uiPatched = patchUiSelectOnce(ctx, selectObserver);
 				}
 				const counted = eventName === "context" || eventName === "turn_end";
 				const compaction = eventName === "session_before_compact" || eventName === "session_compact" || eventName === "session_compact_failed";
@@ -545,14 +506,19 @@ export default function (pi: ExtensionAPI): void {
 					model,
 					counted ? usageSnapshot(ctxAny) : undefined,
 				);
-				// Fire-and-forget: `send()` is synchronous and returns
-				// `void` — it either writes to the live socket, queues
-				// onto the bounded outbox, or drops on the floor when a
-				// reconnect back-off is in effect. None of those gate
-				// pi's flow.
-				send(envelope);
+				// Synchronous best-effort transport never gates pi's flow.
+				if (eventName === "session_shutdown") terminal = envelope;
+				else transport.send(envelope);
 			} catch (e) {
 				logDebug(`handler threw on ${eventName}: ${(e as Error).message}`);
+			} finally {
+				if (eventName === "session_shutdown") {
+					alive = false;
+					latestCtx = undefined;
+					nativeUiOpen = inputPending = false;
+					selectDepth = 0;
+					transport.close(terminal);
+				}
 			}
 			// Returning undefined means we don't block or modify pi's flow.
 			return undefined;

@@ -1,4 +1,10 @@
-//! One decision and its complete append/apply sequence at a time.
+//! One decision and its complete append/apply sequence at a time, not a transaction.
+//!
+//! Known limit (crrv-B L4): TimeoutBeforeHandover on a later append leaves an
+//! applied, published prefix and a healthy actor; it does not resume the suffix.
+//! Retrying an already accepted verdict is a no-op, so its review can remain
+//! Submitted. Startup repairs missing accepted-task costs only, not the missing
+//! review verdict or notifications. Prefix recovery needs a separate design.
 
 #[cfg(test)]
 #[path = "actor_tests.rs"]
@@ -56,6 +62,19 @@ pub(super) async fn run<F, Fut>(
         match request {
             Request::Snapshot(reply) => {
                 let _ = reply.send(state.clone());
+            }
+            Request::SnapshotAt(reply) => {
+                let snapshot = health
+                    .borrow()
+                    .clone()
+                    .map(|seq| (state.clone(), seq))
+                    .map_err(OrgServiceError::Unavailable);
+                let _ = reply.send(snapshot);
+            }
+            Request::ReportSnapshot(reply) => {
+                if let Ok(seq) = health.borrow().as_ref() {
+                    let _ = reply.send((*seq, state.clone()));
+                }
             }
             Request::Execute {
                 command,

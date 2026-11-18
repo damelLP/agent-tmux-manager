@@ -2,19 +2,31 @@
 
 mod command;
 mod pane;
+mod panes;
 mod peek;
 mod reply;
 pub mod reservation;
+mod roles;
 mod send;
 pub mod service;
 mod spawn;
+pub(crate) mod windows;
+pub mod workspace;
 
 pub use command::{build_spawn_command, launch_policy, shell_quote, spawn_env_override};
 pub use pane::{interrupt, kill};
+pub use panes::session_panes;
 pub use peek::peek;
-pub use reply::{reply, ReplyOutcome};
-pub use send::{resolve_pane_id, send};
-pub use spawn::{prepare_spawn, split_spawn, type_spawn_command, SpawnContext};
+#[cfg(test)]
+pub use reply::reply;
+pub use reply::ReplyOutcome;
+pub use send::resolve_pane_id;
+#[cfg(test)]
+pub use send::send;
+pub use spawn::{
+    prepare_spawn, prepare_spawn_largest, split_spawn, type_spawn_command, SpawnContext,
+    SPAWN_ENTER_FAILURE_CONTEXT,
+};
 
 /// Failures resolving or controlling a session's tmux pane.
 #[derive(Debug, thiserror::Error)]

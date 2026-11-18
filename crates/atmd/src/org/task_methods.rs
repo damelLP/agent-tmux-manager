@@ -50,6 +50,8 @@ params!(ReviewParams { pub task_id: TaskId, pub review_task: TaskId, });
 params!(VerdictParams { pub task_id: TaskId, pub verdict: TaskVerdict, pub review_task: Option<TaskId>, pub note: Option<String>, });
 params!(GetParams { pub task_id: TaskId, });
 params!(ListParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     pub agent_id: Option<AgentId>, pub creator: Option<Address>, pub state: Option<TaskState>,
     pub kind: Option<TaskKind>, pub parent: Option<TaskId>, pub after: Option<TaskId>,
     #[serde(default)] pub open_only: bool,
@@ -183,7 +185,19 @@ fn encode(value: impl Serialize) -> Result<serde_json::Value, MethodError> {
 
 /// Always advertised; unavailable persistence cannot yield a successful mutation.
 pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Result<(), MethodError> {
-    let tasks = TaskHandle::new(org.clone());
+    register_task_methods_with_reporting(
+        router,
+        org,
+        super::reporting_line::ReportingFiles::default(),
+    )
+}
+
+pub(crate) fn register_task_methods_with_reporting(
+    router: &mut MethodRouter,
+    org: OrgHandle,
+    reporting: super::reporting_line::ReportingFiles,
+) -> Result<(), MethodError> {
+    let tasks = TaskHandle::new(org.clone()).with_reporting_files(reporting.clone());
     macro_rules! mutation {
         ($name:literal, $ty:ty, $validate:expr, $make:expr) => {{
             let tasks = tasks.clone();
@@ -206,16 +220,24 @@ pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Resul
             let tasks = creating.clone();
             let org = org.clone();
             let intent = intent.clone();
+            let reporting = reporting.clone();
             async move {
                 let p: CreateParams = parse_params(params)?;
                 create(&p)?;
-                let creator = intent
-                    .check(&org, &caller, p.project_id.as_ref(), p.measure.clone())
+                let (creator, project_id) = intent
+                    .check(
+                        &org,
+                        &caller,
+                        p.project_id.as_ref(),
+                        p.measure.clone(),
+                        &reporting,
+                    )
                     .await?;
                 encode(
                     tasks
                         .mutate(caller, move |_| {
                             TaskCommand::Create(TaskCreated {
+                                project_id,
                                 title: p.title,
                                 kind: p.kind,
                                 creator,

@@ -38,7 +38,7 @@ fn caller(pane: Option<&str>) -> CallContext {
 fn actor(who: &str) -> TaskActor {
     TaskActor {
         who: who.parse().unwrap(),
-        lead: who == "project/lead",
+        manager_of: None,
     }
 }
 fn created(title: &str) -> TaskCreated {
@@ -54,6 +54,14 @@ impl Rig {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
+        std::fs::create_dir_all(dir.path().join(".atm/roles")).unwrap();
+        for name in ["worker", "reviewer"] {
+            std::fs::write(
+                dir.path().join(format!(".atm/roles/{name}.md")),
+                "+++\nharness='pi'\nmanager='lead'\n+++\nSynthetic role\n",
+            )
+            .unwrap();
+        }
         let org = OrgHandle::open(dir.path().join("state"), cancel.clone()).await;
         org.execute(
             OrgCommand::RegisterProject {
@@ -397,26 +405,36 @@ async fn withdrawal_is_not_every_work_start() {
                 json!({"task_id":id,"files":[{"path":"old-report.md","kind":"report"}]}),
             )
             .await;
-        let report_id = submitted["notification"]["message_id"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let report = rig.snapshot().await.message(&report_id).unwrap().clone();
+        let report = if creator == "project/worker" {
+            assert_eq!(submitted["notification"], Value::Null);
+            None
+        } else {
+            let report_id = submitted["notification"]["message_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            Some((
+                report_id,
+                rig.snapshot().await.message(&report_id).unwrap().clone(),
+            ))
+        };
         let result = rig.ok(Some("%2"), "task.set_state", working.clone()).await;
         let state = rig.snapshot().await;
-        assert_eq!(
-            state.message(&report_id).unwrap(),
-            &report,
-            "withdrawal must not rewrite the old Report"
-        );
+        if let Some((report_id, report)) = report {
+            assert_eq!(
+                state.message(&report_id).unwrap(),
+                &report,
+                "withdrawal must not rewrite the old Report"
+            );
+        }
         assert_eq!(
             state.task(&id.parse().unwrap()).unwrap().state,
             TaskState::Working
         );
         if creator == "project/worker" {
             assert_eq!(result["notification"], Value::Null);
-            assert_eq!(state.messages().count(), 1);
+            assert_eq!(state.messages().count(), 0);
         } else {
             assert_eq!(
                 result["notification"]["status"], "queued",
@@ -722,7 +740,7 @@ async fn automatic_messages_name_task_and_preserve_actor_files_and_noops() {
     let rig = Rig::new().await;
     let assigned = rig
         .ok(
-            Some("%1"),
+            None,
             "task.assign",
             json!({"task_id":"t6","agent_id":"project/worker"}),
         )
@@ -735,7 +753,7 @@ async fn automatic_messages_name_task_and_preserve_actor_files_and_noops() {
     let brief = state.message(&atm_org::MessageId::new(8)).unwrap();
     assert_eq!(
         serde_json::to_value(&brief.content).unwrap(),
-        json!({"from":"project/lead","to":"project/worker","kind":"brief","body":"Task t6 assigned: Task\nInspect the task: atm task get t6\nRead the attached brief files before starting.","attachments":["briefs/task.md"],"task":"t6"})
+        json!({"from":"owner","to":"project/worker","kind":"brief","body":"Task t6 assigned: Task\nInspect the task: atm task get t6\nRead the attached brief files before starting.","attachments":["briefs/task.md"],"task":"t6"})
     );
     assert_eq!(
         rig.ok(
@@ -948,6 +966,92 @@ async fn near_lead_names_cannot_manage_another_creators_task() {
     }
 }
 
+// Break caught: task self-assignment/submission writes messages or replay invents them.
+#[tokio::test]
+async fn self_task_mutations_commit_without_message_events() {
+    let rig = Rig::new().await;
+    let cursor = rig.org.status().unwrap();
+    let created = rig.ok(Some("%2"), "task.create", json!({"title":"Own task","measure":{"kind":"owner"},"files":[{"path":"brief.md","kind":"brief"}]})).await;
+    let id: atm_org::TaskId = serde_json::from_value(created["task_id"].clone()).unwrap();
+    let assign = json!({"task_id":id,"agent_id":"project/worker"});
+    let submit = json!({"task_id":id,"files":[{"path":"report.md","kind":"report"}]});
+    for (method, params) in [("task.assign", assign), ("task.submit", submit)] {
+        let first = rig.ok(Some("%2"), method, params.clone()).await;
+        assert_eq!(first["changed"], true);
+        assert_eq!(first["notification"], Value::Null, "self enqueue: {first}");
+        let before = rig.snapshot().await;
+        let again = rig.ok(Some("%2"), method, params).await;
+        assert_eq!(again["changed"], false);
+        assert_eq!(again["notification"], Value::Null);
+        assert_eq!(rig.snapshot().await, before);
+    }
+    let state = rig.snapshot().await;
+    assert_eq!(state.messages().count(), 0);
+    assert_eq!(state.task(&id).unwrap().state, TaskState::Submitted);
+    assert_eq!(rig.org.status().unwrap(), cursor + 3);
+    let events = rig
+        .org
+        .tail(atmd::org::TailParams {
+            after_seq: cursor,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["task.created", "task.assigned", "task.submitted"]
+    );
+    for event in events.iter().skip(1) {
+        assert_eq!(event.body["by"], "project/worker");
+    }
+    assert_eq!(events.last().unwrap().body["files"][0]["path"], "report.md");
+    fn copy_log(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_log(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    // Manual self messages are still valid, and become historical records
+    // for the replay check; suppression belongs only to the task composer.
+    for kind in [atm_org::MessageKind::Brief, atm_org::MessageKind::Report] {
+        rig.org
+            .execute(
+                OrgCommand::SendMessage(atm_org::MessageContent {
+                    delivery_notice: None,
+                    from: "project/worker".parse().unwrap(),
+                    to: "project/worker".parse().unwrap(),
+                    kind,
+                    body: "Explicit self message".into(),
+                    attachments: vec![],
+                    task: Some(id.clone()),
+                }),
+                now(),
+            )
+            .await
+            .unwrap();
+    }
+    let state = rig.snapshot().await;
+    assert_eq!(state.messages().count(), 2);
+    // All mutation receipts completed; copy quiescent committed data to give
+    // the replay lifetime its own writer lock, without any shutdown polling.
+    let next = tempfile::tempdir().unwrap();
+    copy_log(&rig.dir.path().join("state"), next.path());
+    let cancel = CancellationToken::new();
+    let reopened = OrgHandle::open(next.path().into(), cancel.clone()).await;
+    assert_eq!(reopened.snapshot().await.unwrap(), state);
+    assert_eq!(reopened.status().unwrap(), cursor + 5);
+    cancel.cancel();
+}
+
 // Break caught: reports on agent-created tasks are always routed to the owner.
 #[tokio::test]
 async fn submitted_report_goes_to_agent_creator_not_assigning_owner() {
@@ -1011,7 +1115,7 @@ async fn automatic_brief_attaches_only_brief_files() {
     assert_eq!(brief.content.attachments, ["briefs/task.md"]);
 }
 
-// Break caught: authority inferred from client name/manager, owner allowed to submit, or own verdict allowed.
+// Break caught: name-only task authority, owner allowed to submit, or own verdict allowed.
 #[tokio::test]
 async fn caller_attribution_authority_and_direct_states_are_enforced() {
     let rig = Rig::new().await;
@@ -1030,7 +1134,7 @@ async fn caller_attribution_authority_and_direct_states_are_enforced() {
         );
     }
     rig.ok(
-        Some("%1"),
+        None,
         "task.assign",
         json!({"task_id":"t6","agent_id":"project/worker"}),
     )
@@ -1235,6 +1339,187 @@ unknown_task_param_test!(
     "kind",
     None
 );
+
+// Break caught: project filtering happens after pagination or ignores other task predicates and legacy fallback.
+#[tokio::test]
+async fn project_filter_intersects_worker_creator_parent_state_kind_and_open_pagination() {
+    let rig = Rig::new().await;
+    for project in ["alpha", "beta", "gamma"] {
+        rig.org
+            .execute(
+                OrgCommand::RegisterProject {
+                    project_id: project.parse().unwrap(),
+                    root: format!("/{project}"),
+                    move_root: false,
+                },
+                now(),
+            )
+            .await
+            .unwrap();
+    }
+    rig.org
+        .execute(
+            OrgCommand::Adopt {
+                agent_id: "beta/worker".parse().unwrap(),
+                pane: "%5".into(),
+                session_id: None,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    let mut root = created("Root");
+    root.project_id = Some("alpha".parse().unwrap());
+    rig.run(TaskCommand::Create(root)).await;
+    let parent: atm_org::TaskId = format!("t{}", rig.org.status().unwrap()).parse().unwrap();
+    let mut expected = Vec::new();
+    for (project, cancelled) in [
+        ("alpha", false),
+        ("beta", false),
+        ("alpha", true),
+        ("alpha", false),
+    ] {
+        let mut body = created("Child");
+        body.project_id = Some(project.parse().unwrap());
+        body.parent = Some(parent.clone());
+        rig.run(TaskCommand::Create(body)).await;
+        let id: atm_org::TaskId = format!("t{}", rig.org.status().unwrap()).parse().unwrap();
+        rig.run(TaskCommand::Assign {
+            task_id: id.clone(),
+            agent_id: "beta/worker".parse().unwrap(),
+            by: actor("owner"),
+        })
+        .await;
+        if cancelled {
+            rig.run(TaskCommand::SetState {
+                task_id: id.clone(),
+                state: TaskState::Cancelled,
+                reason: None,
+                by: actor("owner"),
+            })
+            .await;
+        }
+        if project == "alpha" && !cancelled {
+            expected.push(id.to_string());
+        }
+    }
+    let filter = json!({"project_id":"alpha", "agent_id":"beta/worker", "creator":"owner", "parent":parent, "kind":"work", "state":"assigned", "open_only":true, "limit":1});
+    let first = rig.ok(None, "task.list", filter.clone()).await;
+    assert_eq!(first["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(first["tasks"][0]["task_id"], expected[0]);
+    assert_eq!(first["next_after"], expected[0]);
+    let mut second_filter = filter;
+    second_filter["after"] = first["next_after"].clone();
+    let second = rig.ok(None, "task.list", second_filter).await;
+    assert_eq!(second["tasks"][0]["task_id"], expected[1]);
+    assert!(second["next_after"].is_null());
+    // The legacy owner-created task is unplaced, then follows its current worker, then becomes unplaced again.
+    assert!(rig
+        .ok(None, "task.list", json!({"project_id":"project"}))
+        .await["tasks"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    rig.assign().await;
+    assert_eq!(
+        rig.ok(None, "task.list", json!({"project_id":"project"}))
+            .await["tasks"][0]["task_id"],
+        "t6"
+    );
+    rig.run(TaskCommand::SetState {
+        task_id: "t6".parse().unwrap(),
+        state: TaskState::Open,
+        reason: None,
+        by: actor("owner"),
+    })
+    .await;
+    assert!(rig
+        .ok(None, "task.list", json!({"project_id":"project"}))
+        .await["tasks"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let before = rig.snapshot().await;
+    let seq = rig.org.status().unwrap();
+    for (project, code) in [
+        (json!("missing"), "not_found"),
+        (json!("../alpha"), "invalid_params"),
+        (json!(3), "invalid_params"),
+    ] {
+        assert_eq!(
+            rig.call(None, "task.list", json!({"project_id":project}))
+                .await
+                .unwrap_err()
+                .0
+                .code,
+            code
+        );
+    }
+    assert_eq!(rig.snapshot().await, before);
+    assert_eq!(rig.org.status().unwrap(), seq);
+}
+
+// Break caught: filtered pages skip overflow rows, exceed 512 KiB, or accept one individually oversized summary.
+#[tokio::test]
+async fn project_filter_preserves_byte_bounded_pagination_without_lost_rows() {
+    let rig = Rig::new().await;
+    for project in ["alpha", "beta", "gamma"] {
+        rig.org
+            .execute(
+                OrgCommand::RegisterProject {
+                    project_id: project.parse().unwrap(),
+                    root: format!("/{project}"),
+                    move_root: false,
+                },
+                now(),
+            )
+            .await
+            .unwrap();
+    }
+    let mut expected = Vec::new();
+    for project in ["alpha", "beta", "alpha", "beta", "alpha"] {
+        let mut body = created(&"x".repeat(180_000));
+        body.project_id = Some(project.parse().unwrap());
+        rig.run(TaskCommand::Create(body)).await;
+        if project == "alpha" {
+            expected.push(format!("t{}", rig.org.status().unwrap()));
+        }
+    }
+    let mut found = Vec::new();
+    let mut after = Value::Null;
+    for size in [2, 1] {
+        let page = rig
+            .ok(
+                None,
+                "task.list",
+                json!({"project_id":"alpha", "open_only":true, "limit":1000, "after":after}),
+            )
+            .await;
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 512 * 1024);
+        assert_eq!(page["tasks"].as_array().unwrap().len(), size);
+        found.extend(
+            page["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["task_id"].as_str().unwrap().to_owned()),
+        );
+        after = page["next_after"].clone();
+    }
+    assert!(after.is_null());
+    assert_eq!(found, expected);
+    let mut body = created(&"x".repeat(600_000));
+    body.project_id = Some("gamma".parse().unwrap());
+    rig.run(TaskCommand::Create(body)).await;
+    assert_eq!(
+        rig.call(None, "task.list", json!({"project_id":"gamma"}))
+            .await
+            .unwrap_err()
+            .0
+            .code,
+        "refused"
+    );
+}
 
 // Break caught: task endpoints inherit TaskId's legacy free-text message references, or skip bounds/schema validation.
 #[tokio::test]

@@ -511,6 +511,121 @@ fn summaries_replace_snapshots_and_queries_are_deterministic() {
 }
 
 #[test]
+fn notice_validation_is_atomic() {
+    let mut state = started();
+    apply(
+        &mut state,
+        3,
+        OrgEvent::MessageSent(content(Address::Agent(id()))),
+    );
+    let valid = MessageContent {
+        from: Address::System,
+        kind: MessageKind::Note,
+        delivery_notice: Some(DeliveryNotice {
+            source_message_id: MessageId::new(3),
+            reason: "focus".into(),
+        }),
+        ..content(Address::Owner)
+    };
+    let mut invalid = vec![
+        MessageContent {
+            delivery_notice: Some(DeliveryNotice {
+                source_message_id: MessageId::new(999),
+                reason: "focus".into(),
+            }),
+            ..valid.clone()
+        },
+        MessageContent {
+            delivery_notice: Some(DeliveryNotice {
+                source_message_id: MessageId::new(3),
+                reason: String::new(),
+            }),
+            ..valid.clone()
+        },
+        MessageContent {
+            from: Address::Owner,
+            ..valid.clone()
+        },
+        MessageContent {
+            from: Address::Agent(id()),
+            ..valid.clone()
+        },
+        MessageContent {
+            to: Address::Agent(id()),
+            ..valid.clone()
+        },
+        MessageContent {
+            to: Address::System,
+            ..valid.clone()
+        },
+    ];
+    for kind in [
+        MessageKind::Brief,
+        MessageKind::Report,
+        MessageKind::Question,
+        MessageKind::Answer,
+        MessageKind::Review,
+    ] {
+        invalid.push(MessageContent {
+            kind,
+            ..valid.clone()
+        });
+    }
+    let outcomes: Vec<_> = invalid
+        .into_iter()
+        .map(|note| {
+            let mut candidate = state.clone();
+            let refused = candidate
+                .apply(4, time(), &OrgEvent::MessageSent(note.clone()))
+                .is_err();
+            (note, refused, candidate == state)
+        })
+        .collect();
+    assert!(
+        outcomes
+            .iter()
+            .all(|(_, refused, unchanged)| *refused && *unchanged),
+        "{outcomes:?}"
+    );
+    apply(&mut state, 4, OrgEvent::MessageSent(valid.clone()));
+    let note = state.message(&MessageId::new(4)).unwrap();
+    assert_eq!(note.content, valid);
+    assert_eq!(note.status, DeliveryStatus::Delivered);
+    assert_eq!(note.read_at, None);
+    assert_eq!(note.delivered_at, Some(note.sent_at));
+}
+
+#[test]
+fn duplicate_committed_notice_key_is_atomic() {
+    let mut state = OrgState::default();
+    apply(
+        &mut state,
+        1,
+        OrgEvent::MessageSent(content(Address::Owner)),
+    );
+    let valid = MessageContent {
+        from: Address::System,
+        kind: MessageKind::Note,
+        delivery_notice: Some(DeliveryNotice {
+            source_message_id: MessageId::new(1),
+            reason: "focus".into(),
+        }),
+        ..content(Address::Owner)
+    };
+    apply(&mut state, 2, OrgEvent::MessageSent(valid.clone()));
+    let before = state.clone();
+    let changed = MessageContent {
+        body: "Different diagnostic".into(),
+        ..valid
+    };
+    assert!(state
+        .apply(3, time(), &OrgEvent::MessageSent(changed))
+        .is_err());
+    assert_eq!(state, before);
+    assert!(state.message(&MessageId::new(3)).is_none());
+}
+
+#[test]
 fn each_control_kind_is_a_complete_state_noop() {
     let mut state = started();
     let before = state.clone();

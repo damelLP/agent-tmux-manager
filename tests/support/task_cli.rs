@@ -211,7 +211,7 @@ pub async fn method_answer(fixture: &Value, cli_args: Option<&[&str]>) -> Value 
         .unwrap();
     let actor = |who: &str| TaskActor {
         who: who.parse().unwrap(),
-        lead: who == "project/lead",
+        manager_of: None,
     };
     if !setup.is_empty() {
         org.execute(

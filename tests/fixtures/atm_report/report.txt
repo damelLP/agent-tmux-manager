@@ -1,0 +1,6 @@
+Total  1 accepted  0 cancelled  1 open  0 unknown   you stepped in 1 times on 1 tasks   $0.30 harness-reported, 1 tasks unknown
+alpha  1 accepted  0 cancelled  1 open  0 unknown   you stepped in 1 times on 1 tasks   $0.30 harness-reported (pi), 1 tasks unknown   decisions 0 taken for you, 0 agent decided, 0 relayed, 0 overruled, 0 tasks redone
+  trend per 5 tasks, not size-adjusted   turns -→- none   peak context -→-% none   reviews -→- none   rework -→- none   cost unknown→unknown none
+  t5 accepted  alpha/build  6s (open 1s, assigned 1s, working 3s, submitted 1s)  turns 2  reviews 0  rework 0  you 1 (verdict 1)  context 60% peak, 60% at submit  $0.30 harness-reported (pi; model-a)
+  t14 open  -  53s (open 53s)  turns 0  reviews 0  rework 0  you 0  context unknown peak, unknown at submit  unknown
+Cost is a lower bound; budget savings are an upper bound. Whole-task totals; decisions use requester visibility and request time.

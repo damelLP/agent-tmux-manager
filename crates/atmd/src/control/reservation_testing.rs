@@ -16,13 +16,14 @@
 //! | inspect, present pane | filtered metadata; pane-local tag (2) | script_inspect(Some) |
 //! | inspect, missing pane | successful empty filtered metadata only (1) | script_inspect(None) |
 //! | tag / untag / unguarded keys / paste / kill | filtered metadata; pane-local tag (2), then effect | script_tag_check |
-//! | capture / observe | filtered metadata; single metadata/capture/clients/end command list; pane-local tag (3) | script_capture / script_observe |
-//! | keys_guarded / literal_key_guarded / paste_guarded | same 3 reads as capture, pure check, then effect if approved | script_capture |
+//! | capture / observe | one compound command, consuming metadata/frame/local-tag logical reads (3) | script_capture / script_observe |
+//! | keys_guarded / literal_key_guarded / paste_guarded | same compound capture, pure check, then effect if approved | script_capture |
 //! | split | no observation reads; SplitWindow, then claim before replying | mock().set_next_pane_id |
 //! | legacy send / spawn_type, unavailable org | ownership: filtered metadata; pane-local tag (2), before input | script_tag_check |
 //!
-//! A missing pane stops after the first read. Fence, kind or expected-agent
-//! rejection can stop before any read. Metadata/capture framing matches the
+//! A missing pane stops after its filtered metadata read. A compound capture
+//! first fails, leaving that metadata queued for the diagnostic read. Fence,
+//! kind or expected-agent rejection can stop before any read. Metadata/capture framing matches the
 //! private tmux 3.8 probe fixture; `-N` preserves trailing spaces and viewport
 //! rows, `-e` preserves style. The final tag read distinguishes no bytes (unset)
 //! from a newline (present but empty), without inheriting global/window options.
@@ -43,7 +44,7 @@
 //! untagged ownership check when the org is unavailable); use MockTmuxClient for
 //! legacy sends or alias resolution.
 use super::{
-    pane_ops::{CLIENTS, CLIENTS_MARKER, COMMAND, FORMAT},
+    pane_ops::{CAPTURE_MARKER, CLIENTS, CLIENTS_MARKER, COMMAND, FORMAT, TAG_END, TAG_MARKER},
     CaptureFormat, PaneCapture, PaneId, PaneInspection,
 };
 use atm_tmux::{MockTmuxClient, PaneDirection, PaneInfo, TmuxClient, TmuxError};
@@ -122,6 +123,7 @@ enum ReadKind {
     Metadata,
     Tag,
     Frame(CaptureFormat),
+    Compound(CaptureFormat),
 }
 
 #[derive(Debug)]
@@ -204,7 +206,8 @@ impl ScriptedTmuxClient {
         self.script_capture(capture)
     }
 
-    /// Queue one capture/guard (three reads). Requires exactly height newline-
+    /// Queue one capture/guard (three logical reads, one compound call).
+    /// Individual legacy reads remain supported. Requires exactly height newline-
     /// terminated rows, preserving text/style bytes and meaningful whitespace.
     pub fn script_capture(&self, capture: &PaneCapture) -> Result<(), TmuxError> {
         let pane = pane_id(&capture.inspection.pane.pane_id)?;
@@ -270,6 +273,36 @@ impl ScriptedTmuxClient {
         let reads = scripts
             .get_mut(&pane)
             .ok_or_else(|| error(format!("no observation script for {pane}")))?;
+        if let ReadKind::Compound(format) = kind {
+            if reads
+                .front()
+                .is_some_and(|read| read.kind == ReadKind::Metadata && read.output.is_empty())
+            {
+                return Err(TmuxError::CommandFailed {
+                    command: subcommand.into(),
+                    stderr: format!("can't find pane: {pane}"),
+                });
+            }
+            let expected = [ReadKind::Metadata, ReadKind::Frame(format), ReadKind::Tag];
+            if reads.iter().take(3).map(|read| read.kind).ne(expected) {
+                return Err(error("compound script missing or out of order"));
+            }
+            let metadata = reads
+                .pop_front()
+                .ok_or_else(|| error("missing metadata"))?
+                .output;
+            let frame = reads
+                .pop_front()
+                .ok_or_else(|| error("missing frame"))?
+                .output;
+            let tag = reads
+                .pop_front()
+                .ok_or_else(|| error("missing tag"))?
+                .output;
+            return Ok(format!(
+                "{metadata}{CAPTURE_MARKER}\n{frame}{TAG_MARKER}\n{tag}{TAG_END}\n"
+            ));
+        }
         if reads.front().is_none_or(|read| read.kind != kind) {
             return Err(error(format!(
                 "unexpected {kind:?} read for {pane}; script missing or out of order"
@@ -328,6 +361,53 @@ fn local_tag(inspection: &PaneInspection) -> Read {
 
 fn requested_read(subcommand: &str, args: &[&str]) -> Result<(PaneId, ReadKind), TmuxError> {
     match (subcommand, args) {
+        (
+            "list-panes",
+            ["-a", "-f", _, "-F", _, ";", "display-message", "-p", CAPTURE_MARKER, ";", "display-message", rest @ ..],
+        ) => {
+            let (pane, _) = requested_read(
+                "list-panes",
+                args.get(..5)
+                    .ok_or_else(|| error("missing metadata command"))?,
+            )?;
+            let marker = rest
+                .iter()
+                .position(|arg| *arg == TAG_MARKER)
+                .ok_or_else(|| error("missing tag marker"))?;
+            let end = marker
+                .checked_sub(3)
+                .ok_or_else(|| error("missing frame"))?;
+            let (frame_pane, ReadKind::Frame(format)) = requested_read(
+                "display-message",
+                rest.get(..end)
+                    .ok_or_else(|| error("missing frame arguments"))?,
+            )?
+            else {
+                return Err(error("invalid compound frame"));
+            };
+            let suffix = [
+                ";",
+                "show-options",
+                "-p",
+                "-q",
+                "-v",
+                "-t",
+                pane.as_str(),
+                "@atm-agent",
+                ";",
+                "display-message",
+                "-p",
+                TAG_END,
+            ];
+            if pane != frame_pane
+                || rest.get(end..=marker)
+                    != Some([";", "display-message", "-p", TAG_MARKER].as_slice())
+                || rest.get(marker + 1..) != Some(suffix.as_slice())
+            {
+                return Err(error("unexpected compound command list"));
+            }
+            Ok((pane, ReadKind::Compound(format)))
+        }
         ("list-panes", ["-a", "-f", filter, "-F", format])
             if matches!(*format, FORMAT | LEGACY_FORMAT)
                 || *format == FORMAT.replace(COMMAND, "") =>

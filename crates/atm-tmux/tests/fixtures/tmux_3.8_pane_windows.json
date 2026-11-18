@@ -1,0 +1,56 @@
+{
+  "captured": "Captured: tmux 3.8 (package not recorded), 2026-11-17, private tmux -f /dev/null list-panes -a -F with literal TAB separators.",
+  "format": "#{pane_id}\t#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}",
+  "snapshots": {
+    "grouped_linked": "%0\t@0\talpha\t0\tsupport\n%0\t@0\tbeta\t0\tsupport\n%2\t@2\tgamma\t0\tsh\n%0\t@0\tgamma\t4\tsupport\n",
+    "moved_link": "%0\t@0\talpha\t0\tsupport\n%0\t@0\tbeta\t0\tsupport\n%2\t@2\tgamma\t0\tsh\n%0\t@0\tgamma\t7\tsupport\n",
+    "joined_pane": "%0\t@0\talpha\t0\tsupport\n%3\t@0\talpha\t0\tsupport\n%0\t@0\tbeta\t0\tsupport\n%3\t@0\tbeta\t0\tsupport\n%2\t@2\tgamma\t0\tsh\n%0\t@0\tgamma\t7\tsupport\n%3\t@0\tgamma\t7\tsupport\n",
+    "broken_pane": "%0\t@0\talpha\t0\tsupport\n%0\t@0\tbeta\t0\tsupport\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\tsupport\n",
+    "unicode_name": "%0\t@0\talpha\t0\t支援 café 🚀\n%0\t@0\tbeta\t0\t支援 café 🚀\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\t支援 café 🚀\n",
+    "long_name": "%0\t@0\talpha\t0\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\n%0\t@0\tbeta\t0\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\n",
+    "control_0": "%0\t@0\talpha\t0\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\n%0\t@0\tbeta\t0\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\n",
+    "control_1": "%0\t@0\talpha\t0\tsupport\n%0\t@0\tbeta\t0\tsupport\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\tsupport\n",
+    "control_2": "%0\t@0\talpha\t0\tsupport\n%0\t@0\tbeta\t0\tsupport\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\tsupport\n",
+    "control_3": "%0\t@0\talpha\t0\tsupport\n%0\t@0\tbeta\t0\tsupport\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\tsupport\n",
+    "automatic_observation": "%0\t@0\talpha\t0\tsupport\n%4\t@5\talpha\t1\t\n%0\t@0\tbeta\t0\tsupport\n%4\t@5\tbeta\t1\t\n%2\t@2\tgamma\t0\tsh\n%3\t@4\tgamma\t1\tsh\n%0\t@0\tgamma\t7\tsupport\n"
+  },
+  "name_attempts": [
+    {
+      "kind": "window",
+      "name": "tab\there",
+      "status": 1,
+      "stdout": "",
+      "stderr": "invalid window name: tab\there\n",
+      "quoted": "alpha\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\nbeta\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\ngamma\tsh\ngamma\tsh\ngamma\t界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界\n",
+      "quoted_e": "\t\n\t\n\t\n\t\n\t\n"
+    },
+    {
+      "kind": "window",
+      "name": "line\nbreak",
+      "status": 1,
+      "stdout": "",
+      "stderr": "invalid window name: line\nbreak\n",
+      "quoted": "alpha\tsupport\nbeta\tsupport\ngamma\tsh\ngamma\tsh\ngamma\tsupport\n",
+      "quoted_e": "\t\n\t\n\t\n\t\n\t\n"
+    },
+    {
+      "kind": "window",
+      "name": "esc\u001bhere",
+      "status": 1,
+      "stdout": "",
+      "stderr": "invalid window name: esc\u001bhere\n",
+      "quoted": "alpha\tsupport\nbeta\tsupport\ngamma\tsh\ngamma\tsh\ngamma\tsupport\n",
+      "quoted_e": "\t\n\t\n\t\n\t\n\t\n"
+    },
+    {
+      "kind": "session",
+      "name": "tab\there",
+      "status": 1,
+      "stdout": "",
+      "stderr": "invalid session name: tab\there\n",
+      "quoted": "alpha\tsupport\nbeta\tsupport\ngamma\tsh\ngamma\tsh\ngamma\tsupport\n",
+      "quoted_e": "\t\n\t\n\t\n\t\n\t\n"
+    }
+  ],
+  "automatic_observation": "1\t\t\n"
+}

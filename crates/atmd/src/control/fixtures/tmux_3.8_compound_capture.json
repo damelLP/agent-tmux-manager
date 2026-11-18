@@ -1,0 +1,37 @@
+{
+  "captured": "Captured: tmux 3.8 (package not recorded; tmux 3.8), 2026-11-16, sealed private-server Python PTY renderer and wait-for readiness event.",
+  "samples": [
+    {
+      "name": "inherited",
+      "ansi": false,
+      "metadata": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\nprobe     \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n",
+      "tag": "",
+      "compound": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\nATM-CAPTURE-v1\nATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\nprobe     \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\nATM-TAG-v1\nATM-TAG-END-v1\n"
+    },
+    {
+      "name": "plain",
+      "ansi": false,
+      "metadata": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\nprobe     \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n",
+      "tag": "alpha/seat0\n",
+      "compound": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\nATM-CAPTURE-v1\nATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\nprobe     \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\nATM-TAG-v1\nalpha/seat0\nATM-TAG-END-v1\n"
+    },
+    {
+      "name": "ansi",
+      "ansi": true,
+      "metadata": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\n\u001b[31mprobe  \u001b[39m   \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n",
+      "tag": "alpha/seat0\n",
+      "compound": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\nATM-CAPTURE-v1\nATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\n\u001b[31mprobe  \u001b[39m   \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\nATM-TAG-v1\nalpha/seat0\nATM-TAG-END-v1\n"
+    },
+    {
+      "name": "linked",
+      "ansi": false,
+      "metadata": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\nATM-PANE-v2\t%0\tbeta\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\n",
+      "frame": "ATM-PANE-v2\t%0\tbeta\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\nprobe     \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\n",
+      "tag": "alpha/seat0\n",
+      "compound": "ATM-PANE-v2\t%0\talpha\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\nATM-PANE-v2\t%0\tbeta\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\t\t0\t0\nATM-CAPTURE-v1\nATM-PANE-v2\t%0\tbeta\t0\t168873\t40\t8\t1\t0\t0\t0\t0\t2\t\tpython3\t0\t0\nprobe     \nready               \n\n\n\n\n\n\nATM-CLIENTS-v1\nATM-END\t%0\nATM-TAG-v1\nalpha/seat0\nATM-TAG-END-v1\n"
+    }
+  ]
+}

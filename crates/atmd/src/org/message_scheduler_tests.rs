@@ -15,10 +15,12 @@ use super::super::{
     message_evidence::{AttemptScope, MAX_MESSAGES},
     message_history::{EffectCertainty, PanePresence, SessionObservation},
     message_service_tests::{
-        code, empty_editor, guarded, other, owner, page, pane, until, utc, worker, Rig,
+        code, empty_editor, guarded, other, owner, page, pane, poll_pending, spawn_polled, until,
+        utc, worker, Rig,
     },
     messages::{
-        is_focus_notice, AgentId, InboxEntry, InboxParams, ResolveParams, MESSAGE_ADMISSION_LIMIT,
+        is_focus_notice, AgentId, GiveUpResult, InboxEntry, InboxParams, ResolveParams,
+        MESSAGE_ADMISSION_LIMIT,
     },
 };
 use super::*;
@@ -158,9 +160,11 @@ async fn perform(rt: MessageRuntime, id: MessageId, act: Act) -> Result<(), Mess
     };
     if act == Act::LostReply {
         let org = rt.org.clone();
-        tokio::spawn(async move { org.execute(attempted, now).await });
-        // The writer has the command before the executor returns.
-        tokio::task::yield_now().await;
+        let capacity = org.requests.capacity();
+        spawn_polled(async move { org.execute(attempted, now).await });
+        // Polling execute enqueues the command before the executor returns;
+        // its FIFO accounting read cannot overtake this unknown append.
+        assert_eq!(rt.org.requests.capacity(), capacity - 1);
         return Err(MessageError::Timeout);
     }
     let seq = rt.org.execute(attempted, now).await?.last().unwrap().seq;
@@ -256,6 +260,10 @@ impl Bench {
     }
 
     async fn with_screens(screens: Screens) -> Self {
+        Self::build(screens, true).await
+    }
+
+    async fn build(screens: Screens, scheduled: bool) -> Self {
         let act = Arc::new(Mutex::new(Act::Paste));
         let (enter, entered) = mpsc::unbounded_channel();
         let (work_done, worked) = mpsc::unbounded_channel();
@@ -280,11 +288,15 @@ impl Bench {
                 })
             }
         });
-        let rig = Rig::scheduled(Effects {
-            deliver,
-            observe: screens.effect(),
-        })
-        .await;
+        let rig = if scheduled {
+            Rig::scheduled(Effects {
+                deliver,
+                observe: screens.effect(),
+            })
+            .await
+        } else {
+            Rig::seeded().await
+        };
         let events = rig.org.committed.subscribe();
         Self {
             rig,
@@ -439,34 +451,81 @@ struct ManualJob {
     messages: super::super::messages::MessageHandle,
     screens: Screens,
     gate: Arc<Semaphore>,
+    fault: Arc<Mutex<Option<crate::eventlog::EventLogError>>>,
+    appends: mpsc::UnboundedReceiver<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    journal: Arc<Mutex<Vec<Envelope>>>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
 impl ManualJob {
     async fn new() -> Self {
+        Self::from_records(Vec::new()).await
+    }
+
+    async fn from_records(records: Vec<Envelope>) -> Self {
         use super::super::{
             message_service_tests::runtime, messages::spawn_service_for_test, Request,
         };
         use std::sync::atomic::{AtomicU64, Ordering};
         let (requests, receive) = mpsc::channel::<Request>(64);
-        let (health, status) = watch::channel(Ok(0));
+        let fence = records.last().map_or(0, |e| e.seq);
+        let mut state = atm_org::OrgState::default();
+        for record in &records {
+            if let Some(event) = OrgEvent::from_parts(&record.kind, &record.body).unwrap() {
+                state.apply(record.seq, record.ts, &event).unwrap();
+            }
+        }
+        let journal = Arc::new(Mutex::new(records.clone()));
+        let written = journal.clone();
+        let (health, status) = watch::channel(Ok(fence));
         let (committed, _) = broadcast::channel(1024);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let seq = AtomicU64::new(0);
+        let seq = AtomicU64::new(fence);
         let gate = Arc::new(Semaphore::new(1));
         let append_gate = gate.clone();
-        tokio::spawn(super::super::actor::run(
-            atm_org::OrgState::default(),
+        let fault = Arc::new(Mutex::new(None));
+        let append_fault = fault.clone();
+        let (entered, appends) = mpsc::unbounded_channel();
+        let actor = tokio::spawn(super::super::actor::run(
+            state,
             receive,
             health,
             committed.clone(),
             cancel.clone(),
-            move |_| {
-                let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
+            move |mut envelope| {
+                let written = written.clone();
+                let fault = append_fault.lock().unwrap().take();
+                let next = if fault.is_none()
+                    || matches!(
+                        fault,
+                        Some(crate::eventlog::EventLogError::TimeoutAfterHandover)
+                    ) {
+                    seq.fetch_add(1, Ordering::SeqCst) + 1
+                } else {
+                    0
+                };
                 let gate = append_gate.clone();
+                let _ = entered.send(());
                 async move {
                     let _permit = gate.acquire().await.unwrap();
-                    Ok::<u64, crate::eventlog::EventLogError>(next)
+                    match fault {
+                        Some(error) => {
+                            // A complete record reached disk, but the writer cannot
+                            // acknowledge it; the real actor must disable itself.
+                            if matches!(error, crate::eventlog::EventLogError::TimeoutAfterHandover)
+                            {
+                                envelope.seq = next;
+                                written.lock().unwrap().push(envelope);
+                            }
+                            Err(error)
+                        }
+                        None => {
+                            envelope.seq = next;
+                            written.lock().unwrap().push(envelope);
+                            Ok(next)
+                        }
+                    }
                 }
             },
         ));
@@ -476,8 +535,12 @@ impl ManualJob {
             committed,
             reads: None,
         };
-        let rt = runtime(org.clone(), 0, &cancel);
-        let (messages, _) = spawn_service_for_test(rt, org.committed.subscribe(), 0, None);
+        let rt = runtime(org.clone(), fence, &cancel);
+        let (messages, service_task) =
+            spawn_service_for_test(rt, org.committed.subscribe(), fence, None);
+        for record in &records {
+            org.committed.send(Arc::new(record.clone())).unwrap();
+        }
         guarded(messages.initialized()).await.unwrap();
         let screens = Screens::default();
         let service = messages.service().unwrap();
@@ -496,8 +559,15 @@ impl ManualJob {
             messages,
             screens,
             gate,
+            fault,
+            appends,
+            tasks: vec![actor, service_task],
+            journal,
             cancel,
         };
+        if fence != 0 {
+            return rig;
+        }
         rig.command(OrgCommand::RegisterProject {
             project_id: "demo".parse().unwrap(),
             root: "/demo".into(),
@@ -515,6 +585,14 @@ impl ManualJob {
 
     async fn command(&self, command: OrgCommand) {
         guarded(self.job.commit(command)).await.unwrap();
+    }
+
+    async fn stop(mut self) {
+        self.cancel.cancel();
+        self.gate.add_permits(1);
+        for task in self.tasks.drain(..) {
+            guarded(task).await.unwrap();
+        }
     }
 
     async fn send(&self) -> MessageId {
@@ -536,6 +614,79 @@ impl ManualJob {
                 o.facts.input = InputState::Draft;
             }),
         );
+    }
+
+    /// Synthetic original exit; scheduling fake tests do not claim pane input.
+    async fn recovery_original() -> (Self, MessageId, AttemptScope) {
+        let mut rig = Self::new().await;
+        rig.turn(atm_core::TurnState::NotRunning);
+        let id = rig.send().await;
+        guarded(rig.job.observe()).await.unwrap();
+        rig.command(OrgCommand::DeliveryAttempted {
+            message_id: id,
+            attempt: 1,
+            pane: "%1".into(),
+        })
+        .await;
+        let rt = &rig.job.service.rt;
+        let now = rt.clock.now().unwrap();
+        let seq = rt
+            .history
+            .snapshot(id, now)
+            .unwrap()
+            .last_attempt_seq
+            .unwrap();
+        let scope = AttemptScope {
+            message_id: id,
+            attempt_seq: seq,
+            recipient: worker(),
+            pane: PaneId::parse("%1").unwrap(),
+            harness: Harness::Pi,
+            session_id: Some("s1".into()),
+            excluded_sessions: HashSet::new(),
+        };
+        rt.evidence.register(id, inbox_reference(id)).unwrap();
+        rt.evidence.arm(scope.clone()).unwrap();
+        for update in [
+            HistoryUpdate::Armed {
+                scope: scope.clone(),
+            },
+            HistoryUpdate::Paste {
+                id,
+                pane: scope.pane.clone(),
+                certainty: EffectCertainty::Applied,
+            },
+            HistoryUpdate::Held {
+                id,
+                attempt_seq: seq,
+                hold: ExecutorHold::InputOutcomeUnknown,
+            },
+            HistoryUpdate::AttemptExited {
+                id,
+                attempt_seq: seq,
+                paste: EffectCertainty::Applied,
+                enter: EffectCertainty::NotStarted,
+                cancelled: false,
+            },
+        ] {
+            rt.history.record(update, now).unwrap();
+        }
+        tokio::time::advance(Duration::from_secs(4)).await;
+        (rig, id, scope)
+    }
+
+    async fn recovery_round(&mut self) -> Next {
+        self.job.observed = None;
+        let mut queued = self.job.service.board.queued.subscribe();
+        guarded(self.job.round(&mut queued)).await.unwrap()
+    }
+
+    async fn give_up(&mut self, id: MessageId) -> GiveUpResult {
+        let messages = self.messages.clone();
+        let call =
+            spawn_polled(async move { messages.give_up(ResolveParams { id }, owner()).await });
+        self.round(0).await;
+        guarded(call).await.unwrap().unwrap()
     }
 
     async fn round(&mut self, advance_ms: u64) {
@@ -563,7 +714,123 @@ impl ManualJob {
 impl Drop for ManualJob {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.gate.add_permits(1);
+        // These tasks use only in-memory I/O; abort also covers assertion unwind.
+        for task in &self.tasks {
+            task.abort();
+        }
     }
+}
+
+// Break caught: a historically eligible held draft has no observation wake,
+// or an Empty/Unknown preview spends its only claim / a used one dispatches twice.
+#[tokio::test(start_paused = true)]
+async fn recovery_candidate_reobserves_but_used_hold_does_not() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, id, scope) = ManualJob::recovery_original().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    rig.job.effects.deliver = Arc::new(move |rt, id, _| {
+        let called = called.clone();
+        Box::pin(async move {
+            called.fetch_add(1, Ordering::SeqCst);
+            let now = rt.clock.now()?;
+            let scope = rt.history.recovery_candidate(id, now)?.unwrap();
+            let claim = rt.evidence.claim_recovery(&rt.history, scope, false, now)?;
+            drop(claim);
+            Ok(())
+        })
+    });
+    rig.screens.set(worker(), ready("%1", "s1"));
+    assert!(
+        matches!(rig.recovery_round().await, Next::At(_)),
+        "eligible Empty preview needs an observation wake"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    rig.turn(atm_core::TurnState::Unknown);
+    assert!(matches!(rig.recovery_round().await, Next::At(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    rig.turn(atm_core::TurnState::NotRunning);
+    assert!(matches!(rig.recovery_round().await, Next::Again));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        rig.job
+            .service
+            .rt
+            .history
+            .snapshot(id, rig.job.service.rt.clock.now().unwrap())
+            .unwrap()
+            .last_attempt_seq,
+        Some(scope.attempt_seq)
+    );
+    assert!(matches!(rig.recovery_round().await, Next::Change));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        rig.job.service.rt.history.recovery_registrations().unwrap(),
+        0
+    );
+    rig.stop().await;
+}
+
+// Break caught: an accepted owner decision leaves an active final guard valid
+// while waiting behind its own recipient's reserved recovery.
+#[tokio::test(start_paused = true)]
+async fn recovery_owner_resolution_revokes_before_recipient_slot() {
+    for retry in [false, true] {
+        let (mut rig, id, scope) = ManualJob::recovery_original().await;
+        let rt = &rig.job.service.rt;
+        let claim = rt
+            .evidence
+            .claim_recovery(&rt.history, scope, false, rt.clock.now().unwrap())
+            .unwrap();
+        let view = claim.guard();
+        let mut queued = rig.job.service.board.queued.subscribe();
+        let messages = rig.messages.clone();
+        let request = spawn_polled(async move {
+            if retry {
+                messages
+                    .retry(ResolveParams { id }, owner())
+                    .await
+                    .map(|r| r.status)
+            } else {
+                messages
+                    .give_up(ResolveParams { id }, owner())
+                    .await
+                    .map(|r| r.status)
+            }
+        });
+        guarded(queued.changed()).await.unwrap();
+        assert!(
+            !view.is_valid(),
+            "retry={retry}: still valid before recipient slot returned"
+        );
+        drop(claim);
+        rig.round(0).await;
+        guarded(request).await.unwrap().unwrap();
+        assert_eq!(
+            rig.job.service.rt.history.recovery_registrations().unwrap(),
+            0
+        );
+        rig.stop().await;
+    }
+}
+
+// Break caught: cancellation drains jobs before invalidating a claimed key.
+#[tokio::test(start_paused = true)]
+async fn recovery_service_shutdown_revokes_claim_before_join() {
+    let (rig, _, scope) = ManualJob::recovery_original().await;
+    let rt = &rig.job.service.rt;
+    let claim = rt
+        .evidence
+        .claim_recovery(&rt.history, scope, false, rt.clock.now().unwrap())
+        .unwrap();
+    let view = claim.guard();
+    rig.cancel.cancel();
+    guarded(run(rig.job.service.clone(), rig.job.effects.clone())).await;
+    assert!(!view.is_valid());
+    drop(claim);
+    assert_eq!(rt.history.recovery_registrations().unwrap(), 0);
+    rig.stop().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -584,7 +851,8 @@ async fn first_terminal_evaluation_does_not_retain_busy_turn_bookkeeping() {
     assert!(matches!(next, Next::Change));
     assert!(!rig.job.shown.contains(&id));
     let shared = rig.job.service.board.shared.lock().unwrap();
-    assert!(!shared.busy_turn.contains_key(&id));
+    assert!(!shared.progress.contains_key(&id));
+    assert!(rig.job.pending_notice.is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -683,8 +951,8 @@ async fn ended_turn_has_no_busy_notice_and_a_new_turn_restarts_the_interval() {
     rig.round(1_799_999).await;
     assert_eq!(rig.notes().await.len(), 1);
     rig.round(1).await;
-    assert_eq!(rig.notes().await.len(), 2);
-    // Terminal cleanup discards the per-turn marker and notice dedupe.
+    assert_eq!(rig.notes().await.len(), 1);
+    // Terminal cleanup must not remove the committed lifetime key.
     rig.command(OrgCommand::DeliveryFailed {
         message_id: id,
         reason: "owner cancelled".into(),
@@ -692,9 +960,14 @@ async fn ended_turn_has_no_busy_notice_and_a_new_turn_restarts_the_interval() {
     })
     .await;
     rig.round(0).await;
+    assert!(rig
+        .job
+        .service
+        .has_delivery_notice(&key(id, "running_turn"))
+        .unwrap());
+    assert!(rig.job.pending_notice.is_none());
     let shared = rig.job.service.board.shared.lock().unwrap();
-    assert!(!shared.busy_turn.contains_key(&id));
-    assert!(!shared.noticed.contains_key(&id));
+    assert!(!shared.progress.contains_key(&id));
 }
 
 #[tokio::test(start_paused = true)]
@@ -759,9 +1032,11 @@ async fn busy_notice_unknown_commit_is_not_repeated_and_known_refusal_can_retry(
     rig.gate.forget_permits(usize::MAX);
     // The real writer accepts but cannot append until released. The paused
     // clock reaches the commit budget; its unknown outcome stays deduplicated.
-    rig.round(1_800_000).await;
+    tokio::time::advance(Duration::from_secs(1_800)).await;
+    let mut queued = rig.job.service.board.queued.subscribe();
+    assert!(guarded(rig.job.round(&mut queued)).await.is_err());
     rig.gate.add_permits(1);
-    guarded(rig.job.service.settled()).await.unwrap();
+    guarded(rig.job.service.rt.org.snapshot_at()).await.unwrap();
     rig.round(0).await;
     rig.round(1_800_000).await;
     assert_eq!(rig.notes().await.len(), 1);
@@ -773,13 +1048,18 @@ async fn busy_notice_unknown_commit_is_not_repeated_and_known_refusal_can_retry(
     // A known refusal is different: the same publication key can retry.
     let mut invalid = note("known refusal".into());
     invalid.to = Address::System;
-    rig.job.publish(id, "test refusal", invalid).await;
+    rig.job
+        .publish(id, "test refusal", invalid)
+        .await
+        .unwrap_err();
     rig.job
         .publish(id, "test refusal", note("retry accepted".into()))
-        .await;
+        .await
+        .unwrap();
     rig.job
         .publish(id, "test refusal", note("duplicate".into()))
-        .await;
+        .await
+        .unwrap();
     assert_eq!(rig.notes().await.len(), 2);
     assert_eq!(rig.notes().await.last().unwrap(), "retry accepted");
 }
@@ -847,7 +1127,7 @@ fn blocked_notice_text_is_pinned() {
     );
     assert_eq!(
         reason(Some(ExecutorHold::EnterNotSent)),
-        "reference is staged in the editor; Enter was not sent"
+        "reference token was seen; editor staging is unproven; Enter was not sent"
     );
     assert_eq!(
         blocked_reason(FailureReason::Restarted, Some(ExecutorHold::StagedMismatch)),
@@ -1080,6 +1360,8 @@ async fn an_observation_slower_than_five_seconds_is_a_loss() {
     assert!(bench.entries().is_empty());
 }
 
+// Known exception: the coordinator has no processed-wake/admission event.
+// Preserve the original scheduler-backed check until that seam exists.
 #[tokio::test(start_paused = true)]
 async fn one_observation_per_guard_poll_however_often_the_job_wakes() {
     let bench = Bench::blind().await;
@@ -1100,6 +1382,37 @@ async fn one_observation_per_guard_poll_however_often_the_job_wakes() {
     bench.pass(10).await;
     let calls = bench.screens.calls(&worker());
     assert!((40..=42).contains(&calls), "{calls} observations in 10 s");
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_owned_job_observation_per_guard_poll_however_often_it_wakes() {
+    // Own the actual Job::run future so each same-instant wake has a
+    // processed boundary; no background job races an empty-queue assertion.
+    let bench = Bench::build(Screens::default(), false).await;
+    let effects = Effects {
+        deliver: Arc::new(|_, _, _| Box::pin(async { panic!("blind job dispatched input") })),
+        observe: bench.screens.effect(),
+    };
+    let service = bench.rig.messages.service().unwrap();
+    let mut job = Box::pin(Job::new(service, effects, worker()).run());
+    bench.send(worker(), "first").await;
+    poll_pending(job.as_mut()).await;
+    assert_eq!(bench.screens.calls(&worker()), 1);
+    // Every committed event wakes the job, here three times in one instant.
+    let woke_at = Instant::now();
+    for body in ["second", "third", "fourth"] {
+        bench.send(worker(), body).await;
+        poll_pending(job.as_mut()).await;
+    }
+    assert_eq!(Instant::now(), woke_at, "wake processing advanced time");
+    assert_eq!(bench.screens.calls(&worker()), 1);
+    // After that, one per poll: each will be a tmux capture.
+    let job = spawn_polled(job);
+    bench.pass(10).await;
+    let calls = bench.screens.calls(&worker());
+    assert!((40..=42).contains(&calls), "{calls} observations in 10 s");
+    bench.rig.rt.cancel.cancel();
+    assert_eq!(guarded(job).await.unwrap(), worker());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1543,6 +1856,7 @@ async fn owner_focus_notice_is_inbox_only_and_told_once() {
     // The agreed marker: the owner's notifier skips exactly this note.
     assert!(is_focus_notice(&content));
     assert_eq!(content, focus_notice(id, &PaneId::parse("%1").unwrap()));
+    assert_eq!(content.delivery_notice, Some(key(id, "focus")));
     bench.pass(300).await;
     assert_eq!(bench.notes().await.len(), 1);
     assert!(bench.entries().is_empty());
@@ -1650,7 +1964,7 @@ async fn failure_on_the_first_evaluation_leaves_no_notice_key() {
     let bench = Bench::blind().await;
     let gone = with(ready("%1", "s1"), |o| o.presence = PanePresence::Gone);
     bench.screens.set(worker(), gone);
-    bench.send(worker(), "brief").await;
+    let first = bench.send(worker(), "brief").await;
     bench.pass(120).await;
     // The pane has been gone for longer than the grace: the next message
     // fails on its first evaluation, before anything was shown for it.
@@ -1663,8 +1977,13 @@ async fn failure_on_the_first_evaluation_leaves_no_notice_key() {
     assert_eq!(bench.notes().await.len(), 2);
     // Both are told and gone: the board keeps nothing about either.
     let service = bench.rig.messages.service().unwrap();
+    for id in [first, next] {
+        assert!(service
+            .has_delivery_notice(&key(id, "failed.pane_gone"))
+            .unwrap());
+    }
+    assert!(service.failed_notices(&worker()).unwrap().is_empty());
     let shared = service.board.shared.lock().unwrap();
-    assert!(shared.noticed.is_empty(), "{:?}", shared.noticed);
     assert!(shared.progress.is_empty());
 }
 
@@ -1822,31 +2141,78 @@ async fn receipt_append_reply_lost_is_not_reissued_input() {
 
 #[tokio::test(start_paused = true)]
 async fn owner_retry_reaches_a_new_attempt_of_the_same_message() {
-    let mut bench = Bench::new().await;
-    let id = bench.probably_delivered().await;
-    assert_eq!(bench.entries(), []);
-    assert_eq!(bench.retry(id).await.unwrap(), DeliveryStatus::Delivering);
-    // The session keeps working between the release and the new attempt:
-    // that must not hold the released attempt again.
-    bench.activity("s1", "%1");
-    let retried = bench
-        .event("the second attempt", |e| attempted(e).is_some())
-        .await;
-    assert_eq!(attempted(&retried), Some((id, 2, "%1")));
-    assert_eq!(bench.entered().await, id);
-    assert_eq!(bench.worked().await, id);
-    // After the new attempt is armed, activity holds it as before, and that
-    // block is told again.
-    bench.activity("s1", "%1");
-    bench.event("the second notice", system_note).await;
-    bench.pass(120).await;
-    assert_eq!(bench.entries(), []);
-    let notes = bench.notes().await;
-    assert_eq!(notes, vec![blocked_notice(id, PROBABLY, &[], true); 2]);
-    // The same message throughout: nothing new was sent to the agent.
-    let inbox = bench.rig.inbox(pane("%1"), page()).await;
+    let mut rig = ManualJob::new().await;
+    rig.screens.set(worker(), ready("%1", "s1"));
+    // Match Bench's executor entry/completion events, not terminal Enter keys.
+    let (enter, mut entered) = mpsc::unbounded_channel();
+    let (work_done, mut worked) = mpsc::unbounded_channel();
+    rig.job.effects.deliver = Arc::new(move |rt, id, _| {
+        let (enter, work_done) = (enter.clone(), work_done.clone());
+        Box::pin(async move {
+            enter.send(id).unwrap();
+            let result = perform(rt, id, Act::Paste).await;
+            work_done.send(id).unwrap();
+            result
+        })
+    });
+    let rt = rig.job.service.rt.clone();
+    let activity = || {
+        rt.evidence
+            .tap(
+                &SessionId::new("s1"),
+                Some("%1"),
+                Some(Harness::Pi),
+                Some(&LifecycleEvent::WorkingStart),
+                true,
+                Some(&rt.history),
+            )
+            .unwrap();
+    };
+    let id = rig.send().await;
+    rig.round(0).await;
+    rig.round(10_000).await;
+    assert_eq!(guarded(entered.recv()).await.unwrap(), id);
+    assert_eq!(guarded(worked.recv()).await.unwrap(), id);
+    activity();
+    rig.round(3_000).await;
+    let original = owner_entries(&rig).await;
+    assert_eq!(original.len(), 1);
+    assert_eq!(
+        original[0].content.body,
+        blocked_notice(id, PROBABLY, &[], true)
+    );
+    assert_eq!(
+        original[0].content.delivery_notice,
+        Some(key(id, "blocked.probably_delivered"))
+    );
+    assert_eq!(
+        guarded(rig.job.resolve(Resolve::Retry, id)).await.unwrap(),
+        DeliveryStatus::Delivering
+    );
+    // Activity while released must not hold the old attempt again.
+    activity();
+    rig.round(0).await;
+    rig.round(10_000).await;
+    assert_eq!(guarded(entered.recv()).await.unwrap(), id);
+    assert_eq!(guarded(worked.recv()).await.unwrap(), id);
+    // The returned round consumes the second hold even though its notice
+    // already exists; advancing time alone is not a completion fence.
+    activity();
+    rig.round(3_000).await;
+    let inbox = rig.messages.inbox(page(), pane("%1")).await.unwrap();
     assert_eq!(inbox.messages.len(), 1);
+    assert_eq!(inbox.messages[0].message_id, id);
     assert_eq!(inbox.messages[0].delivery.attempt, 2);
+    assert_eq!(inbox.messages[0].delivery.pane.as_deref(), Some("%1"));
+    assert_eq!(inbox.messages[0].delivery.phase, DeliveryPhase::Blocked);
+    assert_eq!(inbox.messages[0].delivery.reason.as_deref(), Some(PROBABLY));
+    let retained = owner_entries(&rig).await;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].message_id, original[0].message_id);
+    assert_eq!(retained[0].content, original[0].content);
+    assert!(entered.try_recv().is_err());
+    assert!(worked.try_recv().is_err());
+    rig.stop().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1945,6 +2311,168 @@ async fn retry_at_the_attempt_limit_refuses() {
     bench.pass(120).await;
     assert_eq!(bench.entries(), []);
     assert_eq!(bench.give_up(id).await.unwrap(), DeliveryStatus::Failed);
+}
+
+fn assert_editor_warning(result: GiveUpResult, id: MessageId, line: &str) {
+    let warning = format!(
+        "Possible leftover in the recipient's editor: {line}. Giving up did not clear the editor; \
+         further delivery may wait for an empty editor. Inspect the pane before editing it."
+    );
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({"message_id":id,"status":"failed","editor_warning":warning})
+    );
+}
+
+// Break: warning depends on an attempt, disappears on repeat, or alters late-receipt/attempt accounting.
+#[tokio::test(start_paused = true)]
+async fn give_up_warning_is_advisory_for_queued_held_and_repeated_calls() {
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    let line = format!("[{id}] Read: atm inbox --id {id}");
+    assert_editor_warning(rig.give_up(id).await, id, &line);
+    let count = rig.journal.lock().unwrap().len();
+    assert_editor_warning(rig.give_up(id).await, id, &line);
+    assert_eq!(rig.journal.lock().unwrap().len(), count);
+    rig.stop().await;
+
+    let mut bench = Bench::new().await;
+    let id = bench.probably_delivered().await;
+    assert_eq!(
+        bench.entry(worker(), id).await.status,
+        DeliveryStatus::Delivering
+    );
+    let result = guarded(bench.rig.messages.give_up(ResolveParams { id }, owner()))
+        .await
+        .unwrap();
+    assert_editor_warning(result, id, &format!("[{id}] Read: atm inbox --id {id}"));
+    bench.reference(id, "s1", "%1");
+    bench
+        .event("late receipt", |event| delivered(event) == Some(id))
+        .await;
+    let entry = bench.entry(worker(), id).await;
+    assert_eq!(entry.status, DeliveryStatus::Delivered);
+    assert_eq!(entry.delivery.attempt, 1);
+    assert!(bench.entries().is_empty());
+}
+
+// Break: ordinary body text is echoed, or start/historical notes are warned with an inbox reference.
+#[tokio::test(start_paused = true)]
+async fn give_up_warning_uses_canonical_delivery_lines() {
+    use super::super::start_line::start_line;
+    let start = start_line(&worker());
+    let historical = MessageContent {
+        body: "New session: run atm me".into(),
+        ..start.clone()
+    };
+    let lookalike = MessageContent {
+        from: Address::Owner,
+        ..start.clone()
+    };
+    for (content, start_text) in [(start, true), (historical, true), (lookalike, false)] {
+        let mut rig = ManualJob::new().await;
+        rig.command(OrgCommand::SendMessage(content)).await;
+        let id = MessageId::new(rig.journal.lock().unwrap().last().unwrap().seq);
+        let line = if start_text {
+            format!("[{id}] New session: run the shell command atm me")
+        } else {
+            format!("[{id}] Read: atm inbox --id {id}")
+        };
+        assert_editor_warning(rig.give_up(id).await, id, &line);
+        rig.stop().await;
+    }
+}
+
+// Break: resolution observes the pane, trusts a stale Draft, or suppresses its advisory when blind.
+#[tokio::test(start_paused = true)]
+async fn give_up_warning_needs_no_fresh_observation() {
+    for stale in [false, true] {
+        let mut rig = ManualJob::new().await;
+        if !stale {
+            rig.command(OrgCommand::Down {
+                agent_id: worker(),
+                reason: "stopped".into(),
+            })
+            .await;
+        }
+        let id = rig.send().await;
+        if stale {
+            rig.turn(atm_core::TurnState::NotRunning);
+            rig.round(0).await;
+            rig.screens.lose(&worker());
+        }
+        let observations = rig.screens.calls(&worker());
+        assert_eq!(observations, usize::from(stale));
+        assert_editor_warning(
+            rig.give_up(id).await,
+            id,
+            &format!("[{id}] Read: atm inbox --id {id}"),
+        );
+        assert_eq!(rig.screens.calls(&worker()), observations);
+        assert!(rig
+            .journal
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "msg.delivery_attempted"));
+        rig.stop().await;
+    }
+}
+
+// Break: give-up treats releasing the FIFO veto as clearing the editor or permits follower input.
+#[tokio::test(start_paused = true)]
+async fn give_up_leaves_a_draft_blocking_the_follower() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::NotRunning);
+    let head = rig.send().await;
+    let follower = rig.send().await;
+    rig.round(0).await;
+    assert_editor_warning(
+        rig.give_up(head).await,
+        head,
+        &format!("[{head}] Read: atm inbox --id {head}"),
+    );
+    rig.round(120_000).await;
+    let inbox = guarded(rig.messages.inbox(
+        InboxParams {
+            recipient: Some(Address::Agent(worker())),
+            ..page()
+        },
+        owner(),
+    ))
+    .await
+    .unwrap();
+    let entry = inbox
+        .messages
+        .iter()
+        .find(|e| e.message_id == follower)
+        .unwrap();
+    assert_eq!(entry.status, DeliveryStatus::Queued);
+    assert_eq!(entry.delivery.phase, DeliveryPhase::Blocked);
+    assert_eq!(
+        entry.delivery.reason.as_deref(),
+        Some("input draft persisted past the delivery hold deadline")
+    );
+    assert_eq!(entry.delivery.attempt, 0);
+    assert_eq!(entry.delivery.blocked_by, None);
+    assert_eq!(
+        rig.screens
+            .seen
+            .lock()
+            .unwrap()
+            .get(&worker())
+            .unwrap()
+            .facts
+            .input,
+        InputState::Draft
+    );
+    assert!(rig
+        .journal
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|e| e.kind != "msg.delivery_attempted"));
+    rig.stop().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -2470,27 +2998,46 @@ async fn cancellation_lets_the_active_attempt_settle_before_the_service_stops() 
 
 #[tokio::test(start_paused = true)]
 async fn stalled_notice_commit_is_not_repeated_and_grants_nothing() {
-    let mut bench = Bench::blind().await;
-    let draft = with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft);
-    bench.screens.set(worker(), draft);
-    let id = bench.send(worker(), "brief").await;
-    // The writer stalls just before the block is due: the notice's append is
-    // entered and held past the job's budget, so its commit is unknown.
-    bench.pass(110).await;
-    bench.rig.hold();
-    bench.rig.entered().await;
-    bench.pass(60).await;
-    assert!(bench.entries().is_empty());
-    bench.rig.release();
-    bench.event("the blocked notice", system_note).await;
-    bench.pass(300).await;
-    // Told once: a commit of unknown outcome is not sent again.
-    assert_eq!(bench.notes().await.len(), 1);
-    assert!(bench.entries().is_empty());
-    assert_eq!(
-        bench.entry(worker(), id).await.delivery.phase,
-        DeliveryPhase::Blocked
+    let mut rig = ManualJob::new().await;
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
     );
+    let id = rig.send().await;
+    rig.round(0).await;
+    // The paused clock crosses the hold deadline, then an append-entry
+    // acknowledgment (not elapsed quiet time) proves the actual write stalled.
+    tokio::time::advance(Duration::from_secs(120)).await;
+    while rig.appends.try_recv().is_ok() {}
+    rig.gate.forget_permits(usize::MAX);
+    let mut queued = rig.job.service.board.queued.subscribe();
+    let (result, ()) = tokio::join!(guarded(rig.job.round(&mut queued)), async {
+        guarded(rig.appends.recv()).await.unwrap();
+        tokio::time::advance(Duration::from_secs(11)).await;
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        rig.job.service.board.progress(id).phase,
+        Some(DeliveryPhase::Blocked)
+    );
+    assert!(owner_entries(&rig).await.is_empty());
+    rig.gate.add_permits(1);
+    guarded(rig.job.service.rt.org.snapshot_at()).await.unwrap();
+    rig.round(0).await;
+    rig.round(300_000).await;
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "blocked.draft_present"))
+    );
+    assert_eq!(
+        rig.job.service.message(id).unwrap().unwrap().status,
+        DeliveryStatus::Queued
+    );
+    // The ManualJob executor panics on any input dispatch, including after
+    // reconciliation; completed returned rounds above prove it was not called.
+    rig.stop().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -2537,4 +3084,556 @@ async fn owner_decision_does_not_wait_for_admission() {
     assert_eq!(bench.rig.rt.admissions.available_permits(), 0);
     assert_eq!(bench.give_up(id).await.unwrap(), DeliveryStatus::Failed);
     assert_eq!(bench.entries().len(), MESSAGE_ADMISSION_LIMIT);
+}
+
+// Break caught: diagnostic prose, a new attempt or a new process must not be
+// the identity of an owner notice. These drive the real writer/fold and job.
+async fn owner_entries(rig: &ManualJob) -> Vec<InboxEntry> {
+    rig.messages
+        .inbox(page(), owner())
+        .await
+        .unwrap()
+        .messages
+        .into_iter()
+        .filter(|entry| entry.content.from == Address::System)
+        .collect()
+}
+
+fn key(id: MessageId, reason: &str) -> atm_org::DeliveryNotice {
+    atm_org::DeliveryNotice {
+        source_message_id: id,
+        reason: reason.into(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn notice_tags_are_semantic() {
+    let mut rig = ManualJob::new().await;
+    let cases = [
+        (
+            FailureReason::AgentUnavailable,
+            None,
+            "blocked.agent_unavailable",
+        ),
+        (
+            FailureReason::AgentNotReadyTimeout,
+            None,
+            "blocked.agent_not_ready_timeout",
+        ),
+        (
+            FailureReason::Restarted,
+            Some(ExecutorHold::EnterNotSent),
+            "blocked.restarted",
+        ),
+        (FailureReason::CopyMode, None, "blocked.copy_mode"),
+        (
+            FailureReason::ConfirmationTimeout,
+            None,
+            "blocked.confirmation_timeout",
+        ),
+        (FailureReason::PaneGone, None, "blocked.pane_gone"),
+        (FailureReason::DraftPresent, None, "blocked.draft_present"),
+        (FailureReason::DialogOpen, None, "blocked.dialog_open"),
+        (
+            FailureReason::ReadinessTimeout,
+            None,
+            "blocked.readiness_timeout",
+        ),
+        (FailureReason::AttemptLimit, None, "blocked.attempt_limit"),
+        (
+            FailureReason::ProbablyDelivered,
+            None,
+            "blocked.probably_delivered",
+        ),
+        (
+            FailureReason::ProbablyDelivered,
+            Some(ExecutorHold::InputOutcomeUnknown),
+            "hold.input_outcome_unknown",
+        ),
+        (
+            FailureReason::ProbablyDelivered,
+            Some(ExecutorHold::EnterNotSent),
+            "hold.enter_not_sent",
+        ),
+        (
+            FailureReason::ProbablyDelivered,
+            Some(ExecutorHold::TokenVisible),
+            "hold.token_visible",
+        ),
+        (
+            FailureReason::ProbablyDelivered,
+            Some(ExecutorHold::StagedMismatch),
+            "hold.staged_mismatch",
+        ),
+    ];
+    let mut actual = Vec::new();
+    let mut expected_keys = Vec::new();
+    for (reason, hold, expected) in cases {
+        let id = rig.send().await;
+        rig.job
+            .blocked_notice(
+                id,
+                &blocked_notice_tag(reason, hold),
+                &blocked_reason(reason, hold),
+                false,
+            )
+            .await
+            .unwrap();
+        let entry = owner_entries(&rig).await.pop().unwrap();
+        actual.push(entry.content.delivery_notice);
+        expected_keys.push(Some(key(id, expected)));
+    }
+    assert_eq!(actual, expected_keys);
+}
+
+#[tokio::test(start_paused = true)]
+async fn changed_diagnostics_followers_and_read_state_keep_original_note() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    rig.job
+        .publish(id, "evidence_unavailable", note("capacity 1".into()))
+        .await
+        .unwrap();
+    let first = owner_entries(&rig).await.remove(0);
+    rig.messages
+        .ack(
+            super::super::messages::AckParams {
+                ids: vec![first.message_id],
+            },
+            owner(),
+        )
+        .await
+        .unwrap();
+    let original = owner_entries(&rig).await.remove(0);
+    let follower = rig.send().await;
+    rig.job
+        .publish(
+            id,
+            "evidence_unavailable",
+            note(format!("capacity 2; follower {follower}")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(owner_entries(&rig).await).unwrap(),
+        serde_json::json!([original])
+    );
+    let inbox = rig
+        .messages
+        .inbox(
+            InboxParams {
+                recipient: Some(Address::Agent(worker())),
+                ..page()
+            },
+            owner(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.messages[1].delivery.blocked_by, Some(id));
+    rig.job
+        .publish(id, "unobserved", note("different cause".into()))
+        .await
+        .unwrap();
+    rig.job
+        .publish(id, "unobserved", note("changed body again".into()))
+        .await
+        .unwrap();
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "evidence_unavailable"))
+    );
+    assert_eq!(
+        entries[1].content.delivery_notice,
+        Some(key(id, "unobserved"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn observation_flaps_keep_focus_and_unobserved_lifetime_notes() {
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    for _ in 0..2 {
+        rig.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| o.focused = Some(true)),
+        );
+        rig.round(0).await;
+        rig.screens.lose(&worker());
+        rig.round(0).await;
+        rig.round(120_000).await;
+    }
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].content.delivery_notice, Some(key(id, "focus")));
+    assert_eq!(
+        entries[1].content.delivery_notice,
+        Some(key(id, "unobserved"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn notice_pre_handover_timeout_reconciles_and_retries() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    *rig.fault.lock().unwrap() = Some(crate::eventlog::EventLogError::TimeoutBeforeHandover);
+    rig.job
+        .publish(
+            id,
+            "evidence_unavailable",
+            note("retain this diagnostic".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(owner_entries(&rig).await.is_empty());
+    rig.round(0).await;
+    let entries = owner_entries(&rig).await;
+    assert_eq!(
+        entries.len(),
+        1,
+        "an absent append must not lose the pending note"
+    );
+    assert_eq!(entries[0].content.body, "retain this diagnostic");
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "evidence_unavailable"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn notice_reply_lost_reconciles_committed_key() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    rig.gate.forget_permits(usize::MAX);
+    rig.job
+        .publish(id, "unobserved", note("accepted before timeout".into()))
+        .await
+        .unwrap_err();
+    rig.gate.add_permits(1);
+    guarded(rig.job.service.rt.org.snapshot_at()).await.unwrap();
+    rig.round(0).await;
+    rig.job.service.board.forget(id); // A new process has no process-local keys.
+    rig.job
+        .publish(
+            id,
+            "unobserved",
+            note("new diagnostics after restart".into()),
+        )
+        .await
+        .unwrap();
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].content.body, "accepted before timeout");
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "unobserved"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn notice_reconciliation_failure_keeps_pending_without_resending() {
+    let mut rig = ManualJob::new().await;
+    rig.turn(atm_core::TurnState::Running);
+    let id = rig.send().await;
+    while rig.appends.try_recv().is_ok() {}
+    rig.gate.forget_permits(usize::MAX);
+    rig.job
+        .publish(id, "evidence_unavailable", note("still pending".into()))
+        .await
+        .unwrap_err();
+    let mut queued = rig.job.service.board.queued.subscribe();
+    let _ = guarded(rig.job.round(&mut queued)).await;
+    assert_eq!(
+        std::iter::from_fn(|| rig.appends.try_recv().ok()).count(),
+        1
+    );
+    rig.gate.add_permits(1);
+    guarded(rig.job.service.rt.org.snapshot_at()).await.unwrap();
+    rig.round(0).await;
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "evidence_unavailable"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_failure_notice_refusal_is_not_lost_when_source_closes() {
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    rig.command(OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: "recipient pane is not alive".into(),
+        final_failure: true,
+    })
+    .await;
+    assert!(rig.job.service.open(&worker()).unwrap().is_empty());
+    *rig.fault.lock().unwrap() = Some(crate::eventlog::EventLogError::TimeoutBeforeHandover);
+    rig.job
+        .publish(id, "failed.pane_gone", note("failure retained".into()))
+        .await
+        .unwrap_err();
+    rig.round(0).await;
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "failed.pane_gone"))
+    );
+    rig.round(0).await;
+    assert_eq!(owner_entries(&rig).await.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_failure_commit_reply_lost_still_publishes_once() {
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    rig.gate.forget_permits(usize::MAX);
+    let command = OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: "recipient pane is not alive".into(),
+        final_failure: true,
+    };
+    assert!(guarded(rig.job.commit(command)).await.is_err());
+    rig.gate.add_permits(1);
+    guarded(rig.job.service.rt.org.snapshot_at()).await.unwrap();
+    rig.round(0).await;
+    rig.round(0).await;
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "failed.pane_gone"))
+    );
+    assert_eq!(
+        rig.job.service.message(id).unwrap().unwrap().status,
+        DeliveryStatus::Failed
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_notice_rebuild_ignores_give_up_and_arbitrary_prose() {
+    let mut rig = ManualJob::new().await;
+    for reason in [
+        "owner gave up on delivery",
+        "arbitrary diagnostic",
+        "recipient pane is not alive",
+    ] {
+        let id = rig.send().await;
+        rig.command(OrgCommand::DeliveryFailed {
+            message_id: id,
+            reason: reason.into(),
+            final_failure: true,
+        })
+        .await;
+    }
+    rig.round(0).await;
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].content.delivery_notice.as_ref().unwrap().reason,
+        "failed.pane_gone"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_serialized_replay_keeps_note_id_body_and_read_state() {
+    let mut first = ManualJob::new().await;
+    let id = first.send().await;
+    first
+        .job
+        .publish(id, "unobserved", note("original".into()))
+        .await
+        .unwrap();
+    let note_id = owner_entries(&first).await[0].message_id;
+    first
+        .messages
+        .ack(
+            super::super::messages::AckParams { ids: vec![note_id] },
+            owner(),
+        )
+        .await
+        .unwrap();
+    let expected = serde_json::to_value(owner_entries(&first).await).unwrap();
+    let bytes = serde_json::to_vec(&*first.journal.lock().unwrap()).unwrap();
+    first.stop().await;
+    let mut second = ManualJob::from_records(serde_json::from_slice(&bytes).unwrap()).await;
+    second
+        .job
+        .publish(id, "unobserved", note("different diagnostics".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(owner_entries(&second).await).unwrap(),
+        expected
+    );
+    second.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_terminal_notice_rebuilds_from_serialized_committed_log() {
+    let first = ManualJob::new().await;
+    let id = first.send().await;
+    first
+        .command(OrgCommand::DeliveryFailed {
+            message_id: id,
+            reason: "recipient pane is not alive".into(),
+            final_failure: true,
+        })
+        .await;
+    let bytes = serde_json::to_vec(&*first.journal.lock().unwrap()).unwrap();
+    first.stop().await;
+    let mut second = ManualJob::from_records(serde_json::from_slice(&bytes).unwrap()).await;
+    second.round(0).await;
+    second.round(0).await;
+    let entries = owner_entries(&second).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "failed.pane_gone"))
+    );
+    second.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_unkeyed_note_allows_only_one_keyed_successor() {
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    rig.command(OrgCommand::SendMessage(note("legacy notice".into())))
+        .await;
+    rig.job
+        .publish(id, "unobserved", note("keyed successor".into()))
+        .await
+        .unwrap();
+    rig.job.service.board.forget(id);
+    rig.job
+        .publish(id, "unobserved", note("must not append".into()))
+        .await
+        .unwrap();
+    let entries = owner_entries(&rig).await;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].content.delivery_notice, None);
+    assert_eq!(
+        entries[1].content.delivery_notice,
+        Some(key(id, "unobserved"))
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fatal_unknown_append_reconciles_only_after_committed_replay() {
+    let mut first = ManualJob::new().await;
+    let id = first.send().await;
+    *first.fault.lock().unwrap() = Some(crate::eventlog::EventLogError::TimeoutAfterHandover);
+    first
+        .job
+        .publish(
+            id,
+            "unobserved",
+            note("committed without acknowledgment".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(first.job.service.rt.org.status().is_err());
+    assert!(owner_entries(&first).await.is_empty());
+    let records = first.journal.lock().unwrap().clone();
+    first.stop().await;
+    let mut second = ManualJob::from_records(records).await;
+    second
+        .job
+        .publish(id, "unobserved", note("must not repeat".into()))
+        .await
+        .unwrap();
+    let entries = owner_entries(&second).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].content.body, "committed without acknowledgment");
+    assert_eq!(
+        entries[0].content.delivery_notice,
+        Some(key(id, "unobserved"))
+    );
+    second.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_delivered_cancels_unsent_terminal_notice() {
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    rig.command(OrgCommand::DeliveryAttempted {
+        message_id: id,
+        attempt: 1,
+        pane: "%1".into(),
+    })
+    .await;
+    rig.command(OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: "recipient pane is not alive".into(),
+        final_failure: true,
+    })
+    .await;
+    *rig.fault.lock().unwrap() = Some(crate::eventlog::EventLogError::TimeoutBeforeHandover);
+    rig.job
+        .publish(
+            id,
+            "failed.pane_gone",
+            note("must not report a stale failure".into()),
+        )
+        .await
+        .unwrap_err();
+    rig.command(OrgCommand::Delivered {
+        message_id: id,
+        session_id: "s1".into(),
+        confirmation: "prompt_submit_exact_reference".into(),
+    })
+    .await;
+    rig.round(0).await;
+    assert!(owner_entries(&rig).await.is_empty());
+    assert_eq!(
+        rig.job.service.message(id).unwrap().unwrap().status,
+        DeliveryStatus::Delivered
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_notice_tags_are_semantic_for_all_known_causes() {
+    let mut rig = ManualJob::new().await;
+    let mut expected = Vec::new();
+    for (reason, suffix) in [
+        (FailureReason::AgentUnavailable, "agent_unavailable"),
+        (
+            FailureReason::AgentNotReadyTimeout,
+            "agent_not_ready_timeout",
+        ),
+        (FailureReason::Restarted, "restarted"),
+        (FailureReason::CopyMode, "copy_mode"),
+        (FailureReason::ConfirmationTimeout, "confirmation_timeout"),
+        (FailureReason::PaneGone, "pane_gone"),
+        (FailureReason::DraftPresent, "draft_present"),
+        (FailureReason::DialogOpen, "dialog_open"),
+        (FailureReason::ReadinessTimeout, "readiness_timeout"),
+        (FailureReason::AttemptLimit, "attempt_limit"),
+        (FailureReason::ProbablyDelivered, "probably_delivered"),
+    ] {
+        let id = rig.send().await;
+        rig.command(OrgCommand::DeliveryFailed {
+            message_id: id,
+            reason: reason.to_string(),
+            final_failure: true,
+        })
+        .await;
+        expected.push(Some(key(id, &format!("failed.{suffix}"))));
+    }
+    rig.round(0).await;
+    let actual: Vec<_> = owner_entries(&rig)
+        .await
+        .into_iter()
+        .map(|e| e.content.delivery_notice)
+        .collect();
+    assert_eq!(actual, expected);
+    rig.stop().await;
 }

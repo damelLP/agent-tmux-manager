@@ -1,0 +1,31 @@
+[package]
+name = "atm-chat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Terminal chat state and screen for ATM"
+readme = "../../README.md"
+
+[lib]
+name = "atm_chat"
+path = "src/lib.rs"
+
+[dependencies]
+atm-tui = { workspace = true }
+atm-comms = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

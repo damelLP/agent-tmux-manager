@@ -59,6 +59,101 @@ fn unknown_kind_is_skipped_and_counted_without_touching_state() {
     assert_eq!(state, before);
 }
 
+// Break caught: losing designation/provenance on restart or after a final answer,
+// or emitting facts that cannot reconstruct the same state. Synthetic fixture.
+#[test]
+fn relay_fixture_matches_decided_history_and_every_replay_split() {
+    let lines: Vec<decision_support::Line> = include_str!("fixtures/decision_relay.jsonl")
+        .lines()
+        .map(|line| {
+            let row: Value = serde_json::from_str(line).unwrap();
+            decision_support::Line {
+                seq: row["seq"].as_u64().unwrap(),
+                ts: row["ts"].as_str().unwrap().parse().unwrap(),
+                kind: row["kind"].as_str().unwrap().into(),
+                body: row["body"].clone(),
+            }
+        })
+        .collect();
+    let mut live = OrgState::default();
+    for line in &lines {
+        let fact = OrgEvent::from_parts(&line.kind, &line.body)
+            .unwrap()
+            .unwrap();
+        let command = match &fact {
+            OrgEvent::ProjectRegistered { project_id, root } => OrgCommand::RegisterProject {
+                project_id: project_id.clone(),
+                root: root.clone(),
+                move_root: false,
+            },
+            OrgEvent::AgentAdopted {
+                agent_id,
+                pane,
+                session_id,
+            } => OrgCommand::Adopt {
+                agent_id: agent_id.clone(),
+                pane: pane.clone(),
+                session_id: session_id.clone(),
+            },
+            OrgEvent::OwnerRelaySet(f) => OrgCommand::Owner(OwnerCommand::SetRelay {
+                by: f.by.clone(),
+                agent: f.agent.clone(),
+            }),
+            OrgEvent::OwnerAway(f) => OrgCommand::Owner(OwnerCommand::Away {
+                by: f.by.clone(),
+                stacking_caps: f.stacking_caps.clone(),
+            }),
+            OrgEvent::OwnerBack(f) => OrgCommand::Owner(OwnerCommand::Back { by: f.by.clone() }),
+            OrgEvent::DecisionRequested(f) => {
+                OrgCommand::Decision(DecisionCommand::Request(f.clone()))
+            }
+            OrgEvent::DecisionTakenProvisionally(f) => OrgCommand::Decision(match &f.relayed_by {
+                Some(by) => DecisionCommand::Relay {
+                    decision_id: f.decision_id,
+                    option: f.option.clone(),
+                    by: by.clone(),
+                },
+                None => DecisionCommand::TakeProvisionally(f.clone()),
+            }),
+            OrgEvent::DecisionResolved(f) | OrgEvent::DecisionOverruled(f) => {
+                OrgCommand::Decision(DecisionCommand::Resolve(f.resolution.clone()))
+            }
+            other => panic!("unexpected fixture event: {other:?}"),
+        };
+        let events = live.decide(&command, line.ts).unwrap();
+        assert_eq!(events, vec![fact.clone()], "fixture seq {}", line.seq);
+        live.apply(line.seq, line.ts, &fact).unwrap();
+    }
+    for cut in 0..=lines.len() {
+        let mut replayed = OrgState::default();
+        let mut stats = ReplayStats::default();
+        for part in [&lines[..cut], &lines[cut..]] {
+            for line in part {
+                stats
+                    .apply_parts(&mut replayed, line.seq, line.ts, &line.kind, &line.body)
+                    .unwrap();
+            }
+        }
+        assert_eq!(replayed, live, "split {cut}");
+        assert_eq!((stats.applied, stats.skipped_unknown), (16, 0));
+    }
+    assert_eq!(live.owner().relay, None);
+    assert_eq!(live.owner().away_since, None);
+    assert_eq!(live.owner().stacking_cap(Some(&"p".parse().unwrap())), 2);
+    for (seq, status, relayer) in [
+        (5, DecisionStatus::Resolved, Some("p/lead")),
+        (9, DecisionStatus::Overruled, Some("p/builder")),
+        (13, DecisionStatus::TakenProvisionally, None),
+    ] {
+        let decision = live.decision(&DecisionId::new(seq)).unwrap();
+        assert_eq!(decision.status, status);
+        assert_eq!(
+            decision.provisional.as_ref().unwrap().relayed_by,
+            relayer.map(|id| id.parse().unwrap())
+        );
+    }
+}
+
 #[test]
 fn replay_counter_overflow_precedes_mutation() {
     let mut state = OrgState::default();
@@ -129,6 +224,8 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::OwnerAway(_) => 38,
         OrgEvent::OwnerBack(_) => 39,
         OrgEvent::TaskUsageObserved(_) => 40,
+        OrgEvent::OwnerDigestCreated(_) => 41,
+        OrgEvent::OwnerRelaySet(_) => 42,
     }
 }
 
@@ -232,6 +329,14 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
                 .filter(|_| !n.is_multiple_of(7))
                 .collect(),
         }),
+        42 => OrgEvent::OwnerRelaySet(OwnerRelaySet {
+            by: owner_or(flag, agent_id.clone()),
+            agent: flag.then_some(agent_id),
+        }),
+        41 => OrgEvent::OwnerDigestCreated(OwnerDigestCreated {
+            by: owner_or(flag, agent_id),
+            back_seq: flag.then_some(n),
+        }),
         40 => OrgEvent::TaskUsageObserved(TaskUsageObserved {
             session_id: text.into(),
             task_id: flag.then(|| format!("t{n}").parse().unwrap()),
@@ -288,6 +393,7 @@ fn task_event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> 
     };
     match slot {
         26 => OrgEvent::TaskCreated(TaskCreated {
+            project_id: None,
             title: text.clone(),
             kind: [
                 TaskKind::Work,
@@ -514,7 +620,7 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
         }),
         // Slot 25: the switch by the owner or an agent, caps from zero up, and
         // the away table applied to the decision ids a history reaches.
-        _ => OrgCommand::Owner(match n % 3 {
+        _ => OrgCommand::Owner(match n % 4 {
             0 => OwnerCommand::Away {
                 by: owner_or(flag, agent_id),
                 stacking_caps: [("p".parse().unwrap(), (n % 4) as u32)].into(),
@@ -522,8 +628,12 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
             1 => OwnerCommand::Back {
                 by: owner_or(flag, agent_id),
             },
-            _ => OwnerCommand::ApplyAway {
+            2 => OwnerCommand::ApplyAway {
                 decision_id: DecisionId::new(n),
+            },
+            _ => OwnerCommand::CreateDigest {
+                by: owner_or(flag, agent_id),
+                back_seq: None,
             },
         }),
     }
@@ -539,10 +649,11 @@ fn task_command_case(n: u64, flag: bool) -> TaskCommand {
         } else {
             Address::Agent(id())
         },
-        lead: false,
+        manager_of: None,
     };
     match n % 10 {
         0 | 1 => TaskCommand::Create(TaskCreated {
+            project_id: None,
             title: "Work".into(),
             kind: TaskKind::Work,
             creator: by.who,
@@ -607,21 +718,21 @@ fn task_command_case(n: u64, flag: bool) -> TaskCommand {
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..41)
+    let events: Vec<_> = (0..43)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..41).collect::<Vec<_>>());
+    assert_eq!(events, (0..43).collect::<Vec<_>>());
     let commands: Vec<_> = (0..27)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
     assert_eq!(commands, (0..27).collect::<Vec<_>>());
-    let picks: Vec<_> = (0..5)
+    let picks: Vec<_> = (0..6)
         .map(|pick| match command_case(21, pick, true) {
             OrgCommand::Decision(command) => decision_support::decision_command_pick(&command),
             other => panic!("not a decision command: {other:?}"),
         })
         .collect();
-    assert_eq!(picks, (0..5).collect::<Vec<_>>());
+    assert_eq!(picks, (0..6).collect::<Vec<_>>());
     let history = history::History::seeded();
     let wide_commands: Vec<_> = (0..26)
         .map(|slot| {
@@ -792,7 +903,7 @@ impl ExcludedReach {
 
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..41, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..43, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
@@ -980,6 +1091,263 @@ fn multi_project_history_is_serial_deterministic_and_prefix_composes() {
         })
         .unwrap();
     reach.assert_coverage("multi-project");
+}
+
+fn delivery_notice_body(source: &str, reason: &str) -> Value {
+    json!({"from":"system", "to":"owner", "kind":"note", "body":"Delivery needs attention",
+        "attachments":[], "task":null, "delivery_notice":{"source_message_id":source,"reason":reason}})
+}
+
+#[test]
+fn notice_survives_replay_and_lost_reply() {
+    let mut live = OrgState::default();
+    let source = OrgEvent::MessageSent(content(Address::Owner));
+    live.apply(1, time(), &source).unwrap();
+    let OrgEvent::MessageSent(note) =
+        OrgEvent::from_parts("msg.sent", &delivery_notice_body("m1", "focus"))
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected a message");
+    };
+    let events = live.decide(&OrgCommand::SendMessage(note), time()).unwrap();
+    assert_eq!(events.len(), 1, "the note and key must be a single record");
+    let log = [
+        serde_json::to_string(&source).unwrap(),
+        serde_json::to_string(&events[0]).unwrap(),
+    ];
+    // Crash after the single note record was appended, before applying it or
+    // replying. Reconstruct only from serialized facts, not process-local keys.
+    let mut recovered = OrgState::default();
+    let mut stats = ReplayStats::default();
+    for (seq, line) in (1..).zip(&log) {
+        let record: Value = serde_json::from_str(line).unwrap();
+        stats
+            .apply_parts(
+                &mut recovered,
+                seq,
+                time(),
+                record["kind"].as_str().unwrap(),
+                &record["body"],
+            )
+            .unwrap();
+    }
+    live.apply(2, time(), &events[0]).unwrap();
+    assert_eq!(recovered, live);
+    assert_eq!(stats.applied, 2);
+    let note = recovered.message(&MessageId::new(2)).unwrap();
+    assert_eq!(note.status, DeliveryStatus::Delivered);
+    assert_eq!(note.read_at, None);
+    let changed = MessageContent {
+        body: "Changed after the lost reply".into(),
+        ..note.content.clone()
+    };
+    let before = recovered.clone();
+    assert!(recovered
+        .decide(&OrgCommand::SendMessage(changed), time())
+        .unwrap()
+        .is_empty());
+    assert_eq!(recovered, before);
+    assert_eq!(
+        recovered
+            .messages()
+            .filter(|m| m.content.delivery_notice.is_some())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn notice_key_survives_source_and_note_changes() {
+    let note = OrgEvent::from_parts("msg.sent", &delivery_notice_body("m3", "unobserved"))
+        .unwrap()
+        .unwrap();
+    let records = [
+        OrgEvent::ProjectRegistered {
+            project_id: "p".parse().unwrap(),
+            root: "/p".into(),
+        },
+        OrgEvent::AgentUpRequested {
+            agent_id: id(),
+            role: role(),
+        },
+        OrgEvent::MessageSent(content(Address::Agent(id()))),
+        note,
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: MessageId::new(3),
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        OrgEvent::MessageDeliveryFailed {
+            message_id: MessageId::new(3),
+            reason: "retry".into(),
+            final_failure: false,
+        },
+        OrgEvent::MessageDeliveryFailed {
+            message_id: MessageId::new(3),
+            reason: "give up".into(),
+            final_failure: true,
+        },
+        OrgEvent::MessageDelivered {
+            message_id: MessageId::new(3),
+            session_id: "late".into(),
+            confirmation: "receipt".into(),
+        },
+        OrgEvent::MessageRead {
+            message_ids: vec![MessageId::new(3)],
+        },
+        OrgEvent::MessageRead {
+            message_ids: vec![MessageId::new(4)],
+        },
+    ];
+    let mut direct = OrgState::default();
+    let mut recovered = OrgState::default();
+    let mut stats = ReplayStats::default();
+    let mut repeated_counts = Vec::new();
+    for (seq, event) in (1..).zip(&records) {
+        direct.apply(seq, time(), event).unwrap();
+        stats
+            .apply_parts(&mut recovered, seq, time(), event.kind(), &event.to_body())
+            .unwrap();
+        assert_eq!(recovered, direct);
+        if seq >= 4 {
+            let repeated = recovered
+                .message(&MessageId::new(4))
+                .unwrap()
+                .content
+                .clone();
+            repeated_counts.push((
+                seq,
+                recovered
+                    .decide(&OrgCommand::SendMessage(repeated), time())
+                    .unwrap()
+                    .len(),
+            ));
+        }
+    }
+    assert!(
+        repeated_counts.iter().all(|(_, count)| *count == 0),
+        "{repeated_counts:?}"
+    );
+    assert_eq!(
+        recovered.message(&MessageId::new(3)).unwrap().status,
+        DeliveryStatus::Delivered
+    );
+    assert_eq!(
+        recovered.message(&MessageId::new(4)).unwrap().read_at,
+        Some(time())
+    );
+    let OrgEvent::MessageSent(other) =
+        OrgEvent::from_parts("msg.sent", &delivery_notice_body("m3", "future_reason"))
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected a message");
+    };
+    assert_eq!(
+        recovered
+            .decide(&OrgCommand::SendMessage(other), time())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn legacy_unkeyed_notice_does_not_claim_key() {
+    let source = json!({"from":"owner","to":"owner","kind":"brief","body":"Work","attachments":[],"task":null});
+    let legacy_note = json!({"from":"system","to":"owner","kind":"note","body":"Delivery needs attention","attachments":[],"task":null});
+    let mut state = OrgState::default();
+    let mut stats = ReplayStats::default();
+    for (seq, body) in [(1, &source), (2, &legacy_note)] {
+        stats
+            .apply_parts(&mut state, seq, time(), "msg.sent", body)
+            .unwrap();
+    }
+    let mut direct = OrgState::default();
+    for (seq, body) in [(1, &source), (2, &legacy_note)] {
+        direct
+            .apply(
+                seq,
+                time(),
+                &OrgEvent::from_parts("msg.sent", body).unwrap().unwrap(),
+            )
+            .unwrap();
+    }
+    assert_eq!(state, direct);
+    assert!(state
+        .messages()
+        .all(|m| m.content.delivery_notice.is_none()));
+    let OrgEvent::MessageSent(keyed) =
+        OrgEvent::from_parts("msg.sent", &delivery_notice_body("m1", "focus"))
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected a message");
+    };
+    let command = OrgCommand::SendMessage(keyed);
+    let events = state.decide(&command, time()).unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "an old unkeyed note cannot reserve a new key"
+    );
+    direct.apply(3, time(), &events[0]).unwrap();
+    stats
+        .apply_parts(
+            &mut state,
+            3,
+            time(),
+            events[0].kind(),
+            &events[0].to_body(),
+        )
+        .unwrap();
+    assert_eq!(state, direct);
+    assert_eq!(state.inbox(&Address::Owner).len(), 3);
+    assert!(state.decide(&command, time()).unwrap().is_empty());
+    assert_eq!(stats.applied, 3);
+}
+
+#[test]
+fn malformed_notice_replay_is_atomic() {
+    let mut state = OrgState::default();
+    let mut stats = ReplayStats::default();
+    stats.apply_parts(&mut state, 1, time(), "msg.sent", &json!({"from":"owner","to":"owner","kind":"note","body":"Work","attachments":[],"task":null})).unwrap();
+    let valid = delivery_notice_body("m1", "focus");
+    stats
+        .apply_parts(&mut state, 2, time(), "msg.sent", &valid)
+        .unwrap();
+    let before = state.clone();
+    let before_stats = stats.clone();
+    let mut malformed = valid.clone();
+    malformed["delivery_notice"] = json!({"source_message_id":"m1"});
+    let outcomes: Vec<_> = [
+        valid,
+        delivery_notice_body("m999", "focus"),
+        delivery_notice_body("m1", ""),
+        malformed,
+    ]
+    .into_iter()
+    .map(|body| {
+        let mut candidate = state.clone();
+        let mut candidate_stats = stats.clone();
+        let refused = candidate_stats
+            .apply_parts(&mut candidate, 3, time(), "msg.sent", &body)
+            .is_err();
+        (
+            body,
+            refused,
+            candidate == before,
+            candidate_stats == before_stats,
+        )
+    })
+    .collect();
+    assert!(
+        outcomes
+            .iter()
+            .all(|(_, refused, state_same, stats_same)| *refused && *state_same && *stats_same),
+        "{outcomes:?}"
+    );
 }
 
 proptest! {

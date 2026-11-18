@@ -384,7 +384,10 @@ impl OrgState {
                 if content.to == Address::System {
                     return Err(Refusal::InvalidRecipient(Address::System));
                 }
-                true
+                content
+                    .delivery_notice
+                    .as_ref()
+                    .is_none_or(|notice| !self.has_delivery_notice(notice))
             }
             OrgCommand::DeliveryAttempted {
                 message_id,

@@ -8,9 +8,9 @@
 //!
 //! Captured: pi 1.5.0, 2026-11-15, sealed private-tmux startup/short-turn captures.
 //! Captured: pi 1.5.2, 2026-11-15, sealed private-tmux offline/resource startups.
-//! Historical update-notice rules require complete chrome plus faint labels or
-//! a bold title (also captured with built-in dark/light themes), not startup-only
-//! history. Unknown notices and unexplained pasted rules still refuse.
+//! Historical update-notice rules require complete chrome plus every non-whitespace
+//! label glyph faint or a bold title (also captured with built-in dark/light themes),
+//! not startup-only history. Unknown notices and unexplained pasted rules still refuse.
 //!
 //! Pi has no native tool approvals, but extension/core dialogs replace the editor.
 //! Recognized select/input/editor hints and the reload box report Other with
@@ -48,6 +48,11 @@ use atm_core::{
     ScreenInput, ScreenTextFormat, TurnState,
 };
 
+#[cfg(test)]
+thread_local! {
+    static DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Requires attributes and retained grid spaces (`capture-pane -p -e -N`).
 pub const SCREEN_TEXT_FORMAT: ScreenTextFormat = ScreenTextFormat::Styled;
 
@@ -70,6 +75,8 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
     let (text, styled) = match input {
         ScreenInput::Plain(text) if cursor.is_none() => (text, None),
         ScreenInput::Styled(text) => {
+            #[cfg(test)]
+            DECODE_COUNT.with(|count| count.set(count.get() + 1));
             let Ok(screen) = StyledScreen::parse(text) else {
                 return Default::default();
             };
@@ -81,6 +88,10 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
     if text.chars().any(|c| c.is_control() && c != '\n') {
         return Default::default();
     }
+    inspect_prepared(text, styled)
+}
+
+fn inspect_prepared(text: &str, styled: Option<&StyledScreen>) -> (ScreenFacts, Option<String>) {
     let mut lines: Vec<_> = text
         .lines()
         .map(|line| {
@@ -166,10 +177,12 @@ fn update_rules(history: &[&str], lower: &str, screen: &StyledScreen) -> bool {
                 .map(|(line, _)| line.trim())
                 .collect::<Vec<_>>()
                 .join(" ");
-            let faint = |(line, offset): &(&str, usize)| {
-                line.find(|c: char| !c.is_whitespace())
-                    .and_then(|i| screen.faint_at(offset + i))
-                    == Some(true)
+            let faint = |(line, offset): &(&str, usize), label: &str| {
+                line.find(label).is_some_and(|start| {
+                    label.char_indices().all(|(i, c)| {
+                        c.is_whitespace() || screen.faint_at(offset + start + i) == Some(true)
+                    })
+                })
             };
             *upper == lower
                 && *bottom == lower
@@ -181,7 +194,8 @@ fn update_rules(history: &[&str], lower: &str, screen: &StyledScreen) -> bool {
                     changelog.0.trim(),
                     bottom.trim(),
                 ])
-                && ((message.first().is_some_and(faint) && faint(changelog))
+                && ((message.first().is_some_and(|row| faint(row, "New version"))
+                    && faint(changelog, "Changelog:"))
                     || title.char_indices().all(|(i, c)| {
                         c.is_whitespace() || screen.bold_at(title_offset + i) == Some(true)
                     }))

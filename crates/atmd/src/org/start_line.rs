@@ -49,6 +49,7 @@ const SWITCH: &str = "ATM_SPAWN_START_LINE";
 #[must_use]
 pub fn start_line(agent: &AgentId) -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: Address::Agent(agent.clone()),
         kind: MessageKind::Note,

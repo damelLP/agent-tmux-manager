@@ -89,6 +89,9 @@ where
                 work(work_token).await
             })
             .await;
+            // Capability admission consumes this budget too: a delayed reply
+            // can exhaust a consumer's cleanup margin before its callback starts.
+            // A missed supervisor deadline still quarantines ownership.
             let deadline = Instant::now() + state::CLEANUP_TIMEOUT;
             let cleaned = match reservation.begin_cleanup(deadline).await {
                 Ok(cleanup_token) => {
@@ -125,6 +128,7 @@ where
 
 /// Callback invocation is inside the child task, so a callback panic also joins
 /// before phase rotation. Aborting a cooperative async task is not a rollback.
+/// Stop takes precedence; a finished worker beats a simultaneously ready deadline.
 async fn phase<T, E>(
     deadline: Instant,
     cancel: Option<CancellationToken>,
@@ -147,12 +151,12 @@ where
     let (error, completion) = tokio::select! {
         biased;
         () = stopped => (ReservationError::Unavailable, Completion::WorkerStopped),
-        () = sleep_until(deadline) => (ReservationError::Timeout, Completion::TimedOut),
         result = &mut worker => return match result {
             Ok(Ok(value)) => (Ok(value), Completion::Succeeded),
             Ok(Err(error)) => (Err(error), Completion::Failed),
             Err(_) => (Err(ReservationError::Unavailable.into()), Completion::WorkerStopped),
         },
+        () = sleep_until(deadline) => (ReservationError::Timeout, Completion::TimedOut),
     };
     worker.abort();
     let _ = worker.await;
@@ -189,6 +193,9 @@ pub(in crate::control) enum Command {
         deadline: Instant,
         reply: oneshot::Sender<Result<Fence, ReservationError>>,
     },
+    Health {
+        reply: oneshot::Sender<Result<crate::server::health::ReservationHealth, ReservationError>>,
+    },
     /// Read the quarantined operations; changes nothing.
     Quarantines {
         reply: oneshot::Sender<Result<Vec<super::Quarantine>, ReservationError>>,
@@ -217,6 +224,9 @@ impl Command {
                 let _ = reply.send(Err(error));
             }
             Self::Quarantines { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Health { reply } => {
                 let _ = reply.send(Err(error));
             }
         }
@@ -382,6 +392,9 @@ impl Jobs {
             Command::Quarantines { reply } => {
                 let _ = reply.send(Ok(self.state.quarantines()));
             }
+            Command::Health { reply } => {
+                let _ = reply.send(Ok(self.state.health()));
+            }
             Command::Drain { fence, reply } => {
                 let result = self.state.check(&fence, None, now).map(|()| {
                     self.kill_audits
@@ -512,8 +525,302 @@ mod tests {
         reservation::{ReservationKind, WaitPolicy},
         service::spawn_control,
     };
-    use atm_tmux::MockTmuxClient;
-    use std::time::Duration;
+    use atm_tmux::{MockTmuxClient, PaneDirection, PaneInfo, TmuxClient, TmuxError};
+    use std::{
+        future::poll_fn,
+        sync::atomic::{AtomicBool, Ordering},
+        task::Poll,
+        time::Duration,
+    };
+    use tokio::sync::{Notify, Semaphore};
+
+    struct HeldActorRead {
+        mock: MockTmuxClient,
+        entered: Arc<Notify>,
+        release: Arc<Semaphore>,
+    }
+
+    type TmuxCall<'a, T> = Pin<Box<dyn Future<Output = Result<T, TmuxError>> + Send + 'a>>;
+    macro_rules! forward {
+        ($method:ident <$($lt:lifetime),*> ($($arg:ident : $ty:ty),*) -> $result:ty) => {
+            fn $method<'s, $($lt,)* 'async_trait>(&'s self, $($arg: $ty),*) -> TmuxCall<'async_trait, $result>
+            where 's: 'async_trait, $($lt: 'async_trait,)* Self: 'async_trait {
+                Box::pin(self.mock.$method($($arg),*))
+            }
+        };
+    }
+
+    impl TmuxClient for HeldActorRead {
+        fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
+            &'s self,
+            command: &'c str,
+            args: &'a [&'v str],
+        ) -> TmuxCall<'async_trait, String>
+        where
+            's: 'async_trait,
+            'c: 'async_trait,
+            'a: 'async_trait,
+            'v: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+                self.mock.raw_command(command, args).await
+            })
+        }
+        forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
+        forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
+        forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
+        forward!(kill_pane<'a>(pane: &'a str) -> ());
+        forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
+        forward!(list_panes<>() -> Vec<PaneInfo>);
+        forward!(display_popup<'a, 'b, 'c>(width: &'a str, height: &'b str, command: &'c str) -> ());
+        forward!(select_pane<'a>(pane: &'a str) -> ());
+        forward!(capture_pane<'a>(pane: &'a str) -> Vec<String>);
+        forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
+        forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());
+        forward!(new_session<'a>(name: &'a str) -> String);
+    }
+
+    struct CleanupAdmissionObserved {
+        job: Box<dyn Job>,
+        work_returned: Arc<AtomicBool>,
+        waiting: oneshot::Sender<Instant>,
+    }
+
+    impl Job for CleanupAdmissionObserved {
+        fn reject(self: Box<Self>, error: ReservationError) {
+            self.job.reject(error);
+        }
+
+        fn start(
+            self: Box<Self>,
+            reservation: Reservation,
+            cancel: CancellationToken,
+        ) -> JobFuture {
+            let mut future = self.job.start(reservation, cancel);
+            let work_returned = self.work_returned;
+            let mut waiting = Some(self.waiting);
+            Box::pin(poll_fn(move |cx| {
+                let result = future.as_mut().poll(cx);
+                // On the current-thread runtime the work returns without an
+                // await after setting the flag. This pending poll has joined
+                // it and enqueued begin_cleanup behind the held actor read.
+                if result.is_pending() && work_returned.load(Ordering::SeqCst) {
+                    if let Some(waiting) = waiting.take() {
+                        waiting.send(Instant::now()).unwrap();
+                    }
+                }
+                result
+            }))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_delayed_cleanup_capability_consumes_settlement_margin_and_quarantines() {
+        use crate::control::reservation::{CaptureFormat, PaneId, Quarantine};
+
+        let cancel = CancellationToken::new();
+        let read_entered = Arc::new(Notify::new());
+        let read_release = Arc::new(Semaphore::new(0));
+        let (control, actor) = spawn_control(
+            Box::new(HeldActorRead {
+                mock: MockTmuxClient::new(),
+                entered: read_entered.clone(),
+                release: read_release.clone(),
+            }),
+            crate::registry::spawn_registry(),
+            crate::org::OrgHandle::disabled("cleanup admission test"),
+            cancel.clone(),
+        );
+        let (entered, entry) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let (waiting, admission_wait) = oneshot::channel();
+        let (cleaning, clean) = oneshot::channel();
+        let (settled, settlement) = oneshot::channel();
+        let work_returned = Arc::new(AtomicBool::new(false));
+        let returned = work_returned.clone();
+        let (job, response) = job::<(), ReservationError, _, _, _, _>(
+            move |_| async move {
+                entered.send(()).unwrap();
+                finished.await.unwrap();
+                returned.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            move |_, completion| async move {
+                assert_eq!(completion, Completion::Succeeded);
+                let started = Instant::now();
+                cleaning.send(started).unwrap();
+                // Model delivery's eight-second settlement limit, measured
+                // from callback entry rather than before capability admission.
+                let _ = tokio::time::timeout_at(
+                    started + Duration::from_secs(8),
+                    std::future::pending::<()>(),
+                )
+                .await;
+                settled.send(()).unwrap();
+                Ok(())
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        control
+            .enqueue_reserved(
+                Command::Acquire(Admission {
+                    control: control.clone(),
+                    request: ReservationRequest {
+                        agent: "p/a".parse().unwrap(),
+                        pane: Some(PaneId::parse("%1").unwrap()),
+                        kind: ReservationKind::Delivery,
+                        wait: WaitPolicy::Wait,
+                        deadline,
+                    },
+                    job: Box::new(CleanupAdmissionObserved {
+                        job,
+                        work_returned,
+                        waiting,
+                    }),
+                }),
+                deadline,
+            )
+            .await
+            .unwrap();
+        entry.await.unwrap();
+        let other = control.clone();
+        let read = tokio::spawn(async move {
+            other
+                .observe(&PaneId::parse("%2").unwrap(), CaptureFormat::Plain)
+                .await
+        });
+        read_entered.notified().await;
+        finish.send(()).unwrap();
+        let budget_started = admission_wait.await.unwrap();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        read_release.add_permits(1);
+        // The unrelated read intentionally has no valid frame scripted.
+        assert!(read.await.unwrap().is_err());
+        assert_eq!(
+            clean.await.unwrap(),
+            budget_started + Duration::from_secs(3)
+        );
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ReservationError::Timeout)
+        ));
+        assert!(
+            settlement.await.is_err(),
+            "cleanup was stopped before its own limit"
+        );
+        let quarantines = control
+            .quarantines(Instant::now() + Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            quarantines,
+            vec![Quarantine {
+                agent: "p/a".parse().unwrap(),
+                pane: Some(PaneId::parse("%1").unwrap()),
+                kind: ReservationKind::Delivery,
+            }]
+        );
+        cancel.cancel();
+        actor.await.unwrap();
+    }
+
+    async fn finished_worker_phase(
+        deadline: Instant,
+        cancel: Option<CancellationToken>,
+        result: Result<u8, ReservationError>,
+    ) -> impl Future<Output = (Result<u8, ReservationError>, Completion)> {
+        let (returned, finished) = oneshot::channel();
+        let mut call = Box::pin(phase(deadline, cancel, async move {
+            // No await after this signal: on the current-thread runtime the
+            // worker has returned before the test resumes from finished.await.
+            returned.send(()).unwrap();
+            result
+        }));
+        poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        finished.await.unwrap();
+        // Keep the supervisor unpolled until the test makes its timer/stop ready.
+        call
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_phase_finished_ok_beats_simultaneously_ready_deadline() {
+        // None is cleanup's policy; an uncancelled token is work's policy.
+        for cancel in [None, Some(CancellationToken::new())] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let call = finished_worker_phase(deadline, cancel, Ok(17)).await;
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let (result, completion) = call.await;
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(completion, Completion::Succeeded);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_phase_finished_error_beats_simultaneously_ready_deadline() {
+        for cancel in [None, Some(CancellationToken::new())] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let call = finished_worker_phase(
+                deadline,
+                cancel,
+                Err(ReservationError::InvalidRequest {
+                    reason: "worker failed".into(),
+                }),
+            )
+            .await;
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let (result, completion) = call.await;
+            assert!(
+                matches!(result, Err(ReservationError::InvalidRequest { reason }) if reason == "worker failed")
+            );
+            assert_eq!(completion, Completion::Failed);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_phase_stop_beats_finished_worker_and_ready_deadline() {
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let call = finished_worker_phase(deadline, Some(cancel.clone()), Ok(17)).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        cancel.cancel();
+        let (result, completion) = call.await;
+        assert!(matches!(result, Err(ReservationError::Unavailable)));
+        assert_eq!(completion, Completion::WorkerStopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_phase_deadline_aborts_and_joins_unfinished_worker() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (entered, entry) = oneshot::channel();
+        let (alive, mut lifetime) = oneshot::channel::<()>();
+        let mut call = Box::pin(phase(deadline, None, async move {
+            let _alive = alive;
+            entered.send(()).unwrap();
+            std::future::pending::<Result<(), ReservationError>>().await
+        }));
+        poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        entry.await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let (result, completion) = call.await;
+        assert!(matches!(result, Err(ReservationError::Timeout)));
+        assert_eq!(completion, Completion::TimedOut);
+        assert!(matches!(
+            lifetime.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn reservation_shutdown_between_admission_and_grant_never_starts_callbacks() {

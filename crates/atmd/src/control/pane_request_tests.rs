@@ -582,6 +582,220 @@ async fn an_admitted_kill_finishes_and_is_logged_when_the_daemon_stops() {
     org_cancel.cancel();
 }
 
+// Breaks if the interrupt route drops TUI attribution, bypasses either input
+// gate, or fails to audit a resolved-but-refused action. No sleeps or clock I/O.
+#[tokio::test]
+async fn tui_interrupt_refusals_send_no_input_and_keep_audit_attribution() {
+    use crate::server::methods::{router, MethodServices};
+    let (_dir, org, org_cancel) = logged().await;
+    let mock = MockTmuxClient::new();
+    let registry = crate::registry::spawn_registry();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(mock.clone()),
+        registry.clone(),
+        org.clone(),
+        cancel.clone(),
+    );
+    let mut services = MethodServices::new(registry);
+    services.control = Some(control.clone());
+    let router = router(services).unwrap();
+    let call = || {
+        router.call(
+            CallContext {
+                client_id: CallerId("tui-interrupt".into()),
+                from_pane: Some(CallerPane("%9".into())),
+            },
+            "session.interrupt",
+            serde_json::json!({"target": "%1"}),
+        )
+    };
+
+    let (job, release) = hold(&control, ReservationKind::Clear, |_| async { Ok(()) }).await;
+    let error = call().await.unwrap_err().0;
+    assert_eq!(error.code, "refused");
+    assert_eq!(error.message, CLEARING);
+    assert!(effects(&mock).is_empty(), "clearing refusal sent input");
+    release.send(()).unwrap();
+    job.await.unwrap().unwrap();
+    assert_eq!(call().await.unwrap(), serde_json::json!({"pane": "%1"}));
+    assert_eq!(
+        effects(&mock),
+        [MockCall::SendKeys {
+            pane: "%1".into(),
+            keys: "C-c".into()
+        }]
+    );
+    mock.clear_calls();
+    let failed = control
+        .run_reserved(
+            request(ReservationKind::Down),
+            |_| async { Ok(()) },
+            |_, _| async { Err(ReservationError::Unavailable) },
+        )
+        .await;
+    assert!(matches!(failed, Err(ReservationError::Unavailable)));
+    let error = call().await.unwrap_err().0;
+    assert_eq!(error.code, "unavailable");
+    assert_eq!(error.message, QUARANTINED);
+    assert!(effects(&mock).is_empty(), "quarantine refusal sent input");
+    control.flush_audits().await;
+    let recorded = events(&org).await;
+    assert_eq!(recorded.len(), 3);
+    for ((kind, body), (outcome, error)) in recorded.iter().zip([
+        ("error", Some(CLEARING)),
+        ("ok", None),
+        ("error", Some(QUARANTINED)),
+    ]) {
+        assert_eq!(kind, "control.sent");
+        assert_eq!(body["pane"], "%1");
+        assert_eq!(
+            body["action"],
+            serde_json::json!({
+                "method": "session.interrupt", "outcome": outcome, "error": error,
+                "client_id": "tui-interrupt", "from_pane": "%9",
+            })
+        );
+    }
+    cancel.cancel();
+    actor.await.unwrap();
+    org_cancel.cancel();
+}
+
+// Real server + real control actor, with the clearing reservation held by a
+// test-owned channel rather than a timing race. The external sealed rig owns
+// the foreground stand-in and invokes the actual TUI action at both stages.
+mod real_tui_interrupt {
+    use super::*;
+    use crate::server::{methods::MethodServices, DaemonServer};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[derive(Clone)]
+    struct Ready(Arc<tokio::sync::Notify>);
+    impl std::io::Write for Ready {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if String::from_utf8_lossy(bytes).contains("Daemon server listening") {
+                self.0.notify_one();
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a sealed private tmux server and event-synchronized foreground rig"]
+    async fn real_daemon_interrupt_clearing_refusal_and_success() {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let run = std::path::PathBuf::from(std::env::var_os("ATM_INTERRUPT_TEST_RUN").unwrap())
+                .canonicalize()
+                .unwrap();
+            assert_eq!(run.parent(), Some(std::path::Path::new("/var/tmp")));
+            assert!(run
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("cp-op3iq."));
+            assert!(std::env::var_os("TMUX").is_none());
+            assert!(std::env::var_os("TMUX_PANE").is_none());
+            assert_eq!(std::env::var("ATM_TMUX_SOCKET").unwrap(), "op3iq");
+            for key in [
+                "ATM_SOCKET",
+                "TMUX_TMPDIR",
+                "ATM_STATE_DIR",
+                "HOME",
+                "ATM_INTERRUPT_TEST_RIG",
+            ] {
+                assert!(std::path::PathBuf::from(std::env::var_os(key).unwrap()).starts_with(&run));
+            }
+            let client = atm_tmux::RealTmuxClient::new();
+            let identity = client
+                .raw_command("display-message", &["-p", "#{socket_path}\t#{pid}"])
+                .await
+                .unwrap();
+            let (socket, pid) = identity.trim().split_once('\t').unwrap();
+            assert!(std::path::Path::new(socket)
+                .canonicalize()
+                .unwrap()
+                .starts_with(&run));
+            assert!(pid.parse::<u32>().unwrap() > 1);
+            assert_eq!(std::env::var("ATM_INTERRUPT_TEST_PANE").unwrap(), "%1");
+            let (_dir, org, org_cancel) = logged().await;
+            let registry = crate::registry::spawn_registry();
+            let cancel = CancellationToken::new();
+            let (control, actor) = spawn_control(
+                Box::new(client),
+                registry.clone(),
+                org.clone(),
+                cancel.clone(),
+            );
+            let (job, release) = hold(&control, ReservationKind::Clear, |_| async { Ok(()) }).await;
+            let ready = Ready(Arc::new(tokio::sync::Notify::new()));
+            let writer = ready.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let server_cancel = CancellationToken::new();
+            let mut services = MethodServices::new(registry);
+            services.control = Some(control.clone());
+            let server = DaemonServer::with_services(
+                std::env::var_os("ATM_SOCKET").unwrap(),
+                services,
+                server_cancel.clone(),
+            );
+            let server_task = tokio::spawn(async move { server.run().await });
+            ready.0.notified().await;
+            let mut rig = BufReader::new(
+                tokio::net::UnixStream::connect(
+                    std::env::var_os("ATM_INTERRUPT_TEST_RIG").unwrap(),
+                )
+                .await
+                .unwrap(),
+            );
+            rig.get_mut().write_all(b"clearing\n").await.unwrap();
+            let mut line = String::new();
+            rig.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "release\n");
+            release.send(()).unwrap();
+            job.await.unwrap().unwrap();
+            rig.get_mut().write_all(b"free\n").await.unwrap();
+            line.clear();
+            rig.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "stop\n");
+            control.flush_audits().await;
+            let recorded = events(&org).await;
+            assert_eq!(recorded.len(), 2, "{recorded:?}");
+            for ((kind, body), (outcome, error)) in recorded
+                .iter()
+                .zip([("error", Some(CLEARING)), ("ok", None)])
+            {
+                assert_eq!(kind, "control.sent");
+                assert_eq!(body["pane"], "%1");
+                assert_eq!(body["action"]["method"], "session.interrupt");
+                assert_eq!(body["action"]["from_pane"], "%0");
+                assert!(body["action"]["client_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()));
+                assert_eq!(body["action"]["outcome"], outcome);
+                assert_eq!(body["action"]["error"], serde_json::json!(error));
+            }
+            println!("real_interrupt_audits={recorded:?}");
+            server_cancel.cancel();
+            server_task.await.unwrap().unwrap();
+            cancel.cancel();
+            actor.await.unwrap();
+            org_cancel.cancel();
+        })
+        .await
+        .expect("hung real interrupt rig");
+    }
+}
+
 /// tmux takes `%01` for `%1`. The gate must be asked about the pane tmux
 /// will act on, or a non-canonical id slips an interrupt past its clear.
 #[tokio::test(start_paused = true)]

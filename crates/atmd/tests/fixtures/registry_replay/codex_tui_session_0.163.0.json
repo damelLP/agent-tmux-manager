@@ -1,0 +1,5307 @@
+{
+  "frames": 9,
+  "label": "SEALED REPLAY",
+  "raw_dropped": 0,
+  "source": "codex_tui_session_0.163.0",
+  "turns": [
+    {
+      "action": {
+        "command": {
+          "cwd": "$SEALED/repo",
+          "harness": "codex",
+          "kind": "discovered",
+          "pid": 900001,
+          "session_id": "pending-900001",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "163570",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "pending-900001": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "codex",
+              "id": "pending-900001",
+              "last_activity": "2026-11-17T06:21:48.828604184Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "codex",
+              "id": "pending-900001",
+              "id_short": "pending-",
+              "last_activity": "2026-11-17T06:21:48.828604184+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.828780573Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.828604184Z"
+          },
+          {
+            "kind": "instant",
+            "value": 163570
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.828746393Z"
+          }
+        ],
+        "processes": {
+          "parent:Codex:900001": [
+            null
+          ],
+          "start:900001": [
+            80493706
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "git": {
+          "context": [
+            "$SEALED/repo",
+            "$SEALED/repo",
+            "main"
+          ],
+          "cwd": "$SEALED/repo"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "pending-900001": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "codex",
+              "id": "pending-900001",
+              "last_activity": "2026-11-17T06:21:48.828604184Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "codex",
+              "id": "pending-900001",
+              "id_short": "pending-",
+              "last_activity": "2026-11-17T06:21:48.828604184+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.829066253Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829037503Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "source": "startup",
+            "type": "session_start"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.829273403Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.829273403+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.829293752Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829273403Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829280853Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.829399392Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.829399392+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.829410872Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829399392Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829404802Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.829581972Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.829581972+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.829598232Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829581972Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829588152Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "prompt": "Create atm-probe.txt.",
+            "type": "prompt_submit"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.829765522Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.829765522+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.829779432Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829765522Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829770862Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.829878772Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.829878772+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.829889472Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829878772Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.829883172Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.830014381Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.830014381+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.830027401Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830014381Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830019211Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "input": {
+              "command": "touch atm-probe.txt"
+            },
+            "name": "Bash",
+            "tool_use_id": "call_fake_1",
+            "type": "tool_call_start"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.830183961Z",
+                "tool_name": "Bash"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.830183961Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Bash",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.830183961+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.830198311Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830183961Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830189101Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.830183961Z",
+                "tool_name": "Bash"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.830295291Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Bash",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.830295291+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.830305291Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830295291Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830299231Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.830183961Z",
+                "tool_name": "Bash"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.830427791Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Bash",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.830427791+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.830440781Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830427791Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830432641Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "reason": {
+              "reason": "permission_gate",
+              "tool": "Bash"
+            },
+            "type": "needs_input"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.830590900Z",
+                "tool_name": "Bash"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.830590900Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "attention_needed",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Bash",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.830590900+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": true,
+              "project_root": "$SEALED/repo",
+              "should_blink": true,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "attention_needed",
+              "status_icon": "!",
+              "status_label": "needs input",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.830605190Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830590900Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830596300Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.830590900Z",
+                "tool_name": "Bash"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.830698080Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "attention_needed",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Bash",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.830698080+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": true,
+              "project_root": "$SEALED/repo",
+              "should_blink": true,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "attention_needed",
+              "status_icon": "!",
+              "status_label": "needs input",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.830708090Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830698080Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830702200Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "started_at": "2026-11-17T06:21:48.830590900Z",
+                "tool_name": "Bash"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.830847610Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "attention_needed",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Bash",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.830847610+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": true,
+              "project_root": "$SEALED/repo",
+              "should_blink": true,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "attention_needed",
+              "status_icon": "!",
+              "status_label": "needs input",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.830862760Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830847610Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.830853230Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "is_error": false,
+            "name": "Bash",
+            "tool_use_id": "call_fake_1",
+            "type": "tool_call_end"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Thinking",
+                "started_at": "2026-11-17T06:21:48.831008980Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831008980Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Thinking",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831008980+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831022460Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831008980Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831013890Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Thinking",
+                "started_at": "2026-11-17T06:21:48.831008980Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831114630Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Thinking",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831114630+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831124800Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831114630Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831118680Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Thinking",
+                "started_at": "2026-11-17T06:21:48.831008980Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831251959Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Thinking",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831251959+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831265519Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831251959Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831257119Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "type": "working_end"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831400249Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831400249+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831416029Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831400249Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831405339Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831505069Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831505069+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831514719Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831505069Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831508709Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831634289Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831634289+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831646739Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831634289Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831638979Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "trigger": "manual",
+            "type": "context_compact_start"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Compacting",
+                "started_at": "2026-11-17T06:21:48.831769989Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831769989Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Compacting",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831769989+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831783579Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831769989Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831774779Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Compacting",
+                "started_at": "2026-11-17T06:21:48.831769989Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.831886108Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Compacting",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.831886108+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.831896648Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831886108Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.831890238Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "current_activity": {
+                "context": "Compacting",
+                "started_at": "2026-11-17T06:21:48.831769989Z"
+              },
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.832025158Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": "Compacting",
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.832025158+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.832038448Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832025158Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832030178Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "type": "working_end"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.832164018Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.832164018+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.832176858Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832164018Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832168698Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "model": "fake-model",
+            "provider": null,
+            "type": "provider_model_change"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.832263998Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.832263998+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.832273288Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832263998Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832267408Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "context_window_size": 258400,
+            "cost_usd": null,
+            "current_tokens": 7305,
+            "tokens": 8830,
+            "type": "context_update"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [],
+        "git": {},
+        "ids": {
+          "01a16f8c-ffa5-7303-87fa-051477b77d16": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 258400,
+                "current_input_tokens": 7305,
+                "current_output_tokens": 0,
+                "total_input_tokens": 8830,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "last_activity": "2026-11-17T06:21:48.832390918Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "model_display_override": "fake-model",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.828604184Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "2.8% (7.3K/258K)",
+              "context_percentage": 2.8270123839009287,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "first_prompt": "Create atm-probe.txt.",
+              "harness": "codex",
+              "id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+              "id_short": "01a16f8c",
+              "last_activity": "2026-11-17T06:21:48.832390918+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "fake-model",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.828604184+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.832403198Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832390918Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832395738Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "reason": "other",
+            "type": "session_end"
+          },
+          "harness": "codex",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "01a16f8c-ffa5-7303-87fa-051477b77d16",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {},
+        "ids": {},
+        "rows": {}
+      },
+      "comparison": "2026-11-17T06:21:48.832539617Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832520607Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "source": "startup",
+            "type": "session_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "continued": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.832844787Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.832764527Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.832844787+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832764527+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.832862197Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832764527Z"
+          },
+          {
+            "kind": "instant",
+            "value": 4296653
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832844787Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832849167Z"
+          }
+        ],
+        "processes": {
+          "cwd:900001": [
+            "$SEALED/repo"
+          ],
+          "parent:Pi:900001": [
+            null
+          ],
+          "start:900001": [
+            80493706
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": {
+              "agent_type": "general_purpose",
+              "reference": {
+                "name": "worker"
+              }
+            }
+          },
+          "event": {
+            "type": "working_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "continued": 900001,
+          "worker@continued": 2147483648
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "worker@continued",
+              "last_activity": "2026-11-17T06:21:48.833029317Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.832989657Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "worker@continued",
+              "id_short": "worker@c",
+              "last_activity": "2026-11-17T06:21:48.833029317+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832989657+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "worker@continued"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.832844787Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.832764527Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "worker@continued"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.832844787+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832764527+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.833040867Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832989657Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.832993357Z"
+          },
+          {
+            "kind": "instant",
+            "value": 4524333
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833018597Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833024107Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833029317Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833031997Z"
+          }
+        ],
+        "processes": {
+          "start:2147483648": [
+            null
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": {
+              "id": "child-id",
+              "name": "worker"
+            },
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "id": "child-id",
+            "role": null,
+            "type": "child_session_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.833223486Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.833223486+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.833248246Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.832764527Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.833248246+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832764527+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.833259306Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833208576Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833223486Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833226126Z"
+          },
+          {
+            "kind": "instant",
+            "value": 4757542
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833238546Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833243456Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833248246Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833250776Z"
+          }
+        ],
+        "processes": {
+          "start:2147483648": [
+            null
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "get",
+          "session_id": "continued"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.833223486Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.833223486+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.833248246Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.832764527Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.833248246+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832764527+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.833426116Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833419576Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "all"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.833223486Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.833223486+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.833248246Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.832764527Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.833248246+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832764527+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.833570786Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833559866Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833564736Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "pane",
+          "pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.833223486Z",
+              "status": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833226126+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.833223486+00:00",
+              "status": "working",
+              "status_icon": ">",
+              "status_label": "working",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.833248246Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.832764527Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.833248246+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832764527+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.833720366Z",
+      "continuation": "alias",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833707846Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833713526Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": {
+              "agent_type": "general_purpose",
+              "reference": {
+                "name": "worker"
+              }
+            }
+          },
+          "event": {
+            "type": "working_end"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "continued",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [
+          [
+            "continued",
+            {
+              "id": "child-id"
+            },
+            "child-id"
+          ],
+          [
+            "continued",
+            {
+              "name": "worker"
+            },
+            "child-id"
+          ]
+        ],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "child-id": 2147483648,
+          "continued": 900001
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "subagent",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833872145Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "parent_session_id": "continued",
+              "started_at": "2026-11-17T06:21:48.833223486Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "subagent",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "child-id",
+              "id_short": "child-id",
+              "last_activity": "2026-11-17T06:21:48.833872145+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "parent_session_id": "continued",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.833223486+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          },
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "continued",
+              "last_activity": "2026-11-17T06:21:48.833248246Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.832764527Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "startup"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "child_session_ids": [
+                "child-id"
+              ],
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "continued",
+              "id_short": "continue",
+              "last_activity": "2026-11-17T06:21:48.833248246+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.832764527+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.833882465Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833872145Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.833875595Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "context": {
+            "alias": null,
+            "background": null,
+            "child": null
+          },
+          "event": {
+            "source": "clear",
+            "type": "session_start"
+          },
+          "harness": "pi",
+          "kind": "lifecycle",
+          "pid": 900001,
+          "session_id": "replacement",
+          "tmux_pane": "%1"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.834028215Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.834081055Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.834050765Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.834081055+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.834050765+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.834092265Z",
+      "continuation": "ended",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.834028215Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.834050765Z"
+          },
+          {
+            "kind": "instant",
+            "value": 5580261
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.834081055Z"
+          },
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.834083825Z"
+          }
+        ],
+        "processes": {
+          "cwd:900001": [
+            "$SEALED/repo"
+          ],
+          "parent:Pi:900001": [
+            null
+          ],
+          "start:900001": [
+            80493706
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "data": {
+            "api_duration_ms": 0,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "context_window_size": 0,
+            "cost_usd": 0.0,
+            "current_input_tokens": 0,
+            "current_output_tokens": 0,
+            "cwd": null,
+            "lines_added": 0,
+            "lines_removed": 0,
+            "model_display_name": null,
+            "model_id": "",
+            "session_id": "continued",
+            "total_duration_ms": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "version": null
+          },
+          "harness": "pi",
+          "kind": "status",
+          "pid": 900001,
+          "session_id": "continued"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.834028215Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.834081055Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.834050765Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.834081055+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.834050765+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.834217245Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.834210315Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "refresh"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.834028215Z"
+          ]
+        ],
+        "git": {
+          "$SEALED/repo": {
+            "offset_ns": "4296653",
+            "stuck": false
+          }
+        },
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.834081055Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.834050765Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.834081055+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.834050765+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.834307305Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "instant",
+            "value": 5824211
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "git": {
+          "context": [
+            "$SEALED/repo",
+            "$SEALED/repo",
+            "main"
+          ],
+          "cwd": "$SEALED/repo"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.834028215Z"
+          ]
+        ],
+        "git": {},
+        "ids": {
+          "replacement": 900001
+        },
+        "rows": {
+          "900001": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "pi",
+              "id": "replacement",
+              "last_activity": "2026-11-17T06:21:48.834081055Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "project_root": "$SEALED/repo",
+              "started_at": "2026-11-17T06:21:48.834050765Z",
+              "status": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            },
+            "infra": {
+              "accepted_start": {
+                "source": "clear"
+              },
+              "pid": 900001,
+              "start_time": 80493706
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "pi",
+              "id": "replacement",
+              "id_short": "replacem",
+              "last_activity": "2026-11-17T06:21:48.834081055+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "project_root": "$SEALED/repo",
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.834050765+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": "%1",
+              "working_directory": "$SEALED/repo",
+              "worktree_branch": "main",
+              "worktree_path": "$SEALED/repo"
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.834457725Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.834444215Z"
+          }
+        ],
+        "processes": {}
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "cleanup"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.834028215Z"
+          ]
+        ],
+        "git": {},
+        "ids": {},
+        "rows": {}
+      },
+      "comparison": "2026-11-17T06:21:48.834621774Z",
+      "inputs": {
+        "clocks": [
+          {
+            "kind": "utc",
+            "value": "2026-11-17T06:21:48.834599294Z"
+          }
+        ],
+        "processes": {
+          "alive:80493706:900001": [
+            false
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "register",
+          "session": {
+            "agent_type": "general_purpose",
+            "context": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 0,
+              "context_window_size": 200000,
+              "current_input_tokens": 0,
+              "current_output_tokens": 0,
+              "total_input_tokens": 0,
+              "total_output_tokens": 0
+            },
+            "cost": 0.0,
+            "duration": {
+              "api_ms": 0,
+              "total_ms": 0
+            },
+            "harness": "unknown",
+            "id": "supplied",
+            "last_activity": "2026-11-17T06:21:48.834637224Z",
+            "lines_changed": {
+              "added": 0,
+              "removed": 0
+            },
+            "model": "unknown",
+            "started_at": "2026-11-17T06:21:48.834637224Z",
+            "status": "idle"
+          }
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.834028215Z"
+          ]
+        ],
+        "git": {},
+        "ids": {
+          "supplied": 2147483648
+        },
+        "rows": {
+          "2147483648": {
+            "domain": {
+              "agent_type": "general_purpose",
+              "context": {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "context_window_size": 200000,
+                "current_input_tokens": 0,
+                "current_output_tokens": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+              },
+              "cost": 0.0,
+              "duration": {
+                "api_ms": 0,
+                "total_ms": 0
+              },
+              "harness": "unknown",
+              "id": "supplied",
+              "last_activity": "2026-11-17T06:21:48.834637224Z",
+              "lines_changed": {
+                "added": 0,
+                "removed": 0
+              },
+              "model": "unknown",
+              "started_at": "2026-11-17T06:21:48.834637224Z",
+              "status": "idle"
+            },
+            "infra": {
+              "accepted_start": null,
+              "pid": null,
+              "start_time": null
+            },
+            "view": {
+              "activity_detail": null,
+              "age_display": "0s ago",
+              "agent_type": "main",
+              "context_critical": false,
+              "context_display": "0.0% (0/200K)",
+              "context_percentage": 0.0,
+              "context_warning": false,
+              "cost_display": "$0.00",
+              "cost_usd": 0.0,
+              "duration_display": "0s",
+              "duration_seconds": 0.0,
+              "harness": "?",
+              "id": "supplied",
+              "id_short": "supplied",
+              "last_activity": "2026-11-17T06:21:48.834637224+00:00",
+              "last_activity_display": "0s ago",
+              "lines_display": "+0 -0",
+              "model": "Unknown",
+              "needs_attention": false,
+              "should_blink": false,
+              "started_at": "2026-11-17T06:21:48.834637224+00:00",
+              "status": "idle",
+              "status_icon": "-",
+              "status_label": "idle",
+              "tmux_pane": null,
+              "working_directory": null
+            }
+          }
+        }
+      },
+      "comparison": "2026-11-17T06:21:48.834657224Z",
+      "inputs": {
+        "clocks": [],
+        "processes": {
+          "start:2147483648": [
+            null
+          ]
+        }
+      }
+    },
+    {
+      "action": {
+        "command": {
+          "kind": "remove",
+          "session_id": "supplied"
+        }
+      },
+      "checkpoint": {
+        "aliases": [],
+        "ended": [
+          [
+            "01a16f8c-ffa5-7303-87fa-051477b77d16",
+            900001,
+            "2026-11-17T06:21:48.832520607Z"
+          ],
+          [
+            "continued",
+            900001,
+            "2026-11-17T06:21:48.834028215Z"
+          ]
+        ],
+        "git": {},
+        "ids": {},
+        "rows": {}
+      },
+      "comparison": "2026-11-17T06:21:48.834734374Z",
+      "inputs": {
+        "clocks": [],
+        "processes": {}
+      }
+    }
+  ]
+}

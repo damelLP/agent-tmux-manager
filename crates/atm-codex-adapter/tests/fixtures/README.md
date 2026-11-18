@@ -1,5 +1,23 @@
 # Codex screen fixtures
 
+## Staged-reference replay contract (TR4 S0; no new live captures)
+
+The TR4 S0 checks replay only the existing P3 codex-cli 0.167.0 captures below;
+their original 2026-11-14 provenance and bytes are unchanged. No Codex CLI,
+provider, model or real recovery session is started for this replay.
+`tests/staged_reference.rs` now pins exact Some(true)/None outcomes for every
+P3 pair: wide staged references (including after one Escape) match, while empty,
+cleared and 28-column frames return None. Plain always returns None.
+
+Synthetic: labeled test mutations replace only a wide frame's active literal
+with `[m123456] New session: run the shell command atm me`, a leading-space or
+suffix edit, or a changed command ID while retaining the leading token. Exact
+single-row literals match only themselves; the canonical ordinary reference
+returns Some(false) against edited/start drafts. The exact reference only in
+history cannot repair a wrong active editor. These are derived test inputs,
+**not fresh Codex start-line, human-edit or wrapped-start captures**. No Enter,
+erasure, ownership or non-submission claim follows from a screen match.
+
 ## Staged message references (P3)
 
 Captured: codex-cli 0.167.0, 2026-11-14, sealed loopback-only private tmux

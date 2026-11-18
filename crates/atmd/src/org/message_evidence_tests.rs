@@ -1004,6 +1004,7 @@ fn live_history(high_water: u64) -> crate::org::message_history::MessageHistoryH
             session_id: Some("session".into()),
         },
         OrgEvent::MessageSent(MessageContent {
+            delivery_notice: None,
             from: Address::Owner,
             to: Address::Agent("demo/worker".parse().unwrap()),
             kind: MessageKind::Note,
@@ -1240,4 +1241,156 @@ fn confirmed_lists_each_receipt_until_it_is_acknowledged() {
     assert!(e.receipt(other).unwrap().is_none());
     e.acknowledge(id(), &receipt).unwrap();
     assert_eq!(e.confirmed().unwrap(), []);
+}
+
+fn recovery_pair() -> (MessageEvidence, MessageHistoryHandle, AttemptScope) {
+    use crate::org::message_history::{EffectCertainty, ExecutorHold};
+    let e = evidence();
+    let history = live_history(0);
+    let now = e.clock().now().unwrap();
+    let mut scope = scope();
+    scope.message_id = MessageId::new(3);
+    scope.attempt_seq = 4;
+    e.register(scope.message_id, "[m3] Read: atm inbox --id m3".into())
+        .unwrap();
+    history
+        .record(
+            HistoryUpdate::Applied {
+                seq: 4,
+                at: now,
+                event: Some(atm_org::OrgEvent::MessageDeliveryAttempted {
+                    message_id: scope.message_id,
+                    attempt: 1,
+                    pane: "%7".into(),
+                }),
+            },
+            now,
+        )
+        .unwrap();
+    e.arm(scope.clone()).unwrap();
+    for update in [
+        HistoryUpdate::Armed {
+            scope: scope.clone(),
+        },
+        HistoryUpdate::Paste {
+            id: scope.message_id,
+            pane: scope.pane.clone(),
+            certainty: EffectCertainty::Applied,
+        },
+        HistoryUpdate::Held {
+            id: scope.message_id,
+            attempt_seq: 4,
+            hold: ExecutorHold::InputOutcomeUnknown,
+        },
+        HistoryUpdate::AttemptExited {
+            id: scope.message_id,
+            attempt_seq: 4,
+            paste: EffectCertainty::Applied,
+            enter: EffectCertainty::NotStarted,
+            cancelled: false,
+        },
+    ] {
+        history.record(update, now).unwrap();
+    }
+    (e, history, scope)
+}
+
+// Break caught: receiving evidence leaves the final actor guard valid until a later copy.
+#[test]
+fn recovery_claim_receipt_and_activity_revoke_before_history_copy() {
+    for exact in [false, true] {
+        let (e, history, scope) = recovery_pair();
+        let now = e.clock().now().unwrap();
+        let claim = e
+            .claim_recovery(&history, scope.clone(), false, now)
+            .unwrap();
+        let guard = claim.guard();
+        assert_eq!(claim.scope(), &scope);
+        assert!(guard.is_valid());
+        assert_eq!(e.recovery_registrations(), 1);
+        assert_eq!(history.recovery_registrations().unwrap(), 1);
+        let event = if exact {
+            LifecycleEvent::PromptSubmit {
+                prompt: Some("[m3] Read: atm inbox --id m3".into()),
+            }
+        } else {
+            LifecycleEvent::WorkingStart
+        };
+        e.observe(&SessionId::new("session"), Some("%7"), Harness::Pi, &event)
+            .unwrap();
+        assert!(
+            !guard.is_valid(),
+            "exact={exact}: final guard was not revoked"
+        );
+        assert!(
+            history
+                .snapshot(scope.message_id, now)
+                .unwrap()
+                .live
+                .confirmation
+                .is_none(),
+            "no history copy has run"
+        );
+        drop(claim);
+        assert_eq!(e.recovery_registrations(), 0);
+        assert_eq!(history.recovery_registrations().unwrap(), 0);
+        assert!(!guard.is_valid());
+    }
+}
+
+// Break caught: Drop/return leaks registrations or permits a second recovery.
+#[test]
+fn recovery_claim_drop_deregisters_both_stores_and_never_rearms() {
+    let (e, history, scope) = recovery_pair();
+    let now = e.clock().now().unwrap();
+    let claim = e
+        .claim_recovery(&history, scope.clone(), false, now)
+        .unwrap();
+    let view = claim.guard();
+    assert!(view.is_valid());
+    assert!(e
+        .claim_recovery(&history, scope.clone(), false, now)
+        .is_err());
+    drop(claim);
+    assert!(!view.is_valid());
+    assert_eq!(e.recovery_registrations(), 0);
+    assert_eq!(history.recovery_registrations().unwrap(), 0);
+    assert!(e
+        .claim_recovery(&history, scope.clone(), false, now)
+        .is_err());
+    assert_eq!(e.recovery_registrations(), 0);
+    assert_eq!(history.recovery_registrations().unwrap(), 0);
+}
+
+#[test]
+fn recovery_claim_evidence_store_failure_and_release_revoke() {
+    for veto in ["release", "disable", "poison"] {
+        let (e, history, scope) = recovery_pair();
+        let now = e.clock().now().unwrap();
+        let claim = e
+            .claim_recovery(&history, scope.clone(), false, now)
+            .unwrap();
+        let view = claim.guard();
+        match veto {
+            "release" => e.release(scope.message_id, scope.attempt_seq).unwrap(),
+            "disable" => {
+                let mut state = e.state().unwrap();
+                e.disable(&mut state, "Synthetic: unavailable");
+            }
+            "poison" => {
+                let shared = e.state.clone();
+                let result = std::panic::catch_unwind(move || {
+                    let _lock = shared.lock().unwrap();
+                    panic!("Synthetic: poisoned evidence");
+                });
+                assert!(result.is_err());
+                assert!(e.snapshot(scope.message_id).is_err());
+            }
+            _ => unreachable!(),
+        }
+        assert!(!view.is_valid(), "{veto}");
+        drop(claim);
+        assert_eq!(e.recovery_registrations(), 0, "{veto}");
+        assert_eq!(history.recovery_registrations().unwrap(), 0, "{veto}");
+    }
 }

@@ -952,6 +952,7 @@ mod tests {
             );
             h.command(
                 OrgCommand::SendMessage(MessageContent {
+                    delivery_notice: None,
                     from: Address::Owner,
                     to: if to_owner {
                         Address::Owner

@@ -12,7 +12,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may panic
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
 use atm_core::{SessionId, SessionStatus, SessionView};
 use atm_tui::app::{App, AppState};
@@ -24,6 +24,7 @@ use atm_tui::ui::{
     session_list::{render_compact_session_list, render_session_list},
     status_bar::{render_compact_footer, render_footer, render_header},
 };
+use atm_tui::work::{WorkEffect, WorkInput, WorkOrg, WorkWindows};
 use chrono::{DateTime, Utc};
 use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
 
@@ -116,6 +117,45 @@ fn make_session(
         worktree_branch: Some(branch.to_string()),
         ..Default::default()
     }
+}
+
+// Intentional UI: only the named parent gets a waiting-decision mark.
+fn decision_mark_app() -> App {
+    let mut app = App::new();
+    let parent = SessionView {
+        id: "parent".into(),
+        id_short: "parent".into(),
+        project_root: Some("/fixtures/project".into()),
+        tmux_pane: Some("%7".into()),
+        ..Default::default()
+    };
+    let child = SessionView {
+        id: "child".into(),
+        id_short: "child".into(),
+        parent_session_id: Some(parent.id.clone()),
+        ..parent.clone()
+    };
+    app.update_sessions(vec![parent, child]);
+    app.decision_panes.insert("%7".into());
+    app
+}
+#[test]
+fn waiting_decision_normal() {
+    let app = decision_mark_app();
+    let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+    terminal
+        .draw(|f| render_session_list(f, f.area(), &app))
+        .unwrap();
+    insta::assert_debug_snapshot!(terminal.backend().buffer());
+}
+#[test]
+fn waiting_decision_compact() {
+    let app = decision_mark_app();
+    let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+    terminal
+        .draw(|f| render_compact_session_list(f, f.area(), &app))
+        .unwrap();
+    insta::assert_debug_snapshot!(terminal.backend().buffer());
 }
 
 fn make_app_with_sessions() -> App {
@@ -772,6 +812,332 @@ fn footer_search_prompt() {
         render_footer(frame, area, &app);
     });
     insta::assert_debug_snapshot!(buf);
+}
+
+fn work_windows(other_window_child: bool) -> WorkWindows {
+    serde_json::from_value(serde_json::json!({"state":"ok","windows":[
+        {"id":"@3","name":"support","links":[{"session":"work","index":3}],"panes":["%7","%8"]},
+        {"id":"@4","name":"review","links":[{"session":"work","index":4}],"panes": if other_window_child {vec!["%9","%10"]} else {vec!["%10"]}}
+    ]})).unwrap()
+}
+fn work_org() -> WorkOrg {
+    serde_json::from_value(serde_json::json!({"seq":41,"projects":[{
+        "seats":[{"agent_id":"alpha/watcher","pane":"%7","tasks":["t41","t42"]},
+                 {"agent_id":"alpha/reviewer","pane":"%10","tasks":[]}],
+        "tasks":[{"task_id":"t41","title":"Watch the login"},{"task_id":"t42","title":"Check docs"}]
+    }],"needs_owner":{"items":[{"kind":"decision_pending","agent_id":"alpha/watcher"},
+        {"kind":"seat_attention","agent_id":"alpha/watcher"}]}}))
+    .unwrap()
+}
+fn work_load(app: &mut App, effects: Vec<WorkEffect>, windows: WorkWindows, org: WorkOrg) {
+    for effect in effects {
+        let input = match effect {
+            WorkEffect::RequestWindows(generation) => WorkInput::WindowsReply {
+                generation,
+                result: Ok(windows.clone()),
+            },
+            WorkEffect::RequestOrg(generation) => WorkInput::OrgReply {
+                generation,
+                result: Ok(org.clone()),
+            },
+            _ => continue,
+        };
+        let _ = app.reduce_work(input, Duration::ZERO);
+    }
+}
+fn work_app() -> App {
+    let mut app = App::new();
+    let mut parent = make_session(
+        "parent01",
+        "/fixtures/alpha",
+        "cp/work-a",
+        "Opus 4.5",
+        SessionStatus::Idle,
+        "idle",
+        12.0,
+        0.0,
+        "2026-01-15T12:00:00Z",
+    );
+    parent.tmux_pane = Some("%7".into());
+    let child = SessionView {
+        id: "child001".into(),
+        id_short: "child001".into(),
+        parent_session_id: Some(parent.id.clone()),
+        worktree_branch: None,
+        status: SessionStatus::Working,
+        context_percentage: 0.0,
+        ..parent.clone()
+    };
+    let mut other = make_session(
+        "unnamed1",
+        "/fixtures/beta",
+        "cp/u2",
+        "Model B",
+        SessionStatus::Working,
+        "working",
+        54.0,
+        0.0,
+        "2026-01-15T12:00:01Z",
+    );
+    other.tmux_pane = Some("%8".into());
+    other.harness = "pi".into();
+    let mut review = make_session(
+        "review01",
+        "/fixtures/alpha",
+        "cp/review",
+        "Model C",
+        SessionStatus::Idle,
+        "idle",
+        0.0,
+        0.0,
+        "2026-01-15T12:00:02Z",
+    );
+    review.tmux_pane = Some("%10".into());
+    review.harness = "codex".into();
+    app.update_sessions(vec![parent, child, other, review]);
+    let _ = app.reduce_work(
+        WorkInput::Capabilities {
+            methods: vec!["session.windows".into(), "org.tree".into()],
+            watch: false,
+        },
+        Duration::ZERO,
+    );
+    let effects = app.toggle_work_view(Duration::ZERO);
+    work_load(&mut app, effects, work_windows(false), work_org());
+    app.selected_index = app.tree_rows.iter().position(|row| matches!(&row.kind, atm_core::TreeRowKind::Agent {session} if session.id.as_str() == "parent01")).unwrap();
+    app
+}
+fn work_buffer(app: &App, compact: bool) -> Buffer {
+    render_buffer(if compact { 40 } else { 100 }, 12, |frame, area| {
+        if compact {
+            render_compact_session_list(frame, area, app);
+        } else {
+            render_session_list(frame, area, app);
+        }
+    })
+}
+fn buffer_text(buffer: &Buffer) -> String {
+    buffer
+        .content
+        .chunks(usize::from(buffer.area.width).max(1))
+        .map(|row| {
+            let mut text = String::new();
+            let mut covered = 0;
+            for cell in row {
+                if covered > 0 {
+                    covered -= 1;
+                    continue;
+                }
+                text.push_str(cell.symbol());
+                covered = ratatui::text::Span::raw(cell.symbol())
+                    .width()
+                    .saturating_sub(1);
+            }
+            text
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn work_windows_with_marks() {
+    let buf = work_buffer(&work_app(), false);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("Work · 2 windows, 4 agents")
+            && text.contains("2 open")
+            && text.contains("?1")
+    );
+    assert!(
+        text.contains("watcher")
+            && text.contains("◐ t41 Watch the login +1")
+            && text.contains("cp/work-a")
+    );
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_folded_window_counts() {
+    let mut app = work_app();
+    app.collapse_all();
+    let buf = work_buffer(&app, false);
+    let text = buffer_text(&buf);
+    assert!(text.contains("support (3)") && text.contains("review (1)") && text.contains("2 open"));
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_no_window_group() {
+    let mut app = work_app();
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(
+        &mut app,
+        effects,
+        serde_json::from_value(serde_json::json!({"state":"ok","windows":[]})).unwrap(),
+        work_org(),
+    );
+    let buf = work_buffer(&app, false);
+    assert!(
+        buffer_text(&buf).contains("Work · 0 windows, 4 agents")
+            && buffer_text(&buf).contains("(no window)")
+    );
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_child_in_other_window() {
+    let mut app = work_app();
+    let mut child = app
+        .sessions
+        .values()
+        .find(|s| s.id.as_str() == "child001")
+        .unwrap()
+        .clone();
+    child.tmux_pane = Some("%9".into());
+    app.update_sessions(vec![child]);
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, work_windows(true), work_org());
+    let buf = work_buffer(&app, false);
+    let text = buffer_text(&buf);
+    assert!(text.find("4 review").unwrap() < text.find("child001").unwrap());
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_no_org_data() {
+    let mut app = work_app();
+    let _ = app.reduce_work(
+        WorkInput::Capabilities {
+            methods: vec!["session.windows".into()],
+            watch: false,
+        },
+        Duration::ZERO,
+    );
+    let buf = work_buffer(&app, false);
+    let text = buffer_text(&buf);
+    assert!(text.contains("no org data") && !text.contains("watcher") && !text.contains("t41"));
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_stale() {
+    let mut app = work_app();
+    app.work_now = Duration::from_secs(12);
+    let buf = work_buffer(&app, false);
+    assert!(buffer_text(&buf).contains("stale 12s"));
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_needs_newer_daemon() {
+    let mut app = work_app();
+    let _ = app.reduce_work(
+        WorkInput::Capabilities {
+            methods: vec!["org.tree".into()],
+            watch: true,
+        },
+        Duration::ZERO,
+    );
+    let buf = work_buffer(&app, false);
+    assert!(buffer_text(&buf).contains("Work needs a newer atmd. w: Sessions"));
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn compact_work_list() {
+    let buf = work_buffer(&work_app(), true);
+    assert!(buffer_text(&buf).contains("watcher") && buffer_text(&buf).contains("2 open"));
+    insta::assert_debug_snapshot!(buf);
+}
+
+// Lead Medium 1: a pane-sharing child must never impersonate the parent seat.
+#[test]
+fn work_pane_marks_belong_only_to_parentless_rows() {
+    let app = work_app();
+    for compact in [false, true] {
+        let text = buffer_text(&work_buffer(&app, compact));
+        let parent = text.lines().find(|line| line.contains("watcher")).unwrap();
+        assert!(
+            parent.contains("t41") && parent.contains('?') && parent.contains('!'),
+            "{parent}"
+        );
+        let child = text.lines().find(|line| line.contains("child001")).unwrap();
+        assert!(
+            !child.contains("watcher")
+                && !child.contains("t41")
+                && !child.contains('?')
+                && !child.contains('!'),
+            "{child}"
+        );
+    }
+}
+
+// Break caught: missing titles invent text/counts, or new Work text introduces controls into rows.
+#[test]
+fn work_capped_titles_and_untrusted_unicode_text_remain_honest() {
+    let mut app = work_app();
+    let mut org = work_org();
+    org.projects.first_mut().unwrap().tasks.clear();
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, work_windows(false), org);
+    let text = buffer_text(&work_buffer(&app, false));
+    assert!(
+        text.contains("2 open") && text.contains("◐ t41 +1") && !text.contains("Watch the login")
+    );
+    let mut org = work_org();
+    org.projects
+        .first_mut()
+        .unwrap()
+        .tasks
+        .first_mut()
+        .unwrap()
+        .title = "界\u{1b}[2J\tA\nB".repeat(40);
+    let mut windows = work_windows(false);
+    windows.windows.first_mut().unwrap().name = "支援\u{1b}[2J\nname".into();
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, windows, org);
+    for width in [0, 1, 20, 30, 100] {
+        for compact in [false, true] {
+            let buf = render_buffer(width, 12, |frame, area| {
+                if compact {
+                    render_compact_session_list(frame, area, &app)
+                } else {
+                    render_session_list(frame, area, &app)
+                }
+            });
+            assert!(buf
+                .content
+                .iter()
+                .all(|cell| !cell.symbol().chars().any(char::is_control)));
+        }
+    }
+    let text = buffer_text(&work_buffer(&app, false));
+    assert!(
+        text.contains("支援\\u{1b}[2J\\nname") && text.contains("界\\u{1b}[2J\\tA\\nB"),
+        "{text}"
+    );
+}
+
+// Break caught: Work counts visible rows instead of full filtered groups, or old-daemon state leaks into Sessions.
+#[test]
+fn work_counts_empty_filter_and_capabilities_leave_sessions_unchanged() {
+    let mut app = work_app();
+    let _ = app.toggle_work_view(Duration::ZERO);
+    let sessions = work_buffer(&app, false);
+    let _ = app.reduce_work(
+        WorkInput::Capabilities {
+            methods: vec![],
+            watch: false,
+        },
+        Duration::ZERO,
+    );
+    let _ = app.toggle_work_view(Duration::ZERO);
+    assert!(buffer_text(&work_buffer(&app, false)).contains("needs a newer atmd"));
+    let _ = app.toggle_work_view(Duration::ZERO);
+    assert_eq!(work_buffer(&app, false), sessions);
+    let mut app = work_app();
+    app.start_search();
+    for c in "pi".chars() {
+        app.push_search_char(c);
+    }
+    app.collapse_all();
+    assert!(buffer_text(&work_buffer(&app, false)).contains("Work · 1 windows, 1 agents"));
+    app.clear_filter();
+    app.replace_sessions(vec![]);
+    assert!(buffer_text(&work_buffer(&app, false)).contains("Work · 0 windows, 0 agents"));
 }
 
 #[test]

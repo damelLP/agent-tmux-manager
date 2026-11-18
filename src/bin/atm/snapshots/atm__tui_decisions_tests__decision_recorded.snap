@@ -1,0 +1,18 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 395
+expression: "rendered(&mut view,80,14)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────────────────────────┐
+ │d41 resolved: " yes " (recorded)                                            │
+ │No files are reverted.                                                      │
+ │↑/↓: scroll; i: inspect; Esc: back                                          │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘

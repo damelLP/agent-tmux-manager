@@ -253,10 +253,11 @@ async fn me_surfaces_refusal_old_daemon_invalid_result_and_broken_stdout() {
         .await;
         assert_eq!(
             output.status.code(),
-            Some(1),
+            Some(141),
             "{format}: stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 }
 
@@ -309,6 +310,7 @@ async fn me_real_daemon_context_and_report_command() {
             session_id: None,
         },
         OrgCommand::SendMessage(MessageContent {
+            delivery_notice: None,
             from: Address::Owner,
             to: "project/worker".parse().unwrap(),
             kind: MessageKind::Brief,

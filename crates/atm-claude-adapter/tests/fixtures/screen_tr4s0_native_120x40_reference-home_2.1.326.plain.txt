@@ -1,0 +1,41 @@
+Captured: Claude Code 2.1.326, 2026-11-17, sealed stage-only tmux capture-pane -p -N.
+
+ ▐▛███▛█   Claude Code v2.1.326                             
+▝▜██████▀  Haiku 5.5 · API Usage Billing                    
+ ▝▝   ▝▝   /tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…                                                        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    ◐ medium · /effort  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ [m123456] Read: atm inbox --id m123456                    
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                      

@@ -44,6 +44,7 @@ pub fn resolve_pane_id(sessions: &[SessionView], target: &str) -> Result<String,
 
 /// Read the target pane's state, refuse unsafe input, then paste and submit.
 /// Returns the pane id for the caller to report; never prints.
+#[cfg(test)]
 pub async fn send(
     client: &(impl TmuxClient + ?Sized),
     sessions: &[SessionView],
@@ -55,6 +56,7 @@ pub async fn send(
 }
 
 /// The actor resolves, fences and projects rows before entering this same turn.
+#[cfg(test)]
 pub(super) async fn send_resolved(
     client: &(impl TmuxClient + ?Sized),
     sessions: &[SessionView],

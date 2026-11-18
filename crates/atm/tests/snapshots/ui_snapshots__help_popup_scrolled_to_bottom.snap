@@ -1,5 +1,6 @@
 ---
 source: crates/atm/tests/ui_snapshots.rs
+assertion_line: 643
 expression: buf
 ---
 Buffer {
@@ -12,8 +13,6 @@ Buffer {
         "                                                                                                                        ",
         "                                                                                                                        ",
         "                        ┌ Help (j/k to scroll) ────────────────────────────────────────────────┐                        ",
-        "                        │    k / ↑       Move up                                               │                        ",
-        "                        │    0 / gg      Go to top                                             │                        ",
         "                        │    G           Go to bottom                                          │                        ",
         "                        │    Ctrl-d      Half page down                                        │                        ",
         "                        │    Ctrl-u      Half page up                                          │                        ",
@@ -26,6 +25,8 @@ Buffer {
         "                        │                                                                      │                        ",
         "                        │  Actions                                                             │                        ",
         "                        │                                                                      │                        ",
+        "                        │    w           Toggle Work / Sessions view                           │                        ",
+        "                        │    a           Answer waiting decision                               │                        ",
         "                        │    c           Toggle coordinator tag                                │                        ",
         "                        │    Enter       Jump to session (leaf) / toggle fold (group)          │                        ",
         "                        │    r           Rescan / refresh                                      │                        ",
@@ -96,13 +97,12 @@ Buffer {
         x: 95, y: 15, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
         x: 96, y: 15, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 24, y: 16, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
-        x: 25, y: 16, fg: Cyan, bg: Reset, underline: Reset, modifier: BOLD,
-        x: 41, y: 16, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 25, y: 16, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 95, y: 16, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
         x: 96, y: 16, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 24, y: 17, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
-        x: 25, y: 17, fg: Cyan, bg: Reset, underline: Reset, modifier: BOLD,
-        x: 41, y: 17, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 25, y: 17, fg: Yellow, bg: Reset, underline: Reset, modifier: BOLD,
+        x: 34, y: 17, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 95, y: 17, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
         x: 96, y: 17, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 24, y: 18, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
@@ -110,12 +110,13 @@ Buffer {
         x: 95, y: 18, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
         x: 96, y: 18, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 24, y: 19, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
-        x: 25, y: 19, fg: Yellow, bg: Reset, underline: Reset, modifier: BOLD,
-        x: 34, y: 19, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 25, y: 19, fg: Cyan, bg: Reset, underline: Reset, modifier: BOLD,
+        x: 41, y: 19, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 95, y: 19, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
         x: 96, y: 19, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 24, y: 20, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
-        x: 25, y: 20, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
+        x: 25, y: 20, fg: Cyan, bg: Reset, underline: Reset, modifier: BOLD,
+        x: 41, y: 20, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 95, y: 20, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,
         x: 96, y: 20, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
         x: 24, y: 21, fg: Cyan, bg: Reset, underline: Reset, modifier: NONE,

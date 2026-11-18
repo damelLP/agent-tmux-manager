@@ -383,10 +383,11 @@ impl Rig {
     async fn titled(&self, title: &str, creator: Address, to: &str) -> TaskId {
         let by = TaskActor {
             who: creator.clone(),
-            lead: true,
+            manager_of: None,
         };
         let made = self
             .run(OrgCommand::Task(TaskCommand::Create(TaskCreated {
+                project_id: None,
                 title: title.into(),
                 kind: TaskKind::Work,
                 creator,
@@ -415,7 +416,7 @@ impl Rig {
             reason: reason.map(Into::into),
             by: TaskActor {
                 who: Address::Agent(agent(who)),
-                lead: false,
+                manager_of: None,
             },
         }))
         .await;
@@ -655,6 +656,7 @@ async fn a_silent_turn_end_is_answered_after_the_delay_audit_first() {
     assert_eq!(
         note,
         MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to: Address::Agent(agent("build")),
             kind: MessageKind::Note,
@@ -728,6 +730,7 @@ async fn the_next_silent_turn_end_is_told_to_the_creator() {
     assert_eq!(
         note,
         MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to: Address::Agent(agent("lead")),
             kind: MessageKind::Note,
@@ -759,6 +762,7 @@ async fn mail_on_its_way_holds_the_reminder_until_it_is_typed() {
     rig.task(Address::Agent(agent("lead")), "build").await;
     let mail = rig
         .run(OrgCommand::SendMessage(MessageContent {
+            delivery_notice: None,
             from: Address::Agent(agent("lead")),
             to: Address::Agent(agent("build")),
             kind: MessageKind::Note,
@@ -869,7 +873,7 @@ async fn a_task_that_moved_since_the_snapshot_gets_no_event_and_no_note() {
         files: vec![],
         by: TaskActor {
             who: Address::Agent(agent("build")),
-            lead: false,
+            manager_of: None,
         },
     }))
     .await;
@@ -1150,10 +1154,11 @@ async fn long_titles_are_cut_and_many_tasks_wait_for_the_next_turn_end() {
     let rig = Rig::new().await;
     let by = TaskActor {
         who: Address::Owner,
-        lead: false,
+        manager_of: None,
     };
     let made = rig
         .run(OrgCommand::Task(TaskCommand::Create(TaskCreated {
+            project_id: None,
             title: "é".repeat(200),
             kind: TaskKind::Work,
             creator: Address::Owner,

@@ -6,6 +6,52 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+#[allow(dead_code, clippy::expect_used)]
+#[path = "../../../tests/support/stand_in/process.rs"]
+mod process;
+
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Observe bytes without attaching a client or changing focus/geometry. The
+/// reader's same-server signal runs after tmux's PTY callback parsed the bytes.
+async fn output_event(client: &RealTmuxClient, pane: &str, marker: &str, channel: &str) {
+    let socket = client
+        .raw_command("display-message", &["-p", "#{socket_path}"])
+        .await
+        .unwrap();
+    let program = format!(
+        "import os, subprocess\ndata=b''\nwhile {marker:?}.encode() not in data:\n chunk=os.read(0,65536)\n if not chunk: raise EOFError('pane output')\n data+=chunk\nsubprocess.run(['tmux','-S',{:?},'wait-for','-S',{channel:?}],check=True,timeout=30)\n", socket.trim()
+    );
+    client
+        .raw_command(
+            "pipe-pane",
+            &["-O", "-t", pane, &format!("python3 -c {}", quote(&program))],
+        )
+        .await
+        .unwrap();
+}
+
+async fn wait_event(client: &RealTmuxClient, channel: &str) {
+    let socket = client
+        .raw_command("display-message", &["-p", "#{socket_path}"])
+        .await
+        .unwrap();
+    let channel = channel.to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        process::run(std::process::Command::new("tmux").args([
+            "-S",
+            socket.trim(),
+            "wait-for",
+            &channel,
+        ]))
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
 async fn rpc(
     socket: &std::path::Path,
     method: &str,
@@ -44,7 +90,7 @@ fn reservation(kind: ReservationKind) -> ReservationRequest {
     )
 }
 
-/// Real shell Enter is acknowledged by tmux wait-for, not a redraw delay.
+/// Real receiver Enter is acknowledged by tmux wait-for, not a redraw delay.
 /// Real DaemonServer, OrgHandle and shared control actor; no model CLI runs.
 #[tokio::test]
 #[ignore = "requires explicit sealed environment and private tmux server"]
@@ -62,8 +108,37 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
     let label = format!("{}-rpc", std::env::var("ATM_TMUX_SOCKET").unwrap());
     assert!(label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     let client = RealTmuxClient::with_socket(label.clone());
-    client.raw_command("new-session", &["-d", "-s", "private-clear", "-x", "80", "-y", "24",
-        &format!("sh -c 'read line; env -u TMUX -u TMUX_PANE tmux -L {label} wait-for -S clear-entered; exec cat'")]).await.unwrap();
+    // Like the literal-key fixture below, run a program as the pane root:
+    // a Ready/bound agent backed by an idle shell is correctly reconciled Down.
+    let receiver = r#"import os, subprocess, sys
+tmux = ['tmux', '-S', os.environ['TMUX'].rsplit(',', 2)[0]]
+def signal(channel):
+    subprocess.run(tmux + ['wait-for', '-S', channel], check=True, timeout=30)
+signal('fixture-ready')
+if not sys.stdin.readline():
+    raise EOFError('clear Enter')
+signal('clear-entered')
+while data := os.read(0, 4096):
+    os.write(1, data)
+"#;
+    client
+        .raw_command(
+            "new-session",
+            &[
+                "-d",
+                "-s",
+                "private-clear",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "python3",
+                "-c",
+                receiver,
+            ],
+        )
+        .await
+        .unwrap();
     verify_private(&client, &root).await;
     let cancel = CancellationToken::new();
     let org_cancel = CancellationToken::new();
@@ -92,6 +167,8 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
     // its verified private server and daemon instead of abandoning live panes.
     let probe = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(90), async move {
+            // The event comes from Python after exec, never the launching shell.
+            wait_event(&work_client, "fixture-ready").await;
             org.execute(
                 OrgCommand::RegisterProject {
                     project_id: "project".parse().unwrap(),
@@ -177,7 +254,7 @@ async fn reserved_real_rpc_refuses_clear_and_holds_delivery_until_ready() {
                 )
                 .await
             });
-            let _ = entry.await.unwrap(); // real shell consumed clear's Enter
+            let _ = entry.await.unwrap(); // real receiver consumed clear's Enter
             let c = control.clone();
             let o = org.clone();
             let mut delivery = Box::pin(async move {
@@ -550,8 +627,24 @@ async fn check_control_byte_process_names(
     client: RealTmuxClient,
     control: atmd::control::service::ControlHandle,
 ) {
+    use tokio::io::AsyncReadExt;
     for name in ["A\nB", "tab\there", "esc\u{1b}[31mred"] {
-        let command = format!("exec /bin/bash -c 'exec -a \"{name}\" sleep 300'");
+        let fixture = tempfile::tempdir_in(std::env::var("TMUX_TMPDIR").unwrap()).unwrap();
+        let source = fixture.path().join("exec.py");
+        let socket = fixture.path().join("exec.sock");
+        std::fs::write(&source, "import socket, sys\ns=socket.socket(socket.AF_UNIX)\ns.connect(sys.argv[1])\ns.sendall(b'R')\ns.recv(1)\n").unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // Python acknowledges from inside the exec'd process; argv0 retains
+        // the same literal control bytes as the former sleeping fixture.
+        let command = format!(
+            "exec /bin/bash -c {}",
+            quote(&format!(
+                "exec -a {} /usr/bin/python3 {} {}",
+                quote(name),
+                quote(source.to_str().unwrap()),
+                quote(socket.to_str().unwrap())
+            ))
+        );
         let created = client
             .raw_command("new-window", &["-d", "-P", "-F", "#{pane_id}", &command])
             .await
@@ -564,18 +657,20 @@ async fn check_control_byte_process_names(
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let args = tokio::fs::read(format!("/proc/{}/cmdline", pid.trim()))
-                    .await
-                    .unwrap();
-                if args.split(|byte| *byte == 0).next() == Some(name.as_bytes()) {
-                    break;
-                }
-            }
+        // Keep the socket until inspection/kill: EOF would end the fixture.
+        let (_ready, args) = tokio::time::timeout(Duration::from_secs(30), async {
+            let (mut ready, _) = listener.accept().await.unwrap();
+            assert_eq!(ready.read_u8().await.unwrap(), b'R');
+            let args = tokio::fs::read(format!("/proc/{}/cmdline", pid.trim()))
+                .await
+                .unwrap();
+            (ready, args)
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            panic!("after-exec fixture readiness/identity exceeded the 30 s hang guard")
+        });
+        assert_eq!(args.split(|byte| *byte == 0).next(), Some(name.as_bytes()));
         client
             .raw_command(
                 "set-option",
@@ -638,6 +733,8 @@ async fn reserved_real_literal_key_delivers_exactly_one_byte() {
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 tty.setraw(0)
+s.sendall(b'T')
+assert s.recv(1) == b'G'
 os.write(1, b'literal fixture ready\r\n')
 s.sendall(b'R')
 while True:
@@ -692,10 +789,29 @@ s.recv(1)
     let daemon =
         atmd::server::DaemonServer::with_services(&daemon_socket, services, cancel.clone());
     let server = tokio::spawn(async move { daemon.run().await });
+    let output_client = client.clone();
     let probe = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(90), async move {
             let (mut receiver, _) = listener.accept().await.unwrap();
+            assert_eq!(receiver.read_u8().await.unwrap(), b'T');
+            let held = control
+                .observe(&PaneId::parse("%0").unwrap(), CaptureFormat::Plain)
+                .await
+                .unwrap();
+            assert!(
+                !held.text.contains("literal fixture ready"),
+                "PTY output escaped its fixture gate"
+            );
+            output_event(
+                &output_client,
+                "%0",
+                "literal fixture ready",
+                "literal-parsed",
+            )
+            .await;
+            receiver.write_all(b"G").await.unwrap();
             assert_eq!(receiver.read_u8().await.unwrap(), b'R');
+            wait_event(&output_client, "literal-parsed").await;
             control
                 .run_reserved(
                     reservation(ReservationKind::Adopt),
@@ -709,13 +825,8 @@ s.recv(1)
                     reservation(ReservationKind::Up),
                     move |r| async move {
                         let pane = PaneId::parse("%0")?;
-                        // Socket readiness may precede tmux's PTY read: observe the actual condition.
-                        let baseline = loop {
-                            let fresh = r.capture(&pane, CaptureFormat::Plain).await?;
-                            if fresh.text.contains("literal fixture ready") {
-                                break fresh;
-                            }
-                        };
+                        let baseline = r.capture(&pane, CaptureFormat::Plain).await?;
+                        assert!(baseline.text.contains("literal fixture ready"));
                         assert_eq!(baseline.focused, Some(false));
                         let pid = baseline.inspection.pane_root_pid();
                         let command = baseline.inspection.foreground_command.clone();
@@ -780,6 +891,142 @@ s.recv(1)
     drop(probe.unwrap());
 }
 
+/// Fresh single-process frames and actual input, synchronized by tmux events.
+#[tokio::test]
+#[ignore = "requires explicit sealed environment and private tmux server"]
+async fn reserved_real_compound_capture_and_guarded_input() {
+    assert!(std::env::var_os("TMUX").is_none());
+    assert!(std::env::var_os("TMUX_PANE").is_none());
+    let root = std::env::var("TMUX_TMPDIR").unwrap();
+    let label = format!("{}-compound", std::env::var("ATM_TMUX_SOCKET").unwrap());
+    assert!(label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    let client = RealTmuxClient::with_socket(label.clone());
+    let command = format!(
+        "printf '\\033[31mprobe  \\033[39m   \\nready     \\n'; \
+         env -u TMUX -u TMUX_PANE tmux -L {label} wait-for -S screen-ready; \
+         read -r line; printf 'ACK:%s\\n' \"$line\"; \
+         env -u TMUX -u TMUX_PANE tmux -L {label} wait-for -S input-seen; exec /bin/cat"
+    );
+    client
+        .raw_command(
+            "new-session",
+            &["-d", "-s", "alpha", "-x", "80", "-y", "8", &command],
+        )
+        .await
+        .unwrap();
+    verify_private(&client, &root).await;
+    let identity = client
+        .raw_command("display-message", &["-p", "#{socket_path}\t#{pid}"])
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let (control, actor) = spawn_control(
+        Box::new(client.clone()),
+        atmd::registry::spawn_registry(),
+        atmd::org::OrgHandle::disabled("compound real probe"),
+        cancel.clone(),
+    );
+    let c = client.clone();
+    let result = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(90), async move {
+            c.raw_command("wait-for", &["screen-ready"]).await.unwrap();
+            c.raw_command("set-option", &["-g", "@atm-agent", "beta/inherited"])
+                .await
+                .unwrap();
+            let pane = PaneId::parse("%0").unwrap();
+            let inherited = control.observe(&pane, CaptureFormat::Plain).await.unwrap();
+            assert_eq!(inherited.inspection.local_agent_tag, None);
+            assert_eq!(inherited.focused, Some(false));
+            c.raw_command(
+                "set-option",
+                &["-p", "-t", "%0", "@atm-agent", "alpha/seat0"],
+            )
+            .await
+            .unwrap();
+            c.raw_command("new-session", &["-d", "-s", "beta", "-t", "alpha"])
+                .await
+                .unwrap();
+            for format in [CaptureFormat::Plain, CaptureFormat::Ansi] {
+                let capture = control.observe(&pane, format).await.unwrap();
+                assert_eq!(
+                    capture.inspection.local_agent_tag.as_deref(),
+                    Some("alpha/seat0")
+                );
+                assert_eq!(capture.focused, Some(false));
+                assert!(capture.text.contains("ready"));
+                assert_eq!(
+                    capture.text.split_terminator('\n').count(),
+                    usize::from(capture.inspection.pane.height)
+                );
+                if format == CaptureFormat::Ansi {
+                    assert!(capture.text.contains("\x1b[31mprobe"));
+                }
+            }
+            control
+                .run_reserved(
+                    ReservationRequest::new(
+                        "alpha/seat0".parse().unwrap(),
+                        Some(pane.clone()),
+                        ReservationKind::Delivery,
+                        WaitPolicy::Wait,
+                        Instant::now() + Duration::from_secs(60),
+                    ),
+                    move |r| async move {
+                        r.paste_guarded(
+                            &pane,
+                            r.agent().clone(),
+                            "probe-accepted".into(),
+                            CaptureFormat::Plain,
+                            |fresh| fresh.focused == Some(false) && fresh.text.contains("ready"),
+                        )
+                        .await?;
+                        r.keys_guarded(
+                            &pane,
+                            r.agent().clone(),
+                            PaneKey::Enter,
+                            CaptureFormat::Plain,
+                            |fresh| {
+                                fresh.focused == Some(false)
+                                    && fresh.text.contains("probe-accepted")
+                            },
+                        )
+                        .await
+                    },
+                    |_, _| async { Ok(()) },
+                )
+                .await
+                .unwrap();
+            c.raw_command("wait-for", &["input-seen"]).await.unwrap();
+            let after = control
+                .observe(&PaneId::parse("%0").unwrap(), CaptureFormat::Plain)
+                .await
+                .unwrap();
+            assert!(after.text.contains("ACK:probe-accepted"));
+            assert!(matches!(
+                control
+                    .observe(&PaneId::parse("%987654").unwrap(), CaptureFormat::Plain)
+                    .await,
+                Err(ReservationError::PaneGone { .. })
+            ));
+        })
+        .await
+        .unwrap();
+    })
+    .await;
+    cancel.cancel();
+    actor.await.unwrap();
+    verify_private(&client, &root).await;
+    assert_eq!(
+        client
+            .raw_command("display-message", &["-p", "#{socket_path}\t#{pid}"])
+            .await
+            .unwrap(),
+        identity
+    );
+    client.raw_command("kill-server", &[]).await.unwrap();
+    result.unwrap();
+}
+
 async fn verify_private(client: &RealTmuxClient, root: &str) {
     let identity = client
         .raw_command("display-message", &["-p", "#{socket_path}\t#{pid}"])
@@ -826,24 +1073,59 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
         .raw_command("display-message", &["-p", "#{socket_path}"])
         .await
         .unwrap();
-    let mut attached = tokio::process::Command::new("tmux")
-        .args(["-S", socket.trim(), "-C", "attach-session", "-t", "private"])
+    let (notifications, output) = std::os::unix::net::UnixStream::pair().unwrap();
+    notifications.set_nonblocking(true).unwrap();
+    let mut notifications =
+        tokio::io::BufReader::new(tokio::net::UnixStream::from_std(notifications).unwrap());
+    let mut attached = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            socket.trim(),
+            "-C",
+            "attach-session",
+            "-f",
+            "no-output",
+            "-t",
+            "private",
+        ])
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+            output,
+        )))
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
         .spawn()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while client
-            .raw_command("list-clients", &["-F", "#{client_flags}"])
-            .await
-            .unwrap()
-            .is_empty()
-        {}
+    let input = attached.stdin.take();
+    let attached_pid = attached.id();
+    let attached = process::OwnedChild::new(attached);
+    let ready = tokio::time::timeout(Duration::from_secs(30), async {
+        use tokio::io::AsyncBufReadExt;
+        loop {
+            let mut line = String::new();
+            if notifications.read_line(&mut line).await? == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            if line.starts_with("%session-changed ") {
+                return Ok(());
+            }
+        }
     })
-    .await
-    .unwrap();
+    .await;
+    if !matches!(ready, Ok(Ok(()))) {
+        cancel.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(30), actor).await;
+        org_cancel.cancel();
+        verify_private(&client, &root).await;
+        client.raw_command("kill-server", &[]).await.unwrap();
+        drop(input);
+        drop(attached); // kill + reap the owned client before reporting failure
+        panic!("attachment progress failed: {ready:?}; control actor stop: {stopped:?}");
+    }
+    assert!(!client
+        .raw_command("list-clients", &["-F", "#{client_flags}"])
+        .await
+        .unwrap()
+        .is_empty());
     let baseline = control
         .observe(&PaneId::parse("%0").unwrap(), CaptureFormat::Plain)
         .await
@@ -952,11 +1234,12 @@ async fn reserved_real_tmux_effects_and_guard_rejection() {
     actor.await.unwrap();
     verify_private(&client, &root).await;
     client.raw_command("kill-server", &[]).await.unwrap();
-    drop(attached.stdin.take());
-    tokio::time::timeout(Duration::from_secs(30), attached.wait())
+    drop(input);
+    tokio::task::spawn_blocking(move || process::wait_exit(attached_pid, Duration::from_secs(30)))
         .await
         .unwrap()
         .unwrap();
+    attached.wait_with_output().unwrap();
     result.unwrap();
     let records = org.tail(atmd::org::TailParams::default()).await.unwrap();
     assert_eq!(records.len(), 1);

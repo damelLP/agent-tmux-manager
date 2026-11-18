@@ -122,6 +122,15 @@
 //! not after `now`. This policy says whether a decision may be taken
 //! provisionally; the away policy below says when one is.
 //!
+//! [`DecisionCommand::Relay`] first requires the designated full agent ID.
+//! Pending decisions may relay any listed option, even without a recommendation,
+//! only if undoable and not a kind that always waits in the away table. The fact
+//! is provisional `by: owner` with `relayed_by` naming the recorder; self-relays
+//! have the same policy. A same-option provisional retry writes nothing, whatever
+//! its provenance; a different option returns [`DecisionRefusal::AlreadyTaken`].
+//! Closed decisions refuse. Only the owner's Resolve confirms or overrules it,
+//! retaining the relay fact and using the existing cap and frozen redo path.
+//!
 //! # Away policy
 //!
 //! The away switch arrives as [`OrgCommand::Owner`]: only the owner sets away
@@ -134,6 +143,10 @@
 //! while he is present. The stacking cap then holds `Assign` of an open task
 //! whose `rests_on` names a provisional change of intent until the owner has
 //! answered it. Both tables and their limits are in the away module's docs.
+//!
+//! Independently, only the owner designates or clears one full agent ID with
+//! [`OwnerCommand::SetRelay`]. `owner.relay_set` persists that slot; repeating
+//! the same designation writes nothing. Away and back never change it.
 //!
 //! # Tasks
 //!
@@ -195,13 +208,18 @@ mod command;
 mod config;
 mod cost;
 mod decision;
+mod decision_impact;
+mod decision_redo;
 pub mod delivery;
 mod event;
 pub mod idle;
 mod ids;
 mod intent;
+pub mod message_query;
 pub mod reminder;
 mod replay;
+mod report;
+mod return_digest;
 mod state;
 mod task;
 pub use away::*;
@@ -209,9 +227,13 @@ pub use command::*;
 pub use config::*;
 pub use cost::{TaskUsageObservation, TaskUsageObserved};
 pub use decision::*;
+pub use decision_impact::*;
+pub use decision_redo::*;
 pub use event::*;
 pub use ids::*;
 pub use intent::*;
 pub use replay::*;
+pub use report::*;
+pub use return_digest::*;
 pub use state::*;
 pub use task::*;

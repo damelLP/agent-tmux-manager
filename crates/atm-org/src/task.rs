@@ -47,9 +47,9 @@
 //!
 //! # Who may ask
 //!
-//! The caller is a [`TaskActor`]: its address, and whether the daemon counts
-//! it as the lead (this crate cannot know who the lead is). *Authority* over a
-//! task is its creator, the lead and the owner.
+//! The caller is a [`TaskActor`]: its address and an assignee-scoped manager
+//! fact checked by the daemon. *Authority* is the creator, the owner, or a
+//! strict manager of the task's current agent. An unassigned task has no manager.
 //!
 //! | Move | Who |
 //! |---|---|
@@ -92,6 +92,11 @@
 //! keeps the cost-of-change record of an accepted task. When to remind is the
 //! caller's policy, not this module's.
 //!
+//! Known limit: folding a stale `task.cost_recorded` onto a reopened task leaves
+//! that cost in place through its redo. Decide refuses cost recording on an Open
+//! task, and the daemon actor commits verdict and cost in one execution (repairing
+//! missing costs before serving), so an overrule cannot land between them.
+//!
 //! # Log format
 //!
 //! The ten `task.*` kinds are additive: an older daemon skips them, and no
@@ -108,7 +113,8 @@
 
 use crate::command::nonempty;
 use crate::{
-    Address, AgentId, ApplyError, DecisionId, IdError, OrgEvent, OrgState, Refusal, TaskId,
+    Address, AgentId, ApplyError, DecisionId, IdError, OrgEvent, OrgState, ProjectId, Refusal,
+    TaskId,
 };
 use atm_core::Money;
 use chrono::{DateTime, Utc};
@@ -250,6 +256,9 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskCreated {
+    /// The intended project, independent of assignment; absent in legacy events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     pub title: String,
     pub kind: TaskKind,
     pub creator: Address,
@@ -321,6 +330,9 @@ pub struct TaskCostRecorded {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
+    /// Recorded at creation; absent for tasks from legacy events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     #[serde(rename = "task_id")]
     pub id: TaskId,
     pub title: String,
@@ -352,12 +364,13 @@ pub struct Task {
     pub changed_at: DateTime<Utc>,
 }
 
-/// Who asks. The daemon takes `who` from the caller's pane and says whether
-/// it counts that caller as the lead.
+/// Who asks. The daemon takes `who` from the caller's pane and checks the
+/// reporting line at admission. A manager grant applies only to this assignee;
+/// the deciding task's current agent must still match it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskActor {
     pub who: Address,
-    pub lead: bool,
+    pub manager_of: Option<AgentId>,
 }
 
 /// Requests and the daemon's reports about tasks. The module docs hold the
@@ -579,7 +592,8 @@ impl TaskCommand {
 }
 
 /// Only the canonical `t<seq>` names a task; any other text finds nothing.
-fn task_seq(id: &TaskId) -> Option<u64> {
+#[must_use]
+pub fn task_seq(id: &TaskId) -> Option<u64> {
     let text = id.to_string();
     let seq = text.strip_prefix('t')?.parse::<u64>().ok()?;
     (format!("t{seq}") == text).then_some(seq)
@@ -589,6 +603,34 @@ fn task_id(seq: u64) -> Result<TaskId, IdError> {
 }
 
 impl Task {
+    /// Recorded project first; otherwise the reader's legacy agent, then creator.
+    #[must_use]
+    pub fn project<'a>(&'a self, agent: Option<&'a AgentId>) -> Option<&'a ProjectId> {
+        self.project_id.as_ref().or_else(|| {
+            agent.map(|id| &id.project).or(match &self.creator {
+                Address::Agent(id) => Some(&id.project),
+                _ => None,
+            })
+        })
+    }
+
+    /// Only an explicitly annotated decision overrule may invalidate final work.
+    pub(crate) fn reopen_for_overrule(
+        &mut self,
+        decision: DecisionId,
+        option: &str,
+        at: DateTime<Utc>,
+    ) {
+        self.enter(
+            TaskState::Open,
+            Some(format!(
+                "Decision {decision} overruled; redo against {option}."
+            )),
+            at,
+        );
+        self.agent_id = None;
+        self.cost = None;
+    }
     /// Every change of state drops what belonged to the state it leaves.
     fn enter(&mut self, state: TaskState, reason: Option<String>, ts: DateTime<Utc>) {
         self.state = state;
@@ -632,9 +674,15 @@ impl Task {
     fn is_agent(&self, who: &Address) -> bool {
         matches!((&self.agent_id, who), (Some(agent), Address::Agent(caller)) if agent == caller)
     }
-    /// The creator, the lead and the owner.
+    /// The creator, the owner and a strict manager of the current agent.
     fn authority(&self, by: &TaskActor, operation: &'static str) -> Result<(), TaskRefusal> {
-        if by.lead || by.who == Address::Owner || by.who == self.creator {
+        let manager = matches!(&by.who, Address::Agent(_))
+            && !self.is_agent(&by.who)
+            && by
+                .manager_of
+                .as_ref()
+                .is_some_and(|id| self.agent_id.as_ref() == Some(id));
+        if manager || by.who == Address::Owner || by.who == self.creator {
             Ok(())
         } else {
             Err(self.not_allowed(&by.who, operation))
@@ -978,6 +1026,9 @@ fn files_named(files: &[TaskFile]) -> Result<(), Refusal> {
 impl TaskCreated {
     pub(crate) fn check(&self, state: &OrgState) -> Result<(), ApplyError> {
         state.validate_address(&self.creator)?;
+        if let Some(project) = &self.project_id {
+            state.require_project(project)?;
+        }
         for id in self.parent.iter().chain(&self.judges) {
             state.require_task(id)?;
         }
@@ -997,6 +1048,7 @@ impl TaskCreated {
         tasks.insert(
             seq,
             Task {
+                project_id: self.project_id.clone(),
                 id,
                 title: self.title.clone(),
                 kind: self.kind,
@@ -1123,5 +1175,53 @@ impl TaskCostRecorded {
     }
     pub(crate) fn fold(&self, task: &mut Task) {
         task.cost = Some(self.record.clone());
+    }
+}
+
+#[cfg(test)]
+mod task_seq_tests {
+    use crate::{task_seq, TaskId};
+
+    // Break caught: canonical task sequences lose zero or the full u64 range.
+    #[test]
+    fn accepts_canonical_task_sequences() {
+        for (text, seq) in [
+            ("t0", 0),
+            ("t1", 1),
+            ("t10", 10),
+            ("t9223372036854775808", 9_223_372_036_854_775_808),
+            ("t18446744073709551615", u64::MAX),
+        ] {
+            let id: TaskId = text.parse().unwrap();
+            assert_eq!(task_seq(&id), Some(seq), "{text:?}");
+        }
+    }
+
+    // Break caught: permissive TaskId message references become canonical tasks,
+    // or are rejected by TaskId itself instead of only by task lookup.
+    #[test]
+    fn rejects_noncanonical_sequences_without_narrowing_message_references() {
+        for text in [
+            "unit-7",
+            "1",
+            "T1",
+            "t",
+            "t00",
+            "t01",
+            "t+1",
+            "t-1",
+            "t1.0",
+            "t1e1",
+            " t1",
+            "t1 ",
+            "t1\n",
+            "t١",
+            "t１",
+            "t18446744073709551616",
+        ] {
+            let id: TaskId = text.parse().unwrap();
+            assert_eq!(id.to_string(), text);
+            assert_eq!(task_seq(&id), None, "{text:?}");
+        }
     }
 }

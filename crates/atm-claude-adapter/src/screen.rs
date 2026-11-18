@@ -52,6 +52,9 @@
 //! two-row ghost remains unverified and every multiline editor stays Draft.
 //! The same sealed capture also establishes the right-aligned `new task? /clear
 //! to save N tokens` contextual hint at 80/116/160 columns in both cursor modes.
+//! Counts follow Claude Code 2.1.325's compact number formatter (en-US compact
+//! notation, lowercased, with a trailing `.0` removed), accepting optional k/m/b/t
+//! suffixes and at most one decimal digit.
 //! Only its exact shape and two-cell right margin directly above the upper rule
 //! are chrome, not turn evidence. Typed drafts stay Draft; a spinner or unknown
 //! transcript tail above the hint still decides the turn. First-turn auto-mode
@@ -96,6 +99,13 @@
 //! Pill attributes rely on the 2.1.325 bundle's routing: with footer focus, a typed
 //! key or paste goes to the prompt, so staged-then-Enter submission still lands there.
 //!
+//! Captured: Claude Code 2.1.325, 2026-11-17, read-only tmux capture-pane -p -e -N
+//! of an idle seat (supplied by the lead), redacted. `✔ Update installed · /restart
+//! to apply` appears alone or after the clear-context hint's ` tokens · `.
+//! Only these exact, right-aligned pre-border shapes are chrome; the remaining
+//! transcript still proves turn state. The captured 184x11 views have no mode
+//! footer and remain Unknown; footer-added conformance variants are Synthetic.
+//!
 //! Fresh layout evidence does not establish that a particular clear completed.
 //! `/clear` remains in history after a successful clear. Consumers own temporal,
 //! process/pane identity and copy-mode checks; identical historical text cannot
@@ -109,6 +119,11 @@ use atm_core::{
     DialogState, FreshEditorEvidence, InputState, LaunchPolicy, ScreenCursor, ScreenFacts,
     ScreenInput, ScreenTextFormat, TurnState,
 };
+
+#[cfg(test)]
+thread_local! {
+    static DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Requires attributes and retained grid spaces (`capture-pane -p -e -N`).
 pub const SCREEN_TEXT_FORMAT: ScreenTextFormat = ScreenTextFormat::Styled;
@@ -132,6 +147,8 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
     let (text, styled) = match input {
         ScreenInput::Plain(text) if cursor.is_none() => (text, None),
         ScreenInput::Styled(text) => {
+            #[cfg(test)]
+            DECODE_COUNT.with(|count| count.set(count.get() + 1));
             let Ok(screen) = StyledScreen::parse(text) else {
                 return Default::default();
             };
@@ -143,6 +160,10 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
     if text.chars().any(|c| c.is_control() && c != '\n') {
         return Default::default();
     }
+    inspect_prepared(text, styled)
+}
+
+fn inspect_prepared(text: &str, styled: Option<&StyledScreen>) -> (ScreenFacts, Option<String>) {
     let mut lines: Vec<_> = text
         .lines()
         .map(|line| {
@@ -184,6 +205,8 @@ pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bo
         return None;
     }
     if let ScreenInput::Styled(text) = input {
+        #[cfg(test)]
+        DECODE_COUNT.with(|count| count.set(count.get() + 1));
         let screen = StyledScreen::parse(text).ok()?;
         match control::completion_draft(&screen) {
             control::CompletionDraft::Recognised { draft, selected } => {
@@ -272,7 +295,7 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
     {
         return None;
     }
-    editor_facts(lines, styled, header_end, before_footer)
+    editor_facts(lines, styled, header_end, before_footer, footer)
 }
 
 fn editor_facts(
@@ -280,6 +303,7 @@ fn editor_facts(
     styled: Option<&StyledScreen>,
     header_end: Option<usize>,
     before_footer: &[&str],
+    footer: &str,
 ) -> Option<(ScreenFacts, Option<String>)> {
     let lower = before_footer.iter().rposition(|line| rule(line, '─'))?;
     let below = before_footer.get(lower + 1..)?;
@@ -404,6 +428,10 @@ fn editor_facts(
     } else {
         TurnState::Unknown
     };
+    // Busy chrome contradicts idle history; it cannot prove Running by itself.
+    if footer.contains(" · esc to interrupt") && turn == TurnState::NotRunning {
+        return None;
+    }
     let fresh_editor = if header_end.is_some()
         && turn == TurnState::NotRunning
         && input != InputState::Draft
@@ -422,11 +450,18 @@ fn editor_facts(
 }
 
 fn clear_context_notice(line: &str, columns: usize) -> bool {
+    const UPDATE_INSTALLED: &str = "✔ Update installed · /restart to apply";
     if !line.starts_with("  ") || line.chars().count().checked_add(2) != Some(columns) {
         return false;
     }
-    let Some(count) = line
-        .trim_start_matches(' ')
+    let text = line.trim_start_matches(' ');
+    if text == UPDATE_INSTALLED {
+        return true;
+    }
+    let Some(count) = text
+        .strip_suffix(UPDATE_INSTALLED)
+        .and_then(|prefix| prefix.strip_suffix(" · "))
+        .unwrap_or(text)
         .strip_prefix("new task? /clear to save ")
         .and_then(|s| s.strip_suffix(" tokens"))
     else {

@@ -18,6 +18,106 @@ mod daemon;
 use daemon::fake_daemon;
 #[path = "support/control.rs"]
 mod control_support;
+use control_support::role;
+
+// Keep helper assertions at their implementation, but register once: other
+// fixture consumers must not repeat these real-process and readiness checks.
+#[test]
+fn autostart_cleanup_does_not_panic_on_invalid_or_unowned_pid() {
+    control_support::autostart_cleanup_does_not_panic_on_invalid_or_unowned_pid();
+}
+
+#[test]
+fn listening_wait_holds_partial_line_until_pipe_release() {
+    control_support::log_event_tests::listening_wait_holds_partial_line_until_pipe_release();
+}
+
+#[test]
+fn listening_event_delivered_before_wait_is_retained() {
+    control_support::log_event_tests::listening_event_delivered_before_wait_is_retained();
+}
+
+#[test]
+fn daemon_exit_before_listening_returns_the_log() {
+    control_support::log_event_tests::daemon_exit_before_listening_returns_the_log();
+}
+
+#[test]
+fn synchronous_readiness_does_not_block_on_a_full_backlog() {
+    control_support::socket_readiness_tests::synchronous_readiness_does_not_block_on_a_full_backlog(
+    );
+}
+
+#[tokio::test]
+async fn wait_for_socket_retries_bound_socket_until_listen() {
+    control_support::socket_readiness_tests::wait_for_socket_retries_bound_socket_until_listen()
+        .await;
+}
+
+#[tokio::test]
+async fn wait_for_socket_observes_creation_after_watch() {
+    control_support::socket_readiness_tests::wait_for_socket_observes_creation_after_watch().await;
+}
+
+#[tokio::test]
+async fn wait_for_socket_connects_to_existing_listener() {
+    control_support::socket_readiness_tests::wait_for_socket_connects_to_existing_listener().await;
+}
+
+#[test]
+fn cli_exit_observes_pipe_held_and_already_exited_children() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::OwnedFd;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let (output, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    output
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "printf 'ready\\n'; read -r finish; exit 7"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let pid = child.id();
+    let child = role::process::OwnedChild::new(child);
+    let mut ready = String::new();
+    BufReader::new(output).read_line(&mut ready).unwrap();
+    assert_eq!(ready, "ready\n");
+    assert_eq!(
+        role::process::wait_exit(pid, Duration::ZERO)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut,
+        "a ready child held on a pipe has not exited"
+    );
+    input.write_all(b"finish\n").unwrap();
+    role::process::wait_exit(pid, Duration::from_secs(30)).unwrap();
+    // The exit event is already present and the child is still unreaped.
+    role::process::wait_exit(pid, Duration::ZERO).unwrap();
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(7));
+}
+
+#[test]
+fn cli_exit_collects_full_file_backed_output() {
+    let output = role::run(Command::new("/usr/bin/python3").args([
+        "-c",
+        "import sys; sys.stdout.write('x'*262144); sys.stderr.write('y'*262144)",
+    ]));
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 262144);
+    assert_eq!(output.stderr.len(), 262144);
+    assert_eq!(output.stdout, vec![b'x'; 262144]);
+    assert_eq!(output.stderr, vec![b'y'; 262144]);
+}
+
+#[test]
+fn cli_exit_owned_child_reaps_during_unwind() {
+    role::process::tests::owned_child_drop_reaps_on_unwind();
+}
 
 mod shutdown {
     use atm_tmux::{mock::MockCall, MockTmuxClient, PaneDirection, TmuxClient, TmuxError};
@@ -270,8 +370,7 @@ async fn reply_and_peek_use_the_daemon_and_preserve_exact_output_and_refusals() 
     services.control = Some(control.clone());
     let server =
         DaemonServer::with_services(dir.path().join("atmd.sock"), services, cancel.clone());
-    let server = tokio::spawn(async move { server.run().await });
-    control_support::wait_for_socket(&dir.path().join("atmd.sock")).await;
+    let server = control_support::start_server(server, &dir.path().join("atmd.sock")).await;
     let socket = dir
         .path()
         .join(format!("tmux-{}/default", unsafe { libc::getuid() }));
@@ -427,8 +526,7 @@ async fn kill_and_interrupt_use_daemon_registry_and_preserve_refusals() {
     services.control = Some(control);
     let server =
         DaemonServer::with_services(dir.path().join("atmd.sock"), services, cancel.clone());
-    let server = tokio::spawn(async move { server.run().await });
-    control_support::wait_for_socket(&dir.path().join("atmd.sock")).await;
+    let server = control_support::start_server(server, &dir.path().join("atmd.sock")).await;
     let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
     let tmux_socket = dir
         .path()
@@ -505,8 +603,7 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
     services.control = Some(control);
     let server =
         DaemonServer::with_services(dir.path().join("atmd.sock"), services, cancel.clone());
-    let server = tokio::spawn(async move { server.run().await });
-    control_support::wait_for_socket(&dir.path().join("atmd.sock")).await;
+    let server = control_support::start_server(server, &dir.path().join("atmd.sock")).await;
     let exe = Path::new(env!("CARGO_BIN_EXE_atm"));
     let tmux_socket = dir
         .path()
@@ -602,9 +699,8 @@ fn all_commands() -> Vec<Vec<&'static str>> {
 fn atm(exe: &Path, dir: &Path, args: &[&str]) -> Output {
     let path = dir.join("path");
     std::fs::create_dir_all(&path).expect("mkdir PATH dir");
-    let mut tries = 0;
-    loop {
-        let run = Command::new(exe)
+    role::run(
+        Command::new(exe)
             .args(args)
             .env_clear()
             .env("PATH", &path)
@@ -612,18 +708,8 @@ fn atm(exe: &Path, dir: &Path, args: &[&str]) -> Output {
             .env("ATM_SOCKET", dir.join("atmd.sock"))
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("ATM_STATE_DIR", dir.join("eventlog"))
-            .env("TMUX_TMPDIR", dir)
-            .output();
-        match run {
-            // A freshly copied `exe` is busy while a child that a sibling
-            // test forked mid-copy still holds the copy's write fd.
-            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            run => return run.expect("run atm"),
-        }
-    }
+            .env("TMUX_TMPDIR", dir),
+    )
 }
 
 fn assert_fails_with(out: &Output, args: &[&str], expected: &str) {
@@ -641,16 +727,13 @@ fn assert_fails_with(out: &Output, args: &[&str], expected: &str) {
 /// at the auto-start, before it asks for the session list.
 #[test]
 fn test_commands_fail_when_the_daemon_cannot_start() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // The auto-start looks for `atmd` beside `atm` first, and cargo builds
-    // one there, so run `atm` from a dir without it. A hard link opens no
-    // writable fd; a copy (across filesystems) does, so `atm()` retries.
+    let dir = role::artifact_dir();
+    // The auto-start looks for `atmd` beside `atm` first. A fixture beside
+    // the artifact guarantees a hard link without an inherited copy writer.
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).expect("mkdir bin");
     let exe = bin.join("atm");
-    if std::fs::hard_link(env!("CARGO_BIN_EXE_atm"), &exe).is_err() {
-        std::fs::copy(env!("CARGO_BIN_EXE_atm"), &exe).expect("copy atm");
-    }
+    std::fs::hard_link(env!("CARGO_BIN_EXE_atm"), &exe).expect("link atm");
 
     for args in all_commands()
         .into_iter()

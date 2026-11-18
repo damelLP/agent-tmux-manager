@@ -1,14 +1,13 @@
 //! Applying adapter lifecycle events to sessions.
 
-use chrono::Utc;
 use tracing::{debug, info};
 
 use atm_core::{AgentType, LifecycleContext, LifecycleEvent, SessionId};
 
 use super::create::build_session_from_pid;
 use super::RegistryActor;
-use crate::discovery::read_parent_session_id;
 use crate::registry::commands::{AcceptedStart, RegistryError};
+use crate::registry::inputs::stamp_new_session;
 
 impl RegistryActor {
     /// Handles applying a vendor-neutral lifecycle event to a session.
@@ -39,7 +38,7 @@ impl RegistryActor {
         if context.child.is_none() && matches!(event, LifecycleEvent::SessionEnd { .. }) {
             if let Some(p) = target_pid {
                 if let Some((session, _)) = self.sessions_by_pid.get(&p) {
-                    let now = Utc::now();
+                    let now = self.clock.utc_now();
                     // A SessionStart already ended `session_id` in this
                     // process, so the row is a newer session's.
                     if session.id != session_id && self.ended_in(&session_id, p, now) {
@@ -102,7 +101,7 @@ impl RegistryActor {
                         new_id = %session_id,
                         "SessionStart of a new session, ending the session this process's row held"
                     );
-                    self.end_session_in(current_id, p, Utc::now())?;
+                    self.end_session_in(current_id, p, self.clock.utc_now())?;
                 }
             }
         }
@@ -130,7 +129,7 @@ impl RegistryActor {
             // right project / branch once its git lookup lands. Without
             // this, lifecycle-event-created sessions stay in the
             // "Other" tree bucket because working_directory is None.
-            let proc_cwd = std::fs::read_link(format!("/proc/{p}/cwd")).ok();
+            let proc_cwd = self.process_info.cwd(p);
             let session = build_session_from_pid(
                 session_id.clone(),
                 AgentType::GeneralPurpose,
@@ -138,8 +137,9 @@ impl RegistryActor {
                 harness,
                 tmux_pane.clone(),
                 proc_cwd,
-                read_parent_session_id(p, harness),
+                self.process_info.parent(p, harness),
             );
+            let session = stamp_new_session(session, self.clock.as_ref());
             self.insert_new_session(p, session)?;
         }
 
@@ -172,7 +172,7 @@ impl RegistryActor {
         let Some((session, _)) = self.sessions_by_pid.get_mut(&pid) else {
             return;
         };
-        session.apply_lifecycle_event(event);
+        session.apply_lifecycle_event_at(event, self.clock.utc_now());
         session.set_first_prompt_from_event(event);
         if tmux_pane.is_some() && session.tmux_pane.is_none() {
             session.tmux_pane = tmux_pane;

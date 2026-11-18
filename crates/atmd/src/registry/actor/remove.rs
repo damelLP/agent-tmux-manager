@@ -113,14 +113,14 @@ impl RegistryActor {
     /// Removes sessions whose agent process has terminated
     /// (PID no longer exists or was reused by a different process).
     pub(super) fn handle_cleanup_stale(&mut self) {
-        let now = Utc::now();
+        let now = self.clock.utc_now();
 
         // Collect PIDs to remove: only sessions whose process has died
         let to_remove: Vec<(u32, SessionId)> = self
             .sessions_by_pid
             .iter()
             .filter_map(|(pid, (session, infra))| {
-                if !infra.is_process_alive() {
+                if !infra.is_process_alive_with(self.process_info.as_ref()) {
                     Some((*pid, session.id.clone()))
                 } else {
                     None

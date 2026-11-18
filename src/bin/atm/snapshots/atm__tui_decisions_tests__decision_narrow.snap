@@ -1,0 +1,20 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 150
+expression: "rendered(&mut popup(entry(41, \"alpha/lead\")), 28, 16)"
+---
+
+ ┌ Answer waiting decision┐
+ │j/k: option; Tab: note; │
+ │Enter: record; ↑/↓: scro│
+ │ll; Esc: back           │
+ │Selected: none — j/k to │
+ │choose                  │
+ │Note (optional):        │
+ │Owner answers require a │
+ │genuinely unbound owner │
+ │shell.                  │
+ │d41 from alpha/lead     │
+ │Approve the smaller inte│
+ │rface?                  │
+ └────────────────────────┘

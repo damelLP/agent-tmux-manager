@@ -18,7 +18,8 @@ use atm_core::{
 };
 use atm_org::idle::HandoverLimits;
 use atm_org::{
-    Address, AgentId, MessageContent, MessageId, MessageKind, OrgCommand, OrgEvent, OrgState,
+    Address, AgentId, DeliveryStatus, MessageContent, MessageId, MessageKind, OrgCommand, OrgEvent,
+    OrgState,
 };
 use atm_protocol::error_code;
 use chrono::Utc;
@@ -283,6 +284,115 @@ impl Rig {
     async fn state(&self) -> OrgState {
         self.org.snapshot().await.unwrap()
     }
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionWrite {
+    Queue,
+    Audit,
+}
+
+/// Pause one service-side write, leaving the real actor and its other readers live.
+/// Tests may commit it and hold its reply, or return a failure without committing.
+struct AdmissionGate {
+    writes: mpsc::UnboundedReceiver<super::Request>,
+    forwarding: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AdmissionGate {
+    fn drop(&mut self) {
+        self.forwarding.abort();
+    }
+}
+
+impl Rig {
+    fn gate(&mut self, boundary: AdmissionWrite) -> AdmissionGate {
+        let real = self.org.clone();
+        let (requests, mut receive) = mpsc::channel(64);
+        self.service.org = OrgHandle {
+            requests,
+            ..real.clone()
+        };
+        let (held, writes) = mpsc::unbounded_channel();
+        let forwarding = tokio::spawn(async move {
+            let mut armed = true;
+            while let Some(request) = receive.recv().await {
+                let matches = match &request {
+                    super::Request::Execute { command, .. } => match (boundary, command.as_ref()) {
+                        (AdmissionWrite::Queue, OrgCommand::SendMessage(content)) => {
+                            content.body.starts_with("Handover:")
+                        }
+                        (AdmissionWrite::Audit, OrgCommand::SaveRequested { .. }) => true,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if armed && matches {
+                    armed = false;
+                    held.send(request).unwrap();
+                } else {
+                    real.submit(request).unwrap();
+                }
+            }
+        });
+        AdmissionGate { writes, forwarding }
+    }
+}
+
+type WriteResult = Result<super::TaskCommit, super::OrgServiceError>;
+
+impl AdmissionGate {
+    async fn take(&mut self) -> super::Request {
+        tokio::time::timeout(GUARD, self.writes.recv())
+            .await
+            .expect("admission did not reach the write boundary")
+            .unwrap()
+    }
+
+    /// Drop the service's sender and join after every retained sender is gone.
+    /// A manual worker cannot enqueue a later duplicate note beyond this fence.
+    async fn finish(mut self, rig: &mut Rig) {
+        rig.service.org = rig.org.clone();
+        tokio::time::timeout(GUARD, &mut self.forwarding)
+            .await
+            .expect("retained handover did not release its sender")
+            .unwrap();
+    }
+}
+
+/// Commit through the real actor, but leave its original waiter behind a gate.
+async fn commit_held(
+    org: &OrgHandle,
+    request: super::Request,
+) -> (oneshot::Sender<WriteResult>, WriteResult) {
+    let super::Request::Execute {
+        command,
+        now,
+        caller_pane,
+        reply,
+    } = request
+    else {
+        panic!("gate held a read instead of a write");
+    };
+    let (forward, response) = oneshot::channel();
+    org.submit(super::Request::Execute {
+        command,
+        now,
+        caller_pane,
+        reply: forward,
+    })
+    .unwrap();
+    (reply, response.await.unwrap())
+}
+
+fn audit_failure(request: MessageId) -> String {
+    format!(
+        "the save request {request} for p/worker exists, but its handover record was not \
+         confirmed: organisation request timed out; accepted work may still complete; \
+         the request may be queued or already delivered; nothing was cleared; inspect \
+         `atm inbox --for p/worker --id {request}`; a later handover reuses it while queued \
+         or delivering; `atm msg give-up {request}` cancels an undelivered request"
+    )
 }
 
 async fn answer(call: Call) -> Result<HandoverResult, MethodError> {
@@ -612,13 +722,14 @@ async fn a_delivery_read_before_the_save_turns_status_does_not_end_the_save() {
     };
     let due = Box::pin(std::future::ready(()));
     let admitted = rig.service.admit(p, owner(), due).await.ok().unwrap();
+    let job = admitted.job.await.unwrap();
     let request = rig.requested().await;
     std::fs::write(rig.memory("worker"), "written before the request arrived").unwrap();
     // The prompt: the registry shows the save turn, then the delivery is
     // committed. The job has not run yet and has read neither.
     rig.deliver(request, "s1", "%1").await;
 
-    let (code, message) = refusal(answer(tokio::spawn(admitted.job.run())).await);
+    let (code, message) = refusal(answer(tokio::spawn(job.run())).await);
     assert_eq!(code, error_code::TIMEOUT);
     assert_eq!(
         message,
@@ -873,6 +984,7 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
     assert_eq!(
         note,
         MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to: Address::Agent(id("lead")),
             kind: MessageKind::Note,
@@ -1040,6 +1152,234 @@ async fn an_idle_session_is_not_noted_before_a_turn_has_ended_in_it() {
             ("p/lead".to_owned(), line_note("worker", 71)),
         ]
     );
+}
+
+// Break caught: preflight itself sends, before a retained owner exists.
+#[tokio::test]
+async fn admission_preflight_leaves_both_writes_to_the_retained_owner() {
+    let mut rig = Rig::new().await;
+    let admitted = rig
+        .service
+        .admit(
+            HandoverParams {
+                agent: id("worker"),
+                timeout_ms: 600_000,
+            },
+            owner(),
+            Box::pin(std::future::pending()),
+        )
+        .await
+        .ok()
+        .unwrap();
+    assert!(rig.kinds().is_empty(), "preflight queued a save request");
+    drop(admitted);
+    assert!(rig.state().await.messages().next().is_none());
+}
+
+// Break caught: caller cancellation drops either admission write or releases Running.
+#[tokio::test]
+async fn admission_writes_survive_caller_loss_between_queue_and_audit() {
+    for caller in [owner(), from_pane("%1")] {
+        let mut rig = Rig::new().await;
+        let mut gate = rig.gate(AdmissionWrite::Queue);
+        let (_deadline, call) = rig.start("worker", caller);
+        let (reply, committed) = commit_held(&rig.org, gate.take().await).await;
+        let request = MessageId::new(committed.as_ref().unwrap().events[0].seq);
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(
+            !reply.is_closed(),
+            "caller loss dropped the admission write's waiter"
+        );
+        let (_deadline, competing) = rig.start("worker", owner());
+        assert_eq!(refusal(answer(competing).await).0, error_code::CONFLICT);
+        assert!(rig.cleared.try_recv().is_err());
+        assert!(
+            reply.send(committed).is_ok(),
+            "retained queue reply was lost"
+        );
+        assert_eq!(rig.requested().await, request);
+        rig.deliver(request, "s1", "%1").await;
+        std::fs::write(rig.memory("worker"), "saved after disconnect").unwrap();
+        rig.report("s1", LifecycleEvent::Idle).await;
+        assert_eq!(
+            tokio::time::timeout(GUARD, rig.cleared.recv())
+                .await
+                .unwrap(),
+            Some(id("worker"))
+        );
+        gate.finish(&mut rig).await;
+        assert!(rig.cleared.try_recv().is_err(), "cleared more than once");
+        assert!(!rig
+            .state()
+            .await
+            .messages()
+            .any(|m| m.content.body.starts_with("handover of ")));
+    }
+}
+
+// Break caught: an audit error hides an existing request, clears anyway, or is reported twice.
+#[tokio::test]
+async fn admission_failed_audit_reports_the_existing_request_without_clearing() {
+    for own in [false, true] {
+        for lost in [false, true] {
+            let mut rig = Rig::new().await;
+            let mut gate = rig.gate(AdmissionWrite::Audit);
+            let caller = if own { from_pane("%1") } else { owner() };
+            let (_deadline, call) = rig.start("worker", caller);
+            let super::Request::Execute { command, reply, .. } = gate.take().await else {
+                panic!("not a write")
+            };
+            let OrgCommand::SaveRequested {
+                message_id: request,
+                ..
+            } = command.as_ref()
+            else {
+                panic!("not a save audit")
+            };
+            let request = *request;
+            assert!(!call.is_finished(), "Started was returned before the audit");
+            // Even a completed save cannot clear without confirmed admission.
+            rig.deliver(request, "s1", "%1").await;
+            std::fs::write(rig.memory("worker"), "saved while audit held").unwrap();
+            rig.report("s1", LifecycleEvent::Idle).await;
+            rig.kinds();
+            assert!(rig.cleared.try_recv().is_err());
+            let waiting = if lost {
+                call.abort();
+                assert!(call.await.unwrap_err().is_cancelled());
+                None
+            } else {
+                Some(call)
+            };
+            assert!(!reply.is_closed(), "caller loss dropped the audit waiter");
+            assert!(reply.send(Err(super::OrgServiceError::Timeout)).is_ok());
+            if let Some(waiting) = waiting {
+                assert_eq!(
+                    refusal(answer(waiting).await),
+                    (error_code::TIMEOUT.into(), audit_failure(request))
+                );
+            } else {
+                let note = rig.next("msg.sent").await;
+                assert_eq!(note.body["to"], "p/lead");
+                assert_eq!(
+                    note.body["body"],
+                    format!(
+                        "handover of p/worker did not complete: {}",
+                        audit_failure(request)
+                    )
+                );
+            }
+            gate.finish(&mut rig).await;
+            let state = rig.state().await;
+            assert_eq!(
+                state.message(&request).unwrap().status,
+                DeliveryStatus::Delivered
+            );
+            assert_eq!(
+                state
+                    .messages()
+                    .filter(|m| m.content.body.starts_with("handover of "))
+                    .count(),
+                usize::from(lost)
+            );
+            assert!(
+                rig.cleared.try_recv().is_err(),
+                "failed admission cleared the saved session"
+            );
+            assert!(!rig
+                .kinds()
+                .iter()
+                .any(|kind| kind == "agent.saved" || kind == "agent.clear_requested"));
+        }
+    }
+}
+
+// Break caught: failed SaveRequested discards or duplicates an undelivered request on retry.
+#[tokio::test]
+async fn admission_failed_audit_keeps_an_open_request_for_retry() {
+    let mut rig = Rig::new().await;
+    let mut open = None;
+    // Fail once on a new request and once on the reused request.
+    for _ in 0..2 {
+        let mut gate = rig.gate(AdmissionWrite::Audit);
+        let (_deadline, call) = rig.start("worker", owner());
+        let super::Request::Execute { command, reply, .. } = gate.take().await else {
+            panic!("not a write")
+        };
+        let OrgCommand::SaveRequested {
+            message_id: request,
+            ..
+        } = command.as_ref()
+        else {
+            panic!("not a save audit")
+        };
+        let request = *request;
+        assert_eq!(
+            *open.get_or_insert(request),
+            request,
+            "retry sent another request"
+        );
+        reply.send(Err(super::OrgServiceError::Timeout)).unwrap();
+        assert_eq!(refusal(answer(call).await).1, audit_failure(request));
+        assert_eq!(
+            rig.state().await.message(&request).unwrap().status,
+            DeliveryStatus::Queued
+        );
+        assert!(rig.cleared.try_recv().is_err());
+        gate.finish(&mut rig).await;
+    }
+    let request = open.unwrap();
+    let (_deadline, retry) = rig.start("worker", owner());
+    assert_eq!(rig.requested().await, request);
+    rig.deliver(request, "s1", "%1").await;
+    std::fs::write(rig.memory("worker"), "retry saved").unwrap();
+    rig.report("s1", LifecycleEvent::Idle).await;
+    assert_eq!(answer(retry).await.unwrap().message_id, request);
+    assert_eq!(
+        rig.state().await.messages().count(),
+        1,
+        "retry duplicated the save request"
+    );
+}
+
+// Break caught: a lost/empty queue receipt claims no message exists or permits a clear.
+#[tokio::test]
+async fn admission_unconfirmed_queue_is_reported_without_claiming_nothing_was_sent() {
+    for empty in [false, true] {
+        let mut rig = Rig::new().await;
+        let mut gate = rig.gate(AdmissionWrite::Queue);
+        let (_deadline, call) = rig.start("worker", owner());
+        let (reply, committed) = commit_held(&rig.org, gate.take().await).await;
+        let request = MessageId::new(committed.as_ref().unwrap().events[0].seq);
+        let (result, cause, code) = if empty {
+            (
+                Ok(super::TaskCommit {
+                    events: Vec::new(),
+                    before: None,
+                }),
+                "agent operation failed: the save request committed no event",
+                error_code::INTERNAL,
+            )
+        } else {
+            (
+                Err(super::OrgServiceError::Timeout),
+                "organisation request timed out; accepted work may still complete",
+                error_code::TIMEOUT,
+            )
+        };
+        reply.send(result).unwrap();
+        assert_eq!(refusal(answer(call).await), (code.into(), format!(
+            "could not confirm the save request for p/worker: {cause}; a request may be queued \
+             or already delivered; nothing was cleared; inspect `atm inbox --for p/worker` before retrying"
+        )));
+        assert_eq!(
+            rig.state().await.message(&request).unwrap().status,
+            DeliveryStatus::Queued
+        );
+        assert!(rig.cleared.try_recv().is_err());
+        assert!(!rig.kinds().contains(&"agent.save_requested".into()));
+    }
 }
 
 // The handover watcher's tests use this file's rig.

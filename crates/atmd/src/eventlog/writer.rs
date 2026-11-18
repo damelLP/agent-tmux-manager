@@ -268,6 +268,11 @@ mod tests {
 
     #[test]
     fn exact_rotation_limit_reopen_and_failed_rotation_keep_records() {
+        if super::super::test_support::isolated(
+            "eventlog::writer::tests::exact_rotation_limit_reopen_and_failed_rotation_keep_records",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = Stream::Raw.directory(dir.path());
         let ts = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
@@ -282,19 +287,9 @@ mod tests {
             .unwrap();
         assert_eq!(segments(&path).unwrap().len(), 1, "rotated at exact limit");
         drop(writer);
-        // Parallel subprocess tests can fork while the lock fd is open. Even
-        // CLOEXEC fds retain flock in that child until exec; wait for that brief
-        // inheritance window, just as the public reopen tests wait for cleanup.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut writer = loop {
-            match Writer::open(&path, Stream::Raw) {
-                Ok(writer) => break writer,
-                Err(EventLogError::Locked(_)) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("reopen: {error}"),
-            }
-        };
+        // Direct Writer drop is synchronous, and this isolated child has no
+        // unrelated pre-exec fork retaining its flock. Reopen exactly once.
+        let mut writer = Writer::open(&path, Stream::Raw).unwrap();
         writer.max_bytes = one * 2;
         // Existing destination must not be overwritten; failed rotation sync
         // or create must leave the committed old file and next seq intact.

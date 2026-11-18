@@ -43,13 +43,11 @@ use crate::registry::{RegistryHandle, SessionEvent};
 /// Type alias for subscriber writer handle
 pub type SubscriberWriter<W = OwnedWriteHalf> = Arc<Mutex<BufWriter<W>>>;
 
-/// Information about a subscribed client
+/// Lifetime ownership of a subscribed client's writer.
 pub struct Subscriber<W = OwnedWriteHalf> {
-    /// Writer for sending events
+    /// May own the last writer clone after the handler and forwarders finish,
+    /// keeping peer EOF after subscriber membership removal.
     pub writer: SubscriberWriter<W>,
-
-    /// Optional filter for session-specific subscriptions
-    pub filter: Option<SessionId>,
 }
 
 /// Type alias for the subscribers map, keyed by [`subscriber_key`]
@@ -100,6 +98,25 @@ fn is_one_way(message: &MessageType) -> bool {
         | MessageType::Watch { .. }
         | MessageType::Unwatch => false,
     }
+}
+
+/// Original-identity parent proof over borrowed rows; no registry I/O.
+fn parent_rows_proven(
+    rows: &[atm_core::SessionView],
+    session: &SessionId,
+    pane: &str,
+    harness: atm_core::Harness,
+) -> bool {
+    let on_pane = |row: &&atm_core::SessionView| {
+        row.parent_session_id.is_none() && row.tmux_pane.as_deref() == Some(pane)
+    };
+    let mut own = rows
+        .iter()
+        .filter(on_pane)
+        .filter(|row| row.id == *session && row.harness == harness.short_tag());
+    own.next().is_some()
+        && own.next().is_none()
+        && !rows.iter().filter(on_pane).any(|row| row.id != *session)
 }
 
 /// Connection handler for a single client.
@@ -553,32 +570,52 @@ where
                 }
                 // Bound the complete line, including IDs, for tail/capture readers.
                 // Check before admission too: overload errors must fit as well.
-                let size_hint = match method.as_str() {
-                    "log.tail" => Some("limit"),
-                    "session.capture" => Some("tail"),
+                let size_policy = match method.as_str() {
+                    "log.tail"
+                    | "msg.history"
+                    | "session.capture"
+                    | "session.panes"
+                    | "session.roles"
+                    | "session.role_set"
+                    | "session.spawn_prepare_largest" => {
+                        let hint = match method.as_str() {
+                            "log.tail" | "msg.history" => "limit",
+                            "session.panes" => "session",
+                            "session.roles" => "role set",
+                            "session.role_set" => "pane",
+                            "session.spawn_prepare_largest" => "cwd",
+                            _ => "tail",
+                        };
+                        Some((MAX_MESSAGE_SIZE, format!("{method} response exceeds 1 MiB; use a shorter id or smaller {hint}")))
+                    }
+                    "org.tree" => Some((
+                        crate::org::org_tree_methods::REPLY_BYTES,
+                        "org.tree response exceeds 512 KiB; use a shorter id".into(),
+                    )),
                     _ => None,
                 };
-                let size_refusal = if let Some(size_hint) = size_hint {
-                    let refusal = DaemonMessage::response_err(
-                        id.clone(),
-                        error_code::REFUSED,
-                        &format!("{method} response exceeds 1 MiB; use a shorter id or smaller {size_hint}"),
-                    );
-                    if !fits_response(&refusal) {
+                let (response_limit, size_refusal) = if let Some((limit, reason)) = size_policy {
+                    let refusal =
+                        DaemonMessage::response_err(id.clone(), error_code::REFUSED, &reason);
+                    if !fits_response(&refusal, limit) {
                         return Err(ConnectionError::Io(format!(
                             "{method} request id leaves no room for a response"
                         )));
                     }
-                    Some(refusal)
+                    (limit, Some(refusal))
                 } else {
-                    None
+                    (MAX_MESSAGE_SIZE, None)
                 };
                 if requests.len() >= 64 {
-                    self.send_message(DaemonMessage::response_err(
+                    let response = DaemonMessage::response_err(
                         id,
                         error_code::UNAVAILABLE,
                         "too many in-flight requests (max: 64)",
-                    ))
+                    );
+                    self.send_message(match size_refusal {
+                        Some(refusal) if !fits_response(&response, response_limit) => refusal,
+                        _ => response,
+                    })
                     .await?;
                     return Ok(());
                 }
@@ -594,7 +631,7 @@ where
                     let result = tokio::select! {
                         biased;
                         _ = caller_gone.cancelled(),
-                            if matches!(method.as_str(), "session.send" | "session.reply" | "session.capture" | "agent.handover") =>
+                            if matches!(method.as_str(), "session.send" | "session.reply" | "session.capture" | "session.panes" | "session.roles" | "session.role_set" | "session.spawn_prepare_largest" | "agent.handover") =>
                         {
                             Err(MethodError::new(error_code::UNAVAILABLE, "caller disconnected"))
                         }
@@ -607,7 +644,7 @@ where
                         }
                     };
                     match size_refusal {
-                        Some(refusal) if !fits_response(&response) => refusal,
+                        Some(refusal) if !fits_response(&response, response_limit) => refusal,
                         _ => response,
                     }
                 });
@@ -698,7 +735,6 @@ where
                         key,
                         Subscriber {
                             writer: Arc::clone(&self.writer),
-                            filter: session_id.clone(),
                         },
                     );
                 }
@@ -789,6 +825,7 @@ where
         }
         let (pid, pane, status, usage) = parse_status_line_with_pane(data)?;
         let session_id = SessionId::new(status.session_id.clone());
+        let mut proof = None;
 
         // Send to registry for processing
         let applied = self
@@ -807,6 +844,7 @@ where
                     pane.as_deref(),
                     atm_core::Harness::ClaudeCode,
                     &usage,
+                    &mut proof,
                 )
                 .await;
             }
@@ -842,7 +880,10 @@ where
         pid: Option<u32>,
         pane: Option<String>,
         context: atm_core::LifecycleContext,
-    ) -> Result<(), ConnectionError> {
+    ) -> Result<Option<bool>, ConnectionError> {
+        // Frame-local: reuse the first post-apply verdict, including failure,
+        // across evidence and any later metadata accounting, never another frame.
+        let mut proof = None;
         let parent = context.child.is_none()
             && !matches!(
                 event,
@@ -868,7 +909,7 @@ where
             && applied.is_ok()
             && matches!(event, atm_core::LifecycleEvent::PromptSubmit { .. })
         {
-            self.observe_task_usage(&session, pane.as_deref(), harness, &event)
+            self.observe_task_usage(&session, pane.as_deref(), harness, &event, &mut proof)
                 .await;
         }
         if tapped {
@@ -879,10 +920,14 @@ where
                 .filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
             let proven = applied.is_ok()
                 && !ends
-                && self.message_parent_proven(&session, pane, harness).await;
+                && self
+                    .message_parent_proven(&session, pane, harness, &mut proof)
+                    .await;
             self.record_message_event(&session, pane, Some(harness), Some(&event), proven);
         }
-        applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
+        applied
+            .map(|()| proof)
+            .map_err(|e| ConnectionError::RegistryError(e.to_string()))
     }
 
     /// Accounting takes only explicit, applied measurements with the event's
@@ -893,6 +938,7 @@ where
         pane: Option<&str>,
         harness: atm_core::Harness,
         event: &atm_core::LifecycleEvent,
+        proof: &mut Option<bool>,
     ) {
         if self.org.status().is_err() {
             return;
@@ -905,7 +951,10 @@ where
         ) else {
             return;
         };
-        if !self.message_parent_proven(session, pane, harness).await {
+        if !self
+            .message_parent_proven(session, pane, harness, proof)
+            .await
+        {
             return;
         }
         if let Err(error) = self.org.observe_task_usage(input, chrono::Utc::now()) {
@@ -924,7 +973,11 @@ where
         session: &SessionId,
         pane: Option<&str>,
         harness: atm_core::Harness,
+        proof: &mut Option<bool>,
     ) -> bool {
+        if let Some(proven) = *proof {
+            return proven;
+        }
         // Without a pane no event binds or confirms: there is nothing to prove.
         let Some(pane) = pane else {
             return false;
@@ -932,18 +985,12 @@ where
         let Ok(rows) = timeout(Duration::from_secs(1), self.registry.get_all_sessions()).await
         else {
             warn!(session_id = %session, "Registry snapshot timed out; message event is unproven");
+            *proof = Some(false);
             return false;
         };
-        let on_pane = |row: &&atm_core::SessionView| {
-            row.parent_session_id.is_none() && row.tmux_pane.as_deref() == Some(pane)
-        };
-        let mut own = rows
-            .iter()
-            .filter(on_pane)
-            .filter(|row| row.id == *session && row.harness == harness.short_tag());
-        own.next().is_some()
-            && own.next().is_none()
-            && !rows.iter().filter(on_pane).any(|row| row.id != *session)
+        let proven = parent_rows_proven(&rows, session, pane, harness);
+        *proof = Some(proven);
+        proven
     }
 
     /// The one neutral tap, after the registry's answer. A status line passes
@@ -1015,15 +1062,16 @@ where
         let session_id = raw_event.session_id();
         let pid = raw_event.pid;
         let tmux_pane = raw_event.tmux_pane.clone();
-        self.apply_message_lifecycle(
-            session_id,
-            lifecycle,
-            atm_core::Harness::ClaudeCode,
-            pid,
-            tmux_pane,
-            raw_event.lifecycle_context(),
-        )
-        .await?;
+        let _ = self
+            .apply_message_lifecycle(
+                session_id,
+                lifecycle,
+                atm_core::Harness::ClaudeCode,
+                pid,
+                tmux_pane,
+                raw_event.lifecycle_context(),
+            )
+            .await?;
 
         Ok(())
     }
@@ -1077,15 +1125,16 @@ where
                 })?,
         };
 
-        self.apply_message_lifecycle(
-            session_id.clone(),
-            lifecycle,
-            atm_core::Harness::Pi,
-            raw_event.pid,
-            raw_event.tmux_pane.clone(),
-            Default::default(),
-        )
-        .await?;
+        let mut proof = self
+            .apply_message_lifecycle(
+                session_id.clone(),
+                lifecycle,
+                atm_core::Harness::Pi,
+                raw_event.pid,
+                raw_event.tmux_pane.clone(),
+                Default::default(),
+            )
+            .await?;
         // Like Codex's derived metadata: no second activity tap or parent
         // snapshot for a model learned from the same incoming frame.
         for metadata in events {
@@ -1107,6 +1156,7 @@ where
                 raw_event.tmux_pane.as_deref(),
                 atm_core::Harness::Pi,
                 &usage,
+                &mut proof,
             )
             .await;
         }
@@ -1160,15 +1210,16 @@ where
         let transcript_path = raw_event.transcript_path.clone();
         let ends_session = matches!(lifecycle, atm_core::LifecycleEvent::SessionEnd { .. });
 
-        self.apply_message_lifecycle(
-            session_id.clone(),
-            lifecycle,
-            atm_core::Harness::Codex,
-            pid,
-            tmux_pane.clone(),
-            Default::default(),
-        )
-        .await?;
+        let mut proof = self
+            .apply_message_lifecycle(
+                session_id.clone(),
+                lifecycle,
+                atm_core::Harness::Codex,
+                pid,
+                tmux_pane.clone(),
+                Default::default(),
+            )
+            .await?;
 
         if !ends_session && model.is_some() {
             self.registry
@@ -1232,6 +1283,7 @@ where
                     tmux_pane.as_deref(),
                     atm_core::Harness::Codex,
                     &event,
+                    &mut proof,
                 )
                 .await;
             }
@@ -1314,28 +1366,6 @@ where
             _ = self.cancel.cancelled() => Err(ConnectionError::Eof),
             result = write_message(&self.writer, &msg) => result,
         }
-    }
-
-    /// Checks if this client is subscribed to events.
-    pub fn is_subscribed(&self) -> bool {
-        self.subscribed
-    }
-
-    /// Checks if an event should be sent to this client based on filter.
-    pub fn should_receive_event(&self, session_id: &SessionId) -> bool {
-        if !self.subscribed {
-            return false;
-        }
-
-        match &self.subscription_filter {
-            Some(filter) => filter == session_id,
-            None => true, // No filter = receive all
-        }
-    }
-
-    /// Returns the client ID (if connected).
-    pub fn client_id(&self) -> Option<&str> {
-        self.client_id.as_deref()
     }
 }
 
@@ -1581,8 +1611,9 @@ pub async fn send_event<W: AsyncWrite + Unpin>(
     write_message(writer, &msg).await
 }
 
-fn fits_response(message: &DaemonMessage) -> bool {
-    serde_json::to_vec(message).is_ok_and(|bytes| bytes.len() < MAX_MESSAGE_SIZE)
+fn fits_response(message: &DaemonMessage, limit: usize) -> bool {
+    // One byte remains for the newline; never start an oversized frame.
+    serde_json::to_vec(message).is_ok_and(|bytes| bytes.len() < limit)
 }
 
 /// Serializes one complete reply under the connection's shared writer lock.
@@ -1609,6 +1640,13 @@ async fn write_message<W: AsyncWrite + Unpin>(
 }
 
 #[cfg(test)]
+#[path = "connection_replay_corpus.rs"]
+mod replay_corpus;
+#[cfg(test)]
+#[path = "connection_replay_tests.rs"]
+mod replay_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1617,6 +1655,8 @@ mod tests {
     use tokio::net::UnixStream;
 
     use crate::registry::RemovalReason;
+
+    include!("connection_proof_tests.rs");
 
     fn handshake_pair() -> (ConnectionHandler, UnixStream) {
         let (ours, peer) = UnixStream::pair().unwrap();
@@ -2168,6 +2208,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pi_1_5_2_idle_registration() {
+        // Synthetic: proposed identity-only recovery frame, with an armed exact
+        // reference whose receipt an Idle must never manufacture.
+        use atm_core::Harness;
+        let (mut handler, evidence) = evidence_handler(Harness::Pi).await;
+        let row = handler
+            .registry
+            .get_session("evidence-session".into())
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        handler.registry = RegistryHandle::new(sender, events);
+        let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let applies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = observations.clone();
+        let applied = applies.clone();
+        let actor = tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    crate::registry::RegistryCommand::ApplyLifecycleEvent {
+                        event,
+                        respond_to,
+                        ..
+                    } => {
+                        assert!(atm_org::TaskUsageObservation::from_lifecycle(
+                            "evidence-session".into(),
+                            Some("%7".into()),
+                            &event
+                        )
+                        .is_none());
+                        applied.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    crate::registry::RegistryCommand::GetAllSessions { respond_to } => {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = respond_to.send(vec![row.clone()]);
+                    }
+                    _ => panic!("unexpected registry operation"),
+                }
+            }
+        });
+        handler
+            .handle_pi_event(serde_json::json!({
+                "event":"atm_idle", "payload":{}, "session_id":"evidence-session", "pid":123,
+                "tmux_pane":"%7", "model":{"id":"probe", "provider":"synthetic"}
+            }))
+            .await
+            .unwrap();
+        assert!(evidence.receipt("m123".parse().unwrap()).unwrap().is_none());
+        assert!(
+            evidence
+                .snapshot("m123".parse().unwrap())
+                .unwrap()
+                .probably_landed
+        );
+        assert_eq!(
+            observations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one primary activity tap, none for model metadata"
+        );
+        assert_eq!(applies.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(handler);
+        actor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pi_1_5_2_idle_registration_h1_capture() {
+        // Captured: pi 1.5.2, 2026-11-16, sealed SDK/real forwarder/private
+        // receiver, held input/connect; local request preparation stops before
+        // providers. Synthetic: attribution to this real registry/evidence rig.
+        use atm_core::{Harness, SessionStatus};
+        let (mut handler, evidence) = evidence_handler(Harness::Pi).await;
+        handler
+            .registry
+            .remove("evidence-session".into())
+            .await
+            .unwrap();
+        let pid = std::process::id();
+        handler
+            .registry
+            .register_discovered(
+                "evidence-session".into(),
+                pid,
+                std::env::temp_dir(),
+                Some("%7".into()),
+                Harness::Pi,
+            )
+            .await
+            .unwrap();
+        let mut updates = handler.registry.subscribe();
+        let mut before = None;
+        let mut edges = 0;
+        let mut inputs = 0;
+        for line in
+            include_str!("../../../atm-pi-adapter/tests/fixtures/pi_reconnect_1.5.2.jsonl").lines()
+        {
+            let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+            if frame["run"] != "held-input" {
+                continue;
+            }
+            let mut data = frame["data"].clone();
+            data["session_id"] = serde_json::json!("evidence-session");
+            data["pid"] = serde_json::json!(pid);
+            data["tmux_pane"] = serde_json::json!("%7");
+            inputs += usize::from(data["event"] == "input");
+            handler.handle_pi_event(data).await.unwrap();
+            while let Ok(event) = updates.try_recv() {
+                if let SessionEvent::Updated { session } = event {
+                    if session.status == SessionStatus::Idle
+                        && before.is_some_and(|s| s != SessionStatus::Idle)
+                    {
+                        edges += 1;
+                    }
+                    before = Some(session.status);
+                }
+            }
+        }
+        assert_eq!(inputs, 1);
+        assert_eq!(
+            edges, 1,
+            "held input/reconnect must not double-count a turn end"
+        );
+        assert!(evidence.receipt("m123".parse().unwrap()).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn message_evidence_tap_receives_all_three_captured_prompt_shapes() {
         use atm_core::Harness;
         for harness in [Harness::ClaudeCode, Harness::Pi, Harness::Codex] {
@@ -2356,6 +2523,7 @@ mod tests {
                 session_id: Some("evidence-session".into()),
             },
             OrgEvent::MessageSent(atm_org::MessageContent {
+                delivery_notice: None,
                 from: atm_org::Address::Owner,
                 to: atm_org::Address::Agent("demo/worker".parse().unwrap()),
                 kind: atm_org::MessageKind::Note,
@@ -3151,6 +3319,7 @@ mod tests {
                         session_id: Some("evidence-session".into()),
                     },
                     OrgEvent::MessageSent(atm_org::MessageContent {
+                        delivery_notice: None,
                         from: atm_org::Address::Owner,
                         to: atm_org::Address::Agent(worker.clone()),
                         kind: atm_org::MessageKind::Note,
@@ -3421,6 +3590,581 @@ mod tests {
         );
         assert!(start.elapsed() >= READ_TIMEOUT);
         run.await.unwrap();
+    }
+
+    // Break caught: org.tree is bounded by the generic 1 MiB ceiling, by
+    // characters rather than UTF-8 bytes, or without envelope/id/newline bytes.
+    #[tokio::test]
+    async fn org_tree_complete_response_byte_boundaries() {
+        use serde_json::json;
+        const LIMIT: usize = 512 * 1024;
+        for (unit, extra, id) in [
+            ("x", 0, String::from("n")),
+            ("é", 0, String::from("n")),
+            ("🙂", 1, String::from("n")),
+            ("x", 1, "long".repeat(4096)),
+        ] {
+            let empty = DaemonMessage::response_ok(id.clone(), json!({"text":""}));
+            let room = LIMIT - serde_json::to_vec(&empty).unwrap().len() - 1;
+            let text = format!(
+                "{}{}",
+                unit.repeat(room / unit.len()),
+                "x".repeat(room % unit.len() + extra)
+            );
+            let mut methods = MethodRouter::default();
+            methods
+                .register("org.tree", Duration::from_secs(12), move |_, _| {
+                    let text = text.clone();
+                    async move { Ok(json!({"text":text})) }
+                })
+                .unwrap();
+            let (mut read, mut write, cancel, run) = request_connection(Arc::new(methods)).await;
+            send_client(
+                &mut write,
+                ClientMessage::request(id.clone(), "org.tree".into(), json!({}), None),
+            )
+            .await;
+            let mut line = String::new();
+            timeout(Duration::from_secs(60), read.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], id);
+            if extra == 0 {
+                assert_eq!(line.len(), LIMIT);
+                assert!(response.get("result").is_some());
+            } else {
+                assert!(line.len() <= LIMIT);
+                assert_eq!(response["error"]["code"], "refused");
+            }
+            cancel.cancel();
+            run.await.unwrap();
+        }
+    }
+
+    // Break caught: overload skips org.tree's line bound, or a too-long id
+    // causes even the refusal to start an oversized/partial response frame.
+    #[tokio::test(start_paused = true)]
+    async fn org_tree_byte_limit_survives_full_request_queue() {
+        let mut methods = MethodRouter::default();
+        methods
+            .register("hold", Duration::from_secs(10), |_, _| {
+                std::future::pending::<super::super::methods::MethodResult>()
+            })
+            .unwrap();
+        let (mut read, mut write, cancel, run) = request_connection(Arc::new(methods)).await;
+        for n in 0..64 {
+            send_client(
+                &mut write,
+                ClientMessage::request(n.to_string(), "hold".into(), serde_json::json!({}), None),
+            )
+            .await;
+        }
+        send_client(&mut write, ClientMessage::ping(42)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 42 }
+        ));
+        send_client(
+            &mut write,
+            ClientMessage::request(
+                "overload".into(),
+                "org.tree".into(),
+                serde_json::json!({}),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(receive(&mut read).await, DaemonMessage::Response {payload:atm_protocol::ResponsePayload::Error(error),..} if error.code == "unavailable")
+        );
+        send_client(
+            &mut write,
+            ClientMessage::request(
+                "i".repeat(512 * 1024),
+                "org.tree".into(),
+                serde_json::json!({}),
+                None,
+            ),
+        )
+        .await;
+        let mut bytes = Vec::new();
+        assert_eq!(
+            timeout(Duration::from_secs(60), read.read_to_end(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "oversized refusal started a frame"
+        );
+        cancel.cancel();
+        run.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_prepare_largest_complete_response_boundaries() {
+        use serde_json::json;
+        for (unit, extra, id) in [
+            ("x", 0, "short".into()),
+            ("é", 0, "é".repeat(4096)),
+            ("🙂", 1, "short".into()),
+        ] {
+            let empty =
+                DaemonMessage::response_ok(id.clone(), json!({"target_pane":"%7","cwd":""}));
+            let room = MAX_MESSAGE_SIZE - serde_json::to_vec(&empty).unwrap().len() - 1;
+            let cwd = format!(
+                "{}{}",
+                unit.repeat(room / unit.len()),
+                "x".repeat(room % unit.len() + extra)
+            );
+            let mut methods = MethodRouter::default();
+            methods
+                .register(
+                    "session.spawn_prepare_largest",
+                    Duration::from_secs(35),
+                    move |_, _| {
+                        let cwd = cwd.clone();
+                        async move { Ok(json!({"target_pane":"%7","cwd":cwd})) }
+                    },
+                )
+                .unwrap();
+            let (mut read, mut write, cancel, run) = request_connection(Arc::new(methods)).await;
+            send_client(
+                &mut write,
+                ClientMessage::request(
+                    id.clone(),
+                    "session.spawn_prepare_largest".into(),
+                    json!({}),
+                    None,
+                ),
+            )
+            .await;
+            let mut line = String::new();
+            timeout(Duration::from_secs(60), read.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], id);
+            if extra == 0 {
+                assert_eq!(line.len(), MAX_MESSAGE_SIZE);
+                assert!(response.get("result").is_some());
+            } else {
+                assert!(
+                    line.len() <= MAX_MESSAGE_SIZE,
+                    "largest preparation escaped complete envelope bound"
+                );
+                assert_eq!(response["error"]["code"], "refused");
+            }
+            cancel.cancel();
+            run.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_prepare_largest_oversized_id_closes_without_partial_frame() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = gate.clone();
+        let mut methods = MethodRouter::default();
+        methods
+            .register("hold", Duration::from_secs(1000), move |_, _| {
+                let held = held.clone();
+                async move {
+                    held.acquire().await.unwrap().forget();
+                    Ok(serde_json::Value::Null)
+                }
+            })
+            .unwrap();
+        let (mut read, mut write, cancel, run) = request_connection(Arc::new(methods)).await;
+        for n in 0..64 {
+            send_client(
+                &mut write,
+                ClientMessage::request(n.to_string(), "hold".into(), serde_json::json!({}), None),
+            )
+            .await;
+        }
+        send_client(&mut write, ClientMessage::ping(42)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 42 }
+        ));
+        let mut message = ClientMessage::request(
+            String::new(),
+            "session.spawn_prepare_largest".into(),
+            serde_json::json!({}),
+            None,
+        );
+        let base = serde_json::to_vec(&message).unwrap().len() + 1;
+        if let MessageType::Request { id, .. } = &mut message.message {
+            *id = "i".repeat(MAX_MESSAGE_SIZE - base);
+        }
+        send_client(&mut write, message).await;
+        // Finish accepted work by event, so input rejection can drain and close.
+        gate.add_permits(64);
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            timeout(Duration::from_secs(60), read.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "oversized refusal started a frame"
+        );
+        cancel.cancel();
+        run.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_prepare_largest_caller_loss_drops_waiting_read() {
+        timeout(Duration::from_secs(60), async {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+            let mut router = MethodRouter::default();
+            router
+                .register(
+                    "session.spawn_prepare_largest",
+                    Duration::from_secs(60),
+                    move |_, _| {
+                        let (entry, gate, finished) =
+                            (entry.clone(), gate.clone(), finished.clone());
+                        async move {
+                            entry.notify_one();
+                            gate.notified().await;
+                            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(serde_json::Value::Null)
+                        }
+                    },
+                )
+                .unwrap();
+            let (mut handler, peer) = handshake_pair();
+            handler.methods = Arc::new(router);
+            let handler = handler.with_disconnect_monitor().unwrap();
+            let gone = handler.caller_gone.clone();
+            let run = tokio::spawn(handler.run());
+            let mut peer = BufReader::new(peer);
+            send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::Connected { .. }
+            ));
+            send_client(
+                peer.get_mut(),
+                ClientMessage::request(
+                    "largest".into(),
+                    "session.spawn_prepare_largest".into(),
+                    serde_json::json!({}),
+                    None,
+                ),
+            )
+            .await;
+            entered.notified().await;
+            drop(peer);
+            gone.cancelled().await;
+            release.notify_one();
+            run.await.unwrap();
+            assert!(
+                !completed.load(std::sync::atomic::Ordering::SeqCst),
+                "largest preparation outlived caller"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // Breaks if either role method bypasses complete UTF-8 envelope bounds.
+    #[tokio::test]
+    async fn session_roles_complete_response_byte_boundaries() {
+        use serde_json::json;
+        for method in ["session.roles", "session.role_set"] {
+            for (unit, extra, id) in [
+                ("7", 0, "short".to_owned()),
+                ("é", 0, "é".repeat(4096)),
+                ("🙂", 1, "short".to_owned()),
+            ] {
+                let payload = if method == "session.roles" {
+                    json!({"coordinator_panes":[""]})
+                } else {
+                    json!({"pane":"","role":null})
+                };
+                let empty = DaemonMessage::response_ok(id.clone(), payload.clone());
+                let room = MAX_MESSAGE_SIZE - serde_json::to_vec(&empty).unwrap().len() - 1;
+                let large = format!(
+                    "{}{}",
+                    unit.repeat(room / unit.len()),
+                    "x".repeat(room % unit.len() + extra)
+                );
+                let value = if method == "session.roles" {
+                    json!({"coordinator_panes":[large]})
+                } else {
+                    json!({"pane":large,"role":null})
+                };
+                let mut methods = MethodRouter::default();
+                methods
+                    .register(method, Duration::from_secs(35), move |_, _| {
+                        let value = value.clone();
+                        async move { Ok(value) }
+                    })
+                    .unwrap();
+                let (mut read, mut write, cancel, run) =
+                    request_connection(Arc::new(methods)).await;
+                send_client(
+                    &mut write,
+                    ClientMessage::request(id.clone(), method.into(), json!({}), None),
+                )
+                .await;
+                let mut line = String::new();
+                timeout(Duration::from_secs(60), read.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(response["id"], id);
+                if extra == 0 {
+                    assert_eq!(line.len(), MAX_MESSAGE_SIZE);
+                    assert!(response.get("result").is_some());
+                } else {
+                    assert!(
+                        line.len() <= MAX_MESSAGE_SIZE,
+                        "{method} escaped response bound"
+                    );
+                    assert_eq!(response["error"]["code"], "refused");
+                }
+                cancel.cancel();
+                run.await.unwrap();
+            }
+        }
+    }
+
+    // Breaks if the overload path admits an id that cannot fit its refusal.
+    #[tokio::test(start_paused = true)]
+    async fn session_roles_oversized_id_closes_without_a_partial_frame() {
+        for method in ["session.roles", "session.role_set"] {
+            let (mut read, mut write, cancel, run) = request_connection(request_router()).await;
+            for n in 0..64 {
+                send_client(&mut write, request(&n.to_string(), 10)).await;
+            }
+            send_client(&mut write, ClientMessage::ping(42)).await;
+            assert!(matches!(
+                receive(&mut read).await,
+                DaemonMessage::Pong { seq: 42 }
+            ));
+            let mut message =
+                ClientMessage::request(String::new(), method.into(), serde_json::json!({}), None);
+            let base = serde_json::to_vec(&message).unwrap().len() + 1;
+            if let MessageType::Request { id, .. } = &mut message.message {
+                *id = "i".repeat(MAX_MESSAGE_SIZE - base);
+            }
+            send_client(&mut write, message).await;
+            let mut bytes = Vec::new();
+            assert_eq!(
+                timeout(Duration::from_secs(60), read.read_to_end(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "oversized refusal started a frame"
+            );
+            cancel.cancel();
+            run.await.unwrap();
+        }
+    }
+
+    // Breaks if full caller loss leaves either pre-admission role method alive.
+    #[tokio::test]
+    async fn session_roles_full_disconnect_drops_the_waiting_operation() {
+        timeout(Duration::from_secs(60), async {
+            for method in ["session.roles", "session.role_set"] {
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+                let mut router = MethodRouter::default();
+                router
+                    .register(method, Duration::from_secs(60), move |_, _| {
+                        let (entry, gate, finished) =
+                            (entry.clone(), gate.clone(), finished.clone());
+                        async move {
+                            entry.notify_one();
+                            gate.notified().await;
+                            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(serde_json::Value::Null)
+                        }
+                    })
+                    .unwrap();
+                let (mut handler, peer) = handshake_pair();
+                handler.methods = Arc::new(router);
+                let handler = handler.with_disconnect_monitor().unwrap();
+                let gone = handler.caller_gone.clone();
+                let run = tokio::spawn(handler.run());
+                let mut peer = BufReader::new(peer);
+                send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+                assert!(matches!(
+                    receive(&mut peer).await,
+                    DaemonMessage::Connected { .. }
+                ));
+                send_client(
+                    peer.get_mut(),
+                    ClientMessage::request(
+                        "role".into(),
+                        method.into(),
+                        serde_json::json!({}),
+                        None,
+                    ),
+                )
+                .await;
+                entered.notified().await;
+                drop(peer);
+                gone.cancelled().await;
+                release.notify_one();
+                run.await.unwrap();
+                assert!(
+                    !completed.load(std::sync::atomic::Ordering::SeqCst),
+                    "{method} outlived its caller"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    // Breaks if membership bounds omit the envelope/id/newline, count chars
+    // instead of UTF-8 bytes, or serialize an oversized success before refusal.
+    #[tokio::test]
+    async fn session_panes_complete_response_byte_boundaries() {
+        use serde_json::json;
+        for (unit, extra, id) in [
+            ("7", 0, "short".to_owned()),
+            ("é", 0, "é".repeat(4096)),
+            ("🙂", 1, "short".to_owned()),
+        ] {
+            let empty = DaemonMessage::response_ok(id.clone(), json!({"pane_ids":[""]}));
+            let room = MAX_MESSAGE_SIZE - serde_json::to_vec(&empty).unwrap().len() - 1;
+            let value = json!({"pane_ids":[format!("{}{}", unit.repeat(room / unit.len()), "x".repeat(room % unit.len() + extra))]});
+            let mut methods = MethodRouter::default();
+            methods
+                .register("session.panes", Duration::from_secs(35), move |_, _| {
+                    let value = value.clone();
+                    async move { Ok(value) }
+                })
+                .unwrap();
+            let (mut read, mut write, cancel, run) = request_connection(Arc::new(methods)).await;
+            send_client(
+                &mut write,
+                ClientMessage::request(id.clone(), "session.panes".into(), json!({}), None),
+            )
+            .await;
+            let mut line = String::new();
+            timeout(Duration::from_secs(60), read.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], id);
+            if extra == 0 {
+                assert_eq!(line.len(), MAX_MESSAGE_SIZE);
+                assert!(response.get("result").is_some());
+            } else {
+                assert!(
+                    line.len() <= MAX_MESSAGE_SIZE,
+                    "membership escaped response bound"
+                );
+                assert_eq!(response["error"]["code"], "refused");
+            }
+            cancel.cancel();
+            run.await.unwrap();
+        }
+    }
+
+    // Breaks if a saturated connection lets a huge id create an oversized
+    // refusal. The request fits the input budget, but no response can fit.
+    #[tokio::test(start_paused = true)]
+    async fn session_panes_oversized_id_closes_before_starting_a_refusal() {
+        let (mut read, mut write, cancel, run) = request_connection(request_router()).await;
+        for n in 0..64 {
+            send_client(&mut write, request(&n.to_string(), 10)).await;
+        }
+        send_client(&mut write, ClientMessage::ping(42)).await;
+        assert!(matches!(
+            receive(&mut read).await,
+            DaemonMessage::Pong { seq: 42 }
+        ));
+        let mut message = ClientMessage::request(
+            String::new(),
+            "session.panes".into(),
+            serde_json::json!({}),
+            None,
+        );
+        let base = serde_json::to_vec(&message).unwrap().len() + 1;
+        if let MessageType::Request { id, .. } = &mut message.message {
+            *id = "i".repeat(MAX_MESSAGE_SIZE - base);
+        }
+        send_client(&mut write, message).await;
+        let mut bytes = Vec::new();
+        assert_eq!(
+            timeout(Duration::from_secs(60), read.read_to_end(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "oversized refusal started a frame"
+        );
+        cancel.cancel();
+        run.await.unwrap();
+    }
+
+    // Breaks if a full socket close leaves a waiting membership method alive.
+    #[tokio::test]
+    async fn session_panes_full_disconnect_drops_the_waiting_read() {
+        timeout(Duration::from_secs(60), async {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (entry, gate, finished) = (entered.clone(), release.clone(), completed.clone());
+            let mut router = MethodRouter::default();
+            router
+                .register("session.panes", Duration::from_secs(60), move |_, _| {
+                    let (entry, gate, finished) = (entry.clone(), gate.clone(), finished.clone());
+                    async move {
+                        entry.notify_one();
+                        gate.notified().await;
+                        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(serde_json::Value::Null)
+                    }
+                })
+                .unwrap();
+            let (mut handler, peer) = handshake_pair();
+            handler.methods = Arc::new(router);
+            let handler = handler.with_disconnect_monitor().unwrap();
+            let gone = handler.caller_gone.clone();
+            let run = tokio::spawn(handler.run());
+            let mut peer = BufReader::new(peer);
+            send_client(peer.get_mut(), ClientMessage::connect(None)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::Connected { .. }
+            ));
+            send_client(
+                peer.get_mut(),
+                ClientMessage::request(
+                    "panes".into(),
+                    "session.panes".into(),
+                    serde_json::json!({}),
+                    None,
+                ),
+            )
+            .await;
+            entered.notified().await;
+            drop(peer);
+            gone.cancelled().await;
+            release.notify_one();
+            run.await.unwrap();
+            assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

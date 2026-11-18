@@ -1,10 +1,15 @@
 //! In-memory fold. Apply checks references and identity invariants, not policy.
+//!
+//! Known limit: the fold trusts an overrule's frozen redo list and is not
+//! idempotent for duplicated or hand-made overrule facts. The single writer
+//! freezes the started impact, emits nothing for an exact repeat and refuses a
+//! changed answer, so it cannot produce such facts.
 
 use crate::*;
 use atm_core::{Money, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -19,6 +24,10 @@ pub enum ApplyError {
     UnknownMessage(MessageId),
     #[error("message {0} already exists")]
     DuplicateMessage(MessageId),
+    #[error("invalid delivery notice: {0}")]
+    InvalidDeliveryNotice(&'static str),
+    #[error("delivery notice already exists: {0:?}")]
+    DuplicateDeliveryNotice(DeliveryNotice),
     #[error("unknown task {0}")]
     UnknownTask(TaskId),
     #[error("task {0} already exists")]
@@ -29,6 +38,8 @@ pub enum ApplyError {
     UnknownDecision(DecisionId),
     #[error("decision {0} already exists")]
     DuplicateDecision(DecisionId),
+    #[error("invalid return digest: {0}")]
+    InvalidDigest(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +129,10 @@ pub struct OrgState {
     messages: BTreeMap<MessageId, Message>,
     pub(crate) tasks: BTreeMap<u64, Task>,
     pub(crate) costs: crate::cost::CostLedger,
+    pub(crate) reports: crate::report::ReportLedger,
+    ever_assigned: BTreeSet<TaskId>,
+    pub(crate) redo_history: crate::decision_redo::RedoHistory,
+    pub(crate) return_history: crate::return_digest::ReturnHistory,
     summaries: HashMap<SessionId, SessionSummary>,
     decisions: BTreeMap<DecisionId, Decision>,
     pub(crate) owner: OwnerState,
@@ -158,6 +173,13 @@ impl OrgState {
     pub fn message(&self, id: &MessageId) -> Option<&Message> {
         self.messages.get(id)
     }
+    /// The retained committed note is the lifetime key, including after reads,
+    /// source delivery changes and replay. There is no separate mark to lose.
+    #[must_use]
+    pub fn has_delivery_notice(&self, notice: &DeliveryNotice) -> bool {
+        self.messages()
+            .any(|message| message.content.delivery_notice.as_ref() == Some(notice))
+    }
     #[must_use]
     pub fn session_summary(&self, id: &SessionId) -> Option<&SessionSummary> {
         self.summaries.get(id)
@@ -177,6 +199,11 @@ impl OrgState {
     }
     pub fn decisions(&self) -> impl Iterator<Item = &Decision> {
         self.decisions.values()
+    }
+    /// Monotone committed assignment history, not current task state or usage.
+    #[must_use]
+    pub fn task_was_assigned(&self, id: &TaskId) -> bool {
+        self.ever_assigned.contains(id)
     }
     /// All addressed messages, including read/failed ones, ordered by sequence.
     #[must_use]
@@ -284,6 +311,22 @@ impl OrgState {
             OrgEvent::MessageSent(content) => {
                 self.validate_address(&content.from)?;
                 self.validate_address(&content.to)?;
+                if let Some(notice) = &content.delivery_notice {
+                    self.require_message(&notice.source_message_id)?;
+                    if content.from != Address::System
+                        || content.to != Address::Owner
+                        || content.kind != MessageKind::Note
+                    {
+                        return Err(ApplyError::InvalidDeliveryNotice(
+                            "must be a system-to-owner note",
+                        ));
+                    }
+                    if notice.reason.is_empty() {
+                        return Err(ApplyError::InvalidDeliveryNotice(
+                            "reason must not be empty",
+                        ));
+                    }
+                }
             }
             OrgEvent::MessageDeliveryAttempted {
                 message_id, pane, ..
@@ -356,6 +399,15 @@ impl OrgState {
             OrgEvent::DecisionExpired { decision_id } => {
                 self.require_decision(decision_id)?;
             }
+            OrgEvent::OwnerRelaySet(fact) => {
+                self.validate_address(&fact.by)?;
+                if let Some(id) = &fact.agent {
+                    self.require_agent(id)?;
+                }
+            }
+            OrgEvent::OwnerDigestCreated(crate::OwnerDigestCreated { by, .. }) => {
+                self.validate_address(by)?
+            }
             OrgEvent::OwnerAway(OwnerAway { by, .. }) | OrgEvent::OwnerBack(OwnerBack { by }) => {
                 self.validate_address(by)?;
             }
@@ -371,6 +423,22 @@ impl OrgState {
                 self.require_message(message_id)?;
             }
         }
+        if let OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+            relayed_by: Some(id),
+            ..
+        }) = event
+        {
+            self.require_agent(id)?;
+        }
+        if let OrgEvent::DecisionOverruled(answer) = event {
+            let mut seen = BTreeSet::new();
+            for id in answer.redo_tasks.iter().flatten() {
+                self.require_task(id)?;
+                if !seen.insert(id) {
+                    return Err(ApplyError::DuplicateTask(id.clone()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -383,17 +451,25 @@ impl OrgState {
         event: &OrgEvent,
     ) -> Result<(), ApplyError> {
         self.validate_event(event)?;
-        if matches!(event, OrgEvent::MessageSent(_))
-            && self.messages.contains_key(&MessageId::new(seq))
-        {
-            return Err(ApplyError::DuplicateMessage(MessageId::new(seq)));
+        if let OrgEvent::MessageSent(content) = event {
+            if self.messages.contains_key(&MessageId::new(seq)) {
+                return Err(ApplyError::DuplicateMessage(MessageId::new(seq)));
+            }
+            if let Some(notice) = &content.delivery_notice {
+                if self.has_delivery_notice(notice) {
+                    return Err(ApplyError::DuplicateDeliveryNotice(notice.clone()));
+                }
+            }
         }
         if matches!(event, OrgEvent::DecisionRequested(_))
             && self.decisions.contains_key(&DecisionId::new(seq))
         {
             return Err(ApplyError::DuplicateDecision(DecisionId::new(seq)));
         }
+        let reporting = self.report_delta(seq, ts, event);
+        self.track_return_event(seq, ts, event);
         self.track_cost_transition(event, ts);
+        self.track_redo_transition(event);
         match event {
             OrgEvent::ProjectRegistered { project_id, root } => {
                 self.projects.insert(
@@ -564,7 +640,10 @@ impl OrgState {
                 }
             }
             OrgEvent::TaskCreated(fact) => fact.fold(&mut self.tasks, seq, ts)?,
-            OrgEvent::TaskAssigned(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
+            OrgEvent::TaskAssigned(fact) => {
+                self.ever_assigned.insert(fact.task_id.clone());
+                fact.fold(self.task_mut(&fact.task_id)?, ts);
+            }
             OrgEvent::TaskStateChanged(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
             OrgEvent::TaskSubmitted(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
             OrgEvent::TaskReviewStarted(fact) => fact.fold(self.task_mut(&fact.task_id)?, ts),
@@ -606,6 +685,9 @@ impl OrgState {
                     ts,
                 );
                 decision.resolution = Some(resolution.clone());
+                if matches!(event, OrgEvent::DecisionOverruled(_)) {
+                    self.apply_overrule(seq, ts, answer)?;
+                }
             }
             OrgEvent::DecisionExpired { decision_id } => {
                 self.decision_mut(decision_id)?
@@ -618,7 +700,10 @@ impl OrgState {
             }
             OrgEvent::OwnerAway(fact) => fact.fold(&mut self.owner, ts),
             OrgEvent::OwnerBack(_) => self.owner.away_since = None,
+            OrgEvent::OwnerRelaySet(fact) => self.owner.relay.clone_from(&fact.agent),
+            OrgEvent::OwnerDigestCreated(fact) => self.apply_digest(seq, fact.back_seq)?,
         }
+        self.reports.apply(reporting);
         Ok(())
     }
     fn decision_mut(&mut self, id: &DecisionId) -> Result<&mut Decision, ApplyError> {

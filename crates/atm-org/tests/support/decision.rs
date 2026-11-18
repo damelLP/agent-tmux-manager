@@ -97,6 +97,7 @@ pub fn decision_event_case(slot: usize, text: String, n: u64, flag: bool) -> Org
             OrgEvent::DecisionRequested(request)
         }
         1 => OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+            relayed_by: flag.then(builder),
             decision_id,
             option: text,
             by,
@@ -112,7 +113,7 @@ pub fn decision_event_case(slot: usize, text: String, n: u64, flag: bool) -> Org
     }
 }
 
-/// One command per decision command variant (`pick % 5`), aimed at `target`.
+/// One command per decision command variant (`pick % 6`), aimed at `target`.
 pub fn decision_command(
     pick: u64,
     target: DecisionId,
@@ -120,7 +121,7 @@ pub fn decision_command(
     deadline: Option<DateTime<Utc>>,
     flag: bool,
 ) -> DecisionCommand {
-    match pick % 5 {
+    match pick % 6 {
         0 => {
             let mut request = request();
             request.requester = requester;
@@ -129,6 +130,7 @@ pub fn decision_command(
             DecisionCommand::Request(request)
         }
         1 => DecisionCommand::TakeProvisionally(ProvisionalChoice {
+            relayed_by: None,
             decision_id: target,
             option: "a".into(),
             by: Address::System,
@@ -142,6 +144,14 @@ pub fn decision_command(
         }),
         3 => DecisionCommand::Expire {
             decision_id: target,
+        },
+        5 => DecisionCommand::Relay {
+            decision_id: target,
+            option: if flag { "a" } else { "b" }.into(),
+            by: match requester {
+                Address::Agent(id) => id,
+                Address::Owner | Address::System => builder(),
+            },
         },
         _ => DecisionCommand::Withdraw(DecisionWithdrawal {
             decision_id: target,
@@ -159,5 +169,6 @@ pub fn decision_command_pick(command: &DecisionCommand) -> u64 {
         DecisionCommand::Resolve(_) => 2,
         DecisionCommand::Expire { .. } => 3,
         DecisionCommand::Withdraw(_) => 4,
+        DecisionCommand::Relay { .. } => 5,
     }
 }

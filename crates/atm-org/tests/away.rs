@@ -186,7 +186,7 @@ mod world {
     pub fn owner() -> TaskActor {
         TaskActor {
             who: Address::Owner,
-            lead: false,
+            manager_of: None,
         }
     }
 
@@ -279,6 +279,19 @@ mod world {
                 },
             ))))
         }
+        pub fn set_relay(&mut self, name: &str) {
+            self.must(OrgCommand::Owner(OwnerCommand::SetRelay {
+                by: Address::Owner,
+                agent: Some(name.parse().unwrap()),
+            }));
+        }
+        pub fn relay(&mut self, decision_id: DecisionId, option: &str, by: &str) {
+            self.must(OrgCommand::Decision(DecisionCommand::Relay {
+                decision_id,
+                option: option.into(),
+                by: by.parse().unwrap(),
+            }));
+        }
         pub fn apply_away(&mut self, decision_id: DecisionId) -> Result<Vec<OrgEvent>, Refusal> {
             self.owner(OwnerCommand::ApplyAway { decision_id })
         }
@@ -299,6 +312,7 @@ mod world {
         /// An open task, created by the owner, that rests on `rests_on`.
         pub fn task(&mut self, rests_on: Option<DecisionId>) -> TaskId {
             let seq = self.must(OrgCommand::Task(TaskCommand::Create(TaskCreated {
+                project_id: None,
                 title: "Build on it".into(),
                 kind: TaskKind::Work,
                 creator: Address::Owner,
@@ -495,6 +509,7 @@ fn apply_away_takes_a_change_of_intent_by_system_and_a_detail_by_its_requester()
         world.apply_away(change),
         Ok(vec![OrgEvent::DecisionTakenProvisionally(
             ProvisionalChoice {
+                relayed_by: None,
                 decision_id: change,
                 option: "b".into(),
                 by: Address::System,
@@ -505,6 +520,7 @@ fn apply_away_takes_a_change_of_intent_by_system_and_a_detail_by_its_requester()
         world.apply_away(detail),
         Ok(vec![OrgEvent::DecisionTakenProvisionally(
             ProvisionalChoice {
+                relayed_by: None,
                 decision_id: detail,
                 option: "a".into(),
                 by: agent("q/lead"),
@@ -613,6 +629,96 @@ fn default_cap_holds_a_task_that_rests_on_a_provisional_decision_until_it_is_ans
     }
 }
 
+// Break caught: a relay (including a self-relay) bypassing the default cap,
+// lifting it before the owner answers, or failing to freeze/replay dependent redo.
+#[test]
+fn relayed_intent_holds_further_work_until_owner_confirmation_or_overrule() {
+    for requester in ["p/builder", "p/lead"] {
+        for option in ["b", "a"] {
+            let mut world = World::new();
+            world.set_relay("p/lead");
+            let decision = world.request(requester, true, true, Some("a"));
+            let first = world.task(Some(decision));
+            let second = world.task(Some(decision));
+            world.assign(&first, "p/lead").unwrap();
+            world.relay(decision, "b", "p/lead");
+            let taken = world.state.decision(&decision).unwrap().provisional.clone();
+            assert_eq!(world.state.owner().away_since, None); // never away: cap is still 1
+            assert_eq!(
+                held(world.assign(&second, "p/lead")),
+                (second.clone(), decision, 1)
+            );
+            // The same task ID can resume without spending another cap slot.
+            world.set_state(&first, TaskState::Open, world::owner());
+            assert_eq!(world.assign(&first, "p/builder").unwrap().len(), 1);
+            held(world.assign(&second, "p/lead"));
+            let events = world
+                .step(OrgCommand::Decision(DecisionCommand::Resolve(
+                    DecisionResolution {
+                        decision_id: decision,
+                        option: option.into(),
+                        by: Address::Owner,
+                        note: None,
+                        standing_rule: false,
+                    },
+                )))
+                .unwrap();
+            match events.as_slice() {
+                [OrgEvent::DecisionResolved(answer)] if option == "b" => {
+                    assert_eq!(answer.redo_tasks, None);
+                    assert_eq!(
+                        world.state.task(&first).unwrap().agent_id,
+                        Some("p/builder".parse().unwrap())
+                    );
+                }
+                [OrgEvent::DecisionOverruled(answer)] if option == "a" => {
+                    assert_eq!(answer.redo_tasks, Some(vec![first.clone()]));
+                    let reopened = world.state.task(&first).unwrap();
+                    assert_eq!(reopened.state, TaskState::Open);
+                    assert_eq!(reopened.agent_id, None);
+                }
+                other => panic!("wrong owner answer path: {other:?}"),
+            }
+            assert_eq!(world.state.decision(&decision).unwrap().provisional, taken);
+            assert_eq!(world.state.task(&second).unwrap().state, TaskState::Open);
+            assert_eq!(world.assign(&second, "p/lead").unwrap().len(), 1);
+            assert_eq!(world.replayed(), world.state);
+        }
+    }
+}
+
+// Break caught: using the relayer's project or present flag instead of the
+// requester's snapshotted cap, or applying an intent cap to a relayed Detail.
+#[test]
+fn relays_keep_requester_caps_after_back_and_details_remain_uncapped() {
+    for requester in ["p/builder", "q/lead"] {
+        let mut world = World::new();
+        world.away(&[("p", 2)]);
+        world.back();
+        world.set_relay("p/lead");
+        let decision = world.request(requester, true, true, Some("a"));
+        world.relay(decision, "b", "p/lead");
+        let first = world.task(Some(decision));
+        let second = world.task(Some(decision));
+        if requester == "p/builder" {
+            assert_eq!(world.assign(&first, "p/lead").unwrap().len(), 1);
+            assert_eq!(held(world.assign(&second, "p/lead")).2, 2);
+        } else {
+            assert_eq!(held(world.assign(&first, "p/lead")).2, 1);
+        }
+        assert_eq!(world.replayed(), world.state);
+    }
+    let mut world = World::new();
+    world.set_relay("p/lead");
+    let detail = world.request("p/lead", true, false, None);
+    world.relay(detail, "b", "p/lead");
+    for _ in 0..2 {
+        let task = world.task(Some(detail));
+        assert_eq!(world.assign(&task, "p/lead").unwrap().len(), 1);
+    }
+    assert_eq!(world.replayed(), world.state);
+}
+
 #[test]
 fn nothing_else_is_held() {
     let mut world = World::new();
@@ -647,7 +753,7 @@ fn nothing_else_is_held() {
             agent_id: "p/lead".parse().unwrap(),
             by: TaskActor {
                 who: agent("q/lead"),
-                lead: false,
+                manager_of: None,
             },
         })),
         Err(Refusal::Task(TaskRefusal::NotAllowed { .. }))
@@ -667,7 +773,7 @@ fn a_cap_of_two_lets_one_further_task_start() {
     // The started one still counts while it works and once it is submitted.
     let lead = TaskActor {
         who: agent("p/lead"),
-        lead: false,
+        manager_of: None,
     };
     world.set_state(&first, TaskState::Working, lead.clone());
     held(world.assign(&second, "p/lead"));
@@ -678,14 +784,10 @@ fn a_cap_of_two_lets_one_further_task_start() {
         by: lead,
     }));
     held(world.assign(&second, "p/lead"));
-    // Cancelled, it frees its place; the next start takes it.
+    // Cancellation never refunds the committed assignment's place.
     world.set_state(&first, TaskState::Cancelled, world::owner());
-    assert_eq!(world.assign(&second, "p/lead").unwrap().len(), 1);
-    held(world.assign(&third, "p/builder"));
-    // Reopened, the second is a start again and the third may take the place.
-    world.set_state(&second, TaskState::Open, world::owner());
-    assert_eq!(world.assign(&third, "p/builder").unwrap().len(), 1);
     held(world.assign(&second, "p/lead"));
+    held(world.assign(&third, "p/builder"));
     assert_eq!(
         world
             .state

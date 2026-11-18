@@ -109,6 +109,8 @@ class Runtime:
         self.parser = InputParser()
         self.running = True
         self.pending_renders = []
+        self.render_hold = False
+        self.held_render = None
         self.render_sequence = 0
         self.draft_dirty = False
         self.manual_clock = os.environ.get("ATM_STANDIN_MANUAL_CLOCK", "0") == "1"
@@ -187,6 +189,19 @@ class Runtime:
                     self.effects(self.model.release_hooks())
             except ValueError as error:
                 reply["error"] = str(error)
+        elif message.get("command") == "hold_next_render":
+            if self.render_hold or self.parser.pasting or self.parser.pending:
+                reply["error"] = "render hold requires complete input and no existing hold"
+            else:
+                self.render_hold = True
+        elif message.get("command") == "release_render":
+            if self.held_render is None:
+                reply["error"] = "no held draft render to release"
+            else:
+                held = self.held_render
+                self.render_hold = False
+                self.held_render = None
+                self.effects([held])
         elif message.get("command") == "render_source":
             spec = next((s for s in self.screen_catalog if s["key"] == message.get("key")
                          and s["mode"] == self.mode), None)
@@ -312,6 +327,14 @@ class Runtime:
                     self.last_render = effect
                     self.draft_dirty = True
                     continue
+                if self.render_hold and (self.held_render is not None or self.parser.draft):
+                    self.held_render = effect
+                    if "replay_spec" not in effect:
+                        self.last_render = effect
+                    self.draft_dirty = False
+                    self.record({"kind": "render_held", "state": effect["state"],
+                                 "draft": self.parser.draft.decode("utf-8", errors="replace")})
+                    continue
                 self.render_sequence += 1
                 draft = self.parser.draft.decode("utf-8", errors="replace")
                 try:
@@ -349,6 +372,8 @@ class Runtime:
             elif effect["kind"] == "exit":
                 self.running = False
                 self.pending_renders.clear()
+                self.held_render = None
+                self.render_hold = False
 
     def input(self, data):
         # Process each action before subsequent input changes the draft.

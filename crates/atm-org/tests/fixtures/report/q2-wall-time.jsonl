@@ -1,0 +1,11 @@
+{"seq":1,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"alpha","root":"/fixtures/alpha"}}
+{"seq":2,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"beta","root":"/fixtures/beta"}}
+{"seq":3,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"alpha/build","pane":"%1","session_id":"s1"}}
+{"seq":4,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"beta/review","pane":"%2","session_id":"s2"}}
+{"seq":5,"ts":"2026-01-01T00:00:00Z","kind":"task.created","body":{"title":"Work","kind":"work","creator":"owner","parent":null,"judges":null,"measure":{"kind":"mechanical","command":"check"},"budget":null,"files":[],"rests_on":null}}
+{"seq":6,"ts":"2026-01-01T00:00:01Z","kind":"task.assigned","body":{"task_id":"t5","agent_id":"alpha/build","by":"owner"}}
+{"seq":7,"ts":"2026-01-01T00:00:02Z","kind":"task.state_changed","body":{"task_id":"t5","state":"working","reason":null,"by":"alpha/build"}}
+{"seq":8,"ts":"2026-01-01T00:00:04Z","kind":"task.state_changed","body":{"task_id":"t5","state":"waiting","reason":null,"by":"alpha/build"}}
+{"seq":9,"ts":"2026-01-01T00:00:07Z","kind":"task.state_changed","body":{"task_id":"t5","state":"working","reason":null,"by":"alpha/build"}}
+{"seq":10,"ts":"2026-01-01T00:00:09Z","kind":"task.state_changed","body":{"task_id":"t5","state":"blocked","reason":null,"by":"alpha/build"}}
+{"seq":11,"ts":"2026-01-01T00:00:11Z","kind":"task.state_changed","body":{"task_id":"t5","state":"working","reason":null,"by":"alpha/build"}}

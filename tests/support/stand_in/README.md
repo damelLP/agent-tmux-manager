@@ -179,8 +179,10 @@ exercise the real CLI auto-start path, which cleanup owns too.
 starts**. It cannot override sealing variables or TMUX/PANE. It does not change
 environment inside an already-running daemon or CLI-auto-started daemons; for
 the latter set the extra variable on `rig.command(...)` before invoking the CLI.
-**ATM_SPAWN_BIN is CLI-only at this tip**: setting it in the daemon's environment
-does not change daemon command construction.
+For `atm agent up`, `ATM_SPAWN_<HARNESS>_BIN/ARGS` and generic
+`ATM_SPAWN_BIN/ARGS` are read once from the daemon's start environment; nonempty
+per-harness values take precedence. Set them before starting or restarting the
+private daemon, not just on the `atm agent up` CLI command.
 
 ### Spawn, arguments, IDs and respawn
 
@@ -225,12 +227,13 @@ let pane = rig.observe_pane(id, StandInMode::Claude, log);
 // observe_pane waits for live identity, not idle: initial prompt may be working.
 ```
 
-For a **daemon-built command**, put the explicit absolute `rig.launcher(mode)`
-in the role/config command accepted by that consumer, with `--atm-config` pointing
-to a private JSON file containing `LOG` and `ID_PREFIX`. Alternatively configure
-those values in the private tmux server environment as above. Do not rely on
-ATM_SPAWN_BIN or weaken the sealed PATH. For example, the command builder's argv
-can be `[rig.launcher(mode), "--atm-config", rig.root().join("role.json")]`:
+For a **daemon-built command**, `atm agent up` can use the daemon-start overrides
+above. Where a consumer accepts an explicit role/config command, put the absolute
+`rig.launcher(mode)` there, with `--atm-config` pointing to a private JSON file
+containing `LOG` and `ID_PREFIX`. Alternatively configure those values in the
+private tmux server environment as above. Do not weaken the sealed PATH. For
+example, the command builder's argv can be
+`[rig.launcher(mode), "--atm-config", rig.root().join("role.json")]`:
 
 ```rust,ignore
 let config_path = rig.root().join("role.json");
@@ -239,7 +242,7 @@ std::fs::write(&config_path, serde_json::json!({
 }).to_string()).unwrap();
 let command = [rig.launcher(StandInMode::Claude).into_os_string(),
                "--atm-config".into(), config_path.into_os_string()];
-// Supply command to the consumer's role/command builder, not ATM_SPAWN_BIN.
+// Supply command to a consumer that accepts an explicit role/config command.
 ```
 
 `stand_in_explicit_launcher_without_cli_spawn_override` exercises that executable
@@ -293,6 +296,18 @@ normal. No fake dialog or readiness frame is drawn.
 This is **harness non-acceptance after tmux pasted bytes**, not proof that the
 sender sent nothing. It cannot justify a known-zero-effect automatic retry or
 unignore `message_delivery::safe_retry_after_known_zero_effect`.
+
+### Event-released draft renderer (synthetic)
+
+`{"command":"hold_next_render"}` arms a one-shot hold of the next nonempty
+editor render. Input parsing, hooks and the separate control stream keep running;
+no draft bytes or model state are invented. A `kind=render_held` event records the
+real retained draft. Later renders coalesce while held, without painting the
+terminal or acknowledging a new frame. `{"command":"release_render"}` paints
+the latest true state; await its normal DSR-backed `rendered` event separately.
+No Enter is injected. Duplicate arms, incomplete input and release without a
+held frame refuse without erasing the draft or disarming an unused hold.
+This forces a missed delivery-render window by events, not sleeps or load.
 
 ### Releasable hook hold (synthetic)
 

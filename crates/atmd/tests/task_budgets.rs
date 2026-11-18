@@ -49,7 +49,7 @@ async fn task_get_budget_status_reads_the_running_task_ledger() {
             agent_id: "p/build".parse().unwrap(),
             by: TaskActor {
                 who: Address::Owner,
-                lead: false,
+                manager_of: None,
             },
         }),
         now,

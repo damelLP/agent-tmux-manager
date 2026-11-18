@@ -103,7 +103,7 @@ impl Rig {
 fn actor(who: &str) -> TaskActor {
     TaskActor {
         who: who.parse().unwrap(),
-        lead: false,
+        manager_of: None,
     }
 }
 

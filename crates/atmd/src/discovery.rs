@@ -55,14 +55,6 @@ pub enum DiscoveryError {
     #[error("failed to read /proc: {0}")]
     ProcReadError(String),
 
-    /// Failed to read process information
-    #[error("failed to read process {pid}: {message}")]
-    ProcessReadError { pid: u32, message: String },
-
-    /// No active transcript found
-    #[error("no active transcript found for PID {0}")]
-    NoActiveTranscript(u32),
-
     /// Registry error during registration
     #[error("registry error: {0}")]
     RegistryError(String),
@@ -112,8 +104,6 @@ struct DiscoveredProcess {
 /// Called on daemon startup and when TUI requests a rescan.
 pub struct DiscoveryService {
     registry: RegistryHandle,
-    /// Maximum age in seconds for a transcript to be considered "active".
-    transcript_max_age_secs: u64,
     /// Lists tmux panes to map discovered processes to their pane.
     tmux: Box<dyn TmuxClient>,
     /// A named server admits only processes mapped to one of its panes.
@@ -131,18 +121,8 @@ impl DiscoveryService {
     pub fn new(registry: RegistryHandle) -> Self {
         Self {
             registry,
-            transcript_max_age_secs: DEFAULT_TRANSCRIPT_MAX_AGE_SECS,
             tmux: Box::new(RealTmuxClient::new()),
             require_pane: requires_local_pane(std::env::var(TMUX_SOCKET_ENV).ok().as_deref()),
-        }
-    }
-
-    /// Creates a new discovery service with custom transcript age threshold.
-    #[must_use]
-    pub fn with_max_age(registry: RegistryHandle, transcript_max_age_secs: u64) -> Self {
-        Self {
-            transcript_max_age_secs,
-            ..Self::new(registry)
         }
     }
 
@@ -209,9 +189,8 @@ impl DiscoveryService {
         debug!(count = processes.len(), "Found agent processes");
 
         // Try to discover each process
-        let max_age_secs = self.transcript_max_age_secs;
         for process in processes {
-            match self.discover_session(&process, max_age_secs).await {
+            match self.discover_session(&process).await {
                 Ok(Some(session_id)) => {
                     debug!(
                         session_id = %session_id,
@@ -267,7 +246,6 @@ impl DiscoveryService {
     async fn discover_session(
         &self,
         process: &DiscoveredProcess,
-        #[allow(unused_variables)] max_age_secs: u64,
     ) -> Result<Option<SessionId>, DiscoveryError> {
         let pid = process.pid;
         let cwd = process.cwd.clone();
@@ -850,6 +828,13 @@ mod tests {
         assert_eq!(result.unwrap(), session_file);
     }
 
+    fn set_modified(path: &Path, when: std::time::SystemTime) {
+        fs::File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     #[test]
     fn test_find_active_transcript_picks_most_recent() {
         let temp_dir = TempDir::new().unwrap();
@@ -862,10 +847,21 @@ mod tests {
             .path()
             .join("ffffffff-0000-1111-2222-333333333333.jsonl");
 
-        fs::write(&older, "old").unwrap();
-        // Small delay to ensure different mtime
-        std::thread::sleep(Duration::from_millis(10));
+        // Creation order and equal filesystem mtimes must not determine this
+        // fixture's ordering: establish explicit, well-separated past inputs.
         fs::write(&newer, "new").unwrap();
+        fs::write(&older, "old").unwrap();
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(40);
+        for path in [&older, &newer] {
+            fs::File::open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+        let new_time = old_time + Duration::from_secs(20);
+        set_modified(&older, old_time);
+        set_modified(&newer, new_time);
+        assert_eq!(fs::metadata(&newer).unwrap().modified().unwrap(), new_time);
 
         let result = find_active_transcript(temp_dir.path(), DEFAULT_TRANSCRIPT_MAX_AGE_SECS);
         assert!(result.is_some());
@@ -880,10 +876,11 @@ mod tests {
             .join("226f3c14-cc34-4118-804b-b7d442aa2363.jsonl");
         fs::write(&session_file, "{}").unwrap();
 
-        // With a very short max age (0 seconds), file should not be found
-        // (file was just created, so mtime age > 0)
-        // Use 1ms sleep to ensure file is "old"
-        std::thread::sleep(Duration::from_millis(1));
+        // Exact age inputs, independent of filesystem creation resolution.
+        set_modified(
+            &session_file,
+            std::time::SystemTime::now() - Duration::from_secs(10),
+        );
         let result = find_active_transcript(temp_dir.path(), 0);
         assert!(result.is_none());
 
@@ -1482,40 +1479,32 @@ mod tests {
 
         fn start(name: &str, dir: TempDir) -> Self {
             let path = dir.path().join(name);
-            let mut tries = 0;
-            let child = loop {
-                let run = std::process::Command::new(&path)
-                    .args(["-c", "while :; do sleep 1; done"])
-                    .spawn();
-                match run {
-                    // A freshly copied executable is busy while a child that a
-                    // sibling test forked mid-copy still holds the copy's write fd.
-                    Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
-                        tries += 1;
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    run => break run.expect("spawn discovery stand-in"),
-                }
-            };
-            // spawn() returns once exec closes its CLOEXEC pipe, which is
-            // before the kernel sets the new comm and cmdline: under load a
-            // scan can still see the forked test thread. Wait for both.
-            let pid = child.id();
+            use std::io::Read;
+            use std::os::fd::OwnedFd;
+            let (mut ready, output) = std::os::unix::net::UnixStream::pair().unwrap();
+            ready
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let child = std::process::Command::new(&path)
+                .args(["-c", "printf 'ready\\n'; read -r finish"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::from(OwnedFd::from(output)))
+                .spawn()
+                .expect("spawn discovery stand-in");
+            let stand_in = Self { child, _dir: dir };
+            let mut line = [0; 6];
+            ready.read_exact(&mut line).unwrap();
+            assert_eq!(&line, b"ready\n");
+            // The shell itself acknowledged after exec, before its held read.
+            let pid = stand_in.pid();
             let argv0 = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
             let execed = || {
                 process_comm(pid).as_deref() == Some(name)
                     && fs::read(format!("/proc/{pid}/cmdline"))
                         .is_ok_and(|c| c.split(|&b| b == 0).next() == Some(argv0))
             };
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !execed() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "stand-in {name:?} never finished exec"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Self { child, _dir: dir }
+            assert!(execed(), "stand-in {name:?} did not acknowledge its exec");
+            stand_in
         }
 
         fn pid(&self) -> u32 {
@@ -1539,11 +1528,168 @@ mod tests {
         assert!(!matched.matched_via_exe);
     }
 
+    async fn wait_for_copy(
+        child: &mut tokio::process::Child,
+        guard: Duration,
+    ) -> std::process::ExitStatus {
+        let status = tokio::time::timeout(guard, child.wait()).await;
+        if !matches!(&status, Ok(Ok(_))) {
+            // kill().await also waits: reap before unwinding drops this runtime.
+            child.kill().await.expect("kill and reap copy child");
+        }
+        status.expect("copy timed out").expect("copy wait failed")
+    }
+
+    #[test]
+    fn isolated_copy_timeout_reaps_before_unwinding() {
+        use std::future::{poll_fn, Future};
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::task::Poll;
+
+        const CASE: &str = "discovery::tests::isolated_copy_timeout_reaps_before_unwinding";
+        if std::env::var("ATM_TEST_COPIER_REAP_CASE").as_deref() != Ok(CASE) {
+            // Other test runtimes must not reap this case's orphan for it.
+            let log = tempfile::tempfile().unwrap();
+            let mut output = log.try_clone().unwrap();
+            let status = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut child =
+                            tokio::process::Command::new(std::env::current_exe().unwrap())
+                                .args(["--exact", CASE])
+                                .env("ATM_TEST_COPIER_REAP_CASE", CASE)
+                                .stdout(log.try_clone().unwrap())
+                                .stderr(log)
+                                .kill_on_drop(true)
+                                .spawn()
+                                .unwrap();
+                        wait_for_copy(&mut child, Duration::from_secs(60)).await
+                    })
+            })
+            .join()
+            .unwrap();
+            output.seek(SeekFrom::Start(0)).unwrap();
+            let mut text = String::new();
+            output.read_to_string(&mut text).unwrap();
+            assert!(
+                status.success(),
+                "isolated copier regression: {status}\n{text}"
+            );
+            assert!(
+                text.lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "expected exactly one copier regression\n{text}"
+            );
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("held-copy");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut command = tokio::process::Command::new("/bin/cp");
+                    command.arg("/bin/sh").arg(fifo).kill_on_drop(true);
+                    // If the isolated libtest child hits its hang guard, its
+                    // blocked copier must not outlive the owning thread either.
+                    unsafe {
+                        command.pre_exec(|| {
+                            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                    let mut child = command.spawn().unwrap();
+                    let pid = child.id().unwrap();
+                    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                    assert!(raw >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+                    let exited = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+                    send.send((pid, exited)).unwrap();
+                    {
+                        let mut waiting = std::pin::pin!(child.wait());
+                        assert!(
+                            poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await
+                        );
+                    }
+                    // Force cancellation only after the real copy is Pending;
+                    // this is not a delay or a readiness timeout. I/O is unpaused.
+                    wait_for_copy(&mut child, Duration::ZERO).await;
+                })
+        });
+        let (pid, exited) = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+        let unwound = worker.join();
+        let mut event = libc::pollfd {
+            fd: exited.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let ready = unsafe { libc::poll(&mut event, 1, 60_000) };
+            if ready > 0 {
+                break;
+            }
+            assert_ne!(ready, 0, "copier did not exit");
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        let mut status = 0;
+        // On RED, reap our child before asserting so the regression itself
+        // leaves no zombie. On GREEN the wait helper has already reaped it.
+        let reaped =
+            unsafe { libc::waitpid(i32::try_from(pid).unwrap(), &mut status, libc::WNOHANG) };
+        let error = std::io::Error::last_os_error();
+        let panic = unwound.expect_err("copy unexpectedly completed instead of timing out");
+        let text = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(text.contains("copy timed out"), "unexpected panic: {text}");
+        assert_eq!(
+            reaped, -1,
+            "copy child {pid} remained unreaped after timeout/runtime drop; reaped status={status}"
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+    }
+
     #[test]
     fn detection_records_exe_match() {
         let dir = TempDir::new().unwrap();
         // Copy the real file: a symlink would leave exe pointing to /bin/sh.
-        fs::copy("/bin/sh", dir.path().join("claude")).unwrap();
+        let destination = dir.path().join("claude");
+        // Only the isolated copier opens the executable for writing. Its exit
+        // fences every writer fd before another libtest thread can spawn it.
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut child = tokio::process::Command::new("/bin/cp")
+                        .arg("/bin/sh")
+                        .arg(destination)
+                        .kill_on_drop(true)
+                        .spawn()
+                        .unwrap();
+                    let status = wait_for_copy(&mut child, Duration::from_secs(60)).await;
+                    assert!(status.success());
+                });
+        })
+        .join()
+        .unwrap();
         let native = StandIn::start("claude", dir);
         let matched = detect_agent_process(native.pid()).expect("stand-in matches via exe");
         assert_eq!(matched.process.harness, Harness::ClaudeCode);

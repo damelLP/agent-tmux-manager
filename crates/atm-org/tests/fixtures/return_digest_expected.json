@@ -1,0 +1,12 @@
+{
+  "snapshot_seq":31,
+  "absence":{"away_seq":8,"back_seq":30,"since":"2026-11-16T08:00:00Z","until":"2026-11-16T18:00:00Z"},
+  "relay":null,
+  "counts":{"relayed":0,"during_absence":1,"earlier_provisional":0,"waiting_decisions":0,"waiting_tasks":0,"waiting_total":0,"taken_for_owner":1,"overruled":0},
+  "total_rows":2,
+  "rows":[
+    {"kind":"decision","section":"taken","decision":{"id":"d11","request":{"requester":"alpha/builder","kind":"plan","title":"Choose cache","context":"","files":[],"options":["small","large"],"recommended":"small","may_be_undone":true,"changes_intent":false,"deadline":null},"requested_at":"2026-11-16T08:01:00Z","status":"taken_provisionally","provisional":{"decision_id":"d11","option":"small","by":"alpha/builder"},"taken_at":"2026-11-16T08:02:00Z","resolution":null,"withdrawal":null,"closed_at":null},"impact":{"started":1,"accepted":1,"not_started":0,"cancelled":0,"unknown":0},"answer_caller_pane":null},
+    {"kind":"task","decision_id":"d11","task_id":"t14","title":"Write cache","state":"accepted","started":true,"direct":true}
+  ],
+  "next_after":null
+}

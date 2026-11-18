@@ -4,6 +4,22 @@
 //! organisation state again, performs its pane effects through the
 //! reservation, and reports through the organisation log. What a flow decides
 //! from a screen lives in `agent_flow`, which is pure.
+//!
+//! # Characterized limits
+//!
+//! A draft appearing after clear admission can exhaust the work deadline with
+//! no input sent. Cleanup still records Stuck; an eligible session wake with a
+//! safe editor can recover it without replaying the clear or deleting the draft.
+//! The caller's Stuck reason is retained only after its write is acknowledged.
+//! If that acknowledgement times out, a late commit can leave Stuck without a
+//! note, a timeout answer and a quarantined reservation. Poisoned progress also
+//! omits the caller's retained reason; this is not evidence that no effect ran.
+//!
+//! Shell launch proof samples focus, not selection history. A prefix already
+//! present in both initial shell captures can be taken for the prompt, unlike
+//! text introduced after that baseline. A private tmux 3.8 shell/client check
+//! confirmed that a selected pane can retain input after selection moves away;
+//! no real harness launch with such typeahead was checked.
 
 use super::agent_flow::{
     adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, decide_start,
@@ -185,10 +201,13 @@ pub(super) fn changed(
 /// The errors [`ReservationError`] documents as "before effect" for a pane
 /// operation: the call that answered with one sent nothing and changed nothing.
 fn before_effect(error: &ReservationError) -> bool {
+    #[cfg(test)]
+    if matches!(error, ReservationError::NotImplemented { .. }) {
+        return true;
+    }
     matches!(
         error,
-        ReservationError::NotImplemented { .. }
-            | ReservationError::Busy { .. }
+        ReservationError::Busy { .. }
             | ReservationError::StaleReservation
             | ReservationError::ScreenChanged { .. }
             | ReservationError::PacingRefused { .. }
@@ -536,8 +555,8 @@ pub(super) fn stuck_record(waiting: &Waiting) -> Option<String> {
         .and_then(|waiting| waiting.stuck.clone())
 }
 
-/// What the caller of a flow that ended on a timeout is told: the Stuck
-/// reason that flow's own cleanup recorded (`stuck`), in the words of the
+/// What the caller of a flow that decided to stop or timed out is told: the
+/// Stuck reason that flow's own cleanup recorded (`stuck`), in the words of the
 /// owner's note. A timeout without one stays a timeout: it ran out waiting
 /// for the reservation, or before the flow committed to anything, and an
 /// agent stuck since an earlier call is not this call's outcome. Every other
@@ -548,9 +567,10 @@ pub(super) fn deadline_answer(
     stuck: Option<String>,
 ) -> AgentError {
     match (error, stuck) {
-        (AgentError::Reservation(ReservationError::Timeout), Some(reason)) => {
-            AgentError::Refused(format!("agent {id}: {reason}"))
-        }
+        (
+            AgentError::Refused(_) | AgentError::Reservation(ReservationError::Timeout),
+            Some(reason),
+        ) => AgentError::Refused(format!("agent {id}: {reason}")),
         (error, _) => error,
     }
 }
@@ -978,11 +998,16 @@ impl AgentRuntime {
         if let Ok(mut waiting) = waiting.lock() {
             waiting.stuck = Some(reason.clone());
         }
+        self.notify_owner(format!("agent {id}: {reason}")).await
+    }
+
+    async fn notify_owner(&self, body: String) -> Result<(), AgentError> {
         let note = atm_org::MessageContent {
+            delivery_notice: None,
             from: atm_org::Address::System,
             to: atm_org::Address::Owner,
             kind: atm_org::MessageKind::Note,
-            body: format!("agent {id}: {reason}"),
+            body,
             attachments: Vec::new(),
             task: None,
         };
@@ -1185,6 +1210,11 @@ impl AgentRuntime {
                     .await?;
                 // Again, now that time has passed in the kill.
                 if let Some(reason) = placement().await? {
+                    self.notify_owner(format!(
+                        "agent {id} is down: respawn placement failed after take-down: {reason}; fix the placement and run atm agent up {} from project {}",
+                        id.name, id.project
+                    ))
+                    .await?;
                     return Err(AgentError::Refused(format!(
                         "agent {id} was taken down and not started again: {reason}"
                     )));
@@ -1594,5 +1624,44 @@ impl AgentRuntime {
                 _ => waiting_for(waiting, "the shell's prompt could not be read as settled"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_limit_tests {
+    use super::*;
+
+    #[test]
+    fn op7_poisoned_progress_omits_even_a_previously_recorded_stuck_reason() {
+        // Break caught: silently recovering a poisoned caller record publishes
+        // its stale value as a proven outcome, or poisoning starts panicking.
+        const REASON: &str = "clear did not complete: earlier progress; inspect %1";
+        let waiting = Arc::new(std::sync::Mutex::new(Unfinished {
+            stuck: Some(REASON.into()),
+            ..Unfinished::default()
+        }));
+        assert_eq!(stuck_record(&waiting).as_deref(), Some(REASON));
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = waiting.lock().unwrap();
+            panic!("synthetic progress poison");
+        });
+        assert!(poisoned.is_err());
+        assert!(waiting.is_poisoned());
+        let answer = std::panic::catch_unwind(|| {
+            deadline_answer(
+                AgentError::Reservation(ReservationError::Timeout),
+                &"p/lead".parse().unwrap(),
+                stuck_record(&waiting),
+            )
+        });
+        assert!(matches!(
+            answer,
+            Ok(AgentError::Reservation(ReservationError::Timeout))
+        ));
+        assert_eq!(
+            waiting.lock().unwrap_err().into_inner().stuck.as_deref(),
+            Some(REASON),
+            "poisoning omitted the record, rather than erasing its contents"
+        );
     }
 }

@@ -7,6 +7,44 @@ use std::{future::poll_fn, task::Poll, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn reservation_health_is_a_single_live_read_even_when_reserved_work_stops() {
+    let (control, cancel, task, mock) = actor();
+    let deadline = || Instant::now() + Duration::from_secs(60);
+    let (job, _, release) = held(&control, request("p/live", None, ReservationKind::Up)).await;
+    let failed = control
+        .run_reserved(
+            request("p/bad", None, ReservationKind::Up),
+            |_| async { Ok::<_, ReservationError>(()) },
+            |_, _| async { Err(ReservationError::Unavailable) },
+        )
+        .await;
+    assert!(matches!(failed, Err(ReservationError::Unavailable)));
+    let expected =
+        serde_json::json!({"state":"ok", "reason":null, "live":1, "quarantined":1, "capacity":32});
+    assert_eq!(
+        serde_json::to_value(control.reservation_health(deadline()).await.unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(control.reservation_health(deadline()).await.unwrap()).unwrap(),
+        expected
+    );
+    release.send(()).unwrap();
+    job.await.unwrap().unwrap();
+    control.stop_reserved_work();
+    assert_eq!(
+        serde_json::to_value(control.reservation_health(deadline()).await.unwrap()).unwrap(),
+        serde_json::json!({"state":"ok", "reason":null, "live":0, "quarantined":1, "capacity":32})
+    );
+    assert!(
+        mock.calls().is_empty(),
+        "reading health must not touch tmux"
+    );
+    cancel.cancel();
+    task.await.unwrap();
+}
+
 fn request(agent: &str, pane: Option<&str>, kind: ReservationKind) -> ReservationRequest {
     ReservationRequest {
         agent: agent.parse().unwrap(),

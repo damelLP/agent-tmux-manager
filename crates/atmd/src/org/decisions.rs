@@ -8,15 +8,15 @@ use super::{
     messages::{MessageClock, MessageError},
     OrgHandle, OrgServiceError,
 };
-use crate::server::methods::CallContext;
+use crate::server::methods::{CallContext, MethodError};
 use atm_org::{
-    Address, DecisionCommand, DecisionRequest, DecisionResolution, DecisionWithdrawal,
+    Address, AgentId, DecisionCommand, DecisionRequest, DecisionResolution, DecisionWithdrawal,
     MessageContent, MessageKind, OrgCommand, OrgState,
 };
 pub use atm_org::{Decision, DecisionClass, DecisionId, DecisionKind, DecisionStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 use tokio::{
     sync::{watch, Semaphore},
     task::JoinHandle,
@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 mod tests;
 
 const BUDGET: Duration = Duration::from_secs(20);
-const PAGE_BYTES: usize = 512 * 1024;
+pub(super) const PAGE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionError {
@@ -38,6 +38,8 @@ pub enum DecisionError {
     Refused(String),
     #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("decision service unavailable: {0}")]
     Unavailable(String),
     #[error(
@@ -88,6 +90,10 @@ fn default_limit() -> u16 {
 #[serde(deny_unknown_fields)]
 pub struct GetParams {
     pub id: DecisionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo_after: Option<atm_org::TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo_limit: Option<u16>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +103,10 @@ pub struct ResolveParams {
     pub note: Option<String>,
     #[serde(default)]
     pub standing_rule: bool,
+    /// Typed serialization retains forbidden note/standing_rule keys; relay RPC
+    /// callers must send only id/option/relay, as `atm decide --relay` does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,15 +142,29 @@ pub struct ListResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetResult {
     pub decision: DecisionEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo: Option<super::return_digest::RedoPage>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MutationResult {
     pub decision: DecisionEntry,
     pub changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo: Option<super::return_digest::RedoPage>,
 }
 
-fn visible(decision: &Decision, caller: &Address) -> bool {
-    *caller == Address::Owner || decision.request.requester == *caller
+fn visible(decision: &Decision, caller: &Address, reports: &BTreeSet<AgentId>) -> bool {
+    *caller == Address::Owner
+        || decision.request.requester == *caller
+        || matches!(&decision.request.requester, Address::Agent(id) if reports.contains(id))
+}
+fn reporting_error(error: MethodError) -> DecisionError {
+    match error.0.code.as_str() {
+        atm_protocol::error_code::REFUSED => DecisionError::Refused(error.0.message),
+        atm_protocol::error_code::TIMEOUT => DecisionError::Timeout,
+        atm_protocol::error_code::UNAVAILABLE => DecisionError::Unavailable(error.0.message),
+        _ => DecisionError::Internal(error.0.message),
+    }
 }
 fn entry(state: &OrgState, id: DecisionId) -> Result<DecisionEntry, DecisionError> {
     state
@@ -148,7 +172,7 @@ fn entry(state: &OrgState, id: DecisionId) -> Result<DecisionEntry, DecisionErro
         .map(DecisionEntry::from)
         .ok_or_else(|| DecisionError::NotFound(format!("decision {id} was not found")))
 }
-fn bounded<T: Serialize>(value: T) -> Result<T, DecisionError> {
+pub(super) fn bounded<T: Serialize>(value: T) -> Result<T, DecisionError> {
     if serde_json::to_vec(&value)
         .map_err(|e| DecisionError::Internal(e.to_string()))?
         .len()
@@ -163,11 +187,12 @@ fn bounded<T: Serialize>(value: T) -> Result<T, DecisionError> {
 fn list(
     state: &OrgState,
     caller: &Address,
+    reports: &BTreeSet<AgentId>,
     params: &ListParams,
 ) -> Result<ListResult, DecisionError> {
     let scope: Vec<_> = state
         .decisions()
-        .filter(|d| params.count_only || visible(d, caller))
+        .filter(|d| params.count_only || visible(d, caller, reports))
         .collect();
     let mut result = ListResult {
         decisions: vec![],
@@ -242,6 +267,7 @@ fn resolution_message(decision: &Decision) -> Option<MessageContent> {
         "\nStanding rule: no"
     });
     Some(MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: decision.request.requester.clone(),
         kind: MessageKind::Answer,
@@ -266,6 +292,7 @@ pub struct DecisionHandle {
     requests: Arc<Semaphore>,
     /// The away switch's own configuration lane; None while disabled.
     pub(super) projects: Option<AgentProjects>,
+    reporting: super::reporting_line::ReportingFiles,
 }
 impl DecisionHandle {
     pub fn disabled(reason: impl Into<String>) -> Self {
@@ -277,7 +304,15 @@ impl DecisionHandle {
             health,
             requests: Arc::new(Semaphore::new(64)),
             projects: None,
+            reporting: super::reporting_line::ReportingFiles::default(),
         }
+    }
+    pub(crate) fn with_reporting_files(
+        mut self,
+        files: super::reporting_line::ReportingFiles,
+    ) -> Self {
+        self.reporting = files;
+        self
     }
     pub async fn initialized(&self) -> Result<(), DecisionError> {
         let mut health = self.health.clone();
@@ -348,6 +383,37 @@ impl DecisionHandle {
         })
         .await
     }
+    async fn visible_requesters(
+        &self,
+        state: &OrgState,
+        caller: &Address,
+    ) -> Result<BTreeSet<AgentId>, DecisionError> {
+        let Address::Agent(caller) = caller else {
+            return Ok(BTreeSet::new());
+        };
+        let requesters: BTreeSet<_> = state
+            .decisions()
+            .filter_map(|decision| match &decision.request.requester {
+                Address::Agent(id) if id != caller => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut reports = BTreeSet::new();
+        for id in requesters {
+            match self.reporting.ancestors(state.clone(), id.clone()).await {
+                Ok(ancestors) if ancestors.contains(caller) => {
+                    reports.insert(id);
+                }
+                Ok(_) => (),
+                Err(error) if error.0.code == atm_protocol::error_code::REFUSED => {
+                    tracing::warn!(agent_id = %id, %error, "Reporting line unavailable for decision visibility");
+                }
+                Err(error) => return Err(reporting_error(error)),
+            }
+        }
+        Ok(reports)
+    }
+
     pub async fn list(
         &self,
         p: ListParams,
@@ -355,7 +421,13 @@ impl DecisionHandle {
     ) -> Result<ListResult, DecisionError> {
         self.call(false, async {
             let state = self.org.snapshot().await?;
-            list(&state, &caller_address(&state, &caller)?, &p)
+            let caller = caller_address(&state, &caller)?;
+            let reports = if p.count_only {
+                BTreeSet::new()
+            } else {
+                self.visible_requesters(&state, &caller).await?
+            };
+            list(&state, &caller, &reports, &p)
         })
         .await
     }
@@ -363,13 +435,44 @@ impl DecisionHandle {
         self.call(false, async {
             let state = self.org.snapshot().await?;
             let row = entry(&state, p.id)?;
-            if !visible(&row.decision, &caller_address(&state, &caller)?) {
-                return Err(DecisionError::Refused(format!(
-                    "only the requester or owner may read decision {}",
-                    p.id
-                )));
+            let by = caller_address(&state, &caller)?;
+            let explicit = p.redo_after.is_some() || p.redo_limit.is_some();
+            if explicit && by != Address::Owner {
+                return Err(DecisionError::Refused(
+                    "only the owner may page redo tasks".into(),
+                ));
             }
-            bounded(GetResult { decision: row })
+            if !visible(&row.decision, &by, &BTreeSet::new()) {
+                let permitted = match (&by, &row.decision.request.requester) {
+                    (Address::Agent(caller), Address::Agent(requester)) => self
+                        .reporting
+                        .ancestors(state.clone(), requester.clone())
+                        .await
+                        .map_err(reporting_error)?
+                        .contains(caller),
+                    _ => false,
+                };
+                if !permitted {
+                    return Err(DecisionError::Refused(format!(
+                        "only the requester or owner may read decision {}",
+                        p.id
+                    )));
+                }
+            }
+            let mut result = GetResult {
+                decision: row,
+                redo: None,
+            };
+            if explicit || (by == Address::Owner && state.decision_redo(p.id).is_some()) {
+                result.redo = Some(super::return_digest::redo_page(
+                    &state,
+                    p.id,
+                    p.redo_after.as_ref(),
+                    p.redo_limit.unwrap_or(100),
+                    &result,
+                )?);
+            }
+            bounded(result)
         })
         .await
     }
@@ -378,6 +481,11 @@ impl DecisionHandle {
         p: ResolveParams,
         caller: CallContext,
     ) -> Result<MutationResult, DecisionError> {
+        if p.relay && (p.note.is_some() || p.standing_rule) {
+            return Err(DecisionError::InvalidParams(
+                "relays cannot include note or standing_rule".into(),
+            ));
+        }
         let permit = self
             .requests
             .clone()
@@ -394,6 +502,36 @@ impl DecisionHandle {
                 .map_err(|_| DecisionError::Timeout)??;
             let state = handle.org.snapshot().await?;
             let by = caller_address(&state, &caller)?;
+            let committed_error = |error: DecisionError| {
+                DecisionError::Refused(format!(
+                    "decision {} committed; result was not confirmed: {error}",
+                    p.id
+                ))
+            };
+            if p.relay {
+                let by = match by {
+                    Address::Agent(by) if state.owner().relay.as_ref() == Some(&by) => by,
+                    _ => {
+                        return Err(DecisionError::Refused(
+                            "only the designated bound agent may relay a decision".into(),
+                        ))
+                    }
+                };
+                return bounded(
+                    handle
+                        .mutate(
+                            p.id,
+                            DecisionCommand::Relay {
+                                decision_id: p.id,
+                                option: p.option,
+                                by,
+                            },
+                            caller,
+                        )
+                        .await?,
+                )
+                .map_err(committed_error);
+            }
             if by != Address::Owner {
                 return Err(DecisionError::Refused(
                     "only the owner may resolve a decision".into(),
@@ -421,7 +559,15 @@ impl DecisionHandle {
                 super::standing_rules::append(root, result.decision.decision.clone()).await
                     .map_err(|error| DecisionError::Unavailable(format!("decision {} committed; standing-rule append was not confirmed: {error}; retry the identical answer to repair it", p.id)))?;
             }
-            Ok(result)
+            let mut result = result;
+            if result.decision.decision.status == DecisionStatus::Overruled {
+                let state = handle.org.snapshot().await?;
+                result.redo = Some(
+                    super::return_digest::redo_page(&state, p.id, None, 100, &result)
+                        .map_err(committed_error)?,
+                );
+            }
+            bounded(result).map_err(committed_error)
         });
         tokio::time::timeout(BUDGET, worker)
             .await
@@ -466,6 +612,7 @@ impl DecisionHandle {
         Ok(MutationResult {
             decision: entry(&self.org.snapshot().await?, id)?,
             changed: !events.is_empty(),
+            redo: None,
         })
     }
 }
@@ -478,6 +625,7 @@ async fn reconcile(org: &OrgHandle, clock: &MessageClock) -> Result<(), Decision
             for message in missing_resolution_messages(&state)
                 .into_iter()
                 .chain(super::away::missing_notices(&state))
+                .chain(state.redo_notices())
             {
                 org.execute(OrgCommand::SendMessage(message), clock.now()?)
                     .await?;
@@ -526,6 +674,7 @@ pub fn spawn_decisions(
         health: status,
         requests: Arc::new(Semaphore::new(64)),
         projects: Some(projects),
+        reporting: super::reporting_line::ReportingFiles::default(),
     };
     let task = tokio::spawn(async move {
         let work = async {
@@ -550,4 +699,104 @@ pub fn spawn_decisions(
         let _ = health.send_replace(Err(reason));
     });
     (handle, task)
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::*;
+    use atm_org::OrgEvent;
+
+    // Break caught: paging before visibility or rejecting historical Unknown rows.
+    #[test]
+    fn reporting_decision_pages_keep_complete_historical_rows() {
+        let mut state = OrgState::default();
+        let now = Utc::now();
+        for (seq, project) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            state
+                .apply(
+                    seq as u64 + 1,
+                    now,
+                    &OrgEvent::ProjectRegistered {
+                        project_id: project.parse().unwrap(),
+                        root: format!("/{project}"),
+                    },
+                )
+                .unwrap();
+        }
+        for (seq, id, pane) in [(4, "alpha/worker", "%1"), (5, "alpha/lead", "%2")] {
+            state
+                .apply(
+                    seq,
+                    now,
+                    &OrgEvent::AgentAdopted {
+                        agent_id: id.parse().unwrap(),
+                        pane: pane.into(),
+                        session_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        for (seq, requester, size) in [
+            (6, Address::System, PAGE_BYTES),
+            (7, "alpha/worker".parse().unwrap(), 200_000),
+            (8, "alpha/worker".parse().unwrap(), 200_000),
+            (9, "alpha/worker".parse().unwrap(), 200_000),
+        ] {
+            state
+                .apply(
+                    seq,
+                    now,
+                    &OrgEvent::DecisionRequested(DecisionRequest {
+                        requester,
+                        kind: DecisionKind::Unknown,
+                        title: "Historical request".into(),
+                        context: "x".repeat(size),
+                        files: vec!["historical-proof.md".into()],
+                        options: vec!["yes".into(), "no".into()],
+                        recommended: Some("yes".into()),
+                        may_be_undone: true,
+                        changes_intent: true,
+                        deadline: None,
+                    }),
+                )
+                .unwrap();
+        }
+        let caller = "alpha/lead".parse().unwrap();
+        let reports = BTreeSet::from(["alpha/worker".parse().unwrap()]);
+        let params = ListParams {
+            statuses: None,
+            after: None,
+            limit: 100,
+            count_only: false,
+        };
+        let page = list(&state, &caller, &reports, &params).unwrap();
+        assert_eq!(page.pending_count, 3);
+        assert_eq!(
+            page.decisions
+                .iter()
+                .map(|row| row.decision.id)
+                .collect::<Vec<_>>(),
+            [DecisionId::new(7), DecisionId::new(8)]
+        );
+        assert_eq!(page.next_after, Some(DecisionId::new(8)));
+        assert!(serde_json::to_vec(&page).unwrap().len() <= PAGE_BYTES);
+        assert_eq!(page.decisions[0].decision.request.context.len(), 200_000);
+        assert_eq!(
+            page.decisions[0].decision.request.kind,
+            DecisionKind::Unknown
+        );
+        let next = list(
+            &state,
+            &caller,
+            &reports,
+            &ListParams {
+                after: page.next_after,
+                ..params
+            },
+        )
+        .unwrap();
+        assert_eq!(next.decisions.len(), 1);
+        assert_eq!(next.decisions[0].decision.id, DecisionId::new(9));
+        assert_eq!(next.next_after, None);
+    }
 }

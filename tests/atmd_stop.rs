@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use atm_protocol::{ClientMessage, DaemonMessage};
+use stand_in::control_support;
 #[path = "support/stand_in.rs"]
 mod stand_in;
 
@@ -59,6 +60,7 @@ fn exited(fd: &OwnedFd) -> bool {
 
 fn held_daemon_stop(remove_files: bool) {
     let root = tempfile::tempdir().unwrap();
+    let mut events = control_support::LogEvents::new(&root.path().join("daemon.log"));
     let log = std::fs::File::create(root.path().join("daemon.log")).unwrap();
     let mut start = command(root.path());
     start
@@ -83,23 +85,19 @@ fn held_daemon_stop(remove_files: bool) {
     assert!(fd >= 0);
     // SAFETY: syscall returned a new owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let deadline = std::time::Instant::now() + GUARD;
-    loop {
-        if matches!(
+    events.listening(Some(pid));
+    assert!(!exited(&fd), "daemon exited before readiness");
+    assert!(
+        matches!(
             stand_in::protocol_request(
                 &root.path().join("a.sock"),
                 ClientMessage::list_sessions(),
                 GUARD,
             ),
             Ok(DaemonMessage::SessionList { .. })
-        ) {
-            break;
-        }
-        assert!(!exited(&fd), "daemon exited before readiness");
-        assert!(std::time::Instant::now() < deadline, "daemon not ready");
-        // Only failed protocol round trips retry: a condition poll, not settling.
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        ),
+        "daemon not ready"
+    );
     assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32);
     assert_eq!(
         std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),

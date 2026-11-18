@@ -1,18 +1,17 @@
 //! One-shot confirmed-message commands. Bodies stay in the durable inbox.
+use super::output::stdout;
 use anyhow::{bail, Context, Result};
 use atmd::org::messages::*;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{de::DeserializeOwned, Serialize};
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{io::Write, path::PathBuf, time::Duration};
 
 // 10 s router + 5 s startup/transport margin = 15 s (send/inbox/ack/status).
 const MESSAGE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 // 60 s router + 10 s startup/transport margin = 70 s (retry/give-up).
 const MESSAGE_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(70);
+// 12 s history router + 5 s startup/transport margin, one page only.
+const MESSAGE_HISTORY_TIMEOUT: Duration = Duration::from_secs(17);
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum MessageFormat {
@@ -21,6 +20,27 @@ pub enum MessageFormat {
 }
 #[derive(Debug, Subcommand)]
 pub enum MsgAction {
+    /// Read one JSON page of committed history (full agent IDs, no name lookup)
+    History {
+        #[arg(long)]
+        agent: Option<atm_org::AgentId>,
+        #[arg(long)]
+        task: Option<TaskId>,
+        #[arg(long)]
+        correspondent: Option<Address>,
+        #[arg(long)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, value_parser = ["json"], default_value = "json")]
+        format: String,
+    },
     /// Queue a durable message; delivery accepts a reference, not the body
     Send {
         #[arg(long)]
@@ -135,7 +155,7 @@ pub(super) fn output<R: Serialize>(
     }
     Ok(())
 }
-fn status_text(status: impl Serialize) -> Result<String> {
+pub(super) fn status_text(status: impl Serialize) -> Result<String> {
     Ok(serde_json::to_value(status)?
         .as_str()
         .unwrap_or("unknown")
@@ -151,6 +171,32 @@ pub(super) async fn cmd_msg_with_lookup_budget(
     lookup_budget: Duration,
 ) -> Result<()> {
     match action {
+        MsgAction::History {
+            agent,
+            task,
+            correspondent,
+            since,
+            until,
+            text,
+            limit,
+            cursor,
+            format: _,
+        } => {
+            let params = atm_org::message_query::HistoryParams {
+                agent,
+                task,
+                correspondent,
+                since,
+                until,
+                text,
+                limit,
+                cursor,
+            };
+            params.validate()?;
+            let (_, raw): (serde_json::Value, _) =
+                request("msg.history", params, MESSAGE_HISTORY_TIMEOUT).await?;
+            stdout(|out| output(&raw, MessageFormat::Json, "", out))
+        }
         MsgAction::Send {
             to,
             kind,
@@ -188,17 +234,12 @@ pub(super) async fn cmd_msg_with_lookup_budget(
                     "queued"
                 }
             );
-            output(&raw, format, &text, &mut io::stdout().lock())
+            stdout(|out| output(&raw, format, &text, out))
         }
         MsgAction::Ack { ids, format } => {
             let (result, raw): (AckResult, _) =
                 request("msg.ack", AckParams { ids }, MESSAGE_RPC_TIMEOUT).await?;
-            output(
-                &raw,
-                format,
-                &format!("{} marked read", result.count),
-                &mut io::stdout().lock(),
-            )
+            stdout(|out| output(&raw, format, &format!("{} marked read", result.count), out))
         }
         MsgAction::Retry {
             id,
@@ -219,7 +260,7 @@ pub(super) async fn cmd_msg_with_lookup_budget(
                 result.message_id,
                 status_text(result.status)?
             );
-            output(&raw, format, &text, &mut io::stdout().lock())
+            stdout(|out| output(&raw, format, &text, out))
         }
         MsgAction::GiveUp { id, format } => {
             let (result, raw): (GiveUpResult, _) = request(
@@ -228,8 +269,11 @@ pub(super) async fn cmd_msg_with_lookup_budget(
                 MESSAGE_RESOLUTION_TIMEOUT,
             )
             .await?;
-            let text = format!("{} {}", result.message_id, status_text(result.status)?);
-            output(&raw, format, &text, &mut io::stdout().lock())
+            let mut text = format!("{} {}", result.message_id, status_text(result.status)?);
+            if let Some(warning) = &result.editor_warning {
+                text.push_str(&format!("\nwarning: {}", escaped(warning, false)));
+            }
+            stdout(|out| output(&raw, format, &text, out))
         }
     }
 }
@@ -328,17 +372,17 @@ pub(super) async fn cmd_inbox_with_lookup_budget(
         MESSAGE_RPC_TIMEOUT,
     )
     .await?;
-    let mut out = io::stdout().lock();
-    match args.format {
-        MessageFormat::Json => output(&raw, args.format, "", &mut out),
-        MessageFormat::Text => render_inbox(&result, recipient.as_ref(), args.unread, &mut out),
-    }
+    stdout(|out| match args.format {
+        MessageFormat::Json => output(&raw, args.format, "", out),
+        MessageFormat::Text => render_inbox(&result, recipient.as_ref(), args.unread, out),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::io;
 
     struct Broken;
     impl Write for Broken {
@@ -367,6 +411,50 @@ mod tests {
         )
         .is_err());
     }
+    // Break: history chooses the ordinary 15 s or resolution 70 s budget.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)]
+    async fn history_has_one_seventeen_second_total_budget() {
+        use std::{future::Future, task::Poll};
+        let _lock = super::super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Only in-memory permit/clock work: no startup worker or socket can run.
+        let _held = super::super::rpc::startup_slot_for_test()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let super::super::Command::Msg { action } =
+            super::super::Args::try_parse_from(["atm", "msg", "history"])
+                .unwrap()
+                .command
+                .unwrap()
+        else {
+            panic!("wrong command")
+        };
+        let mut call = Box::pin(cmd_msg(action));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_secs(16)).await;
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let Poll::Ready(result) =
+            std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await
+        else {
+            panic!("missing history deadline")
+        };
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let history = serde_json::json!({"messages":[],"next_cursor":null});
+        assert!(output(&history, MessageFormat::Json, "", &mut Broken).is_err());
+    }
+
     #[test]
     fn message_commands_parse_exact_shape() {
         for args in [

@@ -65,7 +65,10 @@ struct Auto {
 impl Auto {
     /// The rig with the watcher running and `keys` in the worker's role file.
     async fn new(keys: &str) -> Self {
-        let rig = Rig::new().await;
+        Self::with_rig(Rig::new().await, keys).await
+    }
+
+    async fn with_rig(rig: Rig, keys: &str) -> Self {
         let (asked, asks) = mpsc::unbounded_channel();
         let clock = Arc::new(Clock {
             now: watch::Sender::new(t0()),
@@ -106,6 +109,24 @@ impl Auto {
 
     fn set(&self, now: DateTime<Utc>) {
         self.clock.now.send_replace(now);
+    }
+
+    /// An independent idle wake, re-requested after every settled outcome.
+    async fn admission_timer(&mut self) {
+        self.role(
+            "timer",
+            "auto_handover = ['idle']\ncache_minutes = 60\nidle_minutes = 45",
+        );
+        self.rig
+            .agent(
+                "timer",
+                "+++\nharness='pi'\n+++\nTimer",
+                "%8",
+                Some("timer-1"),
+            )
+            .await;
+        self.rig.turn("timer-1").await;
+        self.asked_for(after(2700)).await;
     }
 
     /// Returns once the watcher has asked the clock for `at`.
@@ -222,6 +243,7 @@ impl Auto {
     /// A queued message to `name` that is not a save request.
     async fn mail(&mut self, name: &str) -> MessageId {
         self.send(MessageContent {
+            delivery_notice: None,
             from: Address::Owner,
             to: Address::Agent(id(name)),
             kind: MessageKind::Note,
@@ -267,6 +289,152 @@ fn kinds(events: &[Arc<Envelope>]) -> Vec<&str> {
 
 const DELIVERY: [&str; 2] = ["msg.delivery_attempted", "msg.delivered"];
 
+// Break caught: queue/audit failure is mistaken for a silent preflight refusal,
+// returning the automatic attempt or sending both manual and automatic notes.
+#[tokio::test]
+async fn admission_automatic_write_failures_keep_the_attempt_and_report_once() {
+    for boundary in [AdmissionWrite::Queue, AdmissionWrite::Audit] {
+        let mut rig = Rig::new().await;
+        let mut gate = rig.gate(boundary);
+        let mut auto = Auto::with_rig(rig, ON).await;
+        // This independent idle timer is a terminal barrier: after dealing with
+        // an outcome, the watcher asks for this wake again before selecting.
+        auto.admission_timer().await;
+        auto.rig.share("s1", 630).await;
+        auto.rig.turn("s1").await;
+        let held = gate.take().await;
+        let (reply, request, expected) = match boundary {
+            AdmissionWrite::Queue => {
+                let (reply, committed) = commit_held(&auto.rig.org, held).await;
+                let request = MessageId::new(committed.unwrap().events[0].seq);
+                (reply, request, "could not confirm the save request for p/worker: organisation request timed out; accepted work may still complete; a request may be queued or already delivered; nothing was cleared; inspect `atm inbox --for p/worker` before retrying".to_owned())
+            }
+            AdmissionWrite::Audit => {
+                let super::super::Request::Execute { command, reply, .. } = held else {
+                    panic!("not a write")
+                };
+                let OrgCommand::SaveRequested { message_id, .. } = command.as_ref() else {
+                    panic!("not a save audit")
+                };
+                (reply, *message_id, audit_failure(*message_id))
+            }
+        };
+        // spawn does not poll inline: reaching the write proves the watcher's
+        // look returned and it is selecting with the timer already installed.
+        while auto.asked.try_recv().is_ok() {}
+        reply
+            .send(Err(super::super::OrgServiceError::Timeout))
+            .unwrap();
+        auto.asked_for(after(2700)).await;
+        let state = auto.rig.state().await;
+        let notes: Vec<_> = state
+            .messages()
+            .filter(|m| m.content.body.starts_with("automatic handover of p/worker"))
+            .collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "post-preflight failure was silently discarded"
+        );
+        assert_eq!(notes[0].content.to, Address::Agent(id("lead")));
+        assert_eq!(
+            notes[0].content.body,
+            format!(
+            "automatic handover of p/worker (context 63%, line 60%) did not complete: {expected}. \
+             Nothing more is tried in this session. By hand: atm agent handover p/worker"
+        )
+        );
+        assert_eq!(
+            state.message(&request).unwrap().status,
+            DeliveryStatus::Queued
+        );
+        assert!(!state
+            .messages()
+            .any(|m| m.content.body.starts_with("handover of ")));
+        assert!(auto.rig.cleared.try_recv().is_err());
+        auto.rig.kinds();
+        auto.rig.turn("s1").await;
+        auto.quiet(&[]).await;
+        assert_eq!(
+            auto.rig
+                .state()
+                .await
+                .messages()
+                .filter(|m| m.content.body.starts_with("automatic handover of p/worker"))
+                .count(),
+            1
+        );
+    }
+}
+
+// Break caught: an automatic preflight refusal is noted or consumes the attempt.
+#[tokio::test]
+async fn admission_automatic_preflight_refusal_stays_silent_and_allows_retry() {
+    struct RefuseFirst {
+        gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        recorder: Arc<Recorder>,
+    }
+    impl Clearer for RefuseFirst {
+        fn available(
+            &self,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send>> {
+            let gate = self.gate.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some((entered, release)) = gate {
+                    entered.send(()).unwrap();
+                    release.await.unwrap();
+                    return Err(AgentError::Unavailable("preflight unavailable".into()));
+                }
+                Ok(())
+            })
+        }
+        fn clear(
+            &self,
+            agent: AgentId,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<ClearResult, AgentError>> + Send>>
+        {
+            self.recorder.clear(agent)
+        }
+    }
+    let mut rig = Rig::new().await;
+    let (entered, entry) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    rig.service = Handovers::new(
+        rig.org.clone(),
+        rig.registry.clone(),
+        Arc::new(RefuseFirst {
+            gate: Mutex::new(Some((entered, released))),
+            recorder: rig.recorder.clone(),
+        }),
+    );
+    let mut auto = Auto::with_rig(rig, ON).await;
+    auto.admission_timer().await;
+    auto.rig.share("s1", 630).await;
+    auto.rig.turn("s1").await;
+    tokio::time::timeout(GUARD, entry).await.unwrap().unwrap();
+    while auto.asked.try_recv().is_ok() {}
+    release.send(()).unwrap();
+    auto.asked_for(after(2700)).await;
+    assert_eq!(
+        auto.rig.state().await.messages().count(),
+        0,
+        "preflight refusal sent a request or note"
+    );
+    assert!(auto.rig.cleared.try_recv().is_err());
+    auto.rig.kinds();
+    auto.rig.turn("s1").await;
+    auto.one_started().await;
+    let request = auto.save_requested("worker", &[]).await;
+    auto.rig.deliver(request, "s1", "%1").await;
+    std::fs::write(auto.rig.memory("worker"), "retry saved").unwrap();
+    auto.rig.report("s1", LifecycleEvent::Idle).await;
+    auto.message(&["msg.delivery_attempted", "msg.delivered", "agent.saved"])
+        .await;
+    assert_eq!(auto.rig.cleared.try_recv().unwrap(), id("worker"));
+    auto.rig.turn("s1").await;
+    auto.quiet(&[]).await;
+}
+
 // The pure parts.
 
 fn attempt(session: &str) -> Attempt {
@@ -292,6 +460,7 @@ fn an_admitted_handover_ends_in_one_note_to_the_manager_and_keeps_the_attempt() 
     let lead = Address::Agent(id("lead"));
     let attempted = BTreeMap::from([(id("worker"), SessionId::new("s1"))]);
     let note = |to: Address, body: &str| MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to,
         kind: MessageKind::Note,

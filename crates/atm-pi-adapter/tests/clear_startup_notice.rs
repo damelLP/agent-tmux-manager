@@ -5,7 +5,7 @@ use atm_core::{
     styled_screen::StyledScreen, DialogState, FreshEditorEvidence, InputState, ScreenInput,
     TurnState,
 };
-use atm_pi_adapter::screen::{observe_control_screen, staged_draft_matches};
+use atm_pi_adapter::screen::{observe_control_screen, observe_screen, staged_draft_matches};
 
 macro_rules! capture {
     ($name:literal, $version:literal) => {
@@ -182,6 +182,91 @@ fn notice_requires_faint_labels_or_a_bold_title() {
             assert_ne!(changed, text);
             assert_eq!(observe(&changed).facts, Default::default());
             assert_eq!(observe(&changed).dialog, ControlDialog::Unknown);
+        }
+    }
+}
+
+#[test]
+fn first_glyph_only_faint_notice_labels_stay_unknown() {
+    for text in [POST_TURN, STARTUP, capture!("startup_40x20", "1.5.0")] {
+        // Synthetic: only the first glyph of each captured label is faint,
+        // with a plain title so the independent bold-title proof cannot apply.
+        let changed = text
+            .replace("\x1b[1m", "\x1b[22m")
+            .replace("New version", "N\x1b[22mew version")
+            .replace("Changelog:", "C\x1b[22mhangelog:");
+        assert_ne!(changed, text);
+        // Synthetic: the same counterfeit must not authorize staged input.
+        for changed in [changed.clone(), draft(&changed, "/new")] {
+            let input = ScreenInput::Styled(&changed);
+            assert_eq!(observe_screen(input, None), Default::default());
+            assert_eq!(observe(&changed), ControlScreen::default());
+            assert_eq!(staged_draft_matches(input, "/new"), None);
+        }
+    }
+}
+
+#[test]
+fn partially_faint_notice_labels_stay_unknown() {
+    for text in [POST_TURN, STARTUP, capture!("startup_40x20", "1.5.0")] {
+        for label in ["New version", "Changelog:"] {
+            for (offset, glyph) in label.char_indices().filter(|(_, c)| !c.is_whitespace()) {
+                // Synthetic: remove faint from exactly one label glyph, leaving
+                // the other label and every remaining glyph faint.
+                let replacement = format!(
+                    "{}\x1b[22m{glyph}\x1b[2m{}",
+                    &label[..offset],
+                    &label[offset + glyph.len_utf8()..]
+                );
+                let changed = text.replace(label, &replacement);
+                assert_ne!(changed, text);
+                // A complete bold title remains sufficient on its own.
+                assert!(safe(&editor(
+                    &changed,
+                    InputState::Empty,
+                    TurnState::NotRunning
+                )));
+                // Synthetic: a plain title leaves only the incomplete labels.
+                let changed = changed.replace("\x1b[1m", "\x1b[22m");
+                for changed in [changed.clone(), draft(&changed, "/new")] {
+                    let input = ScreenInput::Styled(&changed);
+                    assert_eq!(
+                        observe_screen(input, None),
+                        Default::default(),
+                        "{label}: nonfaint {glyph:?} at {offset}"
+                    );
+                    assert_eq!(observe(&changed), ControlScreen::default());
+                    assert_eq!(staged_draft_matches(input, "/new"), None);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fully_faint_labels_allow_a_plain_title_and_nonfaint_values() {
+    for text in [POST_TURN, STARTUP, capture!("startup_40x20", "1.5.0")] {
+        // Synthetic: keep every label glyph faint but not the title, label
+        // whitespace or version value; command and URL retain captured colors.
+        let changed = text
+            .replace("\x1b[1m", "\x1b[22m")
+            .replace("New version ", "New\x1b[22m \x1b[2mversion \x1b[22m");
+        assert_ne!(changed, text);
+        // Synthetic: multibyte history must not shift label attribute offsets.
+        for changed in [
+            changed.clone(),
+            format!(" Transcript 日本語 🦀\n\n{changed}"),
+        ] {
+            assert!(safe(&editor(
+                &changed,
+                InputState::Empty,
+                TurnState::NotRunning
+            )));
+            let staged = draft(&changed, "/new");
+            assert_eq!(
+                staged_draft_matches(ScreenInput::Styled(&staged), "/new"),
+                Some(true)
+            );
         }
     }
 }

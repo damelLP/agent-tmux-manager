@@ -14,7 +14,7 @@
 //!
 //! | Step | Goes on when | Refused when |
 //! |---|---|---|
-//! | Admission | the agent is ready with a bound session and no handover of it runs | otherwise; nothing was sent |
+//! | Admission | the agent is ready with a bound session and no handover of it runs | Preflight refusal queues no request; after dispatch a request may be queued or delivered even when handover fails; nothing is cleared. |
 //! | Save requested | the request's delivery is confirmed | delivery failed for good, or the deadline: the request stays queued, a later handover reuses it, the owner's give-up cancels it |
 //! | Saving | the session is idle and the memory file has changed | the turn ended and the file did not change; the deadline; the agent or its session went away |
 //! | Saved | `agent.clear` answers | every refusal of `agent.clear`, with "saved its state" in front |
@@ -133,6 +133,7 @@ pub struct HandoverResult {
 /// one is found again and no other message is taken for it.
 pub(super) fn save_request(agent: &AgentId, memory: &Path) -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: Address::Agent(agent.clone()),
         kind: MessageKind::Note,
@@ -351,7 +352,7 @@ impl Handovers {
             .await
     }
 
-    /// Admission and the save request, then the rest as a task of its own.
+    /// Preflight, then both admission writes and the save as a retained task.
     /// The save is given up when `deadline` resolves; tests resolve it by
     /// hand, so that no test waits for time to pass.
     pub(super) async fn request_until(
@@ -360,20 +361,38 @@ impl Handovers {
         caller: CallContext,
         deadline: Deadline,
     ) -> Result<HandoverResult, MethodError> {
+        let agent = p.agent.clone();
         let Admitted { job, own, manager } = self.admit(p, caller, deadline).await?;
-        let (agent_id, message_id) = (job.agent.clone(), job.message_id);
         let org = self.org.clone();
         let (answer, waiting) = oneshot::channel();
-        // The agent itself does not wait: with no receiver from the start,
-        // its handover's failure cannot be taken for a delivered answer.
-        let waiting = (!own).then_some(waiting);
         tokio::spawn(async move {
-            let agent = job.agent.clone();
-            // An answer nobody takes comes back. That is the agent's own
-            // handover, or a caller whose call has ended: a failure is then
-            // told to the agent's manager instead.
-            if let Err(Err(error)) = answer.send(job.run().await) {
+            let mut answer = Some(answer);
+            let result = async {
+                let job = job.await?;
+                // Self must end its turn before delivery. Acknowledge only
+                // after both writes; this task still owns every later step.
+                if own {
+                    if let Some(answer) = answer.take() {
+                        let _ = answer.send(Ok(HandoverResult {
+                            agent_id: job.agent.clone(),
+                            message_id: job.message_id,
+                            state: HandoverState::Started,
+                            session_id: None,
+                        }));
+                    }
+                }
+                job.run().await
+            }
+            .await;
+            let unclaimed = match answer {
+                Some(answer) => answer.send(result),
+                None => Err(result),
+            };
+            // A waiting caller gets the error, or an unclaimed failure is
+            // told to the manager once, including admission write failures.
+            if let Err(Err(error)) = unclaimed {
                 let note = MessageContent {
+                    delivery_notice: None,
                     from: Address::System,
                     to: manager,
                     kind: MessageKind::Note,
@@ -386,21 +405,14 @@ impl Handovers {
                 }
             }
         });
-        let Some(waiting) = waiting else {
-            return Ok(HandoverResult {
-                agent_id,
-                message_id,
-                state: HandoverState::Started,
-                session_id: None,
-            });
-        };
         waiting
             .await
             .map_err(|_| AgentError::Internal("handover task stopped".into()))?
     }
 
-    /// The checks, the save request and its audit: everything before the
-    /// handover waits. Refused here, nothing was sent.
+    /// Preflight only: refusal here queues no request. The returned work
+    /// must be polled by a retained task; dispatch may leave a request even
+    /// when either write's result is unconfirmed. Nothing is then cleared.
     pub(super) async fn admit(
         &self,
         p: HandoverParams,
@@ -438,48 +450,80 @@ impl Handovers {
         let running = Running::claim(&self.running, &p.agent)?;
         let before = self.stat(&memory).await?;
         let request = save_request(&p.agent, &memory);
-        let message_id = match open_save_request(&state, &request) {
-            Some(open) => open,
-            None => {
-                let sent = self.execute(OrgCommand::SendMessage(request)).await?;
-                let sent = sent.first().ok_or_else(|| {
-                    AgentError::Internal("the save request committed no event".into())
+        let open = open_save_request(&state, &request);
+        let pane = agent.pane.clone();
+        let service = self.clone();
+        // Unpolled until a retained owner exists: caller loss cannot land
+        // between a queued request and ownership of the remaining work.
+        let job = Box::pin(async move {
+            let message_id = match open {
+                Some(open) => open,
+                None => service
+                    .execute(OrgCommand::SendMessage(request))
+                    .await
+                    .and_then(|sent| {
+                        sent.first()
+                            .map(|event| MessageId::new(event.seq))
+                            .ok_or_else(|| {
+                                AgentError::Internal("the save request committed no event".into())
+                                    .into()
+                            })
+                    })
+                    .map_err(|mut error| {
+                        error.0.message = format!(
+                            "could not confirm the save request for {}: {}; a request may be \
+                             queued or already delivered; nothing was cleared; inspect \
+                             `atm inbox --for {}` before retrying",
+                            p.agent, error.0.message, p.agent
+                        );
+                        error
+                    })?,
+            };
+            service
+                .execute(OrgCommand::SaveRequested {
+                    agent_id: p.agent.clone(),
+                    message_id,
+                })
+                .await
+                .map_err(|mut error| {
+                    error.0.message = format!(
+                        "the save request {message_id} for {} exists, but its handover record was \
+                     not confirmed: {}; the request may be queued or already delivered; \
+                     nothing was cleared; inspect `atm inbox --for {} --id {message_id}`; \
+                     a later handover reuses it while queued or delivering; \
+                     `atm msg give-up {message_id}` cancels an undelivered request",
+                        p.agent, error.0.message, p.agent
+                    );
+                    error
                 })?;
-                MessageId::new(sent.seq)
+            let mut facts = SaveFacts::default();
+            if let Some(row) = service.registry.get_session(session.clone()).await {
+                facts.status(row.status);
             }
-        };
-        self.execute(OrgCommand::SaveRequested {
-            agent_id: p.agent.clone(),
-            message_id,
-        })
-        .await?;
-        let mut facts = SaveFacts::default();
-        if let Some(row) = self.registry.get_session(session.clone()).await {
-            facts.status(row.status);
-        }
-        let job = Job {
-            service: self.clone(),
-            agent: p.agent.clone(),
-            pane: agent.pane.clone(),
-            session,
-            memory,
-            before,
-            message_id,
-            deadline,
-            seconds: p.timeout_ms / 1000,
-            committed,
-            rows,
-            facts,
-            needs_input: false,
-            _running: running,
-        };
+            Ok(Job {
+                service,
+                agent: p.agent,
+                pane,
+                session,
+                memory,
+                before,
+                message_id,
+                deadline,
+                seconds: p.timeout_ms / 1000,
+                committed,
+                rows,
+                facts,
+                needs_input: false,
+                _running: running,
+            })
+        });
         Ok(Admitted { job, own, manager })
     }
 }
 
-/// A handover that passed admission: its request is queued and recorded.
+/// A handover that passed preflight; its retained owner queues and audits.
 pub(super) struct Admitted {
-    pub job: Job,
+    pub job: Pin<Box<dyn Future<Output = Result<Job, MethodError>> + Send>>,
     /// The caller is the agent itself, so nobody waits for the answer.
     pub own: bool,
     /// Who is told when a handover nobody waits for fails.
@@ -746,6 +790,7 @@ pub(super) fn context_note(
         agent.status == AgentStatus::Ready && agent.session_id.as_ref() == Some(session)
     })?;
     let note = MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: manager_address(&agent.id, agent.role.as_ref()).unwrap_or(Address::Owner),
         kind: MessageKind::Note,

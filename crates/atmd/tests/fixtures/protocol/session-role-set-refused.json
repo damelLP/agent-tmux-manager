@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"role-refused","method":"session.role_set","params":{"caller_server":"/unverified/server","pane":"%7","role":"coordinator"}},"response":{"type":"response","id":"role-refused","error":{"code":"refused","message":"ignored"}},"ignore":["/error/message"]}

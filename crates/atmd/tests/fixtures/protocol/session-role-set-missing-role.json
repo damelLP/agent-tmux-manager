@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"role-missing","method":"session.role_set","params":{"caller_server":"/unverified/server","pane":"%7"}},"response":{"type":"response","id":"role-missing","error":{"code":"invalid_params","message":"ignored"}},"ignore":["/error/message"]}

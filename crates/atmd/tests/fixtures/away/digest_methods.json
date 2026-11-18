@@ -1,0 +1,10 @@
+[
+  {"method":"owner.digest","params":{},"error":"invalid_params"},
+  {"method":"owner.digest","params":{"snapshot_seq":0},"pane":"%7","error":"refused"},
+  {"method":"owner.digest","params":{"snapshot_seq":0,"by":"owner"},"error":"invalid_params"},
+  {"method":"owner.digest","params":{"snapshot_seq":0},"error":"conflict"},
+  {"method":"owner.back","params":{"by":"owner"},"error":"invalid_params"},
+  {"method":"owner.back","params":{},"pane":"%7","error":"refused"},
+  {"method":"decision.get","params":{"id":"d999","redo_limit":0},"error":"invalid_params"},
+  {"method":"decision.get","params":{"id":"d999","redo_after":"t01"},"error":"invalid_params"}
+]

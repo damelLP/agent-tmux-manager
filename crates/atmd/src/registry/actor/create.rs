@@ -1,16 +1,15 @@
 //! Creating sessions: registration, discovery and session-id changes.
 
 use std::path::PathBuf;
-use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
 use atm_core::{AgentType, SessionDomain, SessionId};
 
 use super::{RegistryActor, MAX_SESSIONS};
-use crate::discovery::read_parent_session_id;
 use crate::registry::commands::{RegistryError, RemovalReason, SessionEvent};
 use crate::registry::infra::SessionInfrastructure;
+use crate::registry::inputs::stamp_new_session;
 
 impl RegistryActor {
     /// Handles session registration.
@@ -95,12 +94,12 @@ impl RegistryActor {
         // Resolve project/worktree if not already set
         if session.project_root.is_none() {
             if let Some(cwd) = &session.working_directory {
-                self.git_lookups.request(cwd, Instant::now());
+                self.git_lookups.request(cwd, self.clock.instant_now());
             }
         }
 
         let mut infra = SessionInfrastructure::new();
-        infra.set_pid(pid);
+        infra.set_pid_with(pid, self.process_info.as_ref());
 
         self.sessions_by_pid.insert(pid, (session, infra));
         self.session_id_to_pid.insert(session_id.clone(), pid);
@@ -179,7 +178,7 @@ impl RegistryActor {
             // Update session_id to match the new discovery
             existing_session.id = session_id.clone();
 
-            self.git_lookups.request(&cwd_str, Instant::now());
+            self.git_lookups.request(&cwd_str, self.clock.instant_now());
             existing_session.working_directory = Some(cwd_str);
             if tmux_pane.is_some() {
                 existing_session.tmux_pane = tmux_pane;
@@ -216,8 +215,9 @@ impl RegistryActor {
             harness,
             tmux_pane,
             Some(cwd),
-            read_parent_session_id(pid, harness),
+            self.process_info.parent(pid, harness),
         );
+        let session = stamp_new_session(session, self.clock.as_ref());
         self.insert_new_session(pid, session)?;
 
         info!(

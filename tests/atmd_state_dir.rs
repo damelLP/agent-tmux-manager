@@ -6,9 +6,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use atm_protocol::{ClientMessage, DaemonMessage};
+use stand_in::control_support;
 #[path = "support/stand_in.rs"]
 mod stand_in;
 
@@ -72,6 +73,8 @@ impl Rig {
         state: Option<&Path>,
         reap_after: Receiver<()>,
     ) -> u32 {
+        let mut events =
+            control_support::LogEvents::new(&self.root.path().join(format!("{side}.stderr")));
         let log = std::fs::File::create(self.root.path().join(format!("{side}.stderr"))).unwrap();
         let mut child = self
             .atmd(side, state)
@@ -89,27 +92,23 @@ impl Rig {
             tx.send(child.wait().unwrap()).ok()
         });
         self.reapers.push(rx);
+        events.listening(Some(pid));
         self.ready(side);
         pid
     }
 
     fn ready(&self, side: &str) {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            if matches!(
+        assert!(
+            matches!(
                 stand_in::protocol_request(
                     &self.socket(side),
                     ClientMessage::list_sessions(),
                     DEADLINE,
                 ),
                 Ok(DaemonMessage::SessionList { .. })
-            ) {
-                return;
-            }
-            assert!(Instant::now() < deadline, "no round trip on side {side}");
-            // Condition poll, not a settling delay: only failed round trips retry.
-            std::thread::sleep(Duration::from_millis(20));
-        }
+            ),
+            "no round trip on side {side}"
+        );
     }
 
     fn status(&self, side: &str, state: Option<&Path>, pid: Option<u32>) {
@@ -312,8 +311,10 @@ fn relative_xdg_without_override_keeps_legacy_pid_and_log_paths() {
     let mut rig = Rig::new();
     rig.xdg_state = "relative-xdg".into();
     let state = rig.root.path().join("home/.local/state/atm");
+    let mut events = control_support::LogEvents::new(&state.join("atm.log"));
     let out = stand_in::bounded::run(rig.atmd("legacy", None).args(["start", "-d"]));
     assert!(out.status.success(), "{out:?}");
+    events.listening(None);
     rig.ready("legacy");
     let pid = std::fs::read_to_string(state.join("atmd.pid"))
         .expect("PID remains at the legacy path")

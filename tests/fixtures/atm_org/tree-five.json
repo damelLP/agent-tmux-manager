@@ -1,0 +1,1235 @@
+{
+  "generated_at": "2026-01-15T12:05:00Z",
+  "reporting": {
+    "state": "ok",
+    "reason": null
+  },
+  "needs_owner": {
+    "away_since": "2026-01-15T11:00:00Z",
+    "owner_unread": 0,
+    "unnamed_attention": 0,
+    "items": [
+      {
+        "kind": "decision_pending",
+        "id": "d100",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d101",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d102",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d103",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d104",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d105",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d106",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d107",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d108",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d109",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d110",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d111",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d112",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d113",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d114",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d115",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d116",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d117",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d118",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d119",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d120",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d121",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d122",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d123",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d124",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d125",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d126",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d127",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d128",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d129",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d130",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d131",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d132",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d133",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d134",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d135",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d136",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d137",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d138",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d139",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d140",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d141",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d142",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d143",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d144",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d145",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d146",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d147",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d148",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d149",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d150",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d151",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d152",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d153",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d154",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d155",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d156",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d157",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d158",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d159",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d160",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d161",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d162",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d163",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d164",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d165",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d166",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d167",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d168",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d169",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d170",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d171",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d172",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d173",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d174",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d175",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d176",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d177",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d178",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d179",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d180",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d181",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d182",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d183",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d184",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d185",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d186",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d187",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d188",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d189",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d190",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d191",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d192",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d193",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d194",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d195",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d196",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d197",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d198",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      },
+      {
+        "kind": "decision_pending",
+        "id": "d199",
+        "agent_id": "alpha/lead",
+        "project": "alpha",
+        "since": "2026-01-15T12:00:00Z"
+      }
+    ],
+    "items_total": 103
+  },
+  "projects": [
+    {
+      "id": "alpha",
+      "root": "/fixtures/repos/alpha",
+      "seats": [
+        {
+          "agent_id": "alpha/lead",
+          "state": "ready",
+          "activity": null,
+          "harness": "pi",
+          "model": null,
+          "context_percentage": 12.25,
+          "pane": null,
+          "manager": "owner",
+          "line_error": null,
+          "tasks": []
+        }
+      ],
+      "tasks_open": 53,
+      "tasks": [
+        {
+          "task_id": "t100",
+          "title": "Work item 1",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t101",
+          "title": "Work item 2",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t102",
+          "title": "Work item 3",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t103",
+          "title": "Work item 4",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t104",
+          "title": "Work item 5",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t105",
+          "title": "Work item 6",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t106",
+          "title": "Work item 7",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t107",
+          "title": "Work item 8",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t108",
+          "title": "Work item 9",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t109",
+          "title": "Work item 10",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t110",
+          "title": "Work item 11",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t111",
+          "title": "Work item 12",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t112",
+          "title": "Work item 13",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t113",
+          "title": "Work item 14",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t114",
+          "title": "Work item 15",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t115",
+          "title": "Work item 16",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t116",
+          "title": "Work item 17",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t117",
+          "title": "Work item 18",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t118",
+          "title": "Work item 19",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t119",
+          "title": "Work item 20",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t120",
+          "title": "Work item 21",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t121",
+          "title": "Work item 22",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t122",
+          "title": "Work item 23",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t123",
+          "title": "Work item 24",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t124",
+          "title": "Work item 25",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t125",
+          "title": "Work item 26",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t126",
+          "title": "Work item 27",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t127",
+          "title": "Work item 28",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t128",
+          "title": "Work item 29",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t129",
+          "title": "Work item 30",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t130",
+          "title": "Work item 31",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t131",
+          "title": "Work item 32",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t132",
+          "title": "Work item 33",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t133",
+          "title": "Work item 34",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t134",
+          "title": "Work item 35",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t135",
+          "title": "Work item 36",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t136",
+          "title": "Work item 37",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t137",
+          "title": "Work item 38",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t138",
+          "title": "Work item 39",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t139",
+          "title": "Work item 40",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t140",
+          "title": "Work item 41",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t141",
+          "title": "Work item 42",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t142",
+          "title": "Work item 43",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t143",
+          "title": "Work item 44",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t144",
+          "title": "Work item 45",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t145",
+          "title": "Work item 46",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t146",
+          "title": "Work item 47",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t147",
+          "title": "Work item 48",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t148",
+          "title": "Work item 49",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        },
+        {
+          "task_id": "t149",
+          "title": "Work item 50",
+          "kind": "work",
+          "state": "open",
+          "agent_id": null,
+          "creator": "alpha/lead"
+        }
+      ],
+      "decisions": {
+        "pending": 103,
+        "provisional": 0
+      }
+    },
+    {
+      "id": "beta",
+      "root": "/fixtures/repos/beta",
+      "seats": [
+        {
+          "agent_id": "beta/worker",
+          "state": "down",
+          "activity": null,
+          "harness": null,
+          "model": null,
+          "context_percentage": null,
+          "pane": null,
+          "manager": "gamma/chief",
+          "line_error": null,
+          "tasks": []
+        }
+      ],
+      "tasks_open": 0,
+      "tasks": [],
+      "decisions": {
+        "pending": 0,
+        "provisional": 0
+      }
+    },
+    {
+      "id": "delta",
+      "root": "/fixtures/repos/delta",
+      "seats": [],
+      "tasks_open": 0,
+      "tasks": [],
+      "decisions": {
+        "pending": 0,
+        "provisional": 0
+      }
+    },
+    {
+      "id": "epsilon",
+      "root": "/fixtures/repos/epsilon",
+      "seats": [
+        {
+          "agent_id": "epsilon/worker",
+          "state": "ready",
+          "activity": null,
+          "harness": "pi",
+          "model": null,
+          "context_percentage": 100,
+          "pane": null,
+          "manager": "owner",
+          "line_error": null,
+          "tasks": []
+        }
+      ],
+      "tasks_open": 0,
+      "tasks": [],
+      "decisions": {
+        "pending": 0,
+        "provisional": 0
+      }
+    },
+    {
+      "id": "gamma",
+      "root": "/fixtures/folders/gamma",
+      "seats": [
+        {
+          "agent_id": "gamma/chief",
+          "state": "ready",
+          "activity": null,
+          "harness": "pi",
+          "model": null,
+          "context_percentage": 0,
+          "pane": null,
+          "manager": "owner",
+          "line_error": null,
+          "tasks": []
+        }
+      ],
+      "tasks_open": 0,
+      "tasks": [],
+      "decisions": {
+        "pending": 0,
+        "provisional": 0
+      }
+    }
+  ],
+  "unplaced_tasks": [
+    {
+      "task_id": "t9000",
+      "title": "Triage queue",
+      "kind": "errand",
+      "state": "open",
+      "agent_id": null,
+      "creator": "system"
+    }
+  ]
+}

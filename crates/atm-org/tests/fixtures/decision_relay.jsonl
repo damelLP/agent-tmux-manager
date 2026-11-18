@@ -1,0 +1,16 @@
+{"seq":1,"ts":"2026-01-15T12:00:00Z","kind":"project.registered","body":{"project_id":"p","root":"/project"}}
+{"seq":2,"ts":"2026-01-15T12:00:01Z","kind":"agent.adopted","body":{"agent_id":"p/lead","pane":"%1","session_id":null}}
+{"seq":3,"ts":"2026-01-15T12:00:02Z","kind":"agent.adopted","body":{"agent_id":"p/builder","pane":"%2","session_id":null}}
+{"seq":4,"ts":"2026-01-15T12:00:03Z","kind":"owner.relay_set","body":{"by":"owner","agent":"p/lead"}}
+{"seq":5,"ts":"2026-01-15T12:00:04Z","kind":"decision.requested","body":{"requester":"p/builder","kind":"policy","title":"Which shape","context":"","files":[],"options":["a","b"],"recommended":"a","may_be_undone":true,"changes_intent":true,"deadline":null}}
+{"seq":6,"ts":"2026-01-15T12:00:05Z","kind":"decision.taken_provisionally","body":{"decision_id":"d5","option":"b","by":"owner","relayed_by":"p/lead"}}
+{"seq":7,"ts":"2026-01-15T12:00:06Z","kind":"owner.relay_set","body":{"by":"owner","agent":"p/builder"}}
+{"seq":8,"ts":"2026-01-15T12:00:07Z","kind":"decision.resolved","body":{"decision_id":"d5","option":"b","by":"owner","note":null,"standing_rule":false}}
+{"seq":9,"ts":"2026-01-15T12:00:08Z","kind":"decision.requested","body":{"requester":"p/builder","kind":"plan","title":"Which shape","context":"","files":[],"options":["a","b"],"recommended":"a","may_be_undone":true,"changes_intent":true,"deadline":null}}
+{"seq":10,"ts":"2026-01-15T12:00:09Z","kind":"decision.taken_provisionally","body":{"decision_id":"d9","option":"a","by":"owner","relayed_by":"p/builder"}}
+{"seq":11,"ts":"2026-01-15T12:00:10Z","kind":"decision.overruled","body":{"decision_id":"d9","option":"b","by":"owner","note":null,"standing_rule":false,"redo_tasks":[]}}
+{"seq":12,"ts":"2026-01-15T12:00:11Z","kind":"owner.relay_set","body":{"by":"owner","agent":null}}
+{"seq":13,"ts":"2026-01-15T12:00:12Z","kind":"decision.requested","body":{"requester":"p/builder","kind":"dialog","title":"Which shape","context":"","files":[],"options":["a","b"],"recommended":"a","may_be_undone":true,"changes_intent":false,"deadline":null}}
+{"seq":14,"ts":"2026-01-15T12:00:13Z","kind":"decision.taken_provisionally","body":{"decision_id":"d13","option":"a","by":"system"}}
+{"seq":15,"ts":"2026-01-15T12:00:14Z","kind":"owner.away","body":{"by":"owner","stacking_caps":{"p":2}}}
+{"seq":16,"ts":"2026-01-15T12:00:15Z","kind":"owner.back","body":{"by":"owner"}}

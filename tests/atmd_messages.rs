@@ -15,7 +15,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[path = "support/control.rs"]
+mod control_support;
 
 use atm_protocol::{ClientMessage, DaemonMessage, ResponsePayload};
 use serde_json::{json, Value};
@@ -35,6 +38,7 @@ impl Daemon {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         fs::write(dir.join("config/atm/config.toml"), config).unwrap();
+        let mut events = control_support::LogEvents::new(&log);
         let output = fs::File::create(&log).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_atmd"))
             .arg("start")
@@ -54,17 +58,8 @@ impl Daemon {
             .spawn()
             .expect("start atmd");
         let daemon = Self { child, socket, log };
-        // A bounded poll on a condition (the daemon listens), as the other
-        // real-daemon tests do; nothing after it waits on time.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while UnixStream::connect(&daemon.socket).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "atmd never listened\n{}",
-                daemon.log()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        events.listening(Some(daemon.child.id()));
+        UnixStream::connect(&daemon.socket).expect("atmd never listened");
         daemon
     }
 
@@ -76,7 +71,9 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        if control_support::process::wait_exit(self.child.id(), Duration::from_secs(30)).is_ok() {
+            let _ = self.child.wait();
+        }
     }
 }
 

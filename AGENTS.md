@@ -92,11 +92,13 @@ harness ──hook/extension──▶ atmd (daemon) ◀──unix socket── a
 | Crate | Responsibility | May depend on |
 |---|---|---|
 | `atm-core` | Vendor-neutral domain types | nothing internal |
+| `atm-comms` | Vendor-neutral durable message rows (types only) | `atm-core`, `atm-org` |
 | `atm-protocol` | Vendor-neutral wire messages and protocol versioning | `atm-core` |
 | `atm-<vendor>-adapter` | **All** knowledge of one harness: event vocabulary, payload shapes, mapping to core types | `atm-core` only |
 | `atm-tmux` | Thin async wrapper over the tmux CLI (`TmuxClient` trait + `MockTmuxClient`) | no internal crates |
 | `atmd` | Session registry, broadcast server | core, protocol, tmux, adapters |
 | `atm` (crate `atm-tui`) | TUI and CLI | core, protocol, tmux, adapters |
+| `atm-chat` | Pure terminal-chat state and screen | `atm-tui`, `atm-comms` |
 | root `atm` package | `atm` / `atmd` binaries | everything |
 
 - **Vendor knowledge lives only in its adapter.** `atm-core`, `atm-protocol`

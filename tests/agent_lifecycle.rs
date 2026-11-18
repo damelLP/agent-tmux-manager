@@ -6,6 +6,10 @@
 mod stand_in;
 #[path = "support/agent_lifecycle.rs"]
 mod support;
+use support as lifecycle;
+#[allow(dead_code)]
+#[path = "support/message_delivery.rs"]
+mod delivery_support;
 
 use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 
@@ -942,6 +946,7 @@ fn msg_send_during_clear_delivers_once_to_new_generation() {
         e["kind"] == "rendered" && e["state"] == "clearing"
     });
     // Sent while the stand-in holds the clear: recorded, and not typed.
+    let mut watch = delivery_support::Watch::on(&test.rig, cursor);
     let sent = test.rpc(
         "msg.send",
         json!({"to": id, "body": "after the clear"}),
@@ -967,10 +972,8 @@ fn msg_send_during_clear_delivers_once_to_new_generation() {
     // The new session takes the reference as a prompt, exactly as sent.
     let accepted = test.rig.wait_event(pane, held, |e| e["kind"] == "accepted");
     assert_eq!(accepted["text"], reference.as_str(), "{accepted}");
-    test.rig.wait("the delivery's record", || {
-        test.tail(cursor)
-            .iter()
-            .any(|e| e["kind"] == "msg.delivered")
+    watch.wait("the delivery's record", |e| {
+        e["kind"] == "msg.delivered" && e["body"]["message_id"] == message
     });
     // One prompt since the clear began, in the new session: the clear
     // command was not a prompt, and the reference was not joined to it.
@@ -1158,6 +1161,7 @@ fn stop_during_a_start_that_draws_no_screen_does_not_overrun() {
     test.role("quiet", StandInMode::Pi, "");
     let placement = test.placement(&support::started_config(StandInMode::Pi));
     let cursor = test.cursor();
+    let mut watch = delivery_support::Watch::on(&test.rig, cursor);
     let (socket, up) = (
         test.rig.socket(),
         atm_protocol::ClientMessage::request(
@@ -1176,10 +1180,8 @@ fn stop_during_a_start_that_draws_no_screen_does_not_overrun() {
         stand_in::protocol_request(&socket, up, std::time::Duration::from_secs(90))
     });
     // The launch line has run: from here on the start only looks at the pane.
-    test.rig.wait("the launch to be recorded as run", || {
-        test.tail(cursor)
-            .iter()
-            .any(|event| event["kind"] == "control.spawned")
+    watch.wait("the launch to be recorded as run", |event| {
+        event["kind"] == "control.spawned"
     });
     let stop = test.rig.run(
         test.rig

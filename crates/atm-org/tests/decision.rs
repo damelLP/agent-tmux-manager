@@ -223,6 +223,7 @@ fn golden_log_folds_to_the_expected_state() {
             requested_at: at(3),
             status: DecisionStatus::Overruled,
             provisional: Some(ProvisionalChoice {
+                relayed_by: None,
                 decision_id: d(3),
                 option: "a".into(),
                 by: Address::System,
@@ -249,6 +250,7 @@ fn golden_log_folds_to_the_expected_state() {
     assert_eq!(
         confirmed.provisional,
         Some(ProvisionalChoice {
+            relayed_by: None,
             decision_id: d(6),
             option: "list".into(),
             by: Address::Agent(builder()),
@@ -367,6 +369,7 @@ fn fold_records_facts_without_enforcing_the_table() {
 
     for (seq, option) in [(21, "yes"), (22, "no")] {
         let taken = OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+            relayed_by: None,
             decision_id: d(9),
             option: option.into(),
             by: Address::System,
@@ -415,6 +418,7 @@ fn unknown_references_and_duplicate_ids_leave_the_state_unchanged() {
         standing_rule: false,
     };
     let choice = |decision_id, by: &Address| ProvisionalChoice {
+        relayed_by: None,
         decision_id,
         option: "a".into(),
         by: by.clone(),
@@ -598,6 +602,7 @@ impl Rig {
 
 fn take(decision_id: DecisionId, option: &str) -> DecisionCommand {
     DecisionCommand::TakeProvisionally(ProvisionalChoice {
+        relayed_by: None,
         decision_id,
         option: option.into(),
         by: Address::System,
@@ -718,6 +723,7 @@ fn emitted_events_carry_the_command_and_apply_stamps_the_time() {
     let (mut rig, id) = Rig::with(DecisionStatus::Pending);
     let events = rig.run(take(id, "a"), at(40)).unwrap();
     let choice = ProvisionalChoice {
+        relayed_by: None,
         decision_id: id,
         option: "a".into(),
         by: Address::System,
@@ -756,6 +762,7 @@ fn a_repeated_take_by_another_party_keeps_the_first_choice_and_time() {
     assert_eq!(
         rig.run(
             DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                relayed_by: None,
                 decision_id: id,
                 option: "a".into(),
                 by: other(),
@@ -820,7 +827,10 @@ fn another_option_on_a_provisional_decision_is_an_overrule() {
     let events = rig.run(resolve(id, "b"), at(40)).unwrap();
     assert_eq!(
         events,
-        [OrgEvent::DecisionOverruled(answer(id, "b").into())]
+        [OrgEvent::DecisionOverruled(DecisionResolutionEvent {
+            redo_tasks: Some(vec![]),
+            ..answer(id, "b").into()
+        })]
     );
     let decision = rig.state.decision(&id).unwrap();
     assert_eq!(decision.status, DecisionStatus::Overruled);

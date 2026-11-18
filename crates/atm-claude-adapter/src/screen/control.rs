@@ -7,14 +7,23 @@
 //! history, not a reason to discard an existing conversation.
 //! Column-0 `❯ ` and `● ` lines above the header veto freshness, including
 //! shell prompts and service-status output.
+//!
+//! Captured: Claude Code 2.1.326, 2026-11-17, sealed fake-API TUI.
+//! The busy auto-mode footer places `esc to interrupt` before the optional
+//! agents hint. Only that exact segment is recognized; the transcript still
+//! determines Running. Synthetic completed/fresh-history twins with the busy
+//! footer fail closed rather than supplying idle/fresh readiness. Manual busy
+//! mode has no capture and remains unsupported.
 use super::*;
 use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
 };
 
-pub(super) const MODE_FOOTERS: [&str; 4] = [
+pub(super) const MODE_FOOTERS: [&str; 6] = [
     "⏵⏵ auto mode on (shift+tab to cycle)",
     "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
+    "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents",
     "⏸ manual mode on",
     "⏸ manual mode on · ← for agents",
 ];
@@ -75,6 +84,8 @@ pub fn observe_control_screen(
     let (text, styled) = match input {
         ScreenInput::Plain(text) if cursor.is_none() => (text, None),
         ScreenInput::Styled(text) => {
+            #[cfg(test)]
+            DECODE_COUNT.with(|count| count.set(count.get() + 1));
             let Ok(screen) = StyledScreen::parse(text) else {
                 return result;
             };
@@ -90,7 +101,7 @@ pub fn observe_control_screen(
     while lines.last().is_some_and(|s| s.is_empty()) {
         lines.pop();
     }
-    result.facts = observe_screen(input, cursor);
+    result.facts = inspect_prepared(text, styled).0;
     if let Some(trust) = trust_dialog(&lines) {
         result.dialog = trust;
         return result;
@@ -132,7 +143,7 @@ pub fn observe_control_screen(
     }
     // Without a complete header, only already-recognized ordinary facts apply.
     if let Some((start, end)) = header {
-        if let Some((facts, _)) = editor_facts(&lines, styled, Some(end), before_footer) {
+        if let Some((facts, _)) = editor_facts(&lines, styled, Some(end), before_footer, footer) {
             result.facts = facts;
         }
         if lines.get(..start).unwrap_or_default().iter().any(|line| {
@@ -363,3 +374,6 @@ fn trust_dialog(lines: &[&str]) -> Option<ControlDialog> {
         accept: ControlKey::Enter,
     })
 }
+
+#[cfg(test)]
+mod decode_tests;

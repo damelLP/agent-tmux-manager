@@ -1,0 +1,18 @@
+{"seq":1,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"alpha","root":"/fixtures/alpha"}}
+{"seq":2,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"beta","root":"/fixtures/beta"}}
+{"seq":3,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"alpha/build","pane":"%1","session_id":null}}
+{"seq":4,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"beta/review","pane":"%2","session_id":null}}
+{"seq":5,"ts":"2026-01-01T00:00:01Z","kind":"decision.requested","body":{"requester":"beta/review","kind":"plan","title":"PRIVATE_DECISION","context":"PRIVATE_CONTEXT","files":[],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true,"deadline":null}}
+{"seq":6,"ts":"2026-01-01T00:00:02Z","kind":"decision.taken_provisionally","body":{"decision_id":"d5","option":"yes","by":"system"}}
+{"seq":7,"ts":"2026-01-01T00:00:03Z","kind":"task.created","body":{"title":"Cross-project work","kind":"work","creator":"owner","parent":null,"judges":null,"measure":{"kind":"owner"},"budget":null,"files":[],"rests_on":"d5"}}
+{"seq":8,"ts":"2026-01-01T00:00:04Z","kind":"task.assigned","body":{"task_id":"t7","agent_id":"alpha/build","by":"owner"}}
+{"seq":9,"ts":"2026-01-01T00:00:05Z","kind":"task.submitted","body":{"task_id":"t7","what":"result","files":[],"by":"alpha/build"}}
+{"seq":10,"ts":"2026-01-01T00:00:06Z","kind":"task.verdict","body":{"task_id":"t7","verdict":"accepted","review_task":null,"note":"PRIVATE_VERDICT","by":"owner"}}
+{"seq":11,"ts":"2026-01-01T00:00:06Z","kind":"task.cost_recorded","body":{"task_id":"t7","record":{"turns":null,"review_rounds":0,"changes_requested":0,"cost":null,"peak_context_percent":null,"seconds_in_state":{"open":1,"assigned":1,"submitted":1}}}}
+{"seq":12,"ts":"2026-01-01T00:00:07Z","kind":"task.created","body":{"title":"In-flight work","kind":"work","creator":"beta/review","parent":null,"judges":null,"measure":{"kind":"owner"},"budget":null,"files":[],"rests_on":"d5"}}
+{"seq":13,"ts":"2026-01-01T00:00:08Z","kind":"task.assigned","body":{"task_id":"t12","agent_id":"beta/review","by":"owner"}}
+{"seq":14,"ts":"2026-01-01T00:00:09Z","kind":"decision.overruled","body":{"decision_id":"d5","option":"no","by":"owner","note":"PRIVATE_ANSWER","standing_rule":false,"caller_pane":"%99","redo_tasks":["t7","t12"]}}
+{"seq":15,"ts":"2026-01-01T00:00:10Z","kind":"task.assigned","body":{"task_id":"t7","agent_id":"alpha/build","by":"owner"}}
+{"seq":16,"ts":"2026-01-01T00:00:11Z","kind":"task.submitted","body":{"task_id":"t7","what":"result","files":[],"by":"alpha/build"}}
+{"seq":17,"ts":"2026-01-01T00:00:12Z","kind":"task.verdict","body":{"task_id":"t7","verdict":"accepted","review_task":null,"note":null,"by":"owner"}}
+{"seq":18,"ts":"2026-01-01T00:00:12Z","kind":"task.cost_recorded","body":{"task_id":"t7","record":{"turns":null,"review_rounds":0,"changes_requested":0,"cost":null,"peak_context_percent":null,"seconds_in_state":{"open":2,"assigned":2,"submitted":2,"accepted":3}}}}

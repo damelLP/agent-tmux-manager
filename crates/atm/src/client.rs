@@ -8,17 +8,24 @@
 //! **Panic-Free Policy:** This module follows the project's panic-free guidelines.
 //! No `.unwrap()`, `.expect()`, `panic!()`, `unreachable!()`, or `todo!()`.
 
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::control::{
+    ControlEffect, ControlFailure, ControlInput, ControlNotice, ControlState, RequestId,
+};
+use crate::daemon::{ControlCommand, RequestReply};
 use crate::error::{Result, TuiError};
 use crate::input::{ClientCommand, Event};
 use atm_protocol::{ClientMessage, DaemonMessage, ProtocolVersion};
@@ -30,7 +37,7 @@ pub const DEFAULT_SOCKET_PATH: &str = "/tmp/atm.sock";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for the daemon's reply to `Connect`, and then to `Subscribe`.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Deadline for writing one message to the daemon.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -150,7 +157,7 @@ pub struct DaemonClient {
     event_tx: mpsc::UnboundedSender<Event>,
 
     /// Channel to receive commands from the TUI.
-    command_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<ClientCommand>>,
+    command_rx: tokio::sync::Mutex<CommandQueue>,
 
     /// Cancellation token for graceful shutdown.
     cancel_token: CancellationToken,
@@ -159,10 +166,49 @@ pub struct DaemonClient {
     /// `ensure_daemon_running` on the default socket, which is the only
     /// socket it starts a daemon for; `None` on any other socket.
     respawn: Option<Respawn>,
+
+    /// Pure control state and boundary-owned, single-use reply channels.
+    control: tokio::sync::Mutex<ControlRuntime>,
 }
 
 /// A blocking step that starts the daemon unless it is already running.
 type Respawn = Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
+
+/// Closure observation buffers ingress without admitting or reordering it.
+struct CommandQueue {
+    receiver: mpsc::UnboundedReceiver<ClientCommand>,
+    pending: VecDeque<ClientCommand>,
+}
+
+impl CommandQueue {
+    async fn recv(&mut self) -> Option<ClientCommand> {
+        match self.pending.pop_front() {
+            Some(command) => Some(command),
+            None => self.receiver.recv().await,
+        }
+    }
+
+    fn supersedes_watch(&mut self) -> bool {
+        while let Ok(command) = self.receiver.try_recv() {
+            self.pending.push_back(command);
+        }
+        self.pending.iter().any(|command| {
+            matches!(command, ClientCommand::Control(command)
+                if matches!(&command.input, ControlInput::Watch { .. } | ControlInput::Unwatch))
+        })
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        while !self.receiver.is_closed() {
+            match self.receiver.poll_recv(cx) {
+                Poll::Ready(Some(command)) => self.pending.push_back(command),
+                Poll::Ready(None) => break,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(())
+    }
+}
 
 impl DaemonClient {
     /// Creates a new daemon client.
@@ -192,9 +238,13 @@ impl DaemonClient {
         Self {
             config,
             event_tx,
-            command_rx: tokio::sync::Mutex::new(command_rx),
+            command_rx: tokio::sync::Mutex::new(CommandQueue {
+                receiver: command_rx,
+                pending: VecDeque::new(),
+            }),
             cancel_token,
             respawn,
+            control: tokio::sync::Mutex::new(ControlRuntime::default()),
         }
     }
 
@@ -233,6 +283,50 @@ impl DaemonClient {
     /// The loop checks the cancellation token between operations and will
     /// exit gracefully when cancelled.
     pub async fn run(&self) {
+        let _ = self.run_until_shutdown(self.run_connections()).await;
+    }
+
+    async fn run_until_shutdown<T>(&self, operation: impl Future<Output = T>) -> Option<T> {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => None,
+            _ = self.event_tx.closed() => None,
+            _ = self.command_channel_closed() => None,
+            result = operation => Some(result),
+        };
+        self.cancel_token.cancel();
+        {
+            let mut commands = self.command_rx.lock().await;
+            commands.receiver.close();
+            commands.pending.clear();
+            while commands.receiver.try_recv().is_ok() {}
+        }
+        let _ = self
+            .control
+            .lock()
+            .await
+            .reduce(ControlInput::Disconnected, Instant::now());
+        result
+    }
+
+    async fn command_channel_closed(&self) {
+        let mut lock = std::pin::pin!(self.command_rx.lock());
+        std::future::poll_fn(|cx| {
+            let Poll::Ready(mut commands) = lock.as_mut().poll(cx) else {
+                return Poll::Pending;
+            };
+            let closed = commands.poll_closed(cx);
+            // Never hold the receiver across Pending: the connection loop also
+            // consumes it. Retain a pending lock future so release wakes us even
+            // when the connection is stalled in a write after receiving a command.
+            drop(commands);
+            lock.set(self.command_rx.lock());
+            closed
+        })
+        .await;
+    }
+
+    async fn run_connections(&self) {
         info!(
             socket_path = %self.config.socket_path.display(),
             "Daemon client starting"
@@ -260,7 +354,16 @@ impl DaemonClient {
                         reason = matches!(e, TuiError::Rejected(_)).then(|| e.to_string());
                     }
 
-                    // Notify TUI of disconnect (ignore send errors - TUI may be shutting down)
+                    // Fail admitted requests exactly once; only the desired
+                    // watch survives. Shutdown is not a reconnectable error.
+                    let _ = self
+                        .control
+                        .lock()
+                        .await
+                        .reduce(ControlInput::Disconnected, Instant::now());
+                    if self.cancel_token.is_cancelled() || self.event_tx.is_closed() {
+                        return;
+                    }
                     let _ = self.event_tx.send(Event::DaemonDisconnected(reason));
 
                     if connected_at.elapsed() >= self.config.retry_max_delay {
@@ -410,11 +513,11 @@ impl DaemonClient {
             .map_err(|_| timed_out("handshake"))??;
 
         let response: DaemonMessage = serde_json::from_str(line.trim())?;
-        match response {
+        let (protocol_version, methods) = match response {
             DaemonMessage::Connected {
                 protocol_version,
                 client_id,
-                ..
+                methods,
             } => {
                 // Verify protocol version compatibility
                 if !ProtocolVersion::CURRENT.is_compatible_with(&protocol_version) {
@@ -428,6 +531,7 @@ impl DaemonClient {
                     protocol_version = %protocol_version,
                     "Handshake complete"
                 );
+                (protocol_version, methods)
             }
             DaemonMessage::Rejected { reason, .. } => {
                 return Err(TuiError::Rejected(reason));
@@ -437,7 +541,7 @@ impl DaemonClient {
                     "Unexpected response to connect: {response:?}"
                 )));
             }
-        }
+        };
 
         // Subscribe to session updates. The daemon answers with the initial
         // session list, taken before it forwards any event, or with an Error
@@ -460,7 +564,30 @@ impl DaemonClient {
             Err(e) => warn!(error = %e, line = %line.trim(), "Failed to handle message"),
         }
 
-        // Read messages and handle commands in a loop
+        // Control traffic starts only after Subscribe's reply, so a watch
+        // refusal cannot be mistaken for a session subscription rejection.
+        let supersedes_watch = self.command_rx.lock().await.supersedes_watch();
+        let effects = {
+            let mut control = self.control.lock().await;
+            let now = Instant::now();
+            // Retire an obsolete disconnected desire before automatic resume.
+            // The queued commands themselves still execute in FIFO order once
+            // capabilities are known, without admitting requests offline.
+            let mut effects = if supersedes_watch {
+                control.reduce(ControlInput::Unwatch, now)
+            } else {
+                Vec::new()
+            };
+            effects.extend(control.reduce(
+                ControlInput::Connected {
+                    protocol_version,
+                    methods,
+                },
+                now,
+            ));
+            effects
+        };
+        self.control_effects(&mut writer, effects).await?;
         self.message_loop(&mut buf_reader, &mut writer).await
     }
 
@@ -526,6 +653,13 @@ impl DaemonClient {
                 return Ok(());
             }
 
+            let deadline = self.control.lock().await.state.next_deadline();
+            let deadline_elapsed = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             // Lock the command receiver for this iteration
             let mut command_rx = self.command_rx.lock().await;
 
@@ -542,9 +676,9 @@ impl DaemonClient {
                         }
                         Ok(Some(line)) => {
                             // Parse and handle message
-                            if let Err(e) = self.handle_message(line.trim()).await {
-                                warn!(error = %e, line = %line.trim(), "Failed to handle message");
-                                // Continue reading - don't disconnect on single parse error
+                            match self.handle_message(line.trim()).await {
+                                Ok(effects) => self.control_effects(writer, effects).await?,
+                                Err(e) => warn!(error = %e, line = %line.trim(), "Failed to handle message"),
                             }
                         }
                         Err(e) => {
@@ -564,12 +698,29 @@ impl DaemonClient {
                             // socket, so end the connection and reconnect.
                             self.send_message(writer, &discover_msg).await?;
                         }
+                        Some(ClientCommand::Control(command)) => {
+                            let effects = self.control.lock().await.command(command, Instant::now());
+                            self.control_effects(writer, effects).await?;
+                        }
                         None => {
                             // Command channel closed - TUI shutting down
                             debug!("Command channel closed");
+                            self.cancel_token.cancel();
                             return Ok(());
                         }
                     }
+                }
+
+                _ = deadline_elapsed => {
+                    drop(command_rx);
+                    let effects = self.control.lock().await.reduce(ControlInput::Tick, Instant::now());
+                    self.control_effects(writer, effects).await?;
+                }
+
+                _ = self.event_tx.closed() => {
+                    drop(command_rx);
+                    self.cancel_token.cancel();
+                    return Ok(());
                 }
 
                 // Cancellation
@@ -594,8 +745,70 @@ impl DaemonClient {
     ///
     /// * `Ok(())` - Message handled successfully
     /// * `Err(TuiError)` - Failed to parse message
-    async fn handle_message(&self, line: &str) -> Result<()> {
-        self.dispatch(serde_json::from_str(line)?);
+    async fn handle_message(&self, line: &str) -> Result<Vec<ControlEffect>> {
+        let message: DaemonMessage = serde_json::from_str(line)?;
+        let effects = match &message {
+            DaemonMessage::Response { .. }
+            | DaemonMessage::Event { .. }
+            | DaemonMessage::Error { .. }
+            | DaemonMessage::Pong { .. } => self
+                .control
+                .lock()
+                .await
+                .reduce(ControlInput::Message(message.clone()), Instant::now()),
+            _ => Vec::new(),
+        };
+        self.dispatch(message);
+        Ok(effects)
+    }
+
+    /// Execute effects without holding the control state lock across I/O.
+    async fn control_effects<W: AsyncWriteExt + Unpin>(
+        &self,
+        writer: &mut W,
+        effects: Vec<ControlEffect>,
+    ) -> Result<()> {
+        let mut effects: VecDeque<_> = effects.into();
+        while let Some(effect) = effects.pop_front() {
+            match effect {
+                ControlEffect::Send(message, deadline) => {
+                    let send = async {
+                        let send = self.send_message(writer, &message);
+                        if let Some(deadline) = deadline {
+                            timeout_at(deadline, send)
+                                .await
+                                .map_err(|_| timed_out("control write"))?
+                        } else {
+                            send.await
+                        }
+                    };
+                    tokio::select! {
+                        result = send => result?,
+                        _ = self.cancel_token.cancelled() => return Ok(()),
+                    }
+                }
+                ControlEffect::Notice(notice) => {
+                    let delivered = match &notice {
+                        ControlNotice::Event(DaemonMessage::Event { seq, .. }) => Some(*seq),
+                        _ => None,
+                    };
+                    if self.event_tx.send(Event::Control(notice)).is_err() {
+                        self.cancel_token.cancel();
+                        return Ok(());
+                    }
+                    if let Some(seq) = delivered {
+                        effects.extend(
+                            self.control
+                                .lock()
+                                .await
+                                .reduce(ControlInput::Delivered(seq), Instant::now()),
+                        );
+                    }
+                }
+                // ControlRuntime consumes completions before returning effects.
+                ControlEffect::Complete(_, _) => {}
+            }
+        }
         Ok(())
     }
 
@@ -637,14 +850,371 @@ impl DaemonClient {
                 );
             }
             DaemonMessage::Response { .. } | DaemonMessage::Event { .. } => {
-                // Placeholder until control-plane client handling is implemented (U1b).
-                debug!("Ignoring control-plane message in the session client");
+                // The optional control reducer handles these before dispatch.
+                debug!("Control-plane message handled separately from sessions");
             }
             DaemonMessage::Connected { .. } | DaemonMessage::Rejected { .. } => {
                 // These should only appear during handshake
                 warn!("Received unexpected handshake message after connection");
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct ControlRuntime {
+    state: ControlState,
+    replies: BTreeMap<RequestId, RequestReply>,
+}
+
+impl ControlRuntime {
+    fn reduce(&mut self, input: ControlInput, now: Instant) -> Vec<ControlEffect> {
+        self.state
+            .reduce(input, now)
+            .into_iter()
+            .filter_map(|effect| {
+                if let ControlEffect::Complete(id, result) = effect {
+                    if let Some(reply) = self.replies.remove(&id) {
+                        let _ = reply.send(result);
+                    }
+                    None
+                } else {
+                    Some(effect)
+                }
+            })
+            .collect()
+    }
+
+    fn command(&mut self, command: ControlCommand, now: Instant) -> Vec<ControlEffect> {
+        if let Some((id, reply)) = command.reply {
+            // A caller that timed out or cancelled while offline must never
+            // have its queued mutation applied after reconnect.
+            if reply.is_closed() {
+                return Vec::new();
+            }
+            if self.replies.contains_key(&id) {
+                let _ = reply.send(Err(ControlFailure::DuplicateId));
+                return Vec::new();
+            }
+            self.replies.insert(id, reply);
+        }
+        self.reduce(command.input, now)
+    }
+}
+
+#[cfg(test)]
+mod control_stream_tests {
+    use super::*;
+    use crate::daemon::ControlHandle;
+    use atm_protocol::MessageType;
+    use serde_json::json;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+    use tokio::sync::oneshot;
+
+    fn client() -> (
+        Arc<DaemonClient>,
+        mpsc::UnboundedReceiver<Event>,
+        mpsc::UnboundedSender<ClientCommand>,
+    ) {
+        let (events, receive) = mpsc::unbounded_channel();
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(DaemonClient::new(
+                DaemonConfig::default(),
+                events,
+                command_rx,
+                CancellationToken::new(),
+            )),
+            receive,
+            commands,
+        )
+    }
+
+    async fn enable(client: &DaemonClient) {
+        let _ = client.control.lock().await.reduce(
+            ControlInput::Connected {
+                protocol_version: ProtocolVersion::CURRENT,
+                methods: vec!["task.list".into()],
+            },
+            Instant::now(),
+        );
+    }
+
+    async fn recv<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> MessageType {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+        serde_json::from_str::<ClientMessage>(&line)
+            .unwrap()
+            .message
+    }
+
+    async fn notice(events: &mut mpsc::UnboundedReceiver<Event>) -> ControlNotice {
+        loop {
+            match events.recv().await.unwrap() {
+                Event::Control(ControlNotice::Capabilities { .. }) => {}
+                Event::Control(notice) => return notice,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_response_deadline_cleans_pending_and_ignores_late_reply() {
+        let (client, mut events, commands) = client();
+        enable(&client).await;
+        let (ours, peer) = tokio::io::duplex(64 * 1024);
+        let (read, mut write) = tokio::io::split(ours);
+        let (peer_read, mut peer_write) = tokio::io::split(peer);
+        let mut peer_read = BufReader::new(peer_read);
+        let worker = client.clone();
+        let run = tokio::spawn(async move {
+            worker
+                .message_loop(&mut BufReader::new(read), &mut write)
+                .await
+        });
+        let handle = ControlHandle::new(commands.clone());
+        let pending = tokio::spawn(async move {
+            handle
+                .request("task.list".into(), json!({}), None, Duration::from_secs(30))
+                .await
+        });
+        let MessageType::Request { id, .. } = recv(&mut peer_read).await else {
+            panic!("request")
+        };
+        peer_write.write_all(b"malformed\n").await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(ControlFailure::Timeout)
+        ));
+        peer_write
+            .write_all(
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(&DaemonMessage::response_ok(id, json!(9))).unwrap(),
+                    serde_json::to_string(&DaemonMessage::session_removed(
+                        atm_core::SessionId::new("sentinel")
+                    ))
+                    .unwrap()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        loop {
+            match events.recv().await.unwrap() {
+                Event::Control(ControlNotice::Capabilities { .. }) => {}
+                Event::SessionRemoved(id) if id == "sentinel" => break,
+                other => panic!("late reply became an event: {other:?}"),
+            }
+        }
+        assert!(client.control.lock().await.replies.is_empty());
+        client.cancel_token.cancel();
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_barrier_deadline_does_not_block_session_commands() {
+        let (client, mut events, commands) = client();
+        enable(&client).await;
+        let (ours, peer) = tokio::io::duplex(64 * 1024);
+        let (read, mut write) = tokio::io::split(ours);
+        let (peer_read, _peer_write) = tokio::io::split(peer);
+        let mut peer_read = BufReader::new(peer_read);
+        let worker = client.clone();
+        let run = tokio::spawn(async move {
+            worker
+                .message_loop(&mut BufReader::new(read), &mut write)
+                .await
+        });
+        let handle = ControlHandle::new(commands.clone());
+        handle.watch(vec![], 1).unwrap();
+        assert!(matches!(
+            recv(&mut peer_read).await,
+            MessageType::Watch { .. }
+        ));
+        handle.watch(vec![], 0).unwrap();
+        assert!(matches!(recv(&mut peer_read).await, MessageType::Unwatch));
+        assert!(matches!(
+            recv(&mut peer_read).await,
+            MessageType::Ping { .. }
+        ));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(matches!(
+            notice(&mut events).await,
+            ControlNotice::WatchFailed(ControlFailure::Timeout)
+        ));
+        commands.send(ClientCommand::Discover).unwrap();
+        assert!(matches!(recv(&mut peer_read).await, MessageType::Discover));
+        client.cancel_token.cancel();
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_request_write_uses_its_total_deadline_with_stalled_peer() {
+        let (client, _events, commands) = client();
+        enable(&client).await;
+        let (ours, _stalled) = tokio::io::duplex(1);
+        let (read, mut write) = tokio::io::split(ours);
+        let worker = client.clone();
+        let run = tokio::spawn(async move {
+            worker
+                .message_loop(&mut BufReader::new(read), &mut write)
+                .await
+        });
+        let handle = ControlHandle::new(commands);
+        let pending = handle.request("task.list".into(), json!({}), None, Duration::from_secs(1));
+        let (result, loop_result) = tokio::join!(pending, run);
+        assert!(matches!(result, Err(ControlFailure::Timeout)));
+        assert!(
+            matches!(loop_result.unwrap(), Err(TuiError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_cancelled_queued_call_is_never_admitted() {
+        let (client, _events, commands) = client();
+        enable(&client).await;
+        let handle = ControlHandle::new(commands);
+        let pending = tokio::spawn(async move {
+            handle
+                .request("task.list".into(), json!({}), None, Duration::from_secs(30))
+                .await
+        });
+        let Some(ClientCommand::Control(command)) = client.command_rx.lock().await.recv().await
+        else {
+            panic!("command")
+        };
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        let effects = client.control.lock().await.command(command, Instant::now());
+        assert!(effects.is_empty());
+        assert!(client.control.lock().await.replies.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_channel_closure_cancels_a_stalled_write() {
+        for close_commands in [false, true] {
+            let (client, events, commands) = client();
+            enable(&client).await;
+            ControlHandle::new(commands.clone())
+                .watch(vec![], 0)
+                .unwrap();
+            let (ours, mut stalled) = tokio::io::duplex(1);
+            let (read, mut write) = tokio::io::split(ours);
+            let worker = client.clone();
+            let run = tokio::spawn(async move {
+                worker
+                    .run_until_shutdown(async {
+                        worker
+                            .message_loop(&mut BufReader::new(read), &mut write)
+                            .await
+                    })
+                    .await
+            });
+            let mut byte = [0];
+            stalled.read_exact(&mut byte).await.unwrap();
+            if close_commands {
+                drop(commands);
+            } else {
+                drop(events);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(60), run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_none(),
+                "closure waited for the write deadline"
+            );
+            assert!(client.cancel_token.is_cancelled());
+        }
+    }
+
+    pub(super) struct ObservedRead<R> {
+        pub(super) inner: R,
+        pub(super) read_bytes: bool,
+        pub(super) blocked: Option<oneshot::Sender<()>>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for ObservedRead<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if result.is_ready() && buf.filled().len() > before {
+                self.read_bytes = true;
+            }
+            if result.is_pending() && self.read_bytes {
+                if let Some(blocked) = self.blocked.take() {
+                    let _ = blocked.send(());
+                }
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn control_partial_watch_frame_survives_a_command_without_waits() {
+        let (client, mut events, commands) = client();
+        enable(&client).await;
+        let _ = client.control.lock().await.reduce(
+            ControlInput::Watch {
+                topics: vec![],
+                cursor: 0,
+                barrier: RequestId(1),
+            },
+            Instant::now(),
+        );
+        let (ours, peer) = tokio::io::duplex(64 * 1024);
+        let (read, mut write) = tokio::io::split(ours);
+        let (peer_read, mut peer_write) = tokio::io::split(peer);
+        let mut peer_read = BufReader::new(peer_read);
+        let json = serde_json::to_string(&DaemonMessage::event(
+            "task".into(),
+            20,
+            "now".into(),
+            "task.future".into(),
+            json!({}),
+        ))
+        .unwrap();
+        let (head, tail) = json.split_at(json.len() / 2);
+        peer_write.write_all(head.as_bytes()).await.unwrap();
+        let (blocked, receive) = oneshot::channel();
+        let read = ObservedRead {
+            inner: read,
+            read_bytes: false,
+            blocked: Some(blocked),
+        };
+        let worker = client.clone();
+        let run = tokio::spawn(async move {
+            worker
+                .message_loop(&mut BufReader::new(read), &mut write)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(60), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        commands.send(ClientCommand::Discover).unwrap();
+        assert!(matches!(recv(&mut peer_read).await, MessageType::Discover));
+        peer_write
+            .write_all(format!("{tail}\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(matches!(
+            notice(&mut events).await,
+            ControlNotice::Event(DaemonMessage::Event { seq: 20, .. })
+        ));
+        client.cancel_token.cancel();
+        run.await.unwrap().unwrap();
     }
 }
 
@@ -1236,7 +1806,11 @@ mod tests {
         };
         let mut client = DaemonClient::new(config, event_tx, cmd_rx, cancel_token.clone());
         client.respawn = Some(Arc::new(respawn));
-        let run = tokio::spawn(async move { client.run().await });
+        let run = tokio::spawn(async move {
+            // This rig models a running TUI, not closed UI channels.
+            let _ui_channels = (_event_rx, _cmd_tx);
+            client.run().await;
+        });
         (cancel_token, run)
     }
 
@@ -1351,7 +1925,14 @@ mod tests {
         let (ours, daemon) = tokio::io::duplex(64 * 1024);
         let (reader, mut writer) = tokio::io::split(ours);
         let (daemon_reader, mut daemon_writer) = tokio::io::split(daemon);
-        tokio::spawn(async move {
+        let (blocked, read_blocked) = tokio::sync::oneshot::channel();
+        let reader = super::control_stream_tests::ObservedRead {
+            inner: reader,
+            read_bytes: false,
+            blocked: Some(blocked),
+        };
+        let cancel = client.cancel_token.clone();
+        let run = tokio::spawn(async move {
             client
                 .message_loop(&mut BufReader::new(reader), &mut writer)
                 .await
@@ -1364,8 +1945,17 @@ mod tests {
             .write_all(head.as_bytes())
             .await
             .expect("write head");
-        // Let the client read the head and block waiting for the rest.
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let read_at = tokio::time::Instant::now();
+        // The actual read consumed bytes and polled Pending for the tail.
+        tokio::time::timeout(Duration::from_secs(60), read_blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            read_at,
+            "partial-read synchronization advanced time"
+        );
 
         // The command wins the select while the line is incomplete.
         cmd_tx.send(ClientCommand::Discover).expect("send command");
@@ -1385,6 +1975,8 @@ mod tests {
             matches!(&event, Ok(Some(Event::SessionRemoved(id))) if id == "s1"),
             "half-read line was lost: {event:?}"
         );
+        cancel.cancel();
+        run.await.unwrap().unwrap();
     }
 
     /// A daemon that stops reading must not block the client's writes

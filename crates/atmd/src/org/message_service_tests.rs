@@ -1,7 +1,8 @@
 //! The message service over an in-memory organisation actor: no log files, no
 //! tmux, no harness. Synchronization is by returned calls, the append gate and
 //! the fold cursor. Time tests use a paused clock and only in-memory I/O;
-//! discovery cases use the ordinary clock for real registry/procfs calls.
+//! discovery and cross-agent inbox checks use the ordinary clock for real
+//! registry/procfs/reporting-role reads.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::{
@@ -85,8 +86,114 @@ pub(super) async fn guarded<T>(work: impl std::future::Future<Output = T>) -> T 
         .expect("hang guard: the awaited step never completed")
 }
 
-/// Run the other tasks until a condition they produce holds. Not a time wait:
-/// the clock is paused and a yield does not advance it.
+/// Poll the actual call before handing its remaining work to a task.
+/// Callers check their specific admission state after this poll, not a yield.
+pub(super) fn spawn_polled<F>(work: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut work = Box::pin(work);
+    let first = std::future::Future::poll(
+        work.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    );
+    // A spawned task always polls once, so a wake between this probe and
+    // spawning cannot be lost; that poll installs the task's own waker.
+    tokio::spawn(async move {
+        match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => work.await,
+        }
+    })
+}
+
+/// Probe the real held future once, without advancing the clock.
+pub(super) async fn poll_pending<F: std::future::Future>(mut work: std::pin::Pin<&mut F>) {
+    let polled = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(work.as_mut(), cx))
+    })
+    .await;
+    assert!(polled.is_pending(), "held work completed during the probe");
+}
+
+/// Observe the actual raw-call poll while preserving the client's read,
+/// effect and gate semantics. `true` means Pending, `false` means completed.
+pub(super) struct ObservedTmux<C> {
+    pub(super) inner: C,
+    pub(super) on_raw: RawPollObserver,
+}
+
+pub(super) type RawPollObserver = Arc<dyn Fn(&str, bool) + Send + Sync>;
+
+type ObservedTmuxCall<'a, T> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<T, atm_tmux::TmuxError>> + Send + 'a>,
+>;
+macro_rules! observed_tmux_forward {
+    ($method:ident <$($lt:lifetime),*> ($($arg:ident : $ty:ty),*) -> $result:ty) => {
+        fn $method<'s, $($lt,)* 'async_trait>(&'s self, $($arg: $ty),*) -> ObservedTmuxCall<'async_trait, $result>
+        where 's: 'async_trait, $($lt: 'async_trait,)* Self: 'async_trait {
+            Box::pin(atm_tmux::TmuxClient::$method(&self.inner, $($arg),*))
+        }
+    };
+}
+
+impl<C: atm_tmux::TmuxClient> atm_tmux::TmuxClient for ObservedTmux<C> {
+    fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
+        &'s self,
+        subcommand: &'c str,
+        args: &'a [&'v str],
+    ) -> ObservedTmuxCall<'async_trait, String>
+    where
+        's: 'async_trait,
+        'c: 'async_trait,
+        'a: 'async_trait,
+        'v: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut call = atm_tmux::TmuxClient::raw_command(&self.inner, subcommand, args);
+            std::future::poll_fn(|cx| {
+                let polled = std::future::Future::poll(call.as_mut(), cx);
+                (self.on_raw)(subcommand, polled.is_pending());
+                polled
+            })
+            .await
+        })
+    }
+    observed_tmux_forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: atm_tmux::PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
+    observed_tmux_forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
+    observed_tmux_forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
+    observed_tmux_forward!(kill_pane<'a>(pane: &'a str) -> ());
+    observed_tmux_forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
+    observed_tmux_forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
+    observed_tmux_forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());
+    observed_tmux_forward!(list_panes<>() -> Vec<atm_tmux::PaneInfo>);
+    observed_tmux_forward!(display_popup<'a, 'b, 'c>(width: &'a str, height: &'b str, command: &'c str) -> ());
+    observed_tmux_forward!(select_pane<'a>(pane: &'a str) -> ());
+    observed_tmux_forward!(capture_pane<'a>(pane: &'a str) -> Vec<String>);
+    observed_tmux_forward!(new_session<'a>(name: &'a str) -> String);
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_poll_precedes_return_and_retains_an_already_entered_event() {
+    let (entered, mut entry) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let call = spawn_polled(async move {
+        entered.send(()).unwrap();
+        released.await.unwrap();
+        7
+    });
+    assert_eq!(entry.try_recv(), Ok(()), "the actual call was not polled");
+    assert!(!call.is_finished(), "the dependency is still held");
+    release.send(()).unwrap();
+    assert_eq!(guarded(call).await.unwrap(), 7);
+    // A call that already completed during its first poll keeps its result.
+    assert_eq!(guarded(spawn_polled(async { 11 })).await.unwrap(), 11);
+}
+
+/// Deferred cases without a post-effect observation seam only. This bounded
+/// yield poll is a known exception, not event synchronization; add no callers.
 pub(super) async fn until(what: &str, condition: impl Fn() -> bool) {
     for _ in 0..10_000 {
         if condition() {
@@ -242,7 +349,7 @@ impl Rig {
     }
 
     /// A project, `demo/worker` bound on %1 and `demo/other` bound on %2.
-    async fn seeded() -> Self {
+    pub(super) async fn seeded() -> Self {
         let rig = Self::new().await;
         rig.seed().await;
         rig
@@ -276,6 +383,44 @@ impl Rig {
 
     pub(super) async fn folded(&self, seq: u64) {
         guarded(self.rt.history.folded(seq)).await.unwrap();
+    }
+
+    /// A write's actual future must reach Pending after its commit, while
+    /// the relay still withholds that commit from the message fold.
+    fn write_awaiting_fold<F>(
+        &self,
+        seq: u64,
+        work: F,
+    ) -> (
+        tokio::task::JoinHandle<F::Output>,
+        tokio::sync::oneshot::Receiver<()>,
+    )
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let committed = self.org.health.clone();
+        let call = spawn_polled(async move {
+            let mut work = Box::pin(work);
+            let mut entered = Some(entered);
+            std::future::poll_fn(|cx| {
+                let polled = std::future::Future::poll(work.as_mut(), cx);
+                if polled.is_pending()
+                    && committed
+                        .borrow()
+                        .as_ref()
+                        .is_ok_and(|cursor| *cursor >= seq)
+                {
+                    if let Some(entered) = entered.take() {
+                        let _ = entered.send(());
+                    }
+                }
+                polled
+            })
+            .await
+        });
+        (call, entry)
     }
 
     /// The sequence of the next append the writer enters.
@@ -838,6 +983,8 @@ async fn agent_inbox_isolation_and_owner_inspection() {
     );
     // Not another agent's, and not the owner's.
     for recipient in [Address::Agent(other()), Address::Owner] {
+        // CS2 checks reporting roles on a detached thread for cross-agent reads.
+        tokio::time::resume();
         let refused = rig
             .messages
             .inbox(
@@ -848,6 +995,7 @@ async fn agent_inbox_isolation_and_owner_inspection() {
                 pane("%1"),
             )
             .await;
+        tokio::time::pause();
         assert!(matches!(refused, Err(MessageError::Refused(_))));
     }
     // The owner inspects any agent's inbox, and reads nothing as a side effect.
@@ -886,7 +1034,10 @@ async fn owner_count_only_never_exposes_bodies() {
         count_only: true,
         ..page()
     };
+    // CS2 checks reporting roles on a detached thread even for count-only reads.
+    tokio::time::resume();
     let refused = rig.messages.inbox(other_count, pane("%1")).await;
+    tokio::time::pause();
     assert!(matches!(refused, Err(MessageError::Refused(_))));
 }
 
@@ -1039,14 +1190,15 @@ async fn concurrent_ack_counts_once() {
     // The first acknowledgement's append is in progress; the second request
     // is admitted behind it and decided against the state the first leaves.
     rig.entered().await;
-    let second = tokio::spawn({
+    let second = spawn_polled({
         let messages = rig.messages.clone();
         async move { messages.ack(AckParams { ids: vec![a] }, owner()).await }
     });
-    until("the second acknowledgement is queued at the writer", || {
-        rig.org.requests.capacity() == 63
-    })
-    .await;
+    assert_eq!(
+        rig.org.requests.capacity(),
+        63,
+        "second acknowledgement admitted"
+    );
     rig.release();
     let counts = [
         guarded(first).await.unwrap().unwrap().count,
@@ -1253,6 +1405,7 @@ async fn oversized_legacy_entry_refused_with_id() {
     // Committed by the writer directly, past the router's bounds.
     let huge = MessageId::new(
         rig.run(OrgCommand::SendMessage(MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to: Address::Owner,
             kind: MessageKind::Note,
@@ -1487,7 +1640,7 @@ async fn request_admission_is_bounded_without_waiters() {
     let mut calls = Vec::new();
     for n in 0..64 {
         let messages = rig.messages.clone();
-        calls.push(tokio::spawn(async move {
+        calls.push(spawn_polled(async move {
             messages
                 .send(note(Address::Owner, &format!("{n}")), owner())
                 .await
@@ -1495,10 +1648,11 @@ async fn request_admission_is_bounded_without_waiters() {
     }
     // The first one is in its append; the other 63 queue behind it.
     rig.entered().await;
-    until("63 sends are queued at the writer", || {
-        rig.org.requests.capacity() == 1
-    })
-    .await;
+    assert_eq!(
+        rig.org.requests.capacity(),
+        1,
+        "63 sends admitted behind the append"
+    );
     // The 65th is refused at once, and an inbox read is a request too.
     let refused = rig.messages.send(note(Address::Owner, "65"), owner()).await;
     assert!(matches!(refused, Err(MessageError::Unavailable(_))));
@@ -1514,32 +1668,26 @@ async fn request_admission_is_bounded_without_waiters() {
 #[tokio::test(start_paused = true)]
 async fn write_reply_waits_for_its_fold() {
     let mut rig = Rig::relayed().await;
-    let send = tokio::spawn({
+    let (send, pending) = rig.write_awaiting_fold(1, {
         let messages = rig.messages.clone();
         async move { messages.send(note(Address::Owner, "report"), owner()).await }
     });
-    until("the writer committed the send", || {
-        rig.org.status().ok() == Some(1)
-    })
-    .await;
+    guarded(pending).await.unwrap();
+    assert_eq!(rig.org.status().ok(), Some(1));
     // Committed, but the service has not folded it: the caller is not told
     // yet, because its next read would not find its own write.
-    tokio::task::yield_now().await;
     assert!(!send.is_finished());
     rig.relay();
     let id = guarded(send).await.unwrap().unwrap().message_id;
     assert_eq!(ids(&rig.inbox(owner(), page()).await), [id.seq()]);
 
     // An acknowledgement's count is taken at its fold, so it waits for it too.
-    let ack = tokio::spawn({
+    let (ack, pending) = rig.write_awaiting_fold(2, {
         let messages = rig.messages.clone();
         async move { messages.ack(AckParams { ids: vec![id] }, owner()).await }
     });
-    until("the writer committed the acknowledgement", || {
-        rig.org.status().ok() == Some(2)
-    })
-    .await;
-    tokio::task::yield_now().await;
+    guarded(pending).await.unwrap();
+    assert_eq!(rig.org.status().ok(), Some(2));
     assert!(!ack.is_finished());
     rig.relay();
     assert_eq!(guarded(ack).await.unwrap().unwrap().count, 1);
@@ -1601,6 +1749,7 @@ fn adopted() -> OrgEvent {
 
 fn sent(to: Address, body: &str) -> OrgEvent {
     OrgEvent::MessageSent(MessageContent {
+        delivery_notice: None,
         from: Address::Owner,
         to,
         kind: MessageKind::Note,
@@ -1633,6 +1782,75 @@ async fn replay_live_overlap_applies_once() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn keyed_notice_replay_live_overlap_keeps_one_key() {
+    let replay = Replay::new(4);
+    let mut content = match sent(Address::Owner, "retained note") {
+        OrgEvent::MessageSent(c) => c,
+        _ => unreachable!(),
+    };
+    content.from = Address::System;
+    content.delivery_notice = Some(atm_org::DeliveryNotice {
+        source_message_id: MessageId::new(3),
+        reason: "unobserved".into(),
+    });
+    let events = [
+        project(),
+        adopted(),
+        sent(Address::Agent(worker()), "source"),
+        OrgEvent::MessageSent(content.clone()),
+    ];
+    for seq in [1, 2, 3, 4, 3, 4] {
+        replay.feed(seq, &events[seq as usize - 1]);
+    }
+    guarded(replay.rt.history.folded(4)).await.unwrap();
+    guarded(replay.messages.initialized()).await.unwrap();
+    let inbox = replay.messages.inbox(page(), owner()).await.unwrap();
+    assert_eq!(ids(&inbox), [4]);
+    assert_eq!(inbox.messages[0].content, content);
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_notice_zero_events_waits_for_the_existing_fold() {
+    let mut rig = Rig::relayed().await;
+    rig.org
+        .execute(
+            OrgCommand::SendMessage(match sent(Address::Owner, "source") {
+                OrgEvent::MessageSent(c) => c,
+                _ => unreachable!(),
+            }),
+            utc(),
+        )
+        .await
+        .unwrap();
+    rig.relay();
+    rig.folded(1).await;
+    let mut content = match sent(Address::Owner, "retained note") {
+        OrgEvent::MessageSent(c) => c,
+        _ => unreachable!(),
+    };
+    content.from = Address::System;
+    content.delivery_notice = Some(atm_org::DeliveryNotice {
+        source_message_id: MessageId::new(1),
+        reason: "unobserved".into(),
+    });
+    rig.org
+        .execute(OrgCommand::SendMessage(content.clone()), utc())
+        .await
+        .unwrap();
+    let service = rig.messages.service().unwrap();
+    let mut duplicate = Box::pin(service.execute(OrgCommand::SendMessage(content)));
+    poll_pending(duplicate.as_mut()).await;
+    // The FIFO snapshot proves the duplicate command was already answered;
+    // its only remaining dependency must be the withheld existing fold.
+    guarded(rig.org.snapshot_at()).await.unwrap();
+    poll_pending(duplicate.as_mut()).await;
+    rig.relay();
+    assert!(guarded(duplicate).await.unwrap().is_empty());
+    assert_eq!(rig.org.status().unwrap(), 2);
+    assert_eq!(rig.inbox(owner(), page()).await.messages.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn unknown_kind_advances_startup_cursor() {
     let replay = Replay::new(3);
     replay.feed(1, &project());
@@ -1656,13 +1874,12 @@ async fn requests_wait_for_the_replay_and_then_answer() {
     let replay = Replay::new(3);
     replay.feed(1, &project());
     replay.feed(2, &adopted());
-    let read = tokio::spawn({
+    let read = spawn_polled({
         let messages = replay.messages.clone();
         async move { messages.inbox(page(), pane("%1")).await }
     });
-    // Let the request reach its startup wait; it must not answer from a
+    // The actual request reached its startup wait; it must not answer from a
     // projection that is still behind the startup fence.
-    tokio::task::yield_now().await;
     assert!(!read.is_finished());
     replay.feed(3, &sent(Address::Agent(worker()), "one"));
     assert_eq!(ids(&guarded(read).await.unwrap().unwrap()), [3]);

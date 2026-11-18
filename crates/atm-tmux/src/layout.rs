@@ -430,11 +430,24 @@ pub async fn apply_layout(
     layout: &Layout,
     target: LayoutTarget,
 ) -> Result<LayoutResult, TmuxError> {
+    let caller_pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    apply_layout_for_caller(client, layout, target, Some(&caller_pane)).await
+}
+
+/// Applies a layout using the given caller pane to locate a new window's session.
+///
+/// A missing, empty, or unmatched caller (or a failed pane lookup) uses session
+/// `"0"`. The process's `TMUX_PANE` is not read; other targets ignore the caller.
+pub async fn apply_layout_for_caller(
+    client: &(dyn TmuxClient + Send + Sync),
+    layout: &Layout,
+    target: LayoutTarget,
+    caller_pane: Option<&str>,
+) -> Result<LayoutResult, TmuxError> {
     let root_pane = match &target {
         LayoutTarget::CurrentPane(pane_id) => pane_id.clone(),
         LayoutTarget::NewWindow(_name) => {
-            // Derive current session from $TMUX_PANE (set by tmux) via list_panes
-            let current_pane = std::env::var("TMUX_PANE").unwrap_or_default();
+            let current_pane = caller_pane.unwrap_or_default();
             let session = if !current_pane.is_empty() {
                 let panes = client.list_panes().await.unwrap_or_default();
                 panes
@@ -899,6 +912,150 @@ name = "nope"
 
         let agent_panes = result.panes.get(&SlotRole::Agent).unwrap();
         assert_eq!(agent_panes, &["%20".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn apply_layout_for_caller_uses_explicit_caller_not_environment() {
+        let mock = MockTmuxClient::new();
+        let environment_pane = std::env::var("TMUX_PANE").unwrap_or_else(|_| "%daemon".to_string());
+        let caller = format!("%caller{environment_pane}");
+        mock.set_panes(
+            [
+                (environment_pane.as_str(), "daemon-session"),
+                (caller.as_str(), "caller-session"),
+            ]
+            .into_iter()
+            .map(|(pane_id, session_name)| crate::PaneInfo {
+                pane_id: pane_id.to_string(),
+                session_name: session_name.to_string(),
+                window_index: 0,
+                pane_pid: 1,
+                width: 120,
+                height: 50,
+                is_active: true,
+            })
+            .collect(),
+        );
+        for pane in ["%10", "%11", "%12"] {
+            mock.set_next_pane_id(pane);
+        }
+
+        let result = apply_layout_for_caller(
+            &mock,
+            &preset_pair(),
+            LayoutTarget::NewWindow(Some("still-ignored".to_string())),
+            Some(&caller),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![
+                MockCall::ListPanes,
+                MockCall::NewWindow {
+                    session: "caller-session".to_string(),
+                    command: None,
+                },
+                MockCall::SplitWindow {
+                    target: "%10".to_string(),
+                    size: "50%".to_string(),
+                    direction: crate::PaneDirection::Below,
+                    command: None,
+                    cwd: None,
+                    detached: false,
+                },
+                MockCall::SplitWindow {
+                    target: "%10".to_string(),
+                    size: "25%".to_string(),
+                    direction: crate::PaneDirection::Right,
+                    command: None,
+                    cwd: None,
+                    detached: false,
+                },
+            ]
+        );
+        assert_eq!(
+            result.panes,
+            HashMap::from([
+                (SlotRole::Agent, vec!["%10".to_string(), "%11".to_string()]),
+                (SlotRole::AtmPanel, vec!["%12".to_string()]),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_layout_for_caller_defaults_to_session_zero_without_matching_caller() {
+        for caller in [None, Some(""), Some("%missing")] {
+            let mock = MockTmuxClient::new();
+            mock.set_next_pane_id("%10");
+            mock.set_panes(vec![crate::PaneInfo {
+                pane_id: std::env::var("TMUX_PANE").unwrap_or_else(|_| "%daemon".to_string()),
+                session_name: "daemon-session".to_string(),
+                window_index: 0,
+                pane_pid: 1,
+                width: 120,
+                height: 50,
+                is_active: true,
+            }]);
+
+            let result = apply_layout_for_caller(
+                &mock,
+                &preset_solo(),
+                LayoutTarget::NewWindow(Some("still-ignored".to_string())),
+                caller,
+            )
+            .await
+            .unwrap();
+
+            let mut expected_calls = Vec::new();
+            if caller == Some("%missing") {
+                expected_calls.push(MockCall::ListPanes);
+            }
+            expected_calls.push(MockCall::NewWindow {
+                session: "0".to_string(),
+                command: None,
+            });
+            assert_eq!(mock.calls(), expected_calls, "caller={caller:?}");
+            assert_eq!(
+                result.panes,
+                HashMap::from([(SlotRole::Agent, vec!["%10".to_string()])])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_layout_for_caller_preserves_default_session_on_lookup_error() {
+        let mock = MockTmuxClient::new();
+        mock.set_next_error(TmuxError::CommandFailed {
+            command: "list-panes".to_string(),
+            stderr: "lookup failed".to_string(),
+        });
+        mock.set_next_pane_id("%10");
+
+        let result = apply_layout_for_caller(
+            &mock,
+            &preset_solo(),
+            LayoutTarget::NewWindow(None),
+            Some("%caller"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            vec![
+                MockCall::ListPanes,
+                MockCall::NewWindow {
+                    session: "0".to_string(),
+                    command: None,
+                },
+            ]
+        );
+        assert_eq!(
+            result.panes,
+            HashMap::from([(SlotRole::Agent, vec!["%10".to_string()])])
+        );
     }
 
     // -- Task 5: load_layout tests --------------------------------------------

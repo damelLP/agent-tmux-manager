@@ -687,6 +687,45 @@ async fn test_pending_session_upgrade_on_status_line() {
 }
 
 #[tokio::test]
+async fn pi_1_5_2_idle_registration() {
+    // Synthetic: recovery must reconcile identity without forging launch proof.
+    let (_, mut actor, _) = create_actor();
+    let pid = std::process::id();
+    let (tx, rx) = oneshot::channel();
+    actor.handle_command(RegistryCommand::RegisterDiscovered {
+        session_id: SessionId::pending_from_pid(pid),
+        pid,
+        cwd: std::env::temp_dir(),
+        tmux_pane: Some("%7".into()),
+        harness: atm_core::Harness::Pi,
+        respond_to: tx,
+    });
+    rx.await.unwrap().unwrap();
+    let raw: atm_pi_adapter::RawPiEvent = serde_json::from_value(serde_json::json!({
+        "event":"atm_idle", "payload":{}, "session_id":"recovered-session", "pid":pid,
+        "tmux_pane":"%7"
+    }))
+    .unwrap();
+    for event in raw.to_lifecycle_events() {
+        actor
+            .handle_apply_lifecycle_event(
+                "recovered-session".into(),
+                event,
+                atm_core::Harness::Pi,
+                Some(pid),
+                Some("%7".into()),
+                Default::default(),
+            )
+            .unwrap();
+    }
+    let (session, infra) = actor.sessions_by_pid.get(&pid).unwrap();
+    assert_eq!(session.id.as_str(), "recovered-session");
+    assert!(session.first_prompt.is_none());
+    assert!(infra.start.is_none(), "recovery is not an AcceptedStart");
+    assert_eq!(session.status, atm_core::SessionStatus::Idle);
+}
+
+#[tokio::test]
 async fn test_pending_session_upgrade_on_lifecycle_event() {
     // Mirrors test_pending_session_upgrade_on_status_line but
     // exercises the vendor-adapter lifecycle path. Without the
@@ -1530,30 +1569,34 @@ fn process_teammate_links_to_lead_from_cmdline_and_outlives_it() {
     let lead = register_test_session(&mut actor, "lead-1");
     // The `read` builtin blocks sh itself on stdin: no child process
     // that could outlive `kill`, and no exec to replace the argv.
-    let mut process = std::process::Command::new("sh")
-        .args(["-c", "read _", "claude", "--parent-session-id"])
-        .arg(lead.as_str())
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn fake teammate");
-    // Until exec completes, the child's cmdline is still the test's.
-    let cmdline = format!("/proc/{}/cmdline", process.id());
-    let flag = b"--parent-session-id";
-    for _ in 0..200 {
-        let exec_done =
-            std::fs::read(&cmdline).is_ok_and(|argv| argv.windows(flag.len()).any(|w| w == flag));
-        if exec_done {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    let (mut ready, output) = std::os::unix::net::UnixStream::pair().unwrap();
+    ready.set_read_timeout(Some(GIT_WAIT)).unwrap();
+    let mut process = Sleep(
+        std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf 'ready\\n'; read _",
+                "claude",
+                "--parent-session-id",
+            ])
+            .arg(lead.as_str())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(OwnedFd::from(output)))
+            .spawn()
+            .expect("spawn fake teammate"),
+    );
+    let mut line = [0; 6];
+    ready.read_exact(&mut line).unwrap();
+    assert_eq!(&line, b"ready\n");
 
     let (respond_to, _) = oneshot::channel();
     actor.handle_command(RegistryCommand::ApplyLifecycleEvent {
         session_id: SessionId::new("teammate-1"),
         event: LifecycleEvent::WorkingStart,
         harness: atm_core::Harness::ClaudeCode,
-        pid: Some(process.id()),
+        pid: Some(process.0.id()),
         tmux_pane: None,
         context: LifecycleContext::default(),
         respond_to,
@@ -1567,8 +1610,8 @@ fn process_teammate_links_to_lead_from_cmdline_and_outlives_it() {
         respond_to,
     });
     let survived = session_view(&actor, "teammate-1").is_some();
-    let _ = process.kill();
-    let _ = process.wait();
+    let _ = process.0.kill();
+    let _ = process.0.wait();
 
     assert_eq!(teammate.and_then(|view| view.parent_session_id), Some(lead));
     assert!(lead_view.is_some_and(|view| view.child_session_ids.is_empty()));
@@ -3565,24 +3608,58 @@ fn a_shared_process_row_follows_each_new_session_start() {
 // Git lookups off the actor
 // ========================================================================
 
-const GIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const GIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn receive_git_result(
+    results: &mut mpsc::UnboundedReceiver<crate::registry::git::GitResult>,
+) -> crate::registry::git::GitResult {
+    tokio::time::timeout(GIT_WAIT, results.recv())
+        .await
+        .expect("git result did not land")
+        .expect("git result channel closed")
+}
+
+#[tokio::test]
+async fn held_git_result_receive_is_pending_and_keeps_early_results() {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let (_tx, mut actor, _events, gate) = create_gated_actor();
+    register_session_in(&mut actor, session_in("held", "/a"));
+    gate.expect_call("/a");
+    let mut result = std::pin::pin!(receive_git_result(&mut actor.git_results));
+    assert!(poll_fn(|cx| Poll::Ready(result.as_mut().poll(cx).is_pending())).await);
+    gate.release.send(()).unwrap();
+    assert_eq!(result.await, ("/a".into(), Some(gated_context("/a"))));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tx.send(("/early".into(), None)).unwrap();
+    assert_eq!(receive_git_result(&mut rx).await, ("/early".into(), None));
+}
 
 impl RegistryActor {
-    /// Applies results until no git lookup is in flight. Polls with real
-    /// sleeps so it works in sync tests and under a paused tokio clock.
+    /// Receive on a separate unpaused runtime: sync tests and paused-clock
+    /// callers must not block a Tokio worker on blocking_recv or auto-advance
+    /// their real filesystem workers past the hang guard.
+    fn next_git_result(&mut self) -> crate::registry::git::GitResult {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap()
+                        .block_on(receive_git_result(&mut self.git_results))
+                })
+                .join()
+                .unwrap()
+        })
+    }
+
     fn finish_git_lookups(&mut self) {
-        let deadline = std::time::Instant::now() + GIT_WAIT;
         while self.git_lookups.has_in_flight() {
-            match self.git_results.try_recv() {
-                Ok((cwd, context)) => self.apply_git_result(cwd, context),
-                Err(_) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "git lookups did not land"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
+            let (cwd, context) = self.next_git_result();
+            self.apply_git_result(cwd, context);
         }
     }
 }
@@ -3601,26 +3678,16 @@ fn gated_context(cwd: &str) -> GitContext {
 struct GitGate {
     calls: std::sync::mpsc::Receiver<String>,
     release: std::sync::mpsc::Sender<()>,
+    origin: std::time::Instant,
 }
 
 impl GitGate {
     /// Lets one blocked lookup land, and applies it.
     fn land_one(&self, actor: &mut RegistryActor, cwd: &str) {
         self.release.send(()).unwrap();
-        let deadline = std::time::Instant::now() + GIT_WAIT;
-        loop {
-            match actor.git_results.try_recv() {
-                Ok((got, context)) => {
-                    assert_eq!(got, cwd);
-                    actor.apply_git_result(got, context);
-                    return;
-                }
-                Err(_) => {
-                    assert!(std::time::Instant::now() < deadline, "lookup did not land");
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-        }
+        let (got, context) = actor.next_git_result();
+        assert_eq!(got, cwd);
+        actor.apply_git_result(got, context);
     }
 
     fn expect_call(&self, cwd: &str) {
@@ -3637,10 +3704,20 @@ impl GitGate {
         assert_eq!(calls, cwds);
     }
 
-    fn assert_no_more_calls(&self) {
-        let extra = self
-            .calls
-            .recv_timeout(std::time::Duration::from_millis(100));
+    fn admissions(&self, actor: &RegistryActor) -> serde_json::Value {
+        actor.git_lookups.replay_state(self.origin)
+    }
+
+    fn assert_no_more_calls(&self, actor: &RegistryActor, admitted: &serde_json::Value) {
+        // Commands and their spawn/admission updates are synchronous. An
+        // unreported worker cannot hide behind an empty calls queue: every
+        // successful spawn inserts its cwd/start/stuck state before returning.
+        assert_eq!(
+            &self.admissions(actor),
+            admitted,
+            "unexpected git worker admission"
+        );
+        let extra = self.calls.try_recv();
         assert!(extra.is_err(), "unexpected git lookup: {extra:?}");
     }
 }
@@ -3661,7 +3738,16 @@ fn create_gated_actor() -> (
         let _ = tokens.lock().unwrap().recv();
         gated_context(cwd)
     });
-    (cmd_tx, actor, event_rx, GitGate { calls, release })
+    (
+        cmd_tx,
+        actor,
+        event_rx,
+        GitGate {
+            calls,
+            release,
+            origin: std::time::Instant::now(),
+        },
+    )
 }
 
 fn session_in(id: &str, cwd: &str) -> SessionDomain {
@@ -3710,7 +3796,7 @@ fn a_preset_project_root_requests_no_lookup() {
     preset.project_root = Some("/preset".to_string());
     register_session_in(&mut actor, preset);
 
-    gate.assert_no_more_calls();
+    gate.assert_no_more_calls(&actor, &serde_json::json!({}));
     assert!(!actor.git_lookups.has_in_flight());
 }
 
@@ -3720,7 +3806,7 @@ fn a_session_without_a_cwd_requests_no_lookup() {
 
     register_session_in(&mut actor, create_test_session("no-cwd"));
 
-    gate.assert_no_more_calls();
+    gate.assert_no_more_calls(&actor, &serde_json::json!({}));
     assert!(!actor.git_lookups.has_in_flight());
 }
 
@@ -3770,7 +3856,7 @@ fn a_status_line_keeping_the_cwd_and_root_requests_no_lookup() {
         }),
     );
 
-    gate.assert_no_more_calls();
+    gate.assert_no_more_calls(&actor, &serde_json::json!({}));
 }
 
 #[test]
@@ -3793,15 +3879,26 @@ fn a_refresh_with_no_change_publishes_nothing() {
 fn a_refresh_requests_one_lookup_per_distinct_cwd() {
     let (_tx, mut actor, _events, gate) = create_gated_actor();
     register_session_in(&mut actor, session_in("one", "/a"));
+    let _ = actor
+        .git_lookups
+        .newly_stuck(std::time::Instant::now() + GIT_WAIT);
+    let first = gate.admissions(&actor);
     register_session_in(&mut actor, session_in("two", "/a"));
     gate.expect_call("/a");
-    gate.assert_no_more_calls();
+    gate.assert_no_more_calls(&actor, &first);
     gate.land_one(&mut actor, "/a");
 
     actor.handle_command(RegistryCommand::RefreshGitInfo);
 
     gate.expect_call("/a");
-    gate.assert_no_more_calls();
+    let _ = actor
+        .git_lookups
+        .newly_stuck(std::time::Instant::now() + GIT_WAIT);
+    let refresh = gate.admissions(&actor);
+    for _ in 0..5 {
+        actor.handle_command(RegistryCommand::RefreshGitInfo);
+    }
+    gate.assert_no_more_calls(&actor, &refresh);
 }
 
 #[test]
@@ -3866,9 +3963,14 @@ fn a_result_reaches_a_child_that_copied_a_parent_still_waiting() {
     parent_rx.try_recv().unwrap().unwrap();
     gate.expect_call("/a");
 
+    // Mark the old admission so even an equal timestamp cannot hide a replacement.
+    let _ = actor
+        .git_lookups
+        .newly_stuck(std::time::Instant::now() + GIT_WAIT);
+    let admitted = gate.admissions(&actor);
     start_child(&mut actor, &SessionId::new("lead"), "agent-1");
     assert_no_git_fields(&session_view(&actor, "agent-1").unwrap());
-    gate.assert_no_more_calls();
+    gate.assert_no_more_calls(&actor, &admitted);
     drain_events(&mut event_rx);
 
     gate.land_one(&mut actor, "/a");
@@ -3960,7 +4062,7 @@ fn a_full_registry_requests_no_lookup_for_a_rejected_session() {
         rx.try_recv().unwrap(),
         Err(RegistryError::RegistryFull { .. })
     ));
-    gate.assert_no_more_calls();
+    gate.assert_no_more_calls(&actor, &serde_json::json!({}));
 }
 
 #[tokio::test]

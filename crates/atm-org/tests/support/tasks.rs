@@ -11,7 +11,7 @@ pub const LEAD: &str = "p/lead";
 pub const BUILD: &str = "p/build";
 /// An agent with no part in the task.
 pub const OTHER: &str = "p/other";
-/// An agent the daemon marks as the lead; it created nothing.
+/// A strict manager of BUILD in the supplied synthetic admission facts.
 pub const BOSS: &str = "p/boss";
 /// The agent review tasks are assigned to.
 pub const REVIEWER: &str = "p/reviewer";
@@ -20,16 +20,17 @@ pub const AGENTS: [&str; 5] = [LEAD, BUILD, OTHER, BOSS, REVIEWER];
 pub fn agent(text: &str) -> AgentId {
     text.parse().unwrap()
 }
-/// A caller the daemon did not mark as the lead.
+/// A caller without an assignee-scoped manager grant.
 pub fn by(text: &str) -> TaskActor {
     TaskActor {
         who: text.parse().unwrap(),
-        lead: false,
+        manager_of: None,
     }
 }
+/// Synthetic: the daemon checked that this caller strictly manages BUILD.
 pub fn as_lead(text: &str) -> TaskActor {
     TaskActor {
-        lead: true,
+        manager_of: Some(agent(BUILD)),
         ..by(text)
     }
 }
@@ -58,6 +59,7 @@ pub fn reviewed() -> TaskMeasure {
 }
 pub fn new_task(kind: TaskKind, measure: TaskMeasure, creator: &str) -> TaskCreated {
     TaskCreated {
+        project_id: None,
         title: "Do the work".into(),
         kind,
         creator: creator.parse().unwrap(),

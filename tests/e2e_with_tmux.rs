@@ -92,6 +92,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -105,8 +106,6 @@ use tempfile::TempDir;
 mod role_support;
 
 const HANG_GUARD: Duration = Duration::from_secs(60);
-const SOCKET_WAIT_TIMEOUT: Duration = HANG_GUARD;
-const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Wait on SIGCHLD, not elapsed time. Subscribe before checking the child so
 /// an exit between try_wait and recv is retained. Every wake uses the same guard.
 fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
@@ -145,6 +144,13 @@ fn wait_child(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
         let _ = child.wait();
     }
     result
+}
+
+fn tmux_command() -> Command {
+    let mut command = Command::new("tmux");
+    // Without -u, tmux maps tabs to underscores for a non-UTF-8 client (#138).
+    command.arg("-u").env_remove("TMUX").env_remove("TMUX_PANE");
+    command
 }
 
 /// Files avoid a full stdout/stderr pipe preventing the exit we await.
@@ -376,7 +382,7 @@ impl ByteSink {
 /// tmux 3.6 and 3.8 retain a signal sent before its waiter (verified in private
 /// servers). Each operation uses a distinct channel; repeated signals coalesce.
 fn wait_for_signal(label: &str, channel: &str, deadline: Instant) -> io::Result<()> {
-    let mut child = Command::new("tmux")
+    let mut child = tmux_command()
         .args(["-L", label, "wait-for", channel])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -677,6 +683,15 @@ except Exception as e:
     path
 }
 
+fn next_private_sequence() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn private_session_name(prefix: &str) -> String {
+    format!("{prefix}{}-{}", std::process::id(), next_private_sequence())
+}
+
 /// Owns a private tmux server scoped to this test (tmux `-L <socket>`).
 ///
 /// We pass this label to `RealTmuxClient::with_socket(...)` so the project's
@@ -699,7 +714,15 @@ impl PrivateTmux {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        format!("atm-e2e-{}-{}", std::process::id(), now_nanos)
+        Self::fresh_label_at(now_nanos)
+    }
+
+    fn fresh_label_at(now_nanos: u128) -> String {
+        format!(
+            "atm-e2e-{}-{now_nanos}-{}",
+            std::process::id(),
+            next_private_sequence()
+        )
     }
 
     fn start_with_label_session_env<I, K, V>(socket_label: &str, session_name: &str, env: I) -> Self
@@ -708,7 +731,7 @@ impl PrivateTmux {
         K: AsRef<std::ffi::OsStr>,
         V: AsRef<std::ffi::OsStr>,
     {
-        let mut cmd = Command::new("tmux");
+        let mut cmd = tmux_command();
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -736,6 +759,103 @@ impl PrivateTmux {
     }
 }
 
+#[test]
+fn private_tmux_labels_differ_with_a_frozen_clock() {
+    assert_ne!(
+        PrivateTmux::fresh_label_at(7),
+        PrivateTmux::fresh_label_at(7)
+    );
+}
+
+#[test]
+fn private_tmux_labels_are_unique_concurrently() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                (0..256)
+                    .map(|_| PrivateTmux::fresh_label_at(7))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let labels: std::collections::BTreeSet<_> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(labels.len(), 8 * 256);
+}
+
+fn assert_distinct_private_probe_servers(first: String, second: String) {
+    if tmux_on_path().is_none() {
+        return;
+    }
+    let first = PrivateTmux::start_with_label_session_env(
+        &first,
+        "probe",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    tmux_stdout(
+        first.label(),
+        &["set-option", "-g", "@namespace-owner", "first"],
+    );
+    let second = PrivateTmux::start_with_label_session_env(
+        &second,
+        "probe",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    tmux_stdout(
+        second.label(),
+        &["set-option", "-g", "@namespace-owner", "second"],
+    );
+    assert_eq!(
+        tmux_stdout(
+            first.label(),
+            &["show-options", "-g", "-v", "@namespace-owner"]
+        ),
+        "first"
+    );
+    assert_eq!(
+        tmux_stdout(
+            second.label(),
+            &["show-options", "-g", "-v", "@namespace-owner"]
+        ),
+        "second"
+    );
+    for server in [&first, &second] {
+        assert_eq!(
+            tmux_stdout(server.label(), &["list-sessions", "-F", "#{session_name}"]),
+            "probe"
+        );
+    }
+}
+
+#[test]
+fn private_tmux_frozen_clock_preserves_existing_probe() {
+    assert_distinct_private_probe_servers(
+        PrivateTmux::fresh_label_at(7),
+        PrivateTmux::fresh_label_at(7),
+    );
+}
+
+#[test]
+fn private_tmux_cli_names_differ() {
+    assert_ne!(
+        private_session_name("probe-"),
+        private_session_name("probe-")
+    );
+}
+
+#[test]
+fn private_tmux_cli_names_preserve_existing_probe() {
+    assert_distinct_private_probe_servers(
+        format!("atm-{}", private_session_name("probe-")),
+        format!("atm-{}", private_session_name("probe-")),
+    );
+}
+
 impl Drop for PrivateTmux {
     fn drop(&mut self) {
         let Some(identity) = tmux_run_capture(
@@ -744,27 +864,221 @@ impl Drop for PrivateTmux {
         ) else {
             return;
         };
-        let Some((socket, pid)) = identity.trim().split_once('\t') else {
-            eprintln!(
-                "skipping tmux cleanup: missing identity for {}",
-                self.socket_label
-            );
-            return;
-        };
         let private_root = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
-        if !Path::new(socket).starts_with(private_root)
-            || Path::new(socket).file_name() != Some(self.socket_label.as_ref())
-            || !matches!(pid.parse::<u32>(), Ok(pid) if pid > 1)
-        {
+        let Some((socket, _pid)) =
+            owned_tmux_identity(&identity, &self.socket_label, Path::new(&private_root))
+        else {
             eprintln!("skipping tmux cleanup: unexpected identity {identity:?}");
             return;
+        };
+        if let Err(error) = try_command_output(tmux_command().args(["-S", socket, "kill-server"])) {
+            eprintln!("private tmux cleanup: {error}");
         }
-        let _ = Command::new("tmux")
-            .args(["-S", socket, "kill-server"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
+}
+
+fn owned_tmux_identity<'a>(
+    identity: &'a str,
+    label: &str,
+    private_root: &Path,
+) -> Option<(&'a str, u32)> {
+    let (socket, pid) = identity.trim().split_once('\t')?;
+    let pid = pid.parse::<u32>().ok().filter(|pid| *pid > 1)?;
+    (Path::new(socket).starts_with(private_root)
+        && Path::new(socket).file_name() == Some(label.as_ref()))
+    .then_some((socket, pid))
+}
+
+// Omitting -u corrupts the identity delimiter in a non-UTF-8 client locale.
+#[test]
+fn private_tmux_identity_preserves_tabs_in_ascii_locale() {
+    if tmux_on_path().is_none() {
+        return;
+    }
+    let server = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "ascii-identity",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let output = command_output(
+        tmux_command()
+            .env("LC_ALL", "C")
+            .env_remove("LC_CTYPE")
+            .env_remove("LANG")
+            .args([
+                "-L",
+                server.label(),
+                "display-message",
+                "-p",
+                "#{socket_path}\t#{pid}",
+            ]),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let identity = String::from_utf8(output.stdout).unwrap();
+    let root = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+    assert!(
+        owned_tmux_identity(&identity, server.label(), Path::new(&root)).is_some(),
+        "ASCII locale must retain the exact tab-separated owned identity: {identity:?}"
+    );
+}
+
+fn assert_private_tmux_guard_cleans_up(unwind: bool) {
+    if tmux_on_path().is_none() {
+        return;
+    }
+    let label = PrivateTmux::fresh_label();
+    let result = std::panic::catch_unwind(|| {
+        let _server = PrivateTmux::start_with_label_session_env(
+            &label,
+            "cleanup",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        if unwind {
+            panic!("injected private tmux owner unwind");
+        }
+    });
+    assert_eq!(result.is_err(), unwind);
+    let remaining = command_output(tmux_command().args(["-L", &label, "list-sessions"]));
+    assert!(
+        !remaining.status.success(),
+        "private guard left its server running: {remaining:?}"
+    );
+}
+
+#[test]
+fn private_tmux_guard_cleans_up_on_return() {
+    assert_private_tmux_guard_cleans_up(false);
+}
+
+#[test]
+fn private_tmux_guard_cleans_up_on_unwind() {
+    assert_private_tmux_guard_cleans_up(true);
+}
+
+#[test]
+fn private_tmux_identity_refuses_unowned_sockets() {
+    let root = Path::new("/private-e2e");
+    for identity in [
+        "/other/owned\t42",
+        "/private-e2e/foreign\t42",
+        "/private-e2e/owned\t1",
+        "/private-e2e/owned\tnot-a-pid",
+        "/private-e2e/owned_42",
+    ] {
+        assert_eq!(owned_tmux_identity(identity, "owned", root), None);
+    }
+    assert_eq!(
+        owned_tmux_identity("/private-e2e/owned\t42\n", "owned", root),
+        Some(("/private-e2e/owned", 42))
+    );
+}
+
+fn append_log_line(writer: &mut impl Write, line: &str) -> io::Result<()> {
+    writer.write_all(format!("{line}\n").as_bytes())
+}
+
+// Fragmented formatting lets the independent stderr writer split a stdout line.
+#[test]
+fn daemon_log_keeps_complete_stdout_lines_while_stderr_appends() {
+    #[derive(Default)]
+    struct Interleaved {
+        bytes: Vec<u8>,
+        stderr_written: bool,
+    }
+    impl Write for Interleaved {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            if !self.stderr_written {
+                self.bytes
+                    .extend_from_slice(b"stderr before readiness 4095\n");
+                self.stderr_written = true;
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut log = Interleaved::default();
+    append_log_line(&mut log, "stdout before readiness 4095").unwrap();
+    append_log_line(&mut log, "Daemon server listening").unwrap();
+    assert_eq!(
+        String::from_utf8(log.bytes).unwrap(),
+        "stdout before readiness 4095\nstderr before readiness 4095\nDaemon server listening\n"
+    );
+}
+
+fn write_daemon_fixture(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("atmd-fixture");
+    let mut script = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .unwrap();
+    writeln!(script, "#!/bin/sh\n{body}").unwrap();
+    path
+}
+
+#[tokio::test]
+async fn daemon_readiness_returns_on_log_event_without_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = write_daemon_fixture(
+        dir.path(),
+        r#"i=0
+while [ "$i" -lt 4096 ]; do
+    printf 'stdout before readiness %s\n' "$i"
+    printf 'stderr before readiness %s\n' "$i" >&2
+    i=$((i + 1))
+done
+printf 'Daemon server listening\n'
+exec /bin/cat "$0.hold"
+"#,
+    );
+    // A concurrent fork can retain this writer even after its parent closes it.
+    let _writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&binary)
+        .unwrap();
+    // Keep the child and its stdout open after the event, without any socket.
+    let _hold = ByteSink::new(&binary.with_extension("hold"));
+    let mut command = Command::new("/bin/sh");
+    command.arg(&binary);
+    let mut daemon = Daemon::spawn_command(command, "unused").await;
+    assert!(!daemon.socket_path.exists());
+    assert!(daemon.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    let log = std::fs::read_to_string(&daemon.log_path).unwrap();
+    assert!(log.contains("stdout before readiness 4095\n"));
+    assert!(log.contains("stderr before readiness 4095\n"));
+    assert!(log.contains("Daemon server listening\n"));
+}
+
+#[tokio::test]
+async fn daemon_readiness_rejects_eof_before_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = write_daemon_fixture(
+        dir.path(),
+        "printf 'stdout without listening\\n'\nprintf 'stderr without listening\\n' >&2\nexit 7",
+    );
+    let _writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&binary)
+        .unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.arg(&binary);
+    let failure = tokio::spawn(async move { Daemon::spawn_command(command, "unused").await })
+        .await
+        .err()
+        .expect("EOF without the listening event must fail readiness")
+        .into_panic();
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("readiness failure has a diagnostic message");
+    assert!(message.contains("daemon readiness:"), "{message}");
+    assert!(message.contains("stdout without listening"), "{message}");
+    assert!(message.contains("stderr without listening"), "{message}");
 }
 
 /// Owns a child `atmd` process and its sandbox dirs. Drop sends SIGTERM and
@@ -774,7 +1088,7 @@ struct Daemon {
     socket_path: PathBuf,
     state_dir: PathBuf,
     /// Path to the file capturing daemon stdout+stderr. Surfaced on
-    /// failure so a "socket didn't appear" panic includes actual evidence.
+    /// failure so a readiness panic includes actual evidence.
     log_path: PathBuf,
     _state_dir_guard: TempDir,
     _socket_dir_guard: TempDir,
@@ -785,63 +1099,74 @@ impl Daemon {
     /// atmd's discovery would list the panes of whatever server `$TMUX`
     /// names, which is the developer's own when tests run inside tmux.
     async fn spawn(binary: &Path, tmux_label: &str) -> Self {
-        let socket_dir_guard = tempfile::tempdir().expect("create socket tempdir");
-        let state_dir_guard = tempfile::tempdir().expect("create state tempdir");
-        let socket_path = socket_dir_guard.path().join("atmd.sock");
-        let state_dir = state_dir_guard.path().to_path_buf();
-        let log_path = state_dir_guard.path().join("atmd.log");
+        Self::spawn_command(Command::new(binary), tmux_label).await
+    }
 
-        let log_file = std::fs::File::create(&log_path).expect("create atmd log file");
-        let log_clone = log_file.try_clone().expect("clone atmd log file");
+    async fn spawn_command(command: Command, tmux_label: &str) -> Self {
+        // Startup waits on a blocking channel, not on the async runtime.
+        let tmux_label = tmux_label.to_owned();
+        tokio::task::spawn_blocking(move || Self::spawn_ready(command, &tmux_label))
+            .await
+            .unwrap()
+    }
 
-        let child = Command::new(binary)
+    /// The log event is emitted after bind/listen; no sleep or socket polling.
+    fn spawn_ready(mut command: Command, tmux_label: &str) -> Self {
+        let sockets = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let socket_path = sockets.path().join("atmd.sock");
+        let state_dir = state.path().to_owned();
+        let log_path = state_dir.join("atmd.log");
+        let mut log = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        let mut child = command
             .arg("start")
             .env("ATM_SOCKET", &socket_path)
-            .env("XDG_STATE_HOME", &state_dir)
+            .env("ATM_TMUX_SOCKET", tmux_label)
             .env("ATM_STATE_DIR", state_dir.join("eventlog"))
+            .env("XDG_STATE_HOME", &state_dir)
             // atmd reads `[notify]` from atm's config.toml: never the developer's.
             .env("XDG_CONFIG_HOME", state_dir.join("config"))
-            .env("ATM_TMUX_SOCKET", tmux_label)
-            .env("RUST_LOG", "warn")
-            .stdout(log_file)
-            .stderr(log_clone)
+            .env("RUST_LOG", "warn,atmd::server=info")
+            .stdout(Stdio::piped())
+            .stderr(log.try_clone().unwrap())
             .spawn()
-            .expect("spawn atmd child");
-
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
         let daemon = Self {
             child: Some(child),
             socket_path,
             state_dir,
             log_path,
-            _state_dir_guard: state_dir_guard,
-            _socket_dir_guard: socket_dir_guard,
+            _state_dir_guard: state,
+            _socket_dir_guard: sockets,
         };
-
-        daemon.wait_for_socket().await;
+        let (ready, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("daemon-log".into())
+            .spawn(move || {
+                let mut ready = Some(ready);
+                for line in BufReader::new(stdout).lines() {
+                    let line = line.unwrap();
+                    append_log_line(&mut log, &line).unwrap();
+                    if line.contains("Daemon server listening") {
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(());
+                        }
+                    }
+                }
+            })
+            .unwrap();
+        receiver.recv_timeout(HANG_GUARD).unwrap_or_else(|error| {
+            panic!(
+                "daemon readiness: {error}; {}",
+                std::fs::read_to_string(&daemon.log_path).unwrap_or_default()
+            )
+        });
         daemon
-    }
-
-    async fn wait_for_socket(&self) {
-        let start = Instant::now();
-        while start.elapsed() < SOCKET_WAIT_TIMEOUT {
-            if connect_until(&self.socket_path, start + SOCKET_WAIT_TIMEOUT).is_ok() {
-                return;
-            }
-            // atmd exposes no readiness fd: a successful connect, not a delay
-            // or path existence, establishes that its listener is ready.
-            tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
-        }
-        let log = std::fs::read_to_string(&self.log_path).unwrap_or_default();
-        panic!(
-            "atmd socket {} did not appear within {:?}\n--- atmd log ---\n{}",
-            self.socket_path.display(),
-            SOCKET_WAIT_TIMEOUT,
-            if log.is_empty() {
-                "(empty)".to_string()
-            } else {
-                log
-            }
-        );
     }
 }
 
@@ -986,6 +1311,690 @@ impl E2eEnv {
             shim_path,
             _shim_dir_guard: shim_dir_guard,
         })
+    }
+}
+
+// This unit owns its readiness event; inherited fixtures are deliberately untouched.
+fn staged_spawn_daemon(binary: &Path, label: &str, cwd: &Path) -> Daemon {
+    let sockets = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let socket_path = sockets.path().join("atmd.sock");
+    let log_path = state.path().join("spawn-daemon.log");
+    let mut log = std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    let mut child = Command::new(binary)
+        .arg("start")
+        .current_dir(cwd)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env("ATM_SOCKET", &socket_path)
+        .env("ATM_TMUX_SOCKET", label)
+        .env("ATM_STATE_DIR", state.path().join("events"))
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_CONFIG_HOME", state.path().join("config"))
+        .env("RUST_LOG", "warn,atmd::server=info")
+        .stdout(Stdio::piped())
+        .stderr(log.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (ready, receive) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("spawn-proof-readiness".into())
+        .spawn(move || {
+            let mut ready = Some(ready);
+            for line in BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                writeln!(log, "{line}").unwrap();
+                if line.contains("Daemon server listening") {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(());
+                    }
+                }
+            }
+        })
+        .unwrap();
+    let daemon = Daemon {
+        child: Some(child),
+        socket_path,
+        state_dir: state.path().to_owned(),
+        log_path,
+        _state_dir_guard: state,
+        _socket_dir_guard: sockets,
+    };
+    receive.recv_timeout(HANG_GUARD).unwrap_or_else(|error| {
+        panic!(
+            "spawn daemon readiness: {error}: {}",
+            std::fs::read_to_string(&daemon.log_path).unwrap_or_default()
+        )
+    });
+    daemon
+}
+
+#[test]
+fn daemon_largest_spawn_stages_complete_with_generated_hooks_and_foreign_ids() {
+    use std::os::unix::fs::PermissionsExt;
+    if tmux_on_path().is_none() {
+        eprintln!("SKIP: tmux not on PATH");
+        return;
+    }
+    let Some(binary) = atmd_binary() else {
+        eprintln!("SKIP: atmd not built");
+        return;
+    };
+    let own = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "spawn-own",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let foreign = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "spawn-foreign",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let data = tempfile::tempdir().unwrap();
+    let cwd = data.path().join("target's cwd");
+    let caller_cwd = std::env::current_dir().unwrap();
+    let daemon_cwd = data.path().join("daemon cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(&daemon_cwd).unwrap();
+    let socket = |server: &PrivateTmux| {
+        let identity = tmux_stdout(
+            server.label(),
+            &["display-message", "-p", "#{socket_path}\t#{pid}"],
+        );
+        let (path, pid) = identity.trim().split_once('\t').unwrap();
+        assert!(Path::new(path).canonicalize().unwrap().starts_with(
+            Path::new(&std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into()))
+                .canonicalize()
+                .unwrap()
+        ));
+        assert!(pid.parse::<u32>().unwrap() > 1);
+        path.to_owned()
+    };
+    let own_socket = socket(&own);
+    let foreign_socket = socket(&foreign);
+    assert_ne!(own_socket, foreign_socket);
+    let target = |server: &PrivateTmux| {
+        tmux_stdout(
+            server.label(),
+            &["set-option", "-g", "default-shell", "/bin/sh"],
+        );
+        tmux_stdout(
+            server.label(),
+            &["resize-window", "-t", "%0", "-x", "320", "-y", "60"],
+        );
+        let command = format!(
+            "tmux -L {} wait-for -S spawn-target-ready; exec /bin/sh",
+            atmd::control::shell_quote(server.label())
+        );
+        let pane = tmux_stdout(
+            server.label(),
+            &[
+                "split-window",
+                "-d",
+                "-h",
+                "-l",
+                "80%",
+                "-t",
+                "%0",
+                "-c",
+                cwd.to_str().unwrap(),
+                "-P",
+                "-F",
+                "#{pane_id}",
+                &command,
+            ],
+        )
+        .trim()
+        .to_owned();
+        wait_for_signal(
+            server.label(),
+            "spawn-target-ready",
+            Instant::now() + HANG_GUARD,
+        )
+        .unwrap();
+        pane
+    };
+    let target = target(&own);
+    assert_eq!(target, "%1");
+    // Both servers retain the same numeric pane IDs, not just different labels.
+    let foreign_target = tmux_stdout(
+        foreign.label(),
+        &[
+            "split-window",
+            "-d",
+            "-h",
+            "-t",
+            "%0",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "/bin/sh",
+        ],
+    )
+    .trim()
+    .to_owned();
+    assert_eq!(target, foreign_target);
+    let stub = data.path().join("bin");
+    std::fs::create_dir(&stub).unwrap();
+    std::fs::write(stub.join("atm"), "#!/bin/sh\nexec /bin/cat\n").unwrap();
+    std::fs::set_permissions(stub.join("atm"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    tmux_stdout(
+        own.label(),
+        &[
+            "set-environment",
+            "-g",
+            "PATH",
+            &format!("{}:/usr/bin:/bin", stub.display()),
+        ],
+    );
+    tmux_stdout(
+        own.label(),
+        &["set-option", "-p", "-t", "%0", "@atm-sidebar", "1"],
+    );
+    let hooks = atmd::control::workspace::WorkspaceHooks {
+        script_dir: data.path().join("hooks"),
+        socket: Some(own.label().into()),
+        tmux_prefix: format!("tmux -L {}", atmd::control::shell_quote(own.label())),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = RealTmuxClient::with_socket(own.label());
+    runtime.block_on(async {
+        atmd::control::workspace::install_resize_hooks(&client, "spawn-own", &hooks)
+            .await
+            .unwrap();
+        atmd::control::workspace::install_new_window_hook(&client, "spawn-own", &hooks)
+            .await
+            .unwrap();
+    });
+    for (hook, signal) in [
+        ("after-new-window", "spawn-hook-new"),
+        ("after-resize-window", "spawn-hook-window"),
+        ("after-resize-pane", "spawn-hook-pane"),
+    ] {
+        tmux_stdout(
+            own.label(),
+            &[
+                "set-hook",
+                "-a",
+                "-t",
+                "=spawn-own:",
+                hook,
+                &format!("wait-for -S {signal}"),
+            ],
+        );
+    }
+    let window = tmux_stdout(
+        own.label(),
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            "spawn-own:",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "/bin/sh",
+        ],
+    )
+    .trim()
+    .to_owned();
+    wait_for_signal(own.label(), "spawn-hook-new", Instant::now() + HANG_GUARD).unwrap();
+    assert_eq!(
+        tmux_stdout(
+            own.label(),
+            &["list-panes", "-t", &window, "-F", "#{@atm-sidebar}"]
+        )
+        .lines()
+        .filter(|line| *line == "1")
+        .count(),
+        1
+    );
+    tmux_stdout(own.label(), &["kill-window", "-t", &window]);
+    tmux_stdout(
+        own.label(),
+        &["resize-window", "-t", "%0", "-x", "300", "-y", "60"],
+    );
+    wait_for_signal(
+        own.label(),
+        "spawn-hook-window",
+        Instant::now() + HANG_GUARD,
+    )
+    .unwrap();
+    assert_eq!(
+        tmux_stdout(
+            own.label(),
+            &["display-message", "-p", "-t", "%0", "#{pane_width}"]
+        )
+        .trim(),
+        "40"
+    );
+    tmux_stdout(own.label(), &["resize-pane", "-t", "%0", "-x", "50"]);
+    wait_for_signal(own.label(), "spawn-hook-pane", Instant::now() + HANG_GUARD).unwrap();
+    assert_eq!(
+        tmux_stdout(
+            own.label(),
+            &["display-message", "-p", "-t", "%0", "#{pane_width}"]
+        )
+        .trim(),
+        "40"
+    );
+    let daemon = staged_spawn_daemon(&binary, own.label(), &daemon_cwd);
+    // Readiness already established bind/listen: no connect-until polling needed.
+    let stream = UnixStream::connect(&daemon.socket_path).unwrap();
+    let writer = stream.try_clone().unwrap();
+    let mut peer = Client {
+        reader: BufReader::new(stream),
+        writer,
+        request: "spawn connect".into(),
+        sent_at: Instant::now(),
+        deadline: Instant::now() + HANG_GUARD,
+    };
+    peer.send(ClientMessage::connect(Some("staged-spawn-proof".into())));
+    assert!(
+        matches!(peer.recv(),DaemonMessage::Connected{methods,..} if ["session.spawn_prepare_largest","session.spawn","session.spawn_type"].iter().all(|name|methods.iter().any(|m|m==name)))
+    );
+    let call = |peer: &mut Client, method: &str, params: serde_json::Value| {
+        peer.send(ClientMessage::request(
+            method.into(),
+            method.into(),
+            params,
+            Some("%0".into()),
+        ));
+        match peer.recv() {
+            DaemonMessage::Response { payload, .. } => payload,
+            other => panic!("spawn response {other:?}"),
+        }
+    };
+    let panes = |server: &PrivateTmux| {
+        tmux_stdout(server.label(), &["list-panes", "-a", "-F", "#{pane_id}"])
+    };
+    let own_before = panes(&own);
+    let foreign_before = panes(&foreign);
+    for (method, params) in [
+        (
+            "session.spawn_prepare_largest",
+            json!({"caller_server":foreign_socket,"caller_pane":"%0"}),
+        ),
+        (
+            "session.spawn",
+            json!({"caller_server":foreign_socket,"target_pane":target,"caller_pane_missing":false,"direction":"below","size":"50%","cwd":null}),
+        ),
+        (
+            "session.spawn_type",
+            json!({"caller_server":foreign_socket,"pane":target,"command":"/bin/false"}),
+        ),
+    ] {
+        assert!(
+            matches!(call(&mut peer,method,params),atm_protocol::ResponsePayload::Error(error) if error.code=="refused")
+        );
+        assert_eq!(panes(&own), own_before);
+        assert_eq!(panes(&foreign), foreign_before);
+    }
+    assert!(
+        matches!(call(&mut peer,"session.spawn_prepare_largest",json!({"caller_server":own_socket,"caller_pane":"%0"})),atm_protocol::ResponsePayload::Result(value) if value==json!({"target_pane":target,"cwd":cwd}))
+    );
+    for (index, direction) in ["left", "right", "above", "below"].into_iter().enumerate() {
+        let split = call(
+            &mut peer,
+            "session.spawn",
+            json!({"caller_server":own_socket,"target_pane":target,"caller_pane_missing":false,"direction":direction,"size":"50%","cwd":caller_cwd}),
+        );
+        let pane = match split {
+            atm_protocol::ResponsePayload::Result(value) => {
+                value["pane"].as_str().unwrap().to_owned()
+            }
+            other => panic!("split {other:?}"),
+        };
+        assert_eq!(
+            tmux_stdout(
+                own.label(),
+                &["display-message", "-p", "-t", &pane, "#{pane_start_path}"]
+            )
+            .trim(),
+            caller_cwd.to_str().unwrap(),
+            "split shell must start in the TUI caller's directory, before typed cd"
+        );
+        let output = data.path().join(format!("typed-{index}"));
+        let signal = format!("spawn-typed-{index}");
+        let command = format!(
+            "cd {} && printf 'typed;literal\\n' > {}; tmux -L {} wait-for -S {}",
+            atmd::control::shell_quote(cwd.to_str().unwrap()),
+            atmd::control::shell_quote(output.to_str().unwrap()),
+            atmd::control::shell_quote(own.label()),
+            signal
+        );
+        assert!(
+            matches!(call(&mut peer,"session.spawn_type",json!({"caller_server":own_socket,"pane":pane,"command":command})),atm_protocol::ResponsePayload::Result(value) if value.is_null())
+        );
+        wait_for_signal(own.label(), &signal, Instant::now() + HANG_GUARD).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"typed;literal\n");
+    }
+    assert_eq!(panes(&foreign), foreign_before);
+}
+
+// Breaks if kill retargets, ignores caller_server, or removes a foreign pane
+// with the same id. This uses the real daemon actor and real private tmux.
+#[test]
+fn daemon_kill_exact_target_and_foreign_server_refusal() {
+    if tmux_on_path().is_none() {
+        eprintln!("SKIP: tmux not on PATH");
+        return;
+    }
+    let Some(binary) = atmd_binary() else {
+        eprintln!("SKIP: atmd not built");
+        return;
+    };
+    let own = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "kill-own",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let foreign = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "kill-foreign",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let identity = |server: &PrivateTmux| {
+        let identity = tmux_stdout(
+            server.label(),
+            &["display-message", "-p", "#{socket_path}\t#{pid}"],
+        );
+        let (socket, pid) = identity.trim().split_once('\t').unwrap();
+        let root = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+        assert!(Path::new(socket)
+            .canonicalize()
+            .unwrap()
+            .starts_with(Path::new(&root).canonicalize().unwrap()));
+        assert!(pid.parse::<u32>().unwrap() > 1);
+        eprintln!("private tmux: {identity}");
+        socket.to_owned()
+    };
+    let own_socket = identity(&own);
+    let foreign_socket = identity(&foreign);
+    assert_ne!(own_socket, foreign_socket);
+    let split = |server: &PrivateTmux| {
+        tmux_stdout(
+            server.label(),
+            &[
+                "split-window",
+                "-d",
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "%0",
+                "/bin/sh",
+            ],
+        )
+        .trim()
+        .to_owned()
+    };
+    let target = split(&own);
+    assert_eq!(target, split(&foreign), "exercise colliding pane ids");
+    let panes = |server: &PrivateTmux| {
+        tmux_stdout(server.label(), &["list-panes", "-a", "-F", "#{pane_id}"])
+            .lines()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = std::collections::BTreeSet::from(["%0".to_owned(), target.clone()]);
+    assert_eq!(panes(&own), before);
+    assert_eq!(panes(&foreign), before);
+    let daemon = Daemon::spawn_ready(Command::new(&binary), own.label());
+    let mut client = Client::connect(&daemon.socket_path);
+    client.send(ClientMessage::connect(Some("kill-e2e".into())));
+    assert!(
+        matches!(client.recv(), DaemonMessage::Connected { methods, .. } if methods.iter().any(|m| m == "session.kill"))
+    );
+    client.send(ClientMessage::request(
+        "foreign".into(),
+        "session.kill".into(),
+        json!({"target": target, "caller_server": foreign_socket}),
+        Some("%0".into()),
+    ));
+    assert!(
+        matches!(client.recv(), DaemonMessage::Response { payload: atm_protocol::ResponsePayload::Error(error), .. }
+        if error.code == "refused" && error.message.contains("atmd controls tmux server"))
+    );
+    assert_eq!(panes(&own), before);
+    assert_eq!(panes(&foreign), before);
+    client.send(ClientMessage::request(
+        "own".into(),
+        "session.kill".into(),
+        json!({"target": target, "caller_server": own_socket}),
+        Some("%0".into()),
+    ));
+    assert!(
+        matches!(client.recv(), DaemonMessage::Response { payload: atm_protocol::ResponsePayload::Result(value), .. }
+        if value == json!({"pane": target}))
+    );
+    assert_eq!(
+        panes(&own),
+        std::collections::BTreeSet::from(["%0".to_owned()])
+    );
+    assert_eq!(panes(&foreign), before);
+}
+
+// Breaks if daemon membership matches prefixes or conflates equal pane ids
+// across servers. Real sockets/daemon/tmux; readiness is the existing log event.
+#[test]
+fn daemon_session_panes_exact_membership_and_foreign_server_refusal() {
+    if tmux_on_path().is_none() {
+        eprintln!("SKIP: tmux not on PATH");
+        return;
+    }
+    let Some(binary) = atmd_binary() else {
+        eprintln!("SKIP: atmd not built");
+        return;
+    };
+    let own = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "work",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let foreign = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "work",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let own_socket = tmux_stdout(own.label(), &["display-message", "-p", "#{socket_path}"]);
+    let foreign_socket = tmux_stdout(
+        foreign.label(),
+        &["display-message", "-p", "#{socket_path}"],
+    );
+    let root = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+    for socket in [&own_socket, &foreign_socket] {
+        assert!(Path::new(socket)
+            .canonicalize()
+            .unwrap()
+            .starts_with(Path::new(&root).canonicalize().unwrap()));
+    }
+    assert_ne!(own_socket, foreign_socket);
+    assert_eq!(
+        tmux_stdout(own.label(), &["list-panes", "-a", "-F", "#{pane_id}"]),
+        "%0"
+    );
+    assert_eq!(
+        tmux_stdout(foreign.label(), &["list-panes", "-a", "-F", "#{pane_id}"]),
+        "%0"
+    );
+    let second = tmux_stdout(
+        own.label(),
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            "work:",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "/bin/sh",
+        ],
+    );
+    tmux_stdout(
+        own.label(),
+        &["new-session", "-d", "-s", "work-extra", "/bin/sh"],
+    );
+    let daemon = Daemon::spawn_ready(Command::new(&binary), own.label());
+    let mut client = Client::connect(&daemon.socket_path);
+    client.send(ClientMessage::connect(Some("panes-e2e".into())));
+    assert!(
+        matches!(client.recv(), DaemonMessage::Connected { methods, .. } if methods.iter().any(|m|m=="session.panes"))
+    );
+    client.send(ClientMessage::request(
+        "foreign".into(),
+        "session.panes".into(),
+        json!({"session_name":"work","caller_server":foreign_socket}),
+        Some("%0".into()),
+    ));
+    assert!(
+        matches!(client.recv(), DaemonMessage::Response { payload:atm_protocol::ResponsePayload::Error(e), .. } if e.code=="refused")
+    );
+    for (name, expected) in [
+        ("work", json!(["%0", second])),
+        ("wor", json!([])),
+        ("missing", json!([])),
+    ] {
+        client.send(ClientMessage::request(
+            "own".into(),
+            "session.panes".into(),
+            json!({"session_name":name,"caller_server":own_socket}),
+            Some("%0".into()),
+        ));
+        assert!(
+            matches!(client.recv(), DaemonMessage::Response { payload:atm_protocol::ResponsePayload::Result(v), .. } if v==json!({"pane_ids":expected}))
+        );
+    }
+    assert_eq!(
+        tmux_stdout(foreign.label(), &["list-panes", "-a", "-F", "#{pane_id}"]),
+        "%0"
+    );
+}
+
+// Role metadata uses the same identity fence as pane control. No harness
+// starts; command completion and the existing log-ready event synchronize it.
+#[test]
+fn daemon_roles_read_set_clear_and_foreign_equal_ids() {
+    if tmux_on_path().is_none() {
+        eprintln!("SKIP: tmux not on PATH");
+        return;
+    }
+    let Some(binary) = atmd_binary() else {
+        eprintln!("SKIP: atmd not built");
+        return;
+    };
+    let own = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "roles-own",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let foreign = PrivateTmux::start_with_label_session_env(
+        &PrivateTmux::fresh_label(),
+        "roles-foreign",
+        std::iter::empty::<(&str, &str)>(),
+    );
+    let identity = |server: &PrivateTmux| {
+        let identity = tmux_stdout(
+            server.label(),
+            &["display-message", "-p", "#{socket_path}\t#{pid}"],
+        );
+        let (socket, pid) = identity.trim().split_once('\t').unwrap();
+        let root = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+        assert!(Path::new(socket)
+            .canonicalize()
+            .unwrap()
+            .starts_with(Path::new(&root).canonicalize().unwrap()));
+        assert!(pid.parse::<u32>().unwrap() > 1);
+        socket.to_owned()
+    };
+    let own_socket = identity(&own);
+    let foreign_socket = identity(&foreign);
+    assert_ne!(own_socket, foreign_socket);
+    let panes = |server: &PrivateTmux| {
+        tmux_stdout(
+            server.label(),
+            &["list-panes", "-a", "-F", "#{pane_id}\t#{@atm-role}"],
+        )
+    };
+    assert_eq!(
+        panes(&own),
+        panes(&foreign),
+        "exercise colliding server-local pane ids"
+    );
+    let target = panes(&own).split_whitespace().next().unwrap().to_owned();
+    let untouched = panes(&foreign);
+    // spawn_ready already retains logs and signals only after bind/listen.
+    // Connect directly: no polling helper is needed after that event.
+    let daemon = Daemon::spawn_ready(Command::new(&binary), own.label());
+    let stream = UnixStream::connect(&daemon.socket_path).unwrap();
+    let mut client = Client {
+        writer: stream.try_clone().unwrap(),
+        reader: BufReader::new(stream),
+        request: "roles connect".into(),
+        sent_at: Instant::now(),
+        deadline: Instant::now() + HANG_GUARD,
+    };
+    client.send(ClientMessage::connect(Some("roles-e2e".into())));
+    assert!(
+        matches!(client.recv(),DaemonMessage::Connected{methods,..} if methods.iter().any(|m|m=="session.roles") && methods.iter().any(|m|m=="session.role_set"))
+    );
+    for role in [json!("coordinator"), Value::Null, Value::Null] {
+        client.send(ClientMessage::request(
+            "set".into(),
+            "session.role_set".into(),
+            json!({"caller_server":own_socket,"pane":target,"role":role}),
+            Some(target.clone()),
+        ));
+        assert!(
+            matches!(client.recv(),DaemonMessage::Response{payload:atm_protocol::ResponsePayload::Result(value),..} if value==json!({"pane":target,"role":role}))
+        );
+        client.send(ClientMessage::request(
+            "roles".into(),
+            "session.roles".into(),
+            json!({"caller_server":own_socket}),
+            None,
+        ));
+        let expected = if role.is_null() {
+            json!({"coordinator_panes":[]})
+        } else {
+            json!({"coordinator_panes":[target]})
+        };
+        assert!(
+            matches!(client.recv(),DaemonMessage::Response{payload:atm_protocol::ResponsePayload::Result(value),..} if value==expected)
+        );
+    }
+    let own_before = panes(&own);
+    for (method, params) in [
+        ("session.roles", json!({"caller_server":foreign_socket})),
+        (
+            "session.role_set",
+            json!({"caller_server":foreign_socket,"pane":target,"role":"coordinator"}),
+        ),
+        (
+            "session.role_set",
+            json!({"caller_server":foreign_socket,"pane":target,"role":null}),
+        ),
+    ] {
+        client.send(ClientMessage::request(
+            "foreign".into(),
+            method.into(),
+            params,
+            None,
+        ));
+        assert!(
+            matches!(client.recv(),DaemonMessage::Response{payload:atm_protocol::ResponsePayload::Error(error),..} if error.code=="refused")
+        );
+        assert_eq!(panes(&own), own_before);
+        assert_eq!(panes(&foreign), untouched);
     }
 }
 
@@ -1835,7 +2844,7 @@ async fn scenario_atm_spawn_defaults_to_tmux_pane(env: &E2eEnv, probe_pane: &str
 /// windows opened after creation. An isolated config names the pi stand-in,
 /// whose launch in the agent pane is checked before the hooks.
 async fn scenario_workspace_create(env: &E2eEnv) {
-    let create_session_name = format!("jghcrt{}", std::process::id());
+    let create_session_name = private_session_name("jghcrt");
     let create_socket_label = format!("atm-{create_session_name}");
     let create_data_dir = awkward_data_dir();
     let config_home = tempfile::tempdir().expect("create workspace config tempdir");
@@ -2266,7 +3275,7 @@ async fn scenario_workspace_create(env: &E2eEnv) {
     );
     drop(client);
 
-    let mut cmd = Command::new("tmux");
+    let mut cmd = tmux_command();
     cmd.args([
         "-L",
         create_tmux.label(),
@@ -2337,7 +3346,7 @@ async fn scenario_workspace_create(env: &E2eEnv) {
 /// installed, and the second invocation is idempotent and runs the resize
 /// script once.
 async fn scenario_workspace_attach(env: &E2eEnv) {
-    let attach_session_name = format!("jghatt{}", std::process::id());
+    let attach_session_name = private_session_name("jghatt");
     let attach_socket_label = format!("atm-{attach_session_name}");
     // Hooks/scripts go to a sandboxed XDG_DATA_HOME so the test never
     // writes to `~/.local/share/atm/`.
@@ -2353,7 +3362,7 @@ async fn scenario_workspace_attach(env: &E2eEnv) {
     // since per-window sidebar injection is the loop attach owns.
     let tmux_attach_client = RealTmuxClient::with_socket(attach_tmux.label().to_string());
     for label in ["new-window (2nd)", "new-window (3rd)"] {
-        let mut cmd = Command::new("tmux");
+        let mut cmd = tmux_command();
         cmd.args([
             "-L",
             attach_tmux.label(),
@@ -2832,7 +3841,7 @@ async fn scenario_workspace_attach_autopick_rejects_unsupported_name(env: &E2eEn
     // auto-pick skips. A control-mode client attaches without a tty and
     // exits when stdin closes, leaving "my work" the most recently attached.
     // The deadline turns a client that ignores EOF into a failure, not a hang.
-    let mut ctl = Command::new("tmux")
+    let mut ctl = tmux_command()
         .args([
             "-L",
             tmux.label(),
@@ -2975,7 +3984,7 @@ async fn create_workspace_with_pi_default(
     prefix: &str,
     spawn_pi_args: Option<&str>,
 ) -> String {
-    let session_name = format!("{prefix}{}", std::process::id());
+    let session_name = private_session_name(prefix);
     let data_dir = tempfile::tempdir().expect("create pi data tempdir");
     let config_home = tempfile::tempdir().expect("create pi config tempdir");
     let standin_dir = tempfile::tempdir().expect("create pi stand-in tempdir");
@@ -3097,7 +4106,7 @@ fn top_non_sidebar_pane(socket_label: &str, session: &str) -> String {
 /// Scenario 5e — an unknown configured harness fails `atm workspace create`
 /// before it runs tmux, so no server, session, hook or script is left behind.
 async fn scenario_workspace_create_rejects_unknown_harness(env: &E2eEnv) {
-    let session_name = format!("jghbad{}", std::process::id());
+    let session_name = private_session_name("jghbad");
     let data_dir = tempfile::tempdir().expect("create unknown-harness data tempdir");
     let config_home = tempfile::tempdir().expect("create unknown-harness config tempdir");
     // Kills the server if create wrongly made one.
@@ -3187,7 +4196,7 @@ fn write_pi_standin(dir: &Path, log: &Path) -> PathBuf {
 /// and forwards it to the real tmux, except that lone `Enter`, so the pane
 /// never runs a harness.
 async fn scenario_workspace_create_sends_default_keys(env: &E2eEnv) {
-    let session_name = format!("jghkeys{}", std::process::id());
+    let session_name = private_session_name("jghkeys");
     let data_dir = tempfile::tempdir().expect("create keys data tempdir");
     let config_home = tempfile::tempdir().expect("create keys config tempdir");
     let wrapper_dir = tempfile::tempdir().expect("create tmux wrapper tempdir");
@@ -3268,19 +4277,34 @@ const PREVIEW_STEP_TIMEOUT: Duration = HANG_GUARD;
 /// Runs `tmux -L <label> <args>` and returns stdout.
 fn tmux_stdout(socket_label: &str, args: &[&str]) -> String {
     let stdout = run_tmux_or_panic(
-        Command::new("tmux").args(["-L", socket_label]).args(args),
+        tmux_command().args(["-L", socket_label]).args(args),
         args.first().copied().unwrap_or("tmux"),
     );
     String::from_utf8_lossy(&stdout).trim_end().to_string()
 }
 
-/// A stand-in daemon on `socket`. It answers `connect` with Connected and
-/// `subscribe` with `sessions`, then hands over the subscriber's stream so
-/// the scenario sends each later event itself.
-fn fake_tui_daemon(socket: &Path, sessions: Vec<SessionView>) -> mpsc::Receiver<UnixStream> {
+/// A stand-in daemon on the existing session connection. The scenario still
+/// supplies session events; capture and membership execute on the daemon side.
+struct PreviewDaemonPeer {
+    stream: UnixStream,
+    writes: std::sync::Arc<std::sync::Mutex<()>>,
+    panes_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn fake_tui_daemon(
+    socket: &Path,
+    sessions: Vec<SessionView>,
+    capture_tmux: PathBuf,
+    label: String,
+    captures: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+) -> mpsc::Receiver<PreviewDaemonPeer> {
     let listener = UnixListener::bind(socket).expect("bind");
-    let connected =
-        serde_json::to_string(&DaemonMessage::connected("tui".to_string())).expect("serialize");
+    let connected = serde_json::to_string(&DaemonMessage::Connected {
+        protocol_version: ProtocolVersion::new(1, 1),
+        client_id: "tui".into(),
+        methods: vec!["session.capture".into(), "session.panes".into()],
+    })
+    .expect("serialize");
     let list = serde_json::to_string(&DaemonMessage::session_list(sessions)).expect("serialize");
     let (subscriber_tx, subscriber_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -3301,8 +4325,88 @@ fn fake_tui_daemon(socket: &Path, sessions: Vec<SessionView>) -> mpsc::Receiver<
             read_frame(&mut reader, deadline).expect("TUI Subscribe");
             write_bytes(&mut stream, format!("{list}\n").as_bytes(), deadline)
                 .expect("reply SessionList");
-            let _ = subscriber_tx.send(stream);
-            return;
+            let writes = std::sync::Arc::new(std::sync::Mutex::new(()));
+            let panes_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _ = subscriber_tx.send(PreviewDaemonPeer {
+                stream: stream.try_clone().unwrap(),
+                writes: writes.clone(),
+                panes_requests: panes_requests.clone(),
+            });
+            loop {
+                let deadline = Instant::now() + HANG_GUARD;
+                let Ok(frame) = read_frame(&mut reader, deadline) else {
+                    return;
+                };
+                let message: ClientMessage = serde_json::from_str(&frame).unwrap();
+                if let atm_protocol::MessageType::Request {
+                    id,
+                    method,
+                    params,
+                    from_pane,
+                } = message.message
+                {
+                    if method == "session.panes" {
+                        assert_eq!(method, "session.panes");
+                        let session_name = params["session_name"].as_str().unwrap();
+                        let rows = tmux_stdout(
+                            &label,
+                            &["list-panes", "-a", "-F", "#{pane_id}\t#{session_name}"],
+                        );
+                        let mut ids: Vec<_> = rows
+                            .lines()
+                            .filter_map(|row| row.split_once('\t'))
+                            .filter(|(_, name)| *name == session_name)
+                            .map(|(id, _)| id.to_owned())
+                            .collect();
+                        ids.sort();
+                        ids.dedup();
+                        let response = DaemonMessage::response_ok(id, json!({"pane_ids":ids}));
+                        let _write = writes.lock().unwrap();
+                        write_bytes(
+                            &mut stream,
+                            format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                            deadline,
+                        )
+                        .unwrap();
+                        panes_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        assert_eq!(method, "session.capture");
+                        assert_eq!(params["tail"], Value::Null);
+                        assert_eq!(params["prompt"], false);
+                        assert!(from_pane.is_some());
+                        let target = params["target"].as_str().unwrap();
+                        captures.lock().unwrap().push(params.clone());
+                        let output = command_output(
+                            Command::new(&capture_tmux)
+                                .arg("-u")
+                                .env_remove("TMUX")
+                                .env_remove("TMUX_PANE")
+                                .args(["-L", &label, "capture-pane", "-t", target, "-p"]),
+                        );
+                        let reply = if output.status.success() {
+                            let text = String::from_utf8(output.stdout).unwrap();
+                            let mut lines: Vec<_> = text.lines().map(str::to_owned).collect();
+                            while lines.last().is_some_and(|line| line.trim().is_empty()) {
+                                lines.pop();
+                            }
+                            DaemonMessage::response_ok(id, json!({"lines": lines}))
+                        } else {
+                            DaemonMessage::response_err(
+                                id,
+                                "internal",
+                                &String::from_utf8_lossy(&output.stderr),
+                            )
+                        };
+                        let line = format!("{}\n", serde_json::to_string(&reply).unwrap());
+                        let _write = writes.lock().unwrap();
+                        if write_bytes(&mut stream, line.as_bytes(), Instant::now() + HANG_GUARD)
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
         }
     });
     subscriber_rx
@@ -3338,12 +4442,14 @@ fn preview_session_c(pane: Option<&str>) -> SessionView {
 struct PreviewRig {
     socket_label: String,
     tui_pane: String,
-    daemon: Option<UnixStream>,
+    daemon: Option<PreviewDaemonPeer>,
     capture_hold: PathBuf,
+    captures: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
 }
 
-/// Only the TUI's private PATH uses this wrapper; the test's screen captures
-/// still reach real tmux. A lock stalls future capture replies, not the UI.
+/// The stand-in daemon uses this wrapper for captures; the TUI uses it only
+/// for unmigrated effects. The test's screen reads still reach real tmux.
+/// A lock stalls the daemon's capture response, never the render loop.
 fn preview_tmux_wrapper(dir: &Path, label: &str) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -3369,7 +4475,7 @@ fn shell_word(text: &str) -> String {
 }
 
 fn quiet_tmux(label: &str, args: &[&str]) {
-    match Command::new("tmux")
+    match tmux_command()
         .args(["-L", label])
         .args(args)
         .stdout(Stdio::null())
@@ -3415,8 +4521,8 @@ impl Drop for PreviewRig {
                     eprintln!("the TUI outlived its pane's hang guard");
                     break;
                 };
-                let _ = daemon.set_read_timeout(Some(remaining));
-                match daemon.read(&mut buf) {
+                let _ = daemon.stream.set_read_timeout(Some(remaining));
+                match daemon.stream.read(&mut buf) {
                     Ok(0) => break,
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -3480,8 +4586,10 @@ impl PreviewRig {
 
     fn send(&mut self, message: &DaemonMessage) {
         let line = serde_json::to_string(message).expect("serialize");
+        let daemon = self.daemon.as_mut().expect("the TUI subscribed");
+        let _write = daemon.writes.lock().unwrap();
         write_bytes(
-            self.daemon.as_mut().expect("the TUI subscribed"),
+            &mut daemon.stream,
             format!("{line}\n").as_bytes(),
             Instant::now() + HANG_GUARD,
         )
@@ -3551,8 +4659,15 @@ fn start_preview_tui(
 ) -> PreviewRig {
     let label = env.tmux_server.label();
     let socket = dir.join("atmd.sock");
-    let subscriber = fake_tui_daemon(&socket, sessions);
     let wrapper = preview_tmux_wrapper(dir, label);
+    let captures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = fake_tui_daemon(
+        &socket,
+        sessions,
+        wrapper.join("tmux"),
+        label.into(),
+        captures.clone(),
+    );
     let path_env = format!(
         "PATH={}:{}",
         wrapper.display(),
@@ -3595,6 +4710,7 @@ fn start_preview_tui(
         tui_pane,
         daemon: None,
         capture_hold: dir.join("hold-capture"),
+        captures,
     };
     let daemon = subscriber
         .recv_timeout(PREVIEW_STEP_TIMEOUT)
@@ -3624,6 +4740,14 @@ async fn scenario_tui_capture_preview(env: &E2eEnv) {
     // A key: selecting a row targets its pane, and moving on retargets.
     rig.press("j");
     rig.wait_for_preview("key to session-a", PREVIEW_MARKERS[0]);
+    assert!(
+        rig.captures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|params| params["target"] == pane_a),
+        "preview must come from session.capture, not a client-side tmux read"
+    );
     rig.press("j");
     rig.wait_for_preview("key to session-b", PREVIEW_MARKERS[1]);
 
@@ -3757,6 +4881,12 @@ async fn scenario_tui_capture_preview_filter(env: &E2eEnv) {
     );
     rig.press("j");
     rig.wait_for_preview("filter: key to session-a", PREVIEW_MARKERS[0]);
+    assert!(rig
+        .captures
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|params| params["target"] == pane_a));
     rig.press("j");
     rig.wait_for_preview("filter: key to session-b", PREVIEW_MARKERS[1]);
 
@@ -3771,6 +4901,15 @@ async fn scenario_tui_capture_preview_filter(env: &E2eEnv) {
     hide(pane_a);
     hide(pane_c);
     rig.wait_for_no_preview("filter hides every session");
+    assert!(
+        rig.daemon
+            .as_ref()
+            .unwrap()
+            .panes_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "filter bypassed daemon membership"
+    );
 }
 
 /// Independent of E2eEnv, which would start a real daemon before the test.
@@ -3789,6 +4928,7 @@ fn atm_role_pane_targets_need_no_daemon() {
     let tmux = |args: &[&str]| {
         role_support::run(
             Command::new(&tmux_path)
+                .arg("-u")
                 .args(["-L", server.label()])
                 .args(args)
                 .env_remove("TMUX")
@@ -3914,7 +5054,7 @@ async fn workspace_scripts_do_not_cross_tmux_sockets() {
     };
     for reverse in [false, true] {
         let data = awkward_data_dir();
-        let session = format!("shared-{}-{}", std::process::id(), u8::from(reverse));
+        let session = format!("{}-{}", private_session_name("shared-"), u8::from(reverse));
         let labels = [PrivateTmux::fresh_label(), format!("atm-{session}")];
         let servers: Vec<_> = labels
             .iter()
@@ -4147,7 +5287,7 @@ struct PaneEntry {
 /// `@atm-sidebar` option value. Avoids `RealTmuxClient::list_panes`
 /// because we need the option, not just the standard fields.
 fn list_panes_with_sidebar_marker(socket_label: &str) -> Option<Vec<PaneEntry>> {
-    let output = command_output(Command::new("tmux").args([
+    let output = command_output(tmux_command().args([
         "-L",
         socket_label,
         "list-panes",
@@ -4219,7 +5359,7 @@ impl ControlClient {
     fn attach(socket_label: &str, session: &str) -> Self {
         let deadline = Instant::now() + HANG_GUARD;
         let (reader, writer) = UnixStream::pair().expect("control output socketpair");
-        let child = Command::new("tmux")
+        let child = tmux_command()
             .args([
                 "-L",
                 socket_label,
@@ -4324,7 +5464,8 @@ async fn press_prefix_key(socket_label: &str, session: &str, key: &str, done: im
 /// Whether the `tmux` on PATH is at least `major.minor`. A version tmux
 /// prints without numbers (a `master` build) counts as new.
 fn tmux_version_at_least(major: u32, minor: u32) -> bool {
-    let output = command_output(Command::new("tmux").arg("-V"));
+    let label = PrivateTmux::fresh_label();
+    let output = command_output(tmux_command().args(["-L", &label, "-V"]));
     let version = String::from_utf8_lossy(&output.stdout);
     let numbers: Vec<u32> = version
         .split_whitespace()
@@ -4348,7 +5489,7 @@ fn tmux_version_at_least(major: u32, minor: u32) -> bool {
 /// Tiny `tmux -L <label> ...` helper for scenario 5's hook-inspection
 /// queries. Returns stdout on success.
 fn tmux_run_capture(socket_label: &str, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("tmux");
+    let mut cmd = tmux_command();
     cmd.args(["-L", socket_label]);
     cmd.args(args);
     let output = try_command_output(&mut cmd)

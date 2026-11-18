@@ -6,19 +6,37 @@
 //! Per CLAUDE.md: Tests CAN use `.unwrap()` and `.expect()` - this is allowed.
 //! We test the panic-free behavior of production code through assertions.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)] // test helpers may panic
+
 use atm_core::{AgentType, LifecycleEvent, Model, SessionDomain, SessionId, Tool};
 use atmd::registry::{
     spawn_registry, spawn_registry_with_cancel, supervise_actor, ActorStopped, RegistryError,
     RegistryHandle, RemovalReason, SessionEvent, MAX_SESSIONS,
 };
 use atmd::server::parse_status_line;
+use std::future::{poll_fn, Future};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use tokio::sync::broadcast;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Test Helpers
 // ============================================================================
+
+const EVENT_GUARD: Duration = Duration::from_secs(30);
+
+async fn registered(events: &mut broadcast::Receiver<SessionEvent>, id: &str) {
+    let event = timeout(EVENT_GUARD, events.recv())
+        .await
+        .expect("registration event did not arrive")
+        .expect("registry events closed");
+    assert!(
+        matches!(&event, SessionEvent::Registered { session_id, .. } if session_id.as_str() == id),
+        "expected registration for {id}, got {event:?}"
+    );
+}
 
 /// Helper to create a test session with default values.
 fn create_test_session(id: &str) -> SessionDomain {
@@ -187,7 +205,7 @@ async fn test_event_subscription_registered() {
     handle.register(session).await.unwrap();
 
     // Should receive Registered event
-    let event = timeout(Duration::from_secs(1), rx.recv())
+    let event = timeout(EVENT_GUARD, rx.recv())
         .await
         .expect("should receive event within timeout")
         .expect("event should be Some");
@@ -213,8 +231,7 @@ async fn test_event_subscription_removed() {
     let session = create_test_session("event-remove-test");
     handle.register(session).await.unwrap();
 
-    // Drain registered event
-    let _ = timeout(Duration::from_millis(100), rx.recv()).await;
+    registered(&mut rx, "event-remove-test").await;
 
     // Remove
     handle
@@ -223,7 +240,7 @@ async fn test_event_subscription_removed() {
         .unwrap();
 
     // Should receive Removed event
-    let event = timeout(Duration::from_secs(1), rx.recv())
+    let event = timeout(EVENT_GUARD, rx.recv())
         .await
         .expect("should receive event within timeout")
         .expect("event should be Some");
@@ -249,8 +266,7 @@ async fn test_event_subscription_hook_event_update() {
     let session = create_test_session("hook-event-test");
     handle.register(session).await.unwrap();
 
-    // Drain registered event
-    let _ = timeout(Duration::from_millis(100), rx.recv()).await;
+    registered(&mut rx, "hook-event-test").await;
 
     // Apply lifecycle event
     handle
@@ -269,7 +285,7 @@ async fn test_event_subscription_hook_event_update() {
         .unwrap();
 
     // Should receive Updated event
-    let event = timeout(Duration::from_secs(1), rx.recv())
+    let event = timeout(EVENT_GUARD, rx.recv())
         .await
         .expect("should receive event within timeout")
         .expect("event should be Some");
@@ -368,9 +384,7 @@ async fn test_cleanup_fresh_sessions_not_removed() {
     // Trigger cleanup
     handle.cleanup_stale().await;
 
-    // Small delay to let actor process
-    sleep(Duration::from_millis(50)).await;
-
+    // The following same-handle reply fences the queued cleanup command.
     // Fresh session should still exist
     assert!(
         handle
@@ -631,8 +645,7 @@ async fn test_hook_event_session_end() {
     let session = create_test_session("session-end-test");
     handle.register(session).await.unwrap();
 
-    // Drain registered event
-    let _ = timeout(Duration::from_millis(100), rx.recv()).await;
+    registered(&mut rx, "session-end-test").await;
 
     // Apply SessionEnd hook
     handle
@@ -656,7 +669,7 @@ async fn test_hook_event_session_end() {
     );
 
     // Should receive Removed event with SessionEnded reason
-    let event = timeout(Duration::from_secs(1), rx.recv())
+    let event = timeout(EVENT_GUARD, rx.recv())
         .await
         .expect("should receive event within timeout")
         .expect("event should be Some");
@@ -762,15 +775,15 @@ async fn test_multiple_subscribers() {
     handle.register(session).await.unwrap();
 
     // All subscribers should receive the event
-    let event1 = timeout(Duration::from_secs(1), rx1.recv())
+    let event1 = timeout(EVENT_GUARD, rx1.recv())
         .await
         .expect("rx1 should receive")
         .expect("event1 should be Some");
-    let event2 = timeout(Duration::from_secs(1), rx2.recv())
+    let event2 = timeout(EVENT_GUARD, rx2.recv())
         .await
         .expect("rx2 should receive")
         .expect("event2 should be Some");
-    let event3 = timeout(Duration::from_secs(1), rx3.recv())
+    let event3 = timeout(EVENT_GUARD, rx3.recv())
         .await
         .expect("rx3 should receive")
         .expect("event3 should be Some");
@@ -922,8 +935,7 @@ async fn test_hook_event_forwards_agent_fields() {
     let session = create_test_session("parent-for-subagent");
     handle.register(session).await.unwrap();
 
-    // Drain registered event
-    let _ = timeout(Duration::from_millis(100), rx.recv()).await;
+    registered(&mut rx, "parent-for-subagent").await;
 
     // Send SubagentStart hook with agent_id and agent_type
     handle
@@ -1012,36 +1024,126 @@ async fn test_project_resolution_on_discovery() {
 // CWD Change Detection Tests
 // ============================================================================
 
-/// The refresh task ticks about 1 ms after it spawns. Waits that out, so a test
-/// proves its own code path requested a lookup, not that tick.
-async fn pass_first_refresh_tick() {
-    sleep(Duration::from_millis(50)).await;
+/// Keep the real spawned actor, but join its aborted maintenance sources and
+/// fence any already-queued refresh before registering a session. Only the
+/// command under test can request git work, regardless of wall-clock load.
+struct GitRegistry {
+    handle: RegistryHandle,
+    actor: tokio::task::JoinHandle<()>,
+    cancel: CancellationToken,
 }
 
-/// Git context resolves off the actor, so a session's branch fills in shortly
-/// after a command. Returns the session's view once its branch is `branch`, or
-/// after a timeout, so the caller's assertions report what it has instead. The
-/// timeout stays well under the 5 s refresh interval, so a later refresh tick
-/// can't stand in for the code path a test names; see `pass_first_refresh_tick`.
+impl GitRegistry {
+    async fn spawn() -> Self {
+        let cancel = CancellationToken::new();
+        let (handle, tasks) = spawn_registry_with_cancel(cancel.clone());
+        for task in tasks.maintenance {
+            task.abort();
+            let result = timeout(EVENT_GUARD, task).await.expect("maintenance join");
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "maintenance panicked: {error}");
+            }
+        }
+        // An actor reply orders any tick queued before its source stopped.
+        timeout(EVENT_GUARD, handle.get_all_sessions())
+            .await
+            .expect("refresh command fence");
+        Self {
+            handle,
+            actor: tasks.actor,
+            cancel,
+        }
+    }
+
+    async fn shutdown(mut self) {
+        self.cancel.cancel();
+        timeout(EVENT_GUARD, &mut self.actor)
+            .await
+            .expect("registry shutdown")
+            .expect("registry actor panicked");
+    }
+}
+
+impl Drop for GitRegistry {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Subscribe before the action, then await its matching git-result update.
+/// Events already queued before this wait are consumed without snapshot polls.
 async fn view_with_branch(
-    handle: &RegistryHandle,
+    events: &mut broadcast::Receiver<SessionEvent>,
     id: &str,
     branch: &str,
 ) -> Option<atm_core::SessionView> {
-    for _ in 0..400 {
-        let view = handle.get_session(SessionId::new(id)).await?;
-        if view.worktree_branch.as_deref() == Some(branch) {
-            return Some(view);
+    timeout(EVENT_GUARD, async {
+        loop {
+            if let SessionEvent::Updated { session } = events.recv().await.unwrap() {
+                if session.id.as_str() == id && session.worktree_branch.as_deref() == Some(branch) {
+                    return Some(*session);
+                }
+            }
         }
-        sleep(Duration::from_millis(5)).await;
-    }
-    handle.get_session(SessionId::new(id)).await
+    })
+    .await
+    .expect("matching branch update did not arrive")
+}
+
+#[tokio::test]
+async fn test_unrelated_refresh_cannot_satisfy_cwd_branch_wait() {
+    let (events, mut rx) = broadcast::channel(8);
+    let mut unrelated = create_test_session("unrelated-refresh");
+    unrelated.worktree_branch = Some("feature-x".into());
+    events
+        .send(SessionEvent::Updated {
+            session: Box::new(atm_core::SessionView::from_domain(&unrelated)),
+        })
+        .unwrap();
+
+    let waiting = view_with_branch(&mut rx, "cwd-change-test", "feature-x");
+    tokio::pin!(waiting);
+    poll_fn(|cx| {
+        assert!(
+            waiting.as_mut().poll(cx).is_pending(),
+            "an unrelated refresh cannot satisfy the CWD-change branch wait"
+        );
+        Poll::Ready(())
+    })
+    .await;
+
+    let mut target = create_test_session("cwd-change-test");
+    target.worktree_branch = Some("main".into());
+    events
+        .send(SessionEvent::Updated {
+            session: Box::new(atm_core::SessionView::from_domain(&target)),
+        })
+        .unwrap();
+    poll_fn(|cx| {
+        assert!(
+            waiting.as_mut().poll(cx).is_pending(),
+            "the target's old branch cannot satisfy the CWD-change branch wait"
+        );
+        Poll::Ready(())
+    })
+    .await;
+
+    target.worktree_branch = Some("feature-x".into());
+    events
+        .send(SessionEvent::Updated {
+            session: Box::new(atm_core::SessionView::from_domain(&target)),
+        })
+        .unwrap();
+    let view = waiting.await.unwrap();
+    assert_eq!(view.id.as_str(), "cwd-change-test");
+    assert_eq!(view.worktree_branch.as_deref(), Some("feature-x"));
 }
 
 #[tokio::test]
 async fn test_status_line_cwd_change_updates_git_info() {
-    let handle = spawn_registry();
-    pass_first_refresh_tick().await;
+    let registry = GitRegistry::spawn().await;
+    let handle = &registry.handle;
+    let mut rx = handle.subscribe();
 
     // Create two temp repos to simulate a worktree switch
     let dir = tempfile::tempdir().unwrap();
@@ -1066,7 +1168,7 @@ async fn test_status_line_cwd_change_updates_git_info() {
         .await
         .expect("should register");
 
-    let view = view_with_branch(&handle, "cwd-change-test", "main")
+    let view = view_with_branch(&mut rx, "cwd-change-test", "main")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("main"));
@@ -1094,7 +1196,7 @@ async fn test_status_line_cwd_change_updates_git_info() {
         .expect("status update should succeed");
 
     // Verify git info was re-resolved to repo_b
-    let view = view_with_branch(&handle, "cwd-change-test", "feature-x")
+    let view = view_with_branch(&mut rx, "cwd-change-test", "feature-x")
         .await
         .unwrap();
     assert_eq!(
@@ -1113,11 +1215,14 @@ async fn test_status_line_cwd_change_updates_git_info() {
         "cost should be updated from status line, got {}",
         view.cost_usd
     );
+
+    registry.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_status_line_same_cwd_does_not_re_resolve() {
-    let handle = spawn_registry();
+    let registry = GitRegistry::spawn().await;
+    let handle = &registry.handle;
     let mut rx = handle.subscribe();
 
     let dir = tempfile::tempdir().unwrap();
@@ -1139,8 +1244,10 @@ async fn test_status_line_same_cwd_does_not_re_resolve() {
         .await
         .unwrap();
 
-    // Drain events
-    while timeout(Duration::from_millis(50), rx.recv()).await.is_ok() {}
+    // Registration's git-result update fences all initial events/lookups.
+    view_with_branch(&mut rx, "same-cwd-test", "main")
+        .await
+        .expect("initial git context");
 
     // Send status line with SAME cwd
     let status_json = serde_json::json!({
@@ -1164,10 +1271,12 @@ async fn test_status_line_same_cwd_does_not_re_resolve() {
         .unwrap();
 
     // Session should still have correct info
-    let view = view_with_branch(&handle, "same-cwd-test", "main")
+    let view = view_with_branch(&mut rx, "same-cwd-test", "main")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("main"));
+
+    registry.shutdown().await;
 }
 
 // ============================================================================
@@ -1259,8 +1368,9 @@ async fn test_rescan_preserves_metadata_for_existing_pid() {
 
 #[tokio::test]
 async fn test_rescan_refreshes_git_info() {
-    let handle = spawn_registry();
-    pass_first_refresh_tick().await;
+    let registry = GitRegistry::spawn().await;
+    let handle = &registry.handle;
+    let mut rx = handle.subscribe();
 
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("rescan-git-repo");
@@ -1281,7 +1391,7 @@ async fn test_rescan_refreshes_git_info() {
         .await
         .unwrap();
 
-    let view = view_with_branch(&handle, "rescan-git-test", "old-branch")
+    let view = view_with_branch(&mut rx, "rescan-git-test", "old-branch")
         .await
         .unwrap();
     assert_eq!(view.worktree_branch.as_deref(), Some("old-branch"));
@@ -1301,7 +1411,7 @@ async fn test_rescan_refreshes_git_info() {
         .await
         .unwrap();
 
-    let view = view_with_branch(&handle, "rescan-git-test-2", "new-branch")
+    let view = view_with_branch(&mut rx, "rescan-git-test-2", "new-branch")
         .await
         .unwrap();
     assert_eq!(
@@ -1309,6 +1419,8 @@ async fn test_rescan_refreshes_git_info() {
         Some("new-branch"),
         "rescan should pick up updated branch"
     );
+
+    registry.shutdown().await;
 }
 
 // ============================================================================
@@ -1327,13 +1439,13 @@ async fn test_cancel_stops_and_joins_registry_tasks() {
     cancel.cancel();
 
     // Every task stops, including the maintenance tasks that hold senders.
-    timeout(Duration::from_secs(1), tasks.actor)
+    timeout(EVENT_GUARD, tasks.actor)
         .await
         .expect("actor should stop on cancel")
         .expect("actor should not panic");
     assert_eq!(tasks.maintenance.len(), 2);
     for task in tasks.maintenance {
-        timeout(Duration::from_secs(1), task)
+        timeout(EVENT_GUARD, task)
             .await
             .expect("maintenance task should stop on cancel")
             .expect("maintenance task should not panic");
@@ -1352,12 +1464,9 @@ async fn test_supervise_actor_cancels_when_actor_panics() {
     // Stand-in for an actor that panics while handling a command
     let actor = tokio::spawn(async { panic!("injected actor panic") });
 
-    let result = timeout(
-        Duration::from_secs(1),
-        supervise_actor(actor, cancel.clone()),
-    )
-    .await
-    .expect("supervisor should return once the actor dies");
+    let result = timeout(EVENT_GUARD, supervise_actor(actor, cancel.clone()))
+        .await
+        .expect("supervisor should return once the actor dies");
 
     assert!(
         matches!(&result, Err(ActorStopped(reason)) if reason.contains("injected actor panic")),
@@ -1380,7 +1489,7 @@ async fn test_supervise_actor_reports_panic_during_shutdown() {
     });
     cancel.cancel();
 
-    let result = timeout(Duration::from_secs(1), supervise_actor(actor, cancel))
+    let result = timeout(EVENT_GUARD, supervise_actor(actor, cancel))
         .await
         .expect("supervisor should return once the actor dies");
 
@@ -1396,12 +1505,9 @@ async fn test_supervise_actor_reports_exit_before_cancel() {
     // Stand-in for an actor whose channel closed while the daemon still runs
     let actor = tokio::spawn(async {});
 
-    let result = timeout(
-        Duration::from_secs(1),
-        supervise_actor(actor, cancel.clone()),
-    )
-    .await
-    .expect("supervisor should return once the actor ends");
+    let result = timeout(EVENT_GUARD, supervise_actor(actor, cancel.clone()))
+        .await
+        .expect("supervisor should return once the actor ends");
 
     assert!(
         matches!(&result, Err(ActorStopped(reason)) if reason.contains("exited before shutdown")),
@@ -1419,7 +1525,7 @@ async fn test_supervise_actor_ok_on_shutdown() {
     // Shutdown also stops the actor; that must not count as a failure.
     cancel.cancel();
 
-    let result = timeout(Duration::from_secs(1), supervisor)
+    let result = timeout(EVENT_GUARD, supervisor)
         .await
         .expect("supervisor should return on cancel")
         .expect("supervisor should not panic");

@@ -245,6 +245,7 @@ async fn overruled_rule_records_the_final_owner_answer() {
     rig.org
         .execute(
             OrgCommand::Decision(DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                relayed_by: None,
                 decision_id: id,
                 option: "no".into(),
                 by: Address::System,

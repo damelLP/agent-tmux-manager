@@ -24,7 +24,7 @@
 //! An unrecognised request `kind` folds as [`DecisionKind::Unknown`], losing
 //! its original word; policy refuses new requests with that fallback.
 
-use crate::{Address, OrgEvent, OrgState, Refusal};
+use crate::{Address, AgentId, AwayStep, AwayWait, OrgEvent, OrgState, Refusal};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, str::FromStr};
@@ -145,6 +145,9 @@ pub struct ProvisionalChoice {
     pub decision_id: DecisionId,
     pub option: String,
     pub by: Address,
+    /// Recorder of the owner's spoken answer, pending the owner's own answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayed_by: Option<AgentId>,
 }
 
 /// The owner's answer, independent of the pane that submitted it.
@@ -158,17 +161,21 @@ pub struct DecisionResolution {
 }
 
 /// Body of `decision.resolved` and `decision.overruled`. Caller metadata is
-/// audit only: equality compares the answer, and the fold does not retain it.
+/// audit only for equality. Redo metadata changes replayed state and is compared.
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct DecisionResolutionEvent {
     #[serde(flatten)]
     pub resolution: DecisionResolution,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pane: Option<String>,
+    /// Frozen by the single writer, never supplied by a resolution caller.
+    /// None is a legacy unmeasured action; Some(empty) is measured zero work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo_tasks: Option<Vec<crate::TaskId>>,
 }
 impl PartialEq for DecisionResolutionEvent {
     fn eq(&self, other: &Self) -> bool {
-        self.resolution == other.resolution
+        self.resolution == other.resolution && self.redo_tasks == other.redo_tasks
     }
 }
 impl From<DecisionResolution> for DecisionResolutionEvent {
@@ -176,6 +183,7 @@ impl From<DecisionResolution> for DecisionResolutionEvent {
         Self {
             resolution,
             caller_pane: None,
+            redo_tasks: None,
         }
     }
 }
@@ -236,6 +244,12 @@ pub enum DecisionCommand {
     Request(DecisionRequest),
     /// Only on the recommended option; the caller reads it from the request.
     TakeProvisionally(ProvisionalChoice),
+    /// A designated agent records a listed spoken answer, always provisionally.
+    Relay {
+        decision_id: DecisionId,
+        option: String,
+        by: AgentId,
+    },
     /// The owner's answer. It becomes `decision.overruled` when it differs
     /// from a provisional choice; the caller never picks between the two.
     Resolve(DecisionResolution),
@@ -256,6 +270,11 @@ pub enum DecisionRefusal {
     },
     #[error("decision {decision_id} cannot be undone or reaches outside: it waits for the owner")]
     MustWait { decision_id: DecisionId },
+    #[error("decision {decision_id} is already taken provisionally on {option:?}; only the owner may change it")]
+    AlreadyTaken {
+        decision_id: DecisionId,
+        option: String,
+    },
     #[error("decision {decision_id} can only be taken provisionally on its recommended option, not {option:?}")]
     NotRecommended {
         decision_id: DecisionId,
@@ -288,6 +307,16 @@ impl DecisionCommand {
         match self.clone() {
             Self::Request(request) => OrgEvent::DecisionRequested(request),
             Self::TakeProvisionally(choice) => OrgEvent::DecisionTakenProvisionally(choice),
+            Self::Relay {
+                decision_id,
+                option,
+                by,
+            } => OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+                decision_id,
+                option,
+                by: Address::Owner,
+                relayed_by: Some(by),
+            }),
             Self::Resolve(resolution) => OrgEvent::DecisionResolved(resolution.into()),
             Self::Expire { decision_id } => OrgEvent::DecisionExpired { decision_id },
             Self::Withdraw(withdrawal) => OrgEvent::DecisionWithdrawn(withdrawal),
@@ -337,6 +366,48 @@ impl OrgState {
                     _ => return Err(wrong_state(decision, "take provisionally")),
                 }
             }
+            DecisionCommand::Relay {
+                decision_id,
+                option,
+                by,
+            } => {
+                let decision = self.require_decision(decision_id)?;
+                if self.owner.relay.as_ref() != Some(by) {
+                    return Err(not_allowed(decision, &Address::Agent(by.clone()), "relay"));
+                }
+                match decision.status {
+                    DecisionStatus::Pending => {
+                        if decision.away_step(true) == AwayStep::Wait(AwayWait::Irreversible) {
+                            return Err(DecisionRefusal::MustWait {
+                                decision_id: decision.id,
+                            }
+                            .into());
+                        }
+                        if !decision.request.options.contains(option) {
+                            return Err(DecisionRefusal::UnknownOption {
+                                decision_id: decision.id,
+                                option: option.clone(),
+                            }
+                            .into());
+                        }
+                        true
+                    }
+                    DecisionStatus::TakenProvisionally => {
+                        let Some(taken) = &decision.provisional else {
+                            return Err(wrong_state(decision, "relay"));
+                        };
+                        if taken.option != *option {
+                            return Err(DecisionRefusal::AlreadyTaken {
+                                decision_id: decision.id,
+                                option: taken.option.clone(),
+                            }
+                            .into());
+                        }
+                        false
+                    }
+                    _ => return Err(wrong_state(decision, "relay")),
+                }
+            }
             DecisionCommand::Resolve(resolution) => {
                 let decision = self.require_decision(&resolution.decision_id)?;
                 if resolution.by != Address::Owner {
@@ -357,9 +428,9 @@ impl OrgState {
                                 .as_ref()
                                 .is_some_and(|taken| taken.option != resolution.option);
                         if overrules {
-                            return Ok(vec![OrgEvent::DecisionOverruled(
-                                resolution.clone().into(),
-                            )]);
+                            let mut answer: DecisionResolutionEvent = resolution.clone().into();
+                            answer.redo_tasks = Some(crate::overrule_redo(self, decision.id)?);
+                            return Ok(vec![OrgEvent::DecisionOverruled(answer)]);
                         }
                         true
                     }

@@ -6,6 +6,50 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[allow(dead_code)]
+#[path = "../../../../tests/support/stand_in/process.rs"]
+mod process;
+
+struct CliChild {
+    child: process::OwnedChild,
+    pid: u32,
+}
+impl CliChild {
+    fn start(cli: &Path, args: &[&str]) -> Self {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(cli);
+        command.args(args).stdin(std::process::Stdio::null());
+        // A background runner may inherit SIGINT ignored. Restore the owned
+        // CLI's interactive disposition without changing the test process.
+        unsafe {
+            command.pre_exec(|| {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        Self {
+            child: process::OwnedChild::new(child),
+            pid,
+        }
+    }
+    async fn wait(self) -> std::process::ExitStatus {
+        let pid = self.pid;
+        tokio::task::spawn_blocking(move || process::wait_exit(pid, Duration::from_secs(60)))
+            .await
+            .unwrap()
+            .unwrap();
+        self.child.wait_with_output().unwrap().status
+    }
+}
+
 struct ObservedTmux {
     mock: RealTmuxClient,
     resolved: tokio::sync::mpsc::UnboundedSender<Vec<String>>,
@@ -124,6 +168,9 @@ async fn real_cli_sigint_discards_reservation_parked_send() {
     })
     .await;
     let server = tokio::spawn(server);
+    // This test's current-thread runtime keeps the log event and handler
+    // return in the same poll; the waiter resumes only after its FDs drop.
+    let (disconnected, _logs) = server_event("Client disconnected");
     let work = client.clone();
     let check_root = root.clone();
     let check_identity = identity.clone();
@@ -131,23 +178,22 @@ async fn real_cli_sigint_discards_reservation_parked_send() {
         tokio::time::timeout(Duration::from_secs(60), async move {
             let fixture = tempfile::tempdir_in(&check_root).unwrap();
             let input = fixture.path().join("input.bin");
-            let ready_file = fixture.path().join("pane-ready");
+            let bytes = fixture.path().join("bytes.sock");
+            let listener = tokio::net::UnixListener::bind(&bytes).unwrap();
             let script = fixture.path().join("reader.py");
             std::fs::write(&script, format!(
-                "import os, pathlib, tty\ntty.setraw(0)\nwith open({:?}, 'wb', buffering=0) as f:\n pathlib.Path({:?}).touch()\n while True:\n  b=os.read(0,4096)\n  if not b: break\n  f.write(b)\n", input, ready_file
+                "import os, socket, tty\ns=socket.socket(socket.AF_UNIX)\ns.connect({:?})\ntty.setraw(0)\nwith open({:?}, 'wb', buffering=0) as f:\n s.sendall(b'R')\n while True:\n  b=os.read(0,4096)\n  if not b: break\n  f.write(b)\n  s.sendall(b)\n", bytes, input
             )).unwrap();
             assert_eq!(work.new_window("fixture", Some(&format!("/usr/bin/python3 {}", script.display()))).await.unwrap(), "%1");
-            while !ready_file.exists() { tokio::task::yield_now().await; }
+            use tokio::io::AsyncReadExt;
+            let (mut receiver, _) = listener.accept().await.unwrap();
+            assert_eq!(receiver.read_u8().await.unwrap(), b'R');
             let (job, release) = hold(&control, ReservationKind::Delivery).await;
-            let mut survivor = tokio::process::Command::new(&cli)
-                .args(["send", "survivor-session", "SURVIVOR-U8C10"])
-                .kill_on_drop(true).spawn().unwrap();
+            let survivor = CliChild::start(&cli, &["send", "survivor-session", "SURVIVOR-U8C10"]);
             while !resolved.recv().await.unwrap().iter().any(|arg| arg == "fixture:1") {}
             barrier(&control).await; // survivor parked first: its deadline is earlier
             let baseline = socket_fds();
-            let mut child = tokio::process::Command::new(&cli)
-                .args(["send", "fixture-session", "CANCELLED-U8C9"])
-                .kill_on_drop(true).spawn().unwrap();
+            let child = CliChild::start(&cli, &["send", "fixture-session", "CANCELLED-U8C9"]);
             // Parked sends re-resolve aliases. Require the interrupted sender's
             // distinct alias, not a leftover notification from the survivor.
             while !resolved.recv().await.unwrap().iter().any(|arg| arg == "fixture:1.0") {}
@@ -157,30 +203,28 @@ async fn real_cli_sigint_discards_reservation_parked_send() {
             assert!(!interrupted_fds.is_empty());
             assert!(std::fs::read(&input).unwrap().is_empty());
             assert_eq!(private_identity(&work, &check_root).await, check_identity);
-            let pid = child.id().unwrap();
+            let pid = child.pid;
             // Direct child owned by this fixture, not a discovered process.
             assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGINT) }, 0);
-            assert_eq!(child.wait().await.unwrap().signal(), Some(libc::SIGINT));
+            assert_eq!(child.wait().await.signal(), Some(libc::SIGINT));
             // Watch only this connection: without the monitor, the earlier
             // survivor's descriptors also disappear before this send times out.
-            while interrupted_fds.iter().any(|fd| socket_fds().contains(fd)) {
-                tokio::task::yield_now().await;
-            }
+            disconnected.acquire().await.unwrap().forget();
+            let remaining = socket_fds();
+            assert!(!interrupted_fds.iter().any(|fd| remaining.contains(fd)));
             release.send(()).unwrap();
             job.await.unwrap().unwrap();
-            let status = survivor.wait().await.unwrap();
+            let status = survivor.wait().await;
             assert!(status.success(), "earlier parked survivor must succeed, not time out: {status}");
             control.flush_audits().await;
-            let status = tokio::process::Command::new(&cli)
-                .args(["send", "%1", "POSITIVE-U8C9"])
-                .kill_on_drop(true).status().await.unwrap();
+            let status = CliChild::start(&cli, &["send", "%1", "POSITIVE-U8C9"]).wait().await;
             assert!(status.success());
             // This final positive-control input fences all preceding actor input
             // in the pane's byte stream; require no interrupted-send bytes.
             let expected = b"SURVIVOR-U8C10\rPOSITIVE-U8C9\r";
-            while std::fs::read(&input).unwrap().len() < expected.len() {
-                tokio::task::yield_now().await;
-            }
+            let mut delivered = vec![0; expected.len()];
+            receiver.read_exact(&mut delivered).await.unwrap();
+            assert_eq!(delivered, expected);
             assert_eq!(std::fs::read(&input).unwrap(), expected);
             eprintln!("SIGINT parked CLI: survivor + Enter and positive control only; interrupted send absent");
         }).await.unwrap();

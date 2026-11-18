@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"panes-missing","method":"session.panes","params":{"session_name":"work"}},"response":{"type":"response","id":"panes-missing","error":{"code":"invalid_params","message":"ignored"}},"ignore":["/error/message"]}

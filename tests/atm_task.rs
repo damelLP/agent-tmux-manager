@@ -279,6 +279,136 @@ async fn optional_arguments_keep_existing_structured_shapes() {
     }
 }
 
+// Break caught: project selectors are guessed, dropped or sent under a different RPC field.
+#[tokio::test]
+async fn project_flags_forward_create_and_intersecting_list_selectors() {
+    let create_args = [
+        "task",
+        "create",
+        "Targeted",
+        "--project",
+        "alpha",
+        "--measure",
+        r#"{"kind":"owner"}"#,
+        "--format",
+        "json",
+    ];
+    let output = support::exchange(&create_args, "task.create", json!({"title":"Targeted","project_id":"alpha","kind":"work","parent":null,"judges":null,"measure":{"kind":"owner"},"budget":null,"files":[],"rests_on":null}), json!({"result":{"task_id":"t6","changed":true,"notification":null}}), Some("%7"), true, false).await;
+    assert!(output.status.success(), "{output:?}");
+    let list_args = [
+        "task",
+        "list",
+        "--project",
+        "beta",
+        "--agent",
+        "alpha/worker",
+        "--open",
+        "--after",
+        "t9",
+        "--limit",
+        "1",
+    ];
+    let output = support::exchange(&list_args, "task.list", json!({"project_id":"beta","agent_id":"alpha/worker","creator":null,"state":null,"kind":null,"parent":null,"after":"t9","open_only":true,"limit":1}), json!({"result":{"tasks":[],"next_after":null}}), None, true, false).await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"No matching tasks.\n");
+}
+
+// Break caught: a refused/unsupported selector is retried without it or falls back to local tmux/daemon work.
+#[tokio::test]
+async fn project_errors_and_lost_mutation_responses_never_retry_or_fall_back() {
+    for name in ["create", "list"] {
+        let selected = case(name);
+        let mut args = args(&selected);
+        args.extend(["--project", "alpha"]);
+        let mut params = selected["params"].clone();
+        params["project_id"] = json!("alpha");
+        for code in ["invalid_params", "not_found", "refused"] {
+            let reply = json!({"error":{"code":code,"message":format!("{code}: project selector refused")}});
+            let output = support::exchange(
+                &args,
+                selected["method"].as_str().unwrap(),
+                params.clone(),
+                reply,
+                Some("%7"),
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("project selector refused"));
+        }
+        let output = support::exchange(
+            &args,
+            selected["method"].as_str().unwrap(),
+            params.clone(),
+            Value::Null,
+            None,
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let output = support::exchange(
+            &args,
+            selected["method"].as_str().unwrap(),
+            params,
+            json!({}),
+            None,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("daemon is too old"));
+    }
+}
+
+// Break caught: project additions disappear from raw get or escape the existing text detail renderer.
+#[tokio::test]
+async fn recorded_project_get_is_preserved_in_json_and_text() {
+    let get = case("get");
+    let mut reply = get["reply"].clone();
+    reply["result"]["task"]["project_id"] = json!("alpha");
+    for format in ["json", "text"] {
+        let output = invoke(&get, &["--format", format], reply.clone()).await;
+        assert!(output.status.success());
+        if format == "json" {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                reply["result"]
+            );
+        } else {
+            assert!(String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("  project_id: \"alpha\"\n"));
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    for project in ["../alpha", "", "alpha/worker"] {
+        for args in [
+            vec!["task", "list", "--project", project],
+            vec![
+                "task",
+                "create",
+                "Bad",
+                "--measure",
+                r#"{"kind":"owner"}"#,
+                "--project",
+                project,
+            ],
+        ] {
+            let output = support::command(dir.path(), &args, None)
+                .output()
+                .await
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+        }
+    }
+    assert!(!dir.path().join("fallback").exists());
+}
+
 // Break caught: a no-op claims change, or a committed task with unconfirmed notification is concealed.
 #[tokio::test]
 async fn noops_and_unconfirmed_notifications_are_not_false_success_claims() {

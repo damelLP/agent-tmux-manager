@@ -47,6 +47,11 @@
 //! B builds the exact one-line inbox reference for every message (for a start
 //! line, its own text: see `start_line`) and registers that text with evidence.
 //! Receipt means reference acceptance, not body reading.
+//! Delivery-notice keys are retained owner notes in the committed projection,
+//! replayed before scheduling. Recognized terminal failure facts retain missing
+//! note work separately from the open delivery queue. A vanished transient
+//! observation before its first note commit is not recoverable after a crash;
+//! external notification remains best-effort, not exactly-once.
 //! B waits for U8c focus/read-only observe and U8's single screen dispatch; this
 //! boundary neither adds vendor parsing nor implements a second input path.
 
@@ -72,12 +77,12 @@ use crate::{
     },
     eventlog::Envelope,
     registry::RegistryHandle,
-    server::methods::CallContext,
+    server::methods::{CallContext, MethodError},
 };
 use atm_core::{ScreenFacts, SessionView};
 use atm_org::{
-    delivery::DeliveryPolicy, Agent, AgentStatus, DeliveryReceipt, Message, OrgCommand, OrgEvent,
-    OrgState,
+    delivery::DeliveryPolicy, Agent, AgentStatus, DeliveryNotice, DeliveryReceipt, Message,
+    OrgCommand, OrgEvent, OrgState,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use std::{
@@ -248,6 +253,7 @@ pub fn recipient_observation(
     })
 }
 
+pub(super) const FOCUS_NOTICE_REASON: &str = "focus";
 const FOCUS_NOTICE_SUFFIX: &str =
     "; delivery will resume after focus moves and the editor is safely empty";
 
@@ -255,6 +261,10 @@ const FOCUS_NOTICE_SUFFIX: &str =
 #[must_use]
 pub fn focus_notice(id: MessageId, pane: &PaneId) -> MessageContent {
     MessageContent {
+        delivery_notice: Some(DeliveryNotice {
+            source_message_id: id,
+            reason: FOCUS_NOTICE_REASON.into(),
+        }),
         from: Address::System,
         to: Address::Owner,
         kind: MessageKind::Note,
@@ -275,7 +285,14 @@ pub fn is_focus_notice(content: &MessageContent) -> bool {
         return false;
     };
     match (id.parse::<MessageId>(), PaneId::parse(pane)) {
-        (Ok(id), Ok(pane)) => content == &focus_notice(id, &pane),
+        (Ok(id), Ok(pane)) => {
+            let mut canonical = focus_notice(id, &pane);
+            // Retained pre-upgrade canonical focus notes stay inbox-only too.
+            if content.delivery_notice.is_none() {
+                canonical.delivery_notice = None;
+            }
+            content == &canonical
+        }
         _ => false,
     }
 }
@@ -309,6 +326,9 @@ struct View {
     /// Per recipient, in FIFO order: its queued and delivering messages. Kept
     /// at the fold, so the scheduler never scans the log's messages.
     open: BTreeMap<AgentId, BTreeSet<MessageId>>,
+    /// Recognized final failures lacking their keyed owner note. Rebuilt by the
+    /// same fold as open/state, not a separate persisted outbox or key index.
+    failed_notices: BTreeMap<AgentId, BTreeSet<MessageId>>,
     /// Startup replay only: for each message, where its last attempt went,
     /// read from the agent's binding as it was at that attempt. Taken when
     /// the replay completes, so a live attempt is never recorded.
@@ -345,6 +365,27 @@ impl View {
             open.remove(&id);
             if open.is_empty() {
                 self.open.remove(recipient);
+            }
+        }
+        let missing = (message.status == DeliveryStatus::Failed)
+            .then(|| {
+                message
+                    .failure
+                    .as_deref()
+                    .and_then(|reason| message_scheduler::failure_notice(id, reason))
+            })
+            .flatten()
+            .and_then(|content| content.delivery_notice)
+            .is_some_and(|key| !self.state.has_delivery_notice(&key));
+        if missing {
+            self.failed_notices
+                .entry(recipient.clone())
+                .or_default()
+                .insert(id);
+        } else if let Some(pending) = self.failed_notices.get_mut(recipient) {
+            pending.remove(&id);
+            if pending.is_empty() {
+                self.failed_notices.remove(recipient);
             }
         }
     }
@@ -500,7 +541,49 @@ impl Service {
 
     /// Every recipient with a message that can still be scheduled.
     pub(super) fn recipients(&self) -> Result<Vec<AgentId>, MessageError> {
-        Ok(self.view()?.open.keys().cloned().collect())
+        let view = self.view()?;
+        Ok(view
+            .open
+            .keys()
+            .chain(view.failed_notices.keys())
+            .cloned()
+            .collect())
+    }
+
+    pub(super) fn failed_notices(
+        &self,
+        recipient: &AgentId,
+    ) -> Result<Vec<MessageContent>, MessageError> {
+        let view = self.view()?;
+        Ok(view
+            .failed_notices
+            .get(recipient)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                let message = view.state.message(id)?;
+                message_scheduler::failure_notice(*id, message.failure.as_deref()?)
+            })
+            .collect())
+    }
+
+    pub(super) fn has_delivery_notice(&self, key: &DeliveryNotice) -> Result<bool, MessageError> {
+        Ok(self.view()?.state.has_delivery_notice(key))
+    }
+
+    /// The snapshot is queued behind accepted writes; an unhealthy/unknown
+    /// writer is never treated as an empty key index. Wait for its exact fold.
+    pub(super) async fn reconcile_notice(
+        &self,
+        key: &DeliveryNotice,
+    ) -> Result<bool, MessageError> {
+        tokio::time::timeout(ORDINARY_BUDGET, async {
+            let (state, cursor) = self.rt.org.snapshot_at().await?;
+            self.rt.history.folded(cursor).await?;
+            Ok(state.has_delivery_notice(key))
+        })
+        .await
+        .map_err(|_| MessageError::Timeout)?
     }
 
     pub(super) fn agent(&self, id: &AgentId) -> Result<Option<Agent>, MessageError> {
@@ -557,9 +640,19 @@ impl Service {
     /// Submit to the one organisation writer, then wait until the fold loop
     /// has accounted for what it committed, so the caller reads its own write.
     pub(super) async fn execute(&self, command: OrgCommand) -> Result<Vec<Envelope>, MessageError> {
+        let notice = match &command {
+            OrgCommand::SendMessage(content) => content.delivery_notice.clone(),
+            _ => None,
+        };
         let committed = self.rt.org.execute(command, self.rt.clock.now()?).await?;
         if let Some(last) = committed.last() {
             self.rt.history.folded(last.seq).await?;
+        } else if let Some(key) = notice {
+            if !self.reconcile_notice(&key).await? {
+                return Err(MessageError::Internal(
+                    "duplicate notice key absent from committed state".into(),
+                ));
+            }
         }
         Ok(committed)
     }
@@ -601,7 +694,12 @@ impl Service {
                 }
             }
             match event {
-                OrgEvent::MessageSent(_) => view.index(MessageId::new(envelope.seq)),
+                OrgEvent::MessageSent(content) => {
+                    view.index(MessageId::new(envelope.seq));
+                    if let Some(key) = &content.delivery_notice {
+                        view.index(key.source_message_id);
+                    }
+                }
                 OrgEvent::MessageDeliveryAttempted { message_id, .. }
                 | OrgEvent::MessageDelivered { message_id, .. }
                 | OrgEvent::MessageDeliveryFailed { message_id, .. } => view.index(*message_id),
@@ -758,6 +856,7 @@ fn spawn_service(
     startup_high_water: u64,
     effects: Option<Effects>,
 ) -> (MessageHandle, JoinHandle<()>) {
+    let board = Board::with_recovery(runtime.history.clone());
     let service = Arc::new(Service {
         rt: runtime,
         view: Mutex::new(View {
@@ -767,7 +866,7 @@ fn spawn_service(
         startup: watch::Sender::new(Startup::Replaying),
         requests: Semaphore::new(MAX_REQUESTS),
         folded: watch::Sender::new(0),
-        board: Board::default(),
+        board,
     });
     let task = tokio::spawn({
         let service = service.clone();
@@ -784,6 +883,7 @@ fn spawn_service(
     (
         MessageHandle {
             inner: Backend::Live(service),
+            reporting: super::reporting_line::ReportingFiles::default(),
         },
         task,
     )
@@ -808,6 +908,7 @@ enum Backend {
 #[derive(Clone)]
 pub struct MessageHandle {
     inner: Backend,
+    reporting: super::reporting_line::ReportingFiles,
 }
 
 impl std::fmt::Debug for MessageHandle {
@@ -831,12 +932,31 @@ pub(super) fn unconfirmed_discovery(agent: &Agent, rows: &[SessionView]) -> bool
         && !in_pane().any(|row| &row.id == recorded)
 }
 
+fn reporting_error(error: MethodError) -> MessageError {
+    match error.0.code.as_str() {
+        atm_protocol::error_code::REFUSED => MessageError::Refused(error.0.message),
+        atm_protocol::error_code::NOT_FOUND => MessageError::NotFound(error.0.message),
+        atm_protocol::error_code::TIMEOUT => MessageError::Timeout,
+        atm_protocol::error_code::UNAVAILABLE => MessageError::Unavailable(error.0.message),
+        _ => MessageError::Internal(error.0.message),
+    }
+}
+
 impl MessageHandle {
     #[must_use]
     pub fn disabled(reason: impl Into<String>) -> Self {
         Self {
             inner: Backend::Disabled(Arc::from(reason.into())),
+            reporting: super::reporting_line::ReportingFiles::default(),
         }
+    }
+
+    pub(crate) fn with_reporting_files(
+        mut self,
+        files: super::reporting_line::ReportingFiles,
+    ) -> Self {
+        self.reporting = files;
+        self
     }
 
     /// The live service, for tests that drive one scheduling step by hand.
@@ -899,6 +1019,7 @@ impl MessageHandle {
                     }
                 }
                 let content = MessageContent {
+                    delivery_notice: None,
                     from,
                     to: p.to,
                     kind: p.kind,
@@ -927,15 +1048,40 @@ impl MessageHandle {
         service
             .call(ORDINARY_BUDGET, async {
                 let now = service.rt.clock.now()?;
-                let view = service.view()?;
-                let caller = caller_address(&view.state, &caller)?;
-                // The FIFO predecessor is history's: one definition of the
-                // queue for the policy and for what the owner is shown.
-                inbox(&view.state, &caller, &p, |message| Progress {
+                // History owns FIFO progress; committed recipient facts come
+                // from the same snapshot that supplies reporting admission.
+                let progress = |message: &Message| Progress {
                     blocked_by: (service.rt.history.snapshot(message.id, now).ok())
                         .and_then(|snapshot| snapshot.blocked_by),
                     ..service.board.progress(message.id)
-                })
+                };
+                let (state, caller, recipient) = {
+                    let view = service.view()?;
+                    let who = caller_address(&view.state, &caller)?;
+                    let report = match (&who, &p.recipient) {
+                        (Address::Agent(caller), Some(Address::Agent(report)))
+                            if caller != report && view.state.agent(report).is_some() =>
+                        {
+                            Some(report.clone())
+                        }
+                        _ => None,
+                    };
+                    let Some(report) = report else {
+                        return inbox(&view.state, &who, &p, None, progress);
+                    };
+                    (view.state.clone(), who, report)
+                };
+                // No message-view guard survives this filesystem await.
+                let ancestors = self
+                    .reporting
+                    .ancestors(state.clone(), recipient.clone())
+                    .await
+                    .map_err(reporting_error)?;
+                let grant = match &caller {
+                    Address::Agent(id) if ancestors.contains(id) => Some(&recipient),
+                    _ => None,
+                };
+                inbox(&state, &caller, &p, grant, progress)
             })
             .await
     }
@@ -974,7 +1120,7 @@ impl MessageHandle {
         p: ResolveParams,
         caller: CallContext,
     ) -> Result<RetryResult, MessageError> {
-        let status = self.resolve(Resolve::Retry, p.id, caller).await?;
+        let (status, _) = self.resolve(Resolve::Retry, p.id, caller).await?;
         Ok(RetryResult {
             message_id: p.id,
             status,
@@ -989,10 +1135,14 @@ impl MessageHandle {
         p: ResolveParams,
         caller: CallContext,
     ) -> Result<GiveUpResult, MessageError> {
-        let status = self.resolve(Resolve::GiveUp, p.id, caller).await?;
+        let (status, line) = self.resolve(Resolve::GiveUp, p.id, caller).await?;
         Ok(GiveUpResult {
             message_id: p.id,
             status,
+            editor_warning: Some(format!(
+                "Possible leftover in the recipient's editor: {line}. Giving up did not clear the editor; \
+                 further delivery may wait for an empty editor. Inspect the pane before editing it."
+            )),
         })
     }
 
@@ -1006,12 +1156,12 @@ impl MessageHandle {
         kind: Resolve,
         id: MessageId,
         caller: CallContext,
-    ) -> Result<DeliveryStatus, MessageError> {
+    ) -> Result<(DeliveryStatus, String), MessageError> {
         let service = self.live()?;
         service
             .call(MESSAGE_RESOLUTION_BUDGET, async {
                 let (reply, answer) = oneshot::channel();
-                {
+                let line = {
                     let view = service.view()?;
                     if caller_address(&view.state, &caller)? != Address::Owner {
                         return Err(MessageError::Refused(
@@ -1025,12 +1175,15 @@ impl MessageHandle {
                         // Never scheduled: delivered to the owner at its fold.
                         return Err(kind.refuse_delivered(id));
                     };
+                    let line = delivery_line(id, &message.content);
                     let resolution = Resolution { kind, id, reply };
                     service.board.resolve(recipient.clone(), resolution)?;
-                }
-                answer
+                    line
+                };
+                let status = answer
                     .await
-                    .map_err(|_| MessageError::Unavailable("message service stopped".into()))?
+                    .map_err(|_| MessageError::Unavailable("message service stopped".into()))??;
+                Ok((status, line))
             })
             .await
     }

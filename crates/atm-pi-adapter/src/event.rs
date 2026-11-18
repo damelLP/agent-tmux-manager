@@ -74,19 +74,17 @@ pub enum PiEventType {
 
     // === Synthetic events emitted by `pi-atm` ===
     //
-    // Pi has no event for "ctx.ui.select dialog opened" — the only way
-    // a passive observer can detect that pi is awaiting user permission
-    // is if our extension instruments `ctx.ui.select` itself. When that
-    // happens the extension emits these synthetic events with the
-    // wire `event` field set to the strings below. They are not
-    // produced by pi itself; they're our adapter's contract with the
-    // hook script.
+    // These belong to our extension/adapter contract, not pi itself.
+    // Modern pi's generic ui_prompt notifications veto local idle recovery;
+    // the select wrapper retains the synthetic permission label/state events.
     /// `atm_needs_input_open` — `ctx.ui.select` was just called by some
     /// extension (typically pi-amplike's permission gate). Pi is
     /// blocked awaiting the user's response.
     AtmNeedsInputOpen,
     /// `atm_needs_input_resolved` — the dialog closed. Pi resumes work.
     AtmNeedsInputResolved,
+    /// `atm_idle` — one measured idle identity snapshot after connection flush.
+    AtmIdle,
 
     /// Any event name pi emits that this enum doesn't yet recognize.
     Other(String),
@@ -129,6 +127,7 @@ impl PiEventType {
             Self::Input => "input",
             Self::AtmNeedsInputOpen => "atm_needs_input_open",
             Self::AtmNeedsInputResolved => "atm_needs_input_resolved",
+            Self::AtmIdle => "atm_idle",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -177,6 +176,7 @@ impl PiEventType {
             "input" => Self::Input,
             "atm_needs_input_open" => Self::AtmNeedsInputOpen,
             "atm_needs_input_resolved" => Self::AtmNeedsInputResolved,
+            "atm_idle" => Self::AtmIdle,
             _ => return None,
         })
     }
@@ -217,6 +217,7 @@ mod tests {
             PiEventType::AgentEnd,
             PiEventType::AgentSettled,
             PiEventType::SessionCompactFailed,
+            PiEventType::AtmIdle,
             PiEventType::ToolExecutionStart,
             PiEventType::ToolExecutionEnd,
             PiEventType::ToolCall,

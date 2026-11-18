@@ -34,6 +34,12 @@ bind C-a run-shell "atm toggle-panel"
 # ATM popup overlay (alternative to sidebar)
 bind C-s display-popup -E -w 35% -h 100% -x 0 "atm"
 
+# Organization overview popup
+bind O display-popup -E -w 90% -h 90% "atm org | less -R"
+
+# Flip the separate chat window; reserve the name chat in each session.
+bind C-t if-shell -F '#{==:#{window_name},chat}' 'last-window' 'new-window -S -n chat "atm chat"'
+
 # Status bar integration (uncomment and add to status-right):
 # set -g status-right '#(atm status) | %H:%M'
 "#;

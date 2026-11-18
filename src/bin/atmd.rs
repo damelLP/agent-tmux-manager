@@ -446,10 +446,7 @@ fn main() -> Result<()> {
             if let Some(pid) = is_daemon_running(&state_dir) {
                 println!("Daemon is running (PID {pid})");
 
-                let socket_path = env::var("ATM_SOCKET")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
+                let socket_path = socket_path();
                 if PathBuf::from(&socket_path).exists() {
                     println!("Socket: {socket_path}");
                 }
@@ -876,6 +873,49 @@ mod tests {
             "123 (atmd) Z 1 2 3",
         ] {
             assert!(!proc_stat_has_exited(stat.as_bytes()), "{stat:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_path_keeps_utf8_overrides_and_empty_or_non_utf8_fallbacks() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        const EXPECTED: &str = "ATMD_SOCKET_RESOLVER_TEST_EXPECTED";
+        // Each environment case gets its own process; never mutate the parallel
+        // test runner's environment or connect to the resolved socket.
+        if let Ok(expected) = env::var(EXPECTED) {
+            assert_eq!(socket_path(), expected);
+            return;
+        }
+        for (value, expected) in [
+            (OsString::new(), DEFAULT_SOCKET_PATH),
+            (
+                OsString::from_vec(b"socket-\xff".to_vec()),
+                DEFAULT_SOCKET_PATH,
+            ),
+            (OsString::from("relative.sock"), "relative.sock"),
+            (OsString::from("socket-\u{3c0}"), "socket-\u{3c0}"),
+            (OsString::from(" "), " "),
+        ] {
+            let output = {
+                let _guard = LOCK_AND_SPAWN.lock().unwrap();
+                // output() spawns synchronously; only waiting happens after this block.
+                tokio::process::Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::socket_path_keeps_utf8_overrides_and_empty_or_non_utf8_fallbacks",
+                    ])
+                    .env("ATM_SOCKET", &value)
+                    .env(EXPECTED, expected)
+                    .kill_on_drop(true)
+                    .output()
+            };
+            let output = tokio::time::timeout(Duration::from_secs(30), output)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success(), "{value:?}: {output:?}");
         }
     }
 

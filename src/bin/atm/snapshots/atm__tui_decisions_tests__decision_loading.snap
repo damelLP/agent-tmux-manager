@@ -1,0 +1,14 @@
+---
+source: src/bin/atm/tui_decisions_tests.rs
+assertion_line: 115
+expression: "rendered(&mut DecisionPopup::default(), 60, 10)"
+---
+
+ ┌ Answer waiting decision ───────────────────────────────┐
+ │Loading waiting decisions…                              │
+ │Esc: close                                              │
+ │                                                        │
+ │                                                        │
+ │                                                        │
+ │                                                        │
+ └────────────────────────────────────────────────────────┘

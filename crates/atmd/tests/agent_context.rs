@@ -91,6 +91,7 @@ impl Rig {
             .org
             .execute(
                 OrgCommand::SendMessage(MessageContent {
+                    delivery_notice: None,
                     from: Address::Owner,
                     to: to.parse().unwrap(),
                     kind: MessageKind::Brief,
@@ -270,6 +271,7 @@ async fn context_summarizes_only_unread_for_caller_without_side_effects() {
         .org
         .execute(
             OrgCommand::SendMessage(MessageContent {
+                delivery_notice: None,
                 from: "project/other".parse().unwrap(),
                 to: "project/worker".parse().unwrap(),
                 kind: MessageKind::Report,

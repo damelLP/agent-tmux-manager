@@ -43,5 +43,6 @@ async fn task_titles_are_one_line_and_inspect_pointers_require_canonical_ids() {
     assert!(text.contains("inspect: atm task get t9"));
     assert_eq!(text.matches("inspect: atm task get ").count(), 1);
     let output = exchange(&["me"], json!({"result":tasks()}), true, true).await;
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(141));
+    assert!(output.stderr.is_empty(), "{output:?}");
 }

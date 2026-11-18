@@ -8,8 +8,8 @@
 //! It adds no way to type into a pane: both notes are messages, delivered by
 //! the message runtime with all its guards.
 //!
-//! This is also the single task-budget scheduler: committed task events and
-//! startup reconcile budgets, and its one timer chooses the earliest reminder
+//! This is also the single task-budget scheduler: task events, decision
+//! overrules and startup reconcile budgets; its timer chooses the earliest reminder
 //! or budget deadline. Disabling reminders leaves budget deadlines running.
 //! Registry lag drops reminder observations, never the durable budget deadline.
 //!
@@ -241,6 +241,7 @@ fn told(state: &OrgState, agent: &Agent, task: &Task) -> Address {
 
 fn note(to: Address, body: String, task: Option<&&Task>) -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to,
         kind: MessageKind::Note,
@@ -481,7 +482,7 @@ async fn run(
                 Err(RecvError::Closed) => return,
             },
             event = committed.recv() => match event {
-                Ok(event) => budget_changed = event.kind.starts_with("task."),
+                Ok(event) => budget_changed = event.kind.starts_with("task.") || event.kind == "decision.overruled",
                 Err(RecvError::Lagged(_)) => budget_changed = true,
                 Err(RecvError::Closed) => return,
             },
@@ -489,7 +490,10 @@ async fn run(
         }
         // A ready registry receiver must not hide committed usage forever.
         match committed.try_recv() {
-            Ok(event) => budget_changed |= event.kind.starts_with("task."),
+            Ok(event) => {
+                budget_changed |=
+                    event.kind.starts_with("task.") || event.kind == "decision.overruled"
+            }
             Err(TryRecvError::Lagged(_)) => budget_changed = true,
             Err(TryRecvError::Closed) => return,
             Err(TryRecvError::Empty) => {}
@@ -507,7 +511,7 @@ async fn run(
     }
 }
 
-/// Starts the single task scheduler on registry and committed task events.
+/// Starts the single scheduler on registry, committed task and overrule events.
 /// None disables reminders only; budget deadlines still run. It runs until
 /// `cancel` or until the registry stops.
 pub fn spawn_task_reminders(

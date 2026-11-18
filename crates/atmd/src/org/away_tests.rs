@@ -70,6 +70,7 @@ fn params(request: DecisionRequest) -> RequestParams {
 }
 fn message(kind: MessageKind, body: &str) -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: worker(),
         kind,
@@ -107,6 +108,7 @@ fn away_fact() -> OrgEvent {
 }
 fn taken(by: Address) -> OrgEvent {
     OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+        relayed_by: None,
         decision_id: DecisionId::new(3),
         option: "yes".into(),
         by,
@@ -377,6 +379,15 @@ impl Rig {
         guarded(self.bridge).await.unwrap();
     }
 }
+async fn finish_scenario(rig: Rig, mut scenario: JoinHandle<()>) {
+    let outcome = tokio::time::timeout(Duration::from_secs(120), &mut scenario).await;
+    if outcome.is_err() {
+        scenario.abort();
+        let _ = guarded(scenario).await;
+    }
+    rig.stop().await;
+    outcome.unwrap().unwrap();
+}
 async fn next(watch: &mut crate::org::EventWatch) -> Arc<crate::eventlog::Envelope> {
     guarded(watch.next()).await.unwrap().unwrap()
 }
@@ -455,6 +466,7 @@ async fn decisions_pending_when_the_owner_leaves_are_handled_at_once() {
             option: "no".into(),
             note: None,
             standing_rule: false,
+            relay: false,
         },
         owner(),
     ))
@@ -568,13 +580,13 @@ async fn a_restart_while_away_keeps_the_switch_and_handles_what_was_left_pending
         .await
         .unwrap();
     assert_eq!(
-        back,
-        BackResult {
-            changed: true,
-            away_since: Some(since),
-            provisional_count: 1,
-            pending_count: 0,
-        }
+        (
+            back.changed,
+            back.away_since,
+            back.provisional_count,
+            back.pending_count
+        ),
+        (true, Some(since), 1, 0)
     );
     let back = guarded(handle.back(SwitchParams {}, owner()))
         .await
@@ -685,8 +697,12 @@ async fn methods_are_the_owners_take_no_parameters_and_report_the_switch() {
     let counts = json!({"decisions":[],"pending_count":0,"provisional_count":0,"next_after":null});
     let list = |context: CallContext| call(context, "decision.list", json!({"count_only":true}));
     assert_eq!(list(owner()).await.unwrap(), counts);
+    let mut back = call(owner(), "owner.back", Value::Null).await.unwrap();
+    let digest = back.as_object_mut().unwrap().remove("digest").unwrap();
+    assert_eq!(digest["absence"], Value::Null);
+    assert_eq!(digest["rows"], json!([]));
     assert_eq!(
-        call(owner(), "owner.back", Value::Null).await.unwrap(),
+        back,
         json!({"changed":false,"away_since":null,"provisional_count":0,"pending_count":0})
     );
     // A pane that is no agent's counts as the owner, as for `decision.resolve`.
@@ -707,8 +723,12 @@ async fn methods_are_the_owners_take_no_parameters_and_report_the_switch() {
         call(owner(), "decision.list", json!({})).await.unwrap(),
         marked
     );
+    let mut back = call(owner(), "owner.back", json!({})).await.unwrap();
+    let digest = back.as_object_mut().unwrap().remove("digest").unwrap();
+    assert_eq!(digest["absence"]["since"], json!(since));
+    assert_eq!(digest["rows"], json!([]));
     assert_eq!(
-        call(owner(), "owner.back", json!({})).await.unwrap(),
+        back,
         json!({"changed":true,"away_since":since,"provisional_count":0,"pending_count":0})
     );
     assert_eq!(list(owner()).await.unwrap(), counts);
@@ -727,4 +747,386 @@ async fn methods_are_the_owners_take_no_parameters_and_report_the_switch() {
         assert_eq!(error.code, "invalid_params", "{method}");
     }
     rig.stop().await;
+}
+
+// Synthetic: replay mutations also use other valid `by` values to pin relay
+// provenance as the first branch, not the old requester/system distinction.
+// Break caught: relayed Details/self-relays receiving an away-table notice,
+// or changed text causing a second durable message after replay.
+#[test]
+fn relayed_notices_are_exact_and_deduplicate_every_delivery_state() {
+    for intent in [false, true] {
+        for away in [false, true] {
+            for relayer in ["p/worker", "p/chief"] {
+                for by in [Address::Owner, Address::System, worker()] {
+                    let mut events = vec![
+                        OrgEvent::DecisionRequested(request(true, intent, Some("yes"))),
+                        OrgEvent::AgentAdopted {
+                            agent_id: "p/chief".parse().unwrap(),
+                            pane: "%8".into(),
+                            session_id: None,
+                        },
+                    ];
+                    if away {
+                        events.push(away_fact());
+                    }
+                    events.push(OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
+                        decision_id: DecisionId::new(3),
+                        option: "no".into(),
+                        by: by.clone(),
+                        relayed_by: Some(relayer.parse().unwrap()),
+                    }));
+                    let state = folded(&events);
+                    let suffix = if intent {
+                        " Finish your task in progress on this option. Start nothing further on it: a task built on it names d3 in rests_on and waits until the owner has confirmed d3."
+                    } else {
+                        " Carry on; he may still overrule it."
+                    };
+                    let content = message(MessageKind::Answer, &format!("Decision d3 taken provisionally: no\nRelayed by {relayer} as the owner's spoken answer; he has not confirmed it himself.{suffix}"));
+                    assert_eq!(
+                        missing_notices(&state).as_slice(),
+                        std::slice::from_ref(&content),
+                        "{intent} {away} {relayer} {by}"
+                    );
+                    let mut sent = state.clone();
+                    sent.apply(100, now(), &OrgEvent::MessageSent(content))
+                        .unwrap();
+                    assert!(missing_notices(&sent).is_empty());
+                    let id = atm_org::MessageId::new(100);
+                    for event in [
+                        OrgEvent::MessageDelivered {
+                            message_id: id,
+                            session_id: "fixture".into(),
+                            confirmation: "fixture".into(),
+                        },
+                        OrgEvent::MessageDeliveryFailed {
+                            message_id: id,
+                            reason: "fixture".into(),
+                            final_failure: true,
+                        },
+                        OrgEvent::MessageRead {
+                            message_ids: vec![id],
+                        },
+                    ] {
+                        let mut updated = sent.clone();
+                        updated.apply(101, now(), &event).unwrap();
+                        assert!(missing_notices(&updated).is_empty());
+                    }
+                    let mut decision = state.decision(&DecisionId::new(3)).unwrap().clone();
+                    for status in [DecisionStatus::Resolved, DecisionStatus::Overruled] {
+                        decision.status = status;
+                        assert!(
+                            notice(&decision, away).is_none(),
+                            "stale provenance is not provisional"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Break caught: relay falling into owner Resolve. With no hook observers,
+// each refusal must preserve the entire committed cursor, not just decisions.
+#[tokio::test]
+async fn relay_rpc_refusals_append_nothing_without_hook_telemetry() {
+    let rig = Rig::new().await;
+    let org = rig.org.clone();
+    let handle = rig.handle.clone();
+    // Catch assertion unwinds in the scenario task so stop still joins the
+    // bridge before propagating a failure. No harness/usage observers exist.
+    let scenario = tokio::spawn(async move {
+        org.execute(
+            OrgCommand::Adopt {
+                agent_id: "p/other".parse().unwrap(),
+                pane: "%8".into(),
+                session_id: None,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        let id = handle
+            .request(params(request(true, true, Some("yes"))), pane("%7"))
+            .await
+            .unwrap()
+            .decision_id;
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        services.org = org.clone();
+        services.decisions = Some(handle);
+        let methods = router(services).unwrap();
+        let refuse = |caller: CallContext, params: Value, code: &'static str| {
+            let methods = &methods;
+            let org = &org;
+            async move {
+                let before = org.status().unwrap();
+                let error = guarded(methods.call(caller, "decision.resolve", params))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.0.code, code, "{error}");
+                assert_eq!(org.status().unwrap(), before, "refusal appended a fact");
+            }
+        };
+        let answer = json!({"id":id,"option":"no","relay":true});
+        refuse(pane("%7"), answer.clone(), "refused").await;
+        guarded(methods.call(owner(), "owner.relay", json!({"agent":"p/worker"})))
+            .await
+            .unwrap();
+        for caller in [owner(), pane("%99"), pane("%8")] {
+            refuse(caller, answer.clone(), "refused").await;
+        }
+        for caller in [pane("%00"), pane("not a pane")] {
+            refuse(caller, answer.clone(), "invalid_params").await;
+        }
+        for (key, value) in [
+            ("note", Value::Null),
+            ("note", json!("")),
+            ("note", json!("spoken")),
+            ("standing_rule", json!(false)),
+            ("standing_rule", json!(true)),
+        ] {
+            let mut params = answer.clone();
+            params[key] = value;
+            refuse(pane("%7"), params, "invalid_params").await;
+        }
+        org.execute(
+            OrgCommand::Down {
+                agent_id: "p/worker".parse().unwrap(),
+                reason: "fixture".into(),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        refuse(pane("%7"), answer, "refused").await;
+        let state = org.snapshot().await.unwrap();
+        let decision = state.decision(&id).unwrap();
+        assert_eq!(decision.status, DecisionStatus::Pending);
+        assert!(decision.provisional.is_none() && decision.resolution.is_none());
+    });
+    let outcome = guarded(scenario).await;
+    rig.stop().await;
+    outcome.unwrap();
+}
+
+// Break caught: an oversized relay result disguises its committed take as a
+// refusal, or an identical retry appends another take/notice.
+#[tokio::test]
+async fn relay_oversized_committed_result_reports_commit_and_retries_without_appending() {
+    let rig = Rig::new().await;
+    let org = rig.org.clone();
+    let handle = rig.handle.clone();
+    let scenario = tokio::spawn(async move {
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        services.org = org.clone();
+        services.decisions = Some(handle);
+        let methods = router(services).unwrap();
+        let mut requested = params(request(true, true, Some("yes")));
+        // Valid path byte lengths expand sixfold when their controls are escaped.
+        requested.files = vec!["\u{1}".repeat(4096); 32];
+        let asked = guarded(methods.call(
+            pane("%7"),
+            "decision.request",
+            serde_json::to_value(requested).unwrap(),
+        ))
+        .await
+        .unwrap();
+        let id: DecisionId = serde_json::from_value(asked["decision_id"].clone()).unwrap();
+        guarded(methods.call(owner(), "owner.relay", json!({"agent":"p/worker"})))
+            .await
+            .unwrap();
+        let mut takes = org
+            .watch(
+                vec!["decision.taken_provisionally".into()],
+                org.status().unwrap(),
+            )
+            .unwrap();
+        let mut notices = org
+            .watch(vec!["msg.sent".into()], org.status().unwrap())
+            .unwrap();
+        let answer = json!({"id":id,"option":"no","relay":true});
+        let first = guarded(methods.call(pane("%7"), "decision.resolve", answer.clone()))
+            .await
+            .unwrap_err();
+        let take = next(&mut takes).await;
+        assert_eq!(take.kind, "decision.taken_provisionally");
+        assert_eq!(
+            take.body,
+            json!({"decision_id":id,"option":"no","by":"owner","relayed_by":"p/worker"})
+        );
+        let notice = next(&mut notices).await;
+        assert_eq!(notice.body["to"], "p/worker");
+        assert!(notice.body["body"].as_str().unwrap().starts_with(&format!(
+            "Decision {id} taken provisionally: no\nRelayed by p/worker"
+        )));
+        let state = org.snapshot().await.unwrap();
+        let decision = state.decision(&id).unwrap();
+        let bytes = serde_json::to_vec(&super::super::decisions::DecisionEntry::from(decision))
+            .unwrap()
+            .len();
+        assert!(
+            bytes > 524288,
+            "entry must exceed the result bound: {bytes}"
+        );
+        assert_eq!(decision.status, DecisionStatus::TakenProvisionally);
+        assert!(decision.resolution.is_none());
+        assert_eq!(state.messages().count(), 1);
+        let before = org.status().unwrap();
+        let again = guarded(methods.call(pane("%7"), "decision.resolve", answer))
+            .await
+            .unwrap_err();
+        assert_eq!(org.status().unwrap(), before, "retry appended a fact");
+        eprintln!(
+            "serialized entry bytes: {bytes}; one take and one notice, retry appended nothing"
+        );
+        eprintln!(
+            "first caller response: {}: {}",
+            first.0.code, first.0.message
+        );
+        eprintln!(
+            "repeat caller response: {}: {}",
+            again.0.code, again.0.message
+        );
+        for error in [first, again] {
+            assert_eq!(error.0.code, "refused");
+            assert_eq!(
+                error.0.message,
+                format!("decision {id} committed; result was not confirmed: decision exceeds 524288 bytes")
+            );
+        }
+    });
+    finish_scenario(rig, scenario).await;
+}
+
+// Break caught: owner.relay treats canonical unbound or Down panes as agents,
+// unlike the shared away attribution, or writes a fact merely to show the slot.
+#[tokio::test]
+async fn owner_relay_unbound_and_down_panes_are_owner_for_all_actions() {
+    let rig = Rig::new().await;
+    let org = rig.org.clone();
+    let handle = rig.handle.clone();
+    let scenario = tokio::spawn(async move {
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        services.org = org.clone();
+        services.decisions = Some(handle);
+        let methods = router(services).unwrap();
+        for down in [false, true] {
+            if down {
+                org.execute(
+                    OrgCommand::Down {
+                        agent_id: "p/worker".parse().unwrap(),
+                        reason: "fixture".into(),
+                    },
+                    now(),
+                )
+                .await
+                .unwrap();
+            }
+            let caller = pane(if down { "%7" } else { "%99" });
+            assert!(org
+                .snapshot()
+                .await
+                .unwrap()
+                .agent_for_pane(&caller.from_pane.as_ref().unwrap().0)
+                .is_none());
+            for (params, expected, appends) in [
+                (json!({}), json!({"agent":null,"changed":false}), 0),
+                (
+                    json!({"agent":"p/worker"}),
+                    json!({"agent":"p/worker","changed":true}),
+                    1,
+                ),
+                (json!({}), json!({"agent":"p/worker","changed":false}), 0),
+                (
+                    json!({"clear":true}),
+                    json!({"agent":null,"changed":true}),
+                    1,
+                ),
+            ] {
+                let before = org.status().unwrap();
+                assert_eq!(
+                    guarded(methods.call(caller.clone(), "owner.relay", params.clone()))
+                        .await
+                        .unwrap(),
+                    expected,
+                    "Down={down}: {params}"
+                );
+                assert_eq!(
+                    org.status().unwrap(),
+                    before + appends,
+                    "Down={down}: {params}"
+                );
+            }
+        }
+    });
+    finish_scenario(rig, scenario).await;
+}
+
+// Break caught: a malformed pane falls back to Owner and can show/set/clear
+// the slot instead of returning invalid_params without committing anything.
+#[tokio::test]
+async fn owner_relay_malformed_panes_refuse_all_actions_without_appends() {
+    let rig = Rig::new().await;
+    let org = rig.org.clone();
+    let handle = rig.handle.clone();
+    let scenario = tokio::spawn(async move {
+        let mut services = MethodServices::new(crate::registry::spawn_registry());
+        services.org = org.clone();
+        services.decisions = Some(handle);
+        let methods = router(services).unwrap();
+        for caller in ["%00", "%", "session:1.2", " %7", "%７"] {
+            for params in [
+                json!({}),
+                json!({"agent":"p/worker"}),
+                json!({"clear":true}),
+            ] {
+                let before = org.status().unwrap();
+                let error = guarded(methods.call(pane(caller), "owner.relay", params.clone()))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.0.code, "invalid_params", "{caller:?}: {params}");
+                assert_eq!(org.status().unwrap(), before, "{caller:?}: {params}");
+            }
+        }
+        assert!(org.snapshot().await.unwrap().owner().relay.is_none());
+    });
+    finish_scenario(rig, scenario).await;
+}
+
+// Break caught: a disabled daemon omitting the capability or accepting an
+// invalid designation shape before checking availability.
+#[tokio::test]
+async fn owner_relay_schema_and_disabled_service_fail_closed() {
+    let methods = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
+    assert!(methods.names().iter().any(|m| m == "owner.relay"));
+    for params in [
+        json!({}),
+        Value::Null,
+        json!({"agent":"p/chief"}),
+        json!({"clear":true}),
+    ] {
+        assert_eq!(
+            guarded(methods.call(owner(), "owner.relay", params))
+                .await
+                .unwrap_err()
+                .0
+                .code,
+            "unavailable"
+        );
+    }
+    for params in [
+        json!([]),
+        json!({"by":"owner"}),
+        json!({"agent":"chief"}),
+        json!({"agent":"p/chief","clear":true}),
+    ] {
+        assert_eq!(
+            guarded(methods.call(owner(), "owner.relay", params))
+                .await
+                .unwrap_err()
+                .0
+                .code,
+            "invalid_params"
+        );
+    }
 }

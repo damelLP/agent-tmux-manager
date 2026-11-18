@@ -12,7 +12,7 @@ mod daemon;
 
 async fn list_fixture(
     sessions: Vec<atm_core::SessionView>,
-    tmux_body: Option<&str>,
+    role_result: Option<serde_json::Value>,
     format: &str,
     filters: &[&str],
 ) -> std::process::Output {
@@ -20,19 +20,99 @@ async fn list_fixture(
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    if let Some(body) = tmux_body {
-        let tmux = bin.join("tmux");
-        std::fs::write(
-            &tmux,
-            format!("#!/bin/sh\necho called >> \"$HOME/tmux.log\"\n{body}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    // A client-side tmux invocation is always a bug, including JSON lookups.
+    let tmux = bin.join("tmux");
+    std::fs::write(
+        &tmux,
+        "#!/bin/sh\necho called >> \"$HOME/tmux.log\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
     let socket = dir.path().join("atmd.sock");
-    daemon::fake_daemon(dir.path(), Some(sessions));
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = reads.clone();
+    let handshakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted = handshakes.clone();
+    let advertised = role_result.is_some();
+    let minor = role_result
+        .as_ref()
+        .and_then(|value| value.get("protocol_minor"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as u16;
+    let capable = advertised && minor >= 1;
+    let server = tokio::spawn(async move {
+        use atm_protocol::{ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let mut line = String::new();
+            while read.read_line(&mut line).await.unwrap() != 0 {
+                let request: ClientMessage = serde_json::from_str(&line).unwrap();
+                line.clear();
+                let response = match request.message {
+                    MessageType::Connect { .. } => {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        DaemonMessage::Connected {
+                            protocol_version: ProtocolVersion::new(1, minor),
+                            client_id: "list-test".into(),
+                            methods: if advertised {
+                                vec!["session.roles".into()]
+                            } else {
+                                vec![]
+                            },
+                        }
+                    }
+                    MessageType::ListSessions => DaemonMessage::session_list(sessions.clone()),
+                    MessageType::Request {
+                        id,
+                        method,
+                        params,
+                        from_pane,
+                    } => {
+                        assert_eq!(method, "session.roles");
+                        assert_eq!(
+                            params,
+                            serde_json::json!({"caller_server":"/private/caller.sock"})
+                        );
+                        assert_eq!(from_pane.as_deref(), Some("%99"));
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let value = role_result
+                            .clone()
+                            .expect("unsupported role request was sent");
+                        if value.get("hold").is_some() {
+                            assert_eq!(
+                                read.read_line(&mut line).await.unwrap(),
+                                0,
+                                "timed-out role lookup kept its connection"
+                            );
+                            break;
+                        }
+                        if value.get("disconnect").is_some() {
+                            break;
+                        }
+                        if let Some(error) = value.get("error") {
+                            DaemonMessage::response_err(id, "refused", error.as_str().unwrap())
+                        } else {
+                            DaemonMessage::response_ok(id, value)
+                        }
+                    }
+                    MessageType::Disconnect => break,
+                    other => panic!("unexpected list exchange: {other:?}"),
+                };
+                write
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    });
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_atm"))
             .args(["list", "-f", format])
             .args(filters)
@@ -41,16 +121,30 @@ async fn list_fixture(
             .env("HOME", dir.path())
             .env("XDG_STATE_HOME", dir.path().join("state"))
             .env("ATM_SOCKET", socket)
+            .env("TMUX", "/private/caller.sock,1,0")
+            .env("TMUX_PANE", "%99")
             .kill_on_drop(true)
             .output(),
     )
     .await
     .expect("list timed out")
     .expect("run list");
-    if format != "json" {
-        assert!(
-            !dir.path().join("tmux.log").exists(),
-            "non-JSON list queried tmux"
+    server.abort();
+    let stopped = server.await.unwrap_err();
+    assert!(stopped.is_cancelled(), "stand-in failed: {stopped}");
+    assert!(
+        !dir.path().join("tmux.log").exists(),
+        "list queried local tmux"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        usize::from(format == "json" && capable)
+    );
+    if !capable || format != "json" {
+        assert_eq!(
+            handshakes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unsupported/non-JSON list started another RPC exchange"
         );
     }
     output
@@ -91,7 +185,7 @@ async fn json_adds_only_role_and_does_not_tag_subagents() {
     let rows = rows();
     let output = list_fixture(
         rows.clone(),
-        Some("printf '%s\\t%s\\n' %7 coordinator %8 implementer"),
+        Some(serde_json::json!({"coordinator_panes":["%7"]})),
         "json",
         &[],
     )
@@ -111,9 +205,19 @@ async fn json_adds_only_role_and_does_not_tag_subagents() {
 }
 
 #[tokio::test]
-async fn json_without_tmux_or_a_server_has_explicit_null_roles() {
-    for tmux in [None, Some("echo no-server >&2; exit 1")] {
-        let output = list_fixture(rows(), tmux, "json", &[]).await;
+async fn json_failed_or_unsupported_role_lookups_have_explicit_null_roles() {
+    for result in [
+        None,
+        Some(serde_json::json!({"protocol_minor":0,"coordinator_panes":["%7"]})),
+        Some(serde_json::json!({"error":"no server"})),
+        Some(serde_json::json!({"coordinator_panes":null})),
+        Some(serde_json::json!({"coordinator_panes":["%7",1]})),
+        Some(serde_json::json!({})),
+        Some(serde_json::json!({"hold":true})),
+        Some(serde_json::json!({"disconnect":true})),
+    ] {
+        let output = list_fixture(rows(), result, "json", &[]).await;
+        assert!(output.stderr.is_empty(), "{output:?}");
         assert!(output.status.success(), "{output:?}");
         let listed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(listed.len(), 4);
@@ -128,12 +232,18 @@ async fn json_without_tmux_or_a_server_has_explicit_null_roles() {
 
 #[tokio::test]
 async fn list_keeps_filters_empty_arrays_and_non_json_bytes() {
-    let output = list_fixture(rows(), Some("exit 1"), "json", &["--project", "missing"]).await;
+    let output = list_fixture(
+        rows(),
+        Some(serde_json::json!({"error":"failed"})),
+        "json",
+        &["--project", "missing"],
+    )
+    .await;
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"[]\n");
     let output = list_fixture(
         rows(),
-        Some("printf '%s\\t%s\\n' %7 coordinator"),
+        Some(serde_json::json!({"coordinator_panes":["%7"]})),
         "json",
         &["--project", "project", "--status", "idle"],
     )
@@ -146,7 +256,13 @@ async fn list_keeps_filters_empty_arrays_and_non_json_bytes() {
         ("table", "lead\tidle\t0%\tmodel\tproject\t%7\n"),
         ("ids", "lead\n"),
     ] {
-        let output = list_fixture(rows(), Some("exit 1"), format, &["--project", "project"]).await;
+        let output = list_fixture(
+            rows(),
+            Some(serde_json::json!({"coordinator_panes":["%7"]})),
+            format,
+            &["--project", "project"],
+        )
+        .await;
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, expected.as_bytes());
     }
@@ -172,7 +288,7 @@ async fn json_tags_a_teammates_own_pane_but_not_its_subagent() {
     ]);
     let output = list_fixture(
         sessions.clone(),
-        Some("printf '%s\\t%s\\n' %7 coordinator %9 coordinator"),
+        Some(serde_json::json!({"coordinator_panes":["%7","%9"]})),
         "json",
         &[],
     )
@@ -208,7 +324,7 @@ async fn json_tags_a_child_whose_parent_is_missing() {
             tmux_pane: Some("%7".into()),
             ..SessionView::default()
         }],
-        Some("printf '%s\\t%s\\n' %7 coordinator"),
+        Some(serde_json::json!({"coordinator_panes":["%7"]})),
         "json",
         &[],
     )
@@ -243,7 +359,7 @@ async fn json_does_not_tag_a_subagent_when_filters_hide_its_parent() {
     for filters in [["--status", "working"], ["--project", "child-project"]] {
         let output = list_fixture(
             sessions.clone(),
-            Some("printf '%s\\t%s\\n' %7 coordinator"),
+            Some(serde_json::json!({"coordinator_panes":["%7"]})),
             "json",
             &filters,
         )
@@ -281,7 +397,7 @@ async fn json_duplicate_parent_ids_exclude_a_shared_pane_in_either_row_order() {
         });
         let output = list_fixture(
             sessions,
-            Some("printf '%s\\t%s\\n' %7 coordinator"),
+            Some(serde_json::json!({"coordinator_panes":["%7"]})),
             "json",
             &[],
         )

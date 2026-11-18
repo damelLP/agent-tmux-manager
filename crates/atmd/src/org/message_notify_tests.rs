@@ -106,6 +106,7 @@ async fn decisions_no_longer_pending_suppress_delayed_notifications() {
             reason: None,
         }),
         OrgEvent::DecisionTakenProvisionally(atm_org::ProvisionalChoice {
+            relayed_by: None,
             decision_id: DecisionId::new(3),
             option: "yes".into(),
             by: Address::System,
@@ -271,6 +272,7 @@ fn now() -> DateTime<Utc> {
 }
 fn content() -> MessageContent {
     MessageContent {
+        delivery_notice: None,
         from: Address::Owner,
         to: Address::Owner,
         kind: MessageKind::Note,
@@ -363,7 +365,11 @@ async fn only_new_owner_commits_queue_and_overflow_is_observable() {
 async fn focus_notice_never_notifies_but_user_lookalike_does() {
     let (tx, mut rx) = mpsc::channel(32);
     let mut cursor = 0;
-    let focus = focus_notice(MessageId::new(1), &PaneId::parse("%7").unwrap());
+    let mut focus = focus_notice(MessageId::new(1), &PaneId::parse("%7").unwrap());
+    focus.delivery_notice = Some(atm_org::DeliveryNotice {
+        source_message_id: MessageId::new(1),
+        reason: "focus".into(),
+    });
     assert_eq!(
         enqueue(
             &envelope(1, focus.clone()),
@@ -375,7 +381,19 @@ async fn focus_notice_never_notifies_but_user_lookalike_does() {
         .unwrap(),
         Admission::Ignored
     );
+    let mut legacy = focus.clone();
+    legacy.delivery_notice = None;
+    assert!(is_focus_notice(&legacy));
+    for (id, reason) in [(2, "focus"), (1, "unobserved")] {
+        let mut wrong = focus.clone();
+        wrong.delivery_notice = Some(atm_org::DeliveryNotice {
+            source_message_id: MessageId::new(id),
+            reason: reason.into(),
+        });
+        assert!(!is_focus_notice(&wrong));
+    }
     let mut user = focus;
+    user.delivery_notice = None;
     user.from = Address::Owner;
     assert_eq!(
         enqueue(

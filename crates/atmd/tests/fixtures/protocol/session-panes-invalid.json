@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"panes-invalid","method":"session.panes","params":{"session_name":7,"caller_server":"/private/server"}},"response":{"type":"response","id":"panes-invalid","error":{"code":"invalid_params","message":"ignored"}},"ignore":["/error/message"]}

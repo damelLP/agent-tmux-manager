@@ -150,11 +150,19 @@ verified separately.
   preflight; timeout can terminate only the setup subprocess it started.
 - Procfs may hide exe/environ for unrelated same-user services (observed with
   the user systemd manager). In that case readable comm/argv identify possible
-  ATM processes: those, or unreadable/empty identity, fail closed. Clearly
+  ATM processes: those, or unreadable/empty identity, fail closed unless proven
+  exited as described below. Clearly
   unrelated inaccessible services are ignored. Disguised processes, other UIDs,
   privileged/hostile writers and concurrent autostarts are outside this
   best-effort check. The lock coordinates these tools only; it cannot prevent
   cargo install or a TUI from racing. Owner quiescence is mandatory.
+
+  Before refusing an inaccessible ambiguous identity, preflight rechecks procfs
+  state: only an absent PID or a well-formed single-threaded zombie (`Z`, one
+  thread) is treated as exited. Non-dumpable zombies can still deny exe/environ
+  reads while exposing empty argv. A zombie leader with live workers is not
+  exempt; live, malformed or unreadable state still refuses, including a live
+  PID reused between inspection and the recheck.
 
 ## Rollout in one command
 
@@ -272,10 +280,257 @@ a stage 0 release pair; 0.3.0 has the same lock.
 - The lock stops daemons on this socket. It does not stop `cargo install` or a
   daemon on another socket; `atm-promote`'s own checks still apply.
 
+## Supervisor
+
+`atm-supervise` runs the rollout above, then observes one probation. Start it
+explicitly and keep it running until its verdict; no daemon, TUI or hook starts
+it. Keep `atm_supervisor.py` and the other kit files beside the entrypoint. Run
+from the checkout containing the reviewed kit, with the candidate-kit roots
+selected (see `atm-candidate.md`); the candidate build can be a different commit. Every command requires an explicit `--bin-dir`; probes use
+raw socket requests, never an `atm` call that could autostart a daemon.
+
+```sh
+scripts/atm-supervise init --installed-commit FULL_SHA \
+  --bin-dir /absolute/installed/bin [--install FULL_SHA-debug]
+scripts/atm-supervise status --bin-dir /absolute/installed/bin
+scripts/atm-supervise gate FULL_SHA-debug --gate-pass /absolute/gate-pass.txt \
+  --gate-runner-label gate-runner --bin-dir /absolute/installed/bin --socket /absolute/daemon.sock
+scripts/atm-supervise promote FULL_SHA-debug --approve REPORT_SHA256 \
+  --bin-dir /absolute/installed/bin --socket /absolute/daemon.sock
+scripts/atm-supervise check --bin-dir /absolute/installed/bin --socket /absolute/daemon.sock
+```
+
+The install argument is an immutable candidate-kit **ID**, not a path. `init`
+records the existing installed pair once, matching its full commit, bytes and
+modes to a retained install; use `--install` if matches are ambiguous. Its baseline
+report is an observation, **not approval**. `status` prints the verified slots
+without probing the daemon. All commands take the nonblocking
+`<bin>/.atm-promotion/supervisor.lock`; a concurrent supervisor refuses and names
+the holder. Rollout retains its separate daemon/swap locks.
+
+### Slots and approval
+
+`<bin>/.atm-promotion/slots.json` is checksummed and atomically replaced. It holds
+`stable`, `previous`, `candidate`, the last three `rejected` records, and used
+approval hashes. Each record binds commit, install ID, both binaries' hashes and
+modes, install-manifest hash, retained kit and report hashes. Every read verifies
+the retained artifacts and that the installed pair is stable or pending candidate;
+drift is NEEDS YOU, not permission to repair files. Checksums detect drift, not a
+hostile owner rewriting all evidence. Retained installs, kits, reports and evidence
+are not automatically pruned.
+
+Only acceptance after probation rotates slots: previous becomes stable, stable
+becomes candidate, candidate clears. A gate pass or a swap alone rotates nothing.
+Promotion stages candidate and consumes approval **before** invoking rollout;
+a recorded failure rejects it without rotating stable/previous. A used hash is refused. A
+rejected commit/pair is refused by gate and promote; the same report cannot retry
+it. Do not clear rejection/approval records to retry a failed build.
+
+### Gate and rehearsal
+
+`gate` changes nothing live; it retains a report even on refusal:
+
+| Step | Evidence required |
+|---|---|
+| 1 | Install manifest and hashes match; source-built debug/release provenance, not an unverified prebuilt; candidate is not rejected |
+| 2 | Exact-commit detached worktree, sealed runtime and direct toolchain: `cargo test -p atmd --lib replay`, then `--lib frame_proof`, with `ATM_RECORD_REGISTRY_REPLAY` removed. Each must exit 0, fail zero and pass more than zero tests; counts are compared with stable's report when available. Goldens are not regenerated |
+| 3 | `--gate-pass` is an existing full-gate runner record for that exact commit and the explicit `--gate-runner-label`: one passed outcome, no failed outcome, matching start/pass/exit heads, exit 0 and no leftovers. The full gate is **not rerun** |
+| 4 | Private, disposable state and tmux, repository stand-in pi, no model CLI: stable performs up/message/clear/down, candidate repeats, stable starts again and answers list and agent list, then stops cleanly |
+| 5 | `atm-rollout --dry-run`: protected-file report and its hash, plus the quiet snapshot |
+
+`gate` requires `--gate-runner-label` with the record's exact, nonblank,
+single-line runner label; omission is a usage error. It is matched literally,
+including regex punctuation, with no default, autodetection, environment-variable
+fallback or config-file reader. In the example, exit and outcome lines begin
+`gate-runner exit ...` and `gate-runner: GATE PASSED ...`; the start line still
+begins `gate start ...`. The selected label is retained in the hashed gate-pass
+step command alongside the record evidence. Keep machine-local choices outside
+the checkout and pass the label explicitly.
+
+Rehearsal says **two-way** only if every phase and final stop succeeds; otherwise
+**ONE-WAY**, with the failing step/output. ONE-WAY is not proof that the old build
+can read newer state. It does not itself refuse promotion, but uncertain cleanup
+does refuse gate. Rehearsal never copies live state.
+
+The output names the retained report and its sha256. Read it, including every
+step's command/result/hash, compatibility and the stable it replaces. Obtain the
+owner's yes to **that supervisor report hash** before passing `--approve`. This
+is not rollout's separate protected-report hash. `promote` verifies the unused
+passed report, candidate and retained kit, repeats manifest checks and rollout's
+dry-run, and refuses any protected-report/hash or quiet-snapshot difference. It
+passes the protected-report hash to rollout itself. Approval does not automate
+QUIET, stopping atm-calling helpers, reload reminders or re-confirming seats.
+
+### Probation, bounded recovery and NEEDS YOU
+
+After rollout exits 0, the supervisor pins its checked daemon's PID/start identity
+and probes immediately, then every 15 seconds for 30 minutes (including the end
+boundary). Peer identity is checked too: an autostarted replacement is not the
+same daemon. The verdict uses the whole observation history:
+
+- Failed reservations, stopped lifecycle, refused socket, dead process or changed
+  identity: unhealthy on one read.
+- Missing/malformed or `unavailable` answers while alive: unhealthy on three
+  consecutive reads; a valid supported answer resets the streak. `unavailable`
+  can mean stopped control, **not** an old build without the method.
+- Only `unknown_method` is UNKNOWN before supported health has been seen.
+  Acceptance explicitly relies on rollout checks. Losing previously supported
+  health counts toward the invalid-answer streak.
+- At the end, accept only a healthy or legacy UNKNOWN verdict, or full with an
+  earlier ok. Full throughout ends NEEDS YOU. A pending final verdict ends NEEDS
+  YOU `health remained uncertain at the end of probation`, even after earlier ok.
+
+**One automatic rollback is authorised: UNHEALTHY probation, two-way candidates
+only.** First copy both `atm.log` and `atm.log.1` into a private evidence directory.
+Immediately reverify slots, the installed candidate and the saved last-known-good
+pair (bytes and modes), then invoke `scripts/atm-rollout --rollback` once with the
+explicit socket in `ATM_SOCKET`, under the same 900-second capture guard as the
+forward rollout. Only rollback exit 0 with a verified stable pair and freshly
+pinned daemon permits one stable health read. Healthy or legacy UNKNOWN means
+**exit 3 rolled-back**; output includes R's state line, the restored pair, health
+and diagnostic evidence. The candidate is rejected, approval stays used, and
+stable/previous do not rotate. The supervisor itself starts nothing and makes
+no retry or forward promotion; if a process starts using the daemon socket between
+the quiet check and the swap, R refuses the swap and starts the installed candidate
+again within its one call (as a manual `--rollback` does), then the supervisor exits
+4 NEEDS YOU, and that restart can drop a failed candidate's quarantine tombstones.
+The automatic path needs R's quiet moment during probation (no message in delivery,
+agent start/clear or atm command running over five seconds); otherwise R exits 1,
+the supervisor exits 4, and the candidate is rejected but still installed.
+
+Everything else remains **NEEDS YOU, exit 4**: ONE-WAY, uncertain final health,
+full throughout, failed/missing diagnostic copies, drift, refused/uncertain
+rollback, or unhealthy/uncertain restored health. After an automatic attempt,
+exit 4 prints R's exit and stderr, the rollback command only if the candidate pair
+is still installed, and start preparation only if no daemon accepts on the socket
+now; paths with no automatic attempt keep their existing manual advice.
+The compatibility and manual command below are for intervention, not run again. ONE-WAY adds a warning:
+the old build may not read the organisation log the newer build wrote; named
+agents/messages may be unavailable until the newer build is back. Changed or
+unverifiable slots stay untouched/pending rather than being overwritten with an
+older snapshot. Boundary failures still retain both diagnostic logs and reject
+without an automatic action. State is never copied back, cut or deleted.
+
+```sh
+scripts/atm-rollout --rollback --bin-dir /absolute/installed/bin --socket /absolute/daemon.sock
+```
+
+For dead/refused, the one authorized rollback attempt can refuse because rollout
+itself requires an answering daemon: it says
+`no daemon answers on <socket>; start it and run again`. The supervisor prints
+these preparatory steps too, **for you to run**, never runs them itself:
+
+```sh
+ATM_SOCKET=/absolute/daemon.sock /absolute/installed/bin/atmd start -d
+# Wait for the socket to answer, then run the printed scripts/atm-rollout --rollback.
+```
+
+Keep the same explicit socket/state/HOME/tmux environment. If the candidate cannot
+start, do not retry or let a CLI autostart it: use the stopped-daemon
+`atm-rollback` procedure above after verifying QUIET and the saved stable pair.
+
+Three `missing` reads can also mean a living daemon lost its socket pathname.
+That case prints only the rollback command, with no start preparation; rollout
+still refuses `no daemon answers on <socket>; start it and run again`. Inspect
+the pinned PID/start identity and executable, the selected socket path and daemon
+logs. Do not start a second daemon or assume the first one stopped. Make helpers
+quiet, stop only that verified daemon, then use the stopped-daemon rollback
+procedure with a verified saved stable pair; do not unlink an unknown socket or
+bypass its lock.
+
+Inspect the evidence, installed pair and last-known-good hashes before running
+that command yourself, with the same QUIET/environment requirements as rollout.
+`stable` is the supervisor's last-known-good, not necessarily the pair selected
+by promotion's `previous.json`: a mismatch means **do not roll back**. Manual
+rollout does not reconcile supervisor slots; after rolling back an accepted
+candidate, status may report installed-pair drift. Investigate rather than
+reinitializing or editing slots to hide it.
+
+| NEEDS YOU condition | Exit / action |
+|---|---|
+| Rollout exits 4, or its completion is uncertain | 4; nothing further tried |
+| Unhealthy probation, **ONE-WAY** | 4; diagnostic logs, rejection and manual command only |
+| Two-way recovery lacks either diagnostic copy, rollback refuses/fails, or completion is uncertain | 4; retained evidence and manual steps, no retry/start |
+| Last-known-good pair/hash mismatch | 4; no rollback |
+| Installed pair is neither stable nor pending candidate, or rollout installed an unexpected pair | 4; no swap/retry |
+| Old build cannot read the newer organisation log | Rollout 4, supervisor 4; state left in place |
+| Stable health is unhealthy or uncertain after automatic rollback or rollout's own exit-3 recovery | 4; no further recovery |
+| Full throughout probation, or final health remains uncertain | 4; diagnostic logs, rejection and manual command |
+| Unreadable/invalid slots or retained artifacts; kit cannot be verified | 4; no repair |
+| Probation interrupted, daemon cannot be pinned, or post-swap decision cannot be persisted | 4; investigate installed state, no automatic action |
+| Stable unhealthy outside promotion (`check`) | **2**; report only, no restart |
+
+Rollout's existing internal recovery is unchanged: if it already exits 3, the
+supervisor reads stable health once and exits 3 only if healthy/UNKNOWN; it never
+requests a second recovery. The new automatic path is only after a successful
+forward rollout and an unhealthy two-way probation. Successful probation
+accepts/rotates and exits 0.
+Preflight/approval refusal exits 1; usage exits 2. `check` makes one read only:
+0 healthy, 2 unhealthy, 4 uncertain (including UNKNOWN/full or pending candidate
+installed). It changes no slots and never acts on an unhealthy stable daemon.
+
+### Known limits and the manual way out
+
+- **No resume or slot-reconciliation command.** Abrupt supervisor exit can leave
+  candidate pending indefinitely. Ctrl-C or a failed decision can leave the
+  candidate installed but rejected while stable still names the old pair.
+  `promote` refuses a pending candidate; `check` is not an acceptance command.
+  Preserve the metadata/evidence and verify the installed pair and last-known-good
+  before manual rollback. A manual rollback does not clear pending slots or undo
+  an accepted slot rotation.
+- **Post-swap parsing/identity errors can leave candidate pending.** A ValueError
+  or KitRefused (for example corrupt `previous.json`, or malformed proc identity
+  during probation or the exit-3 health read) exits 4 NEEDS YOU. The original
+  forward-rollout parsing/identity path prints no rollback command or captured
+  result. Automatic recovery's verification/read failures retain its captured
+  evidence and manual steps, but can also leave candidate pending. With corrupt
+  `previous.json`, rollout's `--rollback` refuses too; repeating it cannot repair
+  the marker.
+  Inspect the actual installed pair and retained stable install. With helpers
+  quiet and the verified daemon stopped, use the stopped-daemon `atm-rollback`
+  procedure only if its saved pair/marker can still be verified. Otherwise use
+  the verified immutable stable install and fresh-bin baseline below; do not
+  guess at the saved pair or edit checksummed slots to clear the pending record.
+- **The 900-second guard on either rollout call is not a recovery transaction.**
+  Guard expiry or Ctrl-C kills R's subprocess and retains captured output in
+  `rollout` (forward) or `rollback` (automatic recovery), but R may
+  not have emitted its state line and work it launched may still be in flight.
+  Inspect actual processes, daemon/socket, pair and logs; wait for that work to
+  finish before a manual action. Do not infer that a timeout means nothing changed.
+  If no daemon answers, use the printed preparation above; if it cannot start,
+  follow the stopped-daemon rollback procedure, not repeated promotion attempts.
+- **A post-staging rollout refusal burns approval and rejects the build**, even
+  when R exits 1 before swapping. The same rejected commit/pair cannot be gated
+  again while retained in rejected slots; a fresh hash alone does not bypass it.
+  Use a corrected candidate, not approval/rejection edits or artificial failures
+  to evict the record.
+
+If recovery leaves old metadata inconsistent or pending, retain it intact for
+investigation. There is no supported in-place command to repair that lineage.
+After verified recovery, a manual fresh baseline needs a **new bin directory**,
+the verified stable install's bytes **and modes**, and the same immutable kit
+install. For example, with the daemon stopped and helpers quiet:
+
+```sh
+mkdir -m 700 /absolute/recovery/bin
+cp -p /absolute/retained/stable/bin/atm /absolute/recovery/bin/atm
+cp -p /absolute/retained/stable/bin/atmd /absolute/recovery/bin/atmd
+scripts/atm-supervise init --installed-commit STABLE_FULL_SHA \
+  --install STABLE_FULL_SHA-debug --bin-dir /absolute/recovery/bin
+```
+
+Keep the original bin/metadata, reports, rejected records and used approvals;
+do not copy a pending `slots.json`, delete the old metadata or hand-edit its
+checksum. Start the recovered daemon from the new directory only after verifying
+no old daemon remains, with the same socket and persistent state, then check its
+lists/health before gating a corrected candidate. This explicit operator reset
+is not a retry authorisation or an automatic recovery feature.
+
 ## Verification
 
 `cargo test --test candidate_kit` and `cargo test --workspace` run the candidate
-kit suite, `promotion_kit_test.py` and `rollout_kit_test.py` through the Cargo bridge. For
+kit suite, `promotion_kit_test.py`, `rollout_kit_test.py` and
+`supervisor_kit_test.py` through the Cargo bridge. For
 local combined Python discovery after building both binaries:
 
 ```sh

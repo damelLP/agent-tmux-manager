@@ -597,7 +597,7 @@ fn states_with_their_own_move_cannot_be_set_directly() {
 }
 
 /// Callers, in the column order of the rows below: the task's agent, another
-/// agent, the creator, an agent the daemon marks as the lead, the owner, the
+/// agent, the creator, a scoped manager of BUILD, the owner, the
 /// daemon itself.
 fn callers() -> [TaskActor; 6] {
     [
@@ -611,6 +611,34 @@ fn callers() -> [TaskActor; 6] {
 }
 const ONLY_ITS_AGENT: [bool; 6] = [true, false, false, false, false, false];
 const AUTHORITY: [bool; 6] = [false, false, true, true, true, false];
+
+// Break caught: a scoped manager fact becomes a global grant or None matches None.
+#[test]
+fn manager_grant_is_scoped_to_current_assignee() {
+    let mut rig = Rig::new();
+    let task = rig.work_task();
+    let manager = as_lead(BOSS);
+    assert!(matches!(
+        rig.run(assign(&task, BUILD, manager.clone())),
+        Err(Refusal::Task(TaskRefusal::NotAllowed { .. }))
+    ));
+    rig.ok(assign(&task, BUILD, by(LEAD)));
+    assert!(rig
+        .run(assign(&task, BUILD, manager.clone()))
+        .unwrap()
+        .is_empty());
+    for who in [by(BOSS), as_lead(BUILD), as_lead("system")] {
+        assert!(matches!(
+            rig.run(set(&task, S::Cancelled, None, who)),
+            Err(Refusal::Task(TaskRefusal::NotAllowed { .. }))
+        ));
+    }
+    rig.ok(assign(&task, OTHER, by(LEAD)));
+    assert!(matches!(
+        rig.run(set(&task, S::Cancelled, None, manager)),
+        Err(Refusal::Task(TaskRefusal::NotAllowed { .. }))
+    ));
+}
 
 #[test]
 fn who_may_ask_for_each_move() {

@@ -69,6 +69,7 @@ pub fn budget_note(task: &Task) -> Option<MessageContent> {
         return None;
     }
     Some(MessageContent {
+        delivery_notice: None,
         from: Address::System,
         to: if task.creator == Address::System {
             Address::Owner

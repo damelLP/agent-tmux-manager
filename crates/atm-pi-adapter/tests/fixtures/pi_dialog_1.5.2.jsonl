@@ -1,0 +1,7 @@
+{"protocol_version":{"major":1,"minor":0},"type":"pi_event","data":{"event":"session_start","payload":{"type":"session_start","reason":"startup"},"session_id":"dialog-session","pid":123,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"protocol_version":{"major":1,"minor":0},"type":"pi_event","data":{"event":"atm_idle","payload":{},"session_id":"dialog-session","pid":123,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}
+{"protocol_version":{"major":1,"minor":0},"type":"pi_event","data":{"event":"atm_needs_input_open","payload":{"title":"Neutral pick selection"},"session_id":"dialog-session","pid":123}}
+{"protocol_version":{"major":1,"minor":0},"type":"pi_event","data":{"event":"atm_needs_input_resolved","payload":{"idle":true},"session_id":"dialog-session","pid":123}}
+{"protocol_version":{"major":1,"minor":0},"type":"pi_event","data":{"event":"atm_needs_input_open","payload":{"title":"Neutral cancel selection"},"session_id":"dialog-session","pid":123}}
+{"protocol_version":{"major":1,"minor":0},"type":"pi_event","data":{"event":"atm_needs_input_resolved","payload":{"idle":true},"session_id":"dialog-session","pid":123}}
+{"protocol_version":{"major":1,"minor":0},"type":"pi_event","data":{"event":"session_shutdown","payload":{"type":"session_shutdown","reason":"quit"},"session_id":"dialog-session","pid":123,"model":{"id":"probe","provider":"sealed","contextWindow":128000}}}

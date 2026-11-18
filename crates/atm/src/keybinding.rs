@@ -43,8 +43,12 @@ pub enum UiAction {
     Quit,
     /// Toggle the help popup.
     ToggleHelp,
+    /// Toggle between Sessions and the window-grouped Work view.
+    ToggleWorkView,
     /// Open the `/` search prompt to filter sessions.
     StartSearch,
+    /// Inspect the selected session's waiting decision, or the authorized queue.
+    OpenDecision,
     /// Expand the current tree node if collapsed (bound to `h`, `l`, `zo`).
     /// Never closes a fold — closing is reserved for z-chords.
     ExpandNode,
@@ -192,6 +196,22 @@ pub(crate) static KEYBINDING_HINTS: &[KeybindingHint] = &[
         tmux_only: false,
     },
     // -- Actions -------------------------------------------------------------
+    KeybindingHint {
+        help_key: "w",
+        help_desc: "Toggle Work / Sessions view",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
+    KeybindingHint {
+        help_key: "a",
+        help_desc: "Answer waiting decision",
+        footer_key: "",
+        footer_desc: "",
+        category: HintCategory::Actions,
+        tmux_only: false,
+    },
     KeybindingHint {
         help_key: "c",
         help_desc: "Toggle coordinator tag",
@@ -436,6 +456,7 @@ impl VimKeyResolver {
             'h' | 'l' => KeyMeaning::SimpleAction(UiAction::ExpandNode),
             'o' => KeyMeaning::OPrefix,
             'z' => KeyMeaning::ZPrefix,
+            'a' => KeyMeaning::SimpleAction(UiAction::OpenDecision),
             'c' => KeyMeaning::SimpleAction(UiAction::ToggleCoordinator),
             'n' => KeyMeaning::SimpleAction(UiAction::NextAttention),
             'N' => KeyMeaning::SimpleAction(UiAction::PrevAttention),
@@ -444,6 +465,7 @@ impl VimKeyResolver {
             'q' | 'Q' => KeyMeaning::SimpleAction(UiAction::Quit),
             'r' | 'R' => KeyMeaning::SimpleAction(UiAction::Refresh),
             '?' => KeyMeaning::SimpleAction(UiAction::ToggleHelp),
+            'w' => KeyMeaning::SimpleAction(UiAction::ToggleWorkView),
             '/' => KeyMeaning::SimpleAction(UiAction::StartSearch),
             _ => KeyMeaning::Unbound,
         }
@@ -601,6 +623,8 @@ impl InputHandler {
                 None => Some(UiAction::GoToFirst),
                 Some(n) => Some(UiAction::GoToRow(n.saturating_sub(1))),
             },
+            // Keep gw free for Work navigation; only bare w toggles the view.
+            KeyMeaning::SimpleAction(UiAction::ToggleWorkView) => None,
             KeyMeaning::SimpleAction(action) => Some(action),
             _ => None,
         }
@@ -680,6 +704,55 @@ impl InputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Break caught: Work is unreachable or steals reserved prefix chords/modifier keys.
+    #[test]
+    fn work_key_toggles_without_consuming_reserved_chords() {
+        let mut handler = InputHandler::new();
+        assert_eq!(
+            handler.handle(key(KeyCode::Char('w'))),
+            Some(UiAction::ToggleWorkView)
+        );
+        assert_eq!(handler.handle(key(KeyCode::Char('3'))), None);
+        assert_eq!(
+            handler.handle(key(KeyCode::Char('w'))),
+            Some(UiAction::ToggleWorkView)
+        );
+        for prefix in ['g', 'd', 'o', 'z'] {
+            assert_eq!(handler.handle(key(KeyCode::Char(prefix))), None);
+            assert_eq!(handler.handle(key(KeyCode::Char('w'))), None);
+            assert!(!handler.is_pending());
+        }
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+        ] {
+            assert_eq!(
+                handler.handle(KeyEvent::new(KeyCode::Char('w'), modifiers)),
+                None
+            );
+        }
+    }
+
+    // Break caught: the owner key is absent or steals the existing za chord.
+    #[test]
+    fn answer_key_opens_a_decision_without_changing_za() {
+        let mut handler = InputHandler::new();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(
+            format!("{:?}", handler.handle(key('a'))),
+            "Some(OpenDecision)"
+        );
+        assert_eq!(handler.handle(key('z')), None);
+        assert_eq!(handler.handle(key('a')), Some(UiAction::ToggleFold));
+        assert_eq!(
+            handler.handle(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+            None
+        );
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     // -- helpers ------------------------------------------------------------
@@ -886,8 +959,8 @@ mod tests {
         let mut h = InputHandler::new();
         assert_eq!(h.handle(key(KeyCode::Char('3'))), None);
         assert!(h.is_pending());
-        // 'w' is Unbound → resets state, emits None.
-        assert_eq!(h.handle(key(KeyCode::Char('w'))), None);
+        // '!' is Unbound → resets state, emits None.
+        assert_eq!(h.handle(key(KeyCode::Char('!'))), None);
         assert!(!h.is_pending());
     }
 

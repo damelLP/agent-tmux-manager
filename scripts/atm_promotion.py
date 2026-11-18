@@ -93,7 +93,7 @@ def quiescent(bin_dir, socket_path, pairs):
             require(os.fsencode('ATM_SOCKET=' + str(socket_path)) not in environment,
                     f'running process uses socket: pid {process.name}')
         except (FileNotFoundError, ProcessLookupError):
-            continue  # exited processes and zombies have no executable
+            continue  # exited processes (including some zombies) lose these entries
         except PermissionError as error:
             # User systemd services can hide exe/environ even from their UID.
             # Do not mistake an unrelated service for a running ATM. Ambiguous
@@ -106,6 +106,20 @@ def quiescent(bin_dir, socket_path, pairs):
             if name in NAMES or not any(command) or any(
                     Path(os.fsdecode(arg)) in targets or Path(os.fsdecode(arg)).name in NAMES
                     for arg in command if arg):
+                try:
+                    raw = (process / 'stat').read_text()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except PermissionError:
+                    raw = ''  # Unreadable state is not evidence of exit.
+                head, closing, tail = raw.rpartition(')')
+                fields = tail.split()
+                # A zombie leader can still have live threads. A reused live PID
+                # must also refuse. Length validation makes the field indexes safe.
+                if (head.startswith(process.name + ' (') and closing and len(fields) >= 18
+                        and fields[0] == 'Z' and fields[17] == '1'
+                        and all(re.fullmatch(r'-?[0-9]+', value) for value in fields[1:18])):
+                    continue
                 raise Refused(f'cannot inspect possible ATM process {process.name}; refusing promotion') from error
 
 

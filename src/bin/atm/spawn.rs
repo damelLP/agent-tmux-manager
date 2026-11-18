@@ -170,12 +170,16 @@ fn available_harness_ids_display(config: &AtmConfig) -> String {
     ids.join(", ")
 }
 
-pub(super) fn build_spawn_command(cwd: Option<&str>, model: Option<&str>) -> String {
-    let harness = resolve_spawn_harness(None).unwrap_or_else(|e| {
+pub(super) fn default_spawn_harness() -> SpawnHarnessDefinition {
+    resolve_spawn_harness(None).unwrap_or_else(|e| {
         warn!(error = %e, "Failed to load spawn harness config; using built-in default");
         SpawnHarnessDefinition::from_builtin(default_harness_definition())
-    });
-    build_spawn_command_for_harness(&harness, cwd, model)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn build_spawn_command(cwd: Option<&str>, model: Option<&str>) -> String {
+    build_spawn_command_for_harness(&default_spawn_harness(), cwd, model)
 }
 
 pub(super) fn non_empty_env(key: &str) -> Option<String> {
@@ -317,15 +321,17 @@ pub(super) async fn cmd_spawn(
     // Print the pane as soon as it exists, so a caller can clean it up if
     // starting the agent in it fails. A failed write (a closed pipe) is
     // reported once the agent is started, not as a panic half-way.
-    let mut stdout = std::io::stdout();
-    let printed = match format {
-        SpawnFormat::Text => writeln!(stdout, "{new_pane}"),
-        SpawnFormat::Json => writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"pane": new_pane, "harness": harness.id, "cwd": cwd})
-        ),
-    };
+    let printed = super::output::stdout(|out| {
+        match format {
+            SpawnFormat::Text => writeln!(out, "{new_pane}"),
+            SpawnFormat::Json => writeln!(
+                out,
+                "{}",
+                serde_json::json!({"pane": new_pane, "harness": harness.id, "cwd": cwd})
+            ),
+        }?;
+        Ok(())
+    });
     super::rpc::call(
         "session.spawn_type",
         serde_json::json!({"pane": new_pane, "command": agent_cmd}),

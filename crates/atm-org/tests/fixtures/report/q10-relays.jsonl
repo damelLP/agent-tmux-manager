@@ -1,0 +1,15 @@
+{"seq":1,"ts":"2026-01-01T00:00:00Z","kind":"project.registered","body":{"project_id":"alpha","root":"/fixtures/alpha"}}
+{"seq":2,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"alpha/build","pane":"%1","session_id":null}}
+{"seq":3,"ts":"2026-01-01T00:00:00Z","kind":"agent.adopted","body":{"agent_id":"alpha/chief","pane":"%2","session_id":null}}
+{"seq":4,"ts":"2026-01-01T00:00:00Z","kind":"owner.relay_set","body":{"by":"owner","agent":"alpha/chief"}}
+{"seq":5,"ts":"2026-01-01T00:00:01Z","kind":"task.created","body":{"project_id":"alpha","title":"Work","kind":"work","creator":"owner","parent":null,"judges":null,"measure":{"kind":"owner"},"budget":null,"files":[],"rests_on":null}}
+{"seq":6,"ts":"2026-01-01T00:00:02Z","kind":"task.assigned","body":{"task_id":"t5","agent_id":"alpha/build","by":"owner"}}
+{"seq":7,"ts":"2026-01-01T00:00:03Z","kind":"decision.requested","body":{"requester":"alpha/build","kind":"plan","title":"PRIVATE_SYSTEM_TAKE","context":"","files":[],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true,"deadline":null}}
+{"seq":8,"ts":"2026-01-01T00:00:04Z","kind":"decision.taken_provisionally","body":{"decision_id":"d7","option":"yes","by":"system"}}
+{"seq":9,"ts":"2026-01-01T00:00:05Z","kind":"decision.requested","body":{"requester":"alpha/build","kind":"plan","title":"PRIVATE_AGENT_TAKE","context":"","files":[],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":false,"deadline":null}}
+{"seq":10,"ts":"2026-01-01T00:00:06Z","kind":"decision.taken_provisionally","body":{"decision_id":"d9","option":"yes","by":"alpha/build"}}
+{"seq":11,"ts":"2026-01-01T00:00:07Z","kind":"decision.requested","body":{"requester":"alpha/build","kind":"policy","title":"PRIVATE_RELAY","context":"","files":[],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true,"deadline":null}}
+{"seq":12,"ts":"2026-01-01T00:00:08Z","kind":"decision.taken_provisionally","body":{"decision_id":"d11","option":"no","by":"owner","relayed_by":"alpha/chief"}}
+{"seq":13,"ts":"2026-01-01T00:00:09Z","kind":"decision.requested","body":{"requester":"alpha/chief","kind":"dialog","title":"PRIVATE_SELF_RELAY","context":"","files":[],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true,"deadline":null}}
+{"seq":14,"ts":"2026-01-01T00:00:10Z","kind":"decision.taken_provisionally","body":{"decision_id":"d13","option":"no","by":"owner","relayed_by":"alpha/chief"}}
+{"seq":15,"ts":"2026-01-01T00:00:11Z","kind":"decision.resolved","body":{"decision_id":"d11","option":"no","by":"owner","note":null,"standing_rule":false}}

@@ -24,6 +24,25 @@ use serde_json::{json, Value};
 use stand_in::StandInMode;
 use support::{about, notice, reference, Confirmation, FocusClient, MessageRig, Watch};
 
+#[test]
+fn committed_action_before_watch_wait_is_observed() {
+    let mut rig = MessageRig::start(Confirmation::Generous);
+    let mut watch = rig.watch();
+    let id = rig.send(None, "owner", "committed before wait");
+    // send has answered after commit; receiving starts only now.
+    let event = watch.wait("the already-committed owner message", |e| id_of(e) == id);
+    assert_eq!(event["kind"], "msg.sent");
+    assert_eq!(event["body"]["body"], "committed before wait");
+    watch.catch_up(&rig);
+    assert_eq!(watch.all(|e| id_of(e) == id).len(), 1);
+    rig.test.rig.close();
+}
+
+#[test]
+fn watch_replay_live_overlap_is_deduplicated() {
+    support::watch_tests::replay_live_overlap_keeps_each_sequence_once();
+}
+
 /// Blank lines, both quote kinds, a tab, leading spaces and non-ASCII text.
 const BODY: &str = "first line\n\n  \"double\" and 'single' quotes\n\tταχύ ✓ 日本語\nlast line";
 
@@ -177,6 +196,85 @@ mod delivered_reference_and_exact_inbox_body {
     #[ignore = "the Codex stand-in at 200x50 is adopted Starting, never Ready: adoption finds no safe editor on its screen, after a finished turn too"]
     fn codex() {
         run(StandInMode::Codex);
+    }
+}
+
+/// The renderer misses the original window; only the product may submit its
+/// original draft after the event release. No driver Enter or owner retry.
+mod recovery_render_hold_delivers_source_then_follower {
+    use super::*;
+
+    fn run(mode: StandInMode) {
+        let mut rig = MessageRig::start(Confirmation::Default);
+        let agent = rig.ready_agent("lead", mode);
+        let mut watch = rig.watch();
+        let cursor = rig.test.rig.event_cursor(&agent.pane);
+        let armed = rig
+            .test
+            .rig
+            .control(&agent.pane, json!({"command":"hold_next_render"}));
+        assert!(armed["error"].is_null(), "{armed}");
+        let source = rig.send(None, &agent.id, "event-held original renderer");
+        let follower = rig.send(None, &agent.id, "FIFO follower after recovery");
+        rig.test.rig.wait_event(&agent.pane, cursor, |event| {
+            event["kind"] == "render_held" && event["draft"] == reference(&source)
+        });
+        watch.wait(
+            "the original attempt is held",
+            notice(&format!("{source} blocked: ")),
+        );
+        assert!(rig.accepted_since(&agent.pane, cursor).is_empty());
+        assert_eq!(attempts(&mut watch, &rig, &source).len(), 1);
+        assert!(attempts(&mut watch, &rig, &follower).is_empty());
+        let head = rig.inbox_entry(None, Some(&agent.id), &source);
+        assert_eq!(head["delivery"]["attempt"], 1, "{head}");
+        let released = rig
+            .test
+            .rig
+            .control(&agent.pane, json!({"command":"release_render"}));
+        assert!(released["error"].is_null(), "{released}");
+        let delivered = watch.wait(
+            "the product recovery's exact receipt",
+            about("msg.delivered", &source),
+        );
+        assert_eq!(
+            delivered["body"]["confirmation"],
+            "prompt_submit_exact_reference"
+        );
+        assert_eq!(
+            delivered["body"]["session_id"].as_str(),
+            agent.session.as_deref()
+        );
+        rig.finish_turn(&agent.pane);
+        let next = watch.wait(
+            "the follower's original attempt",
+            about("msg.delivery_attempted", &follower),
+        );
+        assert!(seq(&delivered) < seq(&next));
+        assert_eq!(next["body"]["attempt"], 1);
+        watch.wait("the follower's receipt", about("msg.delivered", &follower));
+        rig.finish_turn(&agent.pane);
+        assert_eq!(
+            rig.accepted_since(&agent.pane, cursor),
+            [reference(&source), reference(&follower)]
+        );
+        assert_eq!(attempts(&mut watch, &rig, &source).len(), 1);
+        assert_eq!(attempts(&mut watch, &rig, &follower).len(), 1);
+        assert!(watch.all(about("msg.delivery_failed", &source)).is_empty());
+        assert_eq!(
+            rig.inbox_entry(None, Some(&agent.id), &source)["delivery"]["attempt"],
+            1
+        );
+        rig.test.rig.close();
+    }
+
+    #[test]
+    fn claude() {
+        run(StandInMode::Claude);
+    }
+    #[test]
+    fn pi() {
+        run(StandInMode::Pi);
     }
 }
 
@@ -364,7 +462,16 @@ fn give_up_releases_queue() {
     block_head(&rig, &mut watch, &lead, &ids[0]);
 
     let gave_up = rig.atm_json(None, &["msg", "give-up", &ids[0], "--format", "json"]);
-    assert_eq!(gave_up, json!({"message_id": ids[0], "status": "failed"}));
+    let warning = format!(
+        "Possible leftover in the recipient's editor: [{}] Read: atm inbox --id {}. \
+         Giving up did not clear the editor; further delivery may wait for an empty editor. \
+         Inspect the pane before editing it.",
+        ids[0], ids[0]
+    );
+    assert_eq!(
+        gave_up,
+        json!({"message_id": ids[0], "status": "failed", "editor_warning": warning})
+    );
     let failed = watch.wait("the final failure", about("msg.delivery_failed", &ids[0]));
     assert_eq!(failed["body"]["final"], true);
     assert_eq!(failed["body"]["reason"], "owner gave up on delivery");
@@ -739,17 +846,15 @@ fn unavailable_org_causes_no_paste() {
         !rig.daemon_log().contains(refused),
         "another append met the fault before the attempt could"
     );
+    let mut log =
+        stand_in::control_support::LogEvents::new(&rig.test.rig.root().join("daemon.log"));
     client.focus(&rig, false);
 
-    rig.test.rig.wait("the log's refusal of the attempt", || {
-        rig.daemon_log().contains(refused)
-    });
+    log.wait_for(refused, None).unwrap();
     // The actor logs its refusal before the executor handles the error. Fence
     // on the scheduler's return, after the executor and its cleanup are done.
-    rig.test.rig.wait("the attempt's return", || {
-        rig.daemon_log()
-            .contains("Message scheduling round failed; no input")
-    });
+    log.wait_for("Message scheduling round failed; no input", None)
+        .unwrap();
     let (code, message) = rig
         .call("msg.inbox", json!({"for": lead.id}), None)
         .expect_err("the message service still answers without its log");

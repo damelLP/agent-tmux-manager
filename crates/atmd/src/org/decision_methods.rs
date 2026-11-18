@@ -18,6 +18,7 @@ impl From<DecisionError> for MethodError {
             DecisionError::InvalidParams(_) => error_code::INVALID_PARAMS,
             DecisionError::Refused(_) => error_code::REFUSED,
             DecisionError::NotFound(_) => error_code::NOT_FOUND,
+            DecisionError::Conflict(_) => error_code::CONFLICT,
             DecisionError::Unavailable(_) => error_code::UNAVAILABLE,
             DecisionError::Timeout => error_code::TIMEOUT,
             DecisionError::Internal(_) => error_code::INTERNAL,
@@ -75,12 +76,36 @@ fn validate_list(p: &ListParams) -> Result<(), DecisionError> {
     }
     Ok(())
 }
+fn validate_get(p: &super::decisions::GetParams) -> Result<(), DecisionError> {
+    if p.redo_limit
+        .is_some_and(|limit| !(1..=1000).contains(&limit))
+    {
+        return Err(invalid("redo_limit must be between 1 and 1000"));
+    }
+    if let Some(after) = &p.redo_after {
+        super::tasks::sequence(after)
+            .map_err(|error| DecisionError::InvalidParams(error.to_string()))?;
+    }
+    Ok(())
+}
 fn validate_resolve(p: &ResolveParams) -> Result<(), DecisionError> {
     option(&p.option)?;
     note(p.note.as_deref())
 }
 fn validate_withdraw(p: &WithdrawParams) -> Result<(), DecisionError> {
     note(p.reason.as_deref())
+}
+fn parse_resolve(params: serde_json::Value) -> Result<ResolveParams, MethodError> {
+    if params.get("relay").and_then(serde_json::Value::as_bool) == Some(true)
+        && ["note", "standing_rule"]
+            .iter()
+            .any(|key| params.get(key).is_some())
+    {
+        return Err(invalid("relays cannot include note or standing_rule").into());
+    }
+    let p = parse_params(params)?;
+    validate_resolve(&p)?;
+    Ok(p)
 }
 
 /// Always advertised; a disabled service never accepts a valid mutation.
@@ -89,12 +114,12 @@ pub fn register_decision_methods(
     decisions: DecisionHandle,
 ) -> Result<(), MethodError> {
     macro_rules! register {
-        ($name:literal, $method:ident $(, $validate:expr)?) => {{
+        ($name:literal, $method:ident, $parse:ident $(, $validate:expr)?) => {{
             let decisions = decisions.clone();
             router.register($name, Duration::from_secs(22), move |caller, params| {
                 let decisions = decisions.clone();
                 async move {
-                    let p = parse_params(params)?;
+                    let p = $parse(params)?;
                     $( $validate(&p)?; )?
                     let result = decisions.$method(p, caller).await?;
                     serde_json::to_value(result).map_err(|error| MethodError::new(error_code::INTERNAL, error.to_string()))
@@ -102,10 +127,98 @@ pub fn register_decision_methods(
             })?;
         }};
     }
-    register!("decision.request", request, validate_request);
-    register!("decision.list", list, validate_list);
-    register!("decision.get", get);
-    register!("decision.resolve", resolve, validate_resolve);
-    register!("decision.withdraw", withdraw, validate_withdraw);
+    register!("decision.request", request, parse_params, validate_request);
+    register!("decision.list", list, parse_params, validate_list);
+    register!("decision.get", get, parse_params, validate_get);
+    register!("decision.resolve", resolve, parse_resolve);
+    register!(
+        "decision.withdraw",
+        withdraw,
+        parse_params,
+        validate_withdraw
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    // Break caught: serializing false breaks old daemons, or omitting the new
+    // default breaks legacy callers. Plain note/rule bytes are historical.
+    #[test]
+    fn resolve_relay_is_additive_and_false_is_byte_compatible() {
+        let plain = json!({"id":"d3","option":"yes","note":null,"standing_rule":false});
+        let mut p: ResolveParams = parse_params(plain.clone()).unwrap();
+        assert!(!p.relay);
+        assert_eq!(serde_json::to_value(&p).unwrap(), plain);
+        p.relay = true;
+        // This typed encoding is not a valid relay RPC; send only id/option/relay.
+        assert_eq!(serde_json::to_value(p).unwrap()["relay"], true);
+        assert!(
+            parse_resolve(json!({"id":"d3","option":"no","relay":true}))
+                .unwrap()
+                .relay
+        );
+    }
+
+    // Break caught: Option/default deserialization erases forbidden null/false
+    // key presence, or a caller can supply its own relayer identity.
+    #[test]
+    fn relay_params_reject_note_and_rule_key_presence() {
+        for (key, value) in [
+            ("note", Value::Null),
+            ("note", json!("")),
+            ("note", json!("go")),
+            ("standing_rule", json!(false)),
+            ("standing_rule", json!(true)),
+            ("by", json!("owner")),
+            ("relayed_by", json!("p/chief")),
+        ] {
+            let mut p = json!({"id":"d3","option":"no","relay":true});
+            p[key] = value;
+            assert_eq!(parse_resolve(p).unwrap_err().0.code, "invalid_params");
+        }
+        for p in [
+            json!([]),
+            json!({"id":"d3","option":"no","relay":"true"}),
+            json!({"id":"d3","option":"","relay":true}),
+        ] {
+            assert_eq!(parse_resolve(p).unwrap_err().0.code, "invalid_params");
+        }
+        assert!(parse_resolve(
+            json!({"id":"d3","option":"yes","note":"owner note","standing_rule":true,"relay":false})
+        )
+        .is_ok());
+    }
+
+    // Break caught: an internal typed caller bypasses the raw schema and enters
+    // rule-file or final-answer work. Reject before even awaiting the service.
+    #[tokio::test]
+    async fn typed_relays_reject_note_and_rule_before_service_work() {
+        for (note, standing_rule) in [(Some(String::new()), false), (None, true)] {
+            let p = ResolveParams {
+                id: atm_org::DecisionId::new(3),
+                option: "yes".into(),
+                note,
+                standing_rule,
+                relay: true,
+            };
+            let error = DecisionHandle::disabled("fixture")
+                .resolve(
+                    p,
+                    crate::server::methods::CallContext {
+                        client_id: crate::server::methods::CallerId("relay-test".into()),
+                        from_pane: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, DecisionError::InvalidParams(_)),
+                "{error:?}"
+            );
+        }
+    }
 }

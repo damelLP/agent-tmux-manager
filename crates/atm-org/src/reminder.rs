@@ -61,8 +61,9 @@
 //! - After `Act` or `Nothing` the turn end is used up. The policy keeps no
 //!   memory: the marks it reads are in the state.
 
-use crate::{Address, AgentId, DeliveryStatus, OrgState, TaskId, TaskState};
-use chrono::{DateTime, TimeDelta, Utc};
+use crate::auto_handover::{later, mail_on_its_way};
+use crate::{AgentId, OrgState, TaskId, TaskState};
+use chrono::{DateTime, Utc};
 use std::time::Duration;
 
 /// How long an agent stays idle after a silent turn end before anything is sent.
@@ -92,11 +93,6 @@ pub enum ReminderStep {
         remind: Vec<TaskId>,
         flag: Vec<TaskId>,
     },
-}
-
-/// `delay` after `from`, when the calendar can hold it.
-fn after(from: DateTime<Utc>, delay: Duration) -> Option<DateTime<Utc>> {
-    from.checked_add_signed(TimeDelta::from_std(delay).ok()?)
 }
 
 /// The step for `agent`, whose last turn ended at `ended_at` and who has been
@@ -129,21 +125,14 @@ pub fn reminder_step(
     if remind.is_empty() && flag.is_empty() {
         return ReminderStep::Nothing;
     }
-    let Some(limit) = after(ended_at, settings.delay) else {
+    let Some(limit) = later(ended_at, settings.delay) else {
         return ReminderStep::Nothing;
     };
     if now < limit {
         return ReminderStep::WaitUntil(limit);
     }
-    let mail_on_its_way = state.messages().any(|message| {
-        matches!(&message.content.to, Address::Agent(to) if to == agent)
-            && matches!(
-                message.status,
-                DeliveryStatus::Queued | DeliveryStatus::Delivering
-            )
-    });
-    if mail_on_its_way {
-        return after(now, settings.delay).map_or(ReminderStep::Nothing, ReminderStep::WaitUntil);
+    if mail_on_its_way(state, agent) {
+        return later(now, settings.delay).map_or(ReminderStep::Nothing, ReminderStep::WaitUntil);
     }
     ReminderStep::Act { remind, flag }
 }

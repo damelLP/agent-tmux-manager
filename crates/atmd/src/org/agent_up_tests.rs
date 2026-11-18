@@ -787,6 +787,33 @@ const UNREAD_FOCUS: &str = "whether the new pane was selected could not be read 
 const CHANGED: &str = "the shell's line changed after its prompt was read, so nothing was typed";
 
 #[tokio::test]
+async fn op7_shell_prefix_before_first_capture_is_accepted_as_the_prompt() {
+    // Characterized limit, not permission to overwrite user input: an earlier
+    // focus excursion is absent from both captures. The shell prefix is then
+    // indistinguishable from a prompt. Twin: launch_line_with_typed_prefix_sends_no_enter
+    // refuses a prefix introduced AFTER the baseline has been read.
+    // Synthetic: a harmless shell prefix stable before the first capture.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut starting = Starting::new(Harness::Codex).await;
+        starting.script_pane();
+        let before = format!("{PROMPT}printf earlier-input; ");
+        for _ in 0..3 {
+            starting.frame(Starting::shell(&before));
+        }
+        let staged = Starting::shell(&format!("{before}{}", starting.text));
+        starting.frame(staged.clone());
+        starting.frame(staged);
+        starting.frame(Starting::screen(CODEX_FRESH, "codex"));
+        let result = starting.up().await.unwrap();
+        assert_eq!(result.state, AgentStatus::Ready);
+        assert_eq!(starting.effects(), starting.launched());
+        assert_eq!(starting.unread(), 0);
+    })
+    .await
+    .expect("pre-capture shell-prefix characterization exceeded its hang guard");
+}
+
+#[tokio::test]
 async fn focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed() {
     // Text reaches the new pane's line only from a client that selected the
     // pane. A focus seen before the prompt is read voids the reading for this
@@ -818,6 +845,7 @@ async fn focus_before_the_prompt_is_read_ends_the_start_with_nothing_typed() {
         );
         assert_eq!(starting.effects().len(), 2, "{:?}", starting.effects());
         starting.assert_stuck(SELECTED).await;
+        assert_told_stuck(&result, &starting.agent().await.unwrap());
     }
 }
 

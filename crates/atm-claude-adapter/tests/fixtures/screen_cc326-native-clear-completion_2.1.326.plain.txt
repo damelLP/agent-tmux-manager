@@ -1,0 +1,41 @@
+Captured: Claude Code 2.1.326, 2026-11-17, sealed fake-API TUI.
+
+ ▐▂███▂█   Claude Code v2.1.326                           
+▝▜██████▀  Haiku 5.5 · API Usage Billing                  
+ ▝▝   ▝▝   /tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxx/native/project                                                        
+
+
+❯ /clear                                                                                                            
+
+❯ survey turn: reply with the neutral fixture response                                                              
+
+● Neutral fixture response 1.
+
+✻ Cooked for 0s · done 2:10 AM                            
+
+❯ survey turn: reply with the neutral fixture response 2                                                            
+
+● Neutral fixture response 2.
+
+✻ Brewed for 0s · done 2:10 AM                            
+
+● Auto mode lets Claude handle permission prompts automatically — Claude checks each tool call for risky            
+  actions and prompt injection before executing. Actions Claude identifies as safe are executed, while              
+  actions Claude identifies as risky are blocked and Claude may try a different approach. Ideal for                 
+  long-running tasks. Sessions are slightly more expensive. Claude can make mistakes that allow harmful             
+  commands to run, it's recommended to only use in isolated environments. Shift+Tab to change mode.                 
+
+
+
+
+
+
+
+                                                          
+
+  ❯ /clear              Start a new session with empty context; previous session stays on disk (resumable with      
+                        /resume)                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /clear                                                  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)                                                                              

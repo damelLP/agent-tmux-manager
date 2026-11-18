@@ -1,0 +1,1 @@
+{"request":{"protocol_version":{"major":1,"minor":1},"type":"request","id":"roles-invalid","method":"session.roles","params":{"caller_server":7}},"response":{"type":"response","id":"roles-invalid","error":{"code":"invalid_params","message":"ignored"}},"ignore":["/error/message"]}

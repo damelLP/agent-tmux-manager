@@ -1,5 +1,6 @@
 //! Thin, one-shot named-agent RPC commands. No local tmux fallback or retry.
 
+use super::output::stdout;
 use atmd::org::agent_handover::{HandoverParams, HandoverResult};
 use atmd::org::agents::*;
 use clap::{Subcommand, ValueEnum};
@@ -46,6 +47,7 @@ pub enum AgentAction {
         agent: String,
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Clear timeout in milliseconds (5000..=120000).
         #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(5_000..=120_000))]
         timeout_ms: u64,
         #[arg(long, value_enum, default_value = "text")]
@@ -309,21 +311,22 @@ pub(super) async fn cmd_agent_with_lookup_budget(
             true,
         ),
     };
-    let mut out = io::stdout().lock();
-    if json {
-        writeln!(out, "{value}")?;
-    } else if list {
-        writeln!(
-            out,
-            "AGENT\tSTATE\tACTIVITY\tPANE\tSESSION\tHARNESS\tMODEL\tCOST\tREASON"
-        )?;
-        if let Some(rows) = value.as_array() {
-            for value in rows {
-                writeln!(out, "{}", row(value, columns))?;
+    stdout(|out| {
+        if json {
+            writeln!(out, "{value}")?;
+        } else if list {
+            writeln!(
+                out,
+                "AGENT\tSTATE\tACTIVITY\tPANE\tSESSION\tHARNESS\tMODEL\tCOST\tREASON"
+            )?;
+            if let Some(rows) = value.as_array() {
+                for value in rows {
+                    writeln!(out, "{}", row(value, columns))?;
+                }
             }
+        } else {
+            writeln!(out, "{}", row(&value, columns))?;
         }
-    } else {
-        writeln!(out, "{}", row(&value, columns))?;
-    }
-    Ok(())
+        Ok(())
+    })
 }

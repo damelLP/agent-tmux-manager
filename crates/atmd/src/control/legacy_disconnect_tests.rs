@@ -17,6 +17,82 @@ use tokio::{
     sync::{RwLock, Semaphore},
 };
 
+/// The existing server removal log is emitted after the real handler returned.
+/// These tests use a current-thread runtime, so its task cannot resume the
+/// waiter until the removal's lock scope has also ended.
+struct ServerEvent {
+    message: &'static str,
+    ready: Arc<Semaphore>,
+}
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ServerEvent {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message<'a>(&'a ServerEvent);
+        impl tracing::field::Visit for Message<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" && format!("{value:?}") == self.0.message {
+                    self.0.ready.add_permits(1);
+                }
+            }
+        }
+        if event.metadata().target().starts_with("atmd::server") {
+            event.record(&mut Message(self));
+        }
+    }
+}
+
+fn server_event(message: &'static str) -> (Arc<Semaphore>, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::prelude::*;
+    let ready = Arc::new(Semaphore::new(0));
+    let logs = tracing::subscriber::set_default(tracing_subscriber::registry().with(ServerEvent {
+        message,
+        ready: ready.clone(),
+    }));
+    (ready, logs)
+}
+
+struct ObservedIdentity {
+    mock: MockTmuxClient,
+    called: tokio::sync::mpsc::UnboundedSender<()>,
+}
+impl TmuxClient for ObservedIdentity {
+    fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
+        &'s self,
+        command: &'c str,
+        args: &'a [&'v str],
+    ) -> Call<'async_trait, String>
+    where
+        's: 'async_trait,
+        'c: 'async_trait,
+        'a: 'async_trait,
+        'v: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let result = self.mock.raw_command(command, args).await;
+            if command == "display-message" && args.contains(&"#{socket_path}") {
+                let _ = self.called.send(());
+            }
+            result
+        })
+    }
+    forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());
+    forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
+    forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
+    forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
+    forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
+    forward!(kill_pane<'a>(pane: &'a str) -> ());
+    forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
+    forward!(list_panes<>() -> Vec<PaneInfo>);
+    forward!(display_popup<'a, 'b, 'c>(width: &'a str, height: &'b str, command: &'c str) -> ());
+    forward!(select_pane<'a>(pane: &'a str) -> ());
+    forward!(capture_pane<'a>(pane: &'a str) -> Vec<String>);
+    forward!(new_session<'a>(name: &'a str) -> String);
+}
+
 struct Connection {
     peer: BufReader<UnixStream>,
     run: JoinHandle<Option<String>>,
@@ -243,10 +319,12 @@ async fn daemon_disconnect_preserves_earlier_parked_survivor() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let mock = MockTmuxClient::new();
+        let (called, mut identity_calls) = tokio::sync::mpsc::unbounded_channel();
+        let (removed, _logs) = server_event("Removed disconnected subscriber");
         let registry = crate::registry::spawn_registry();
         let cancel = CancellationToken::new();
         let (control, actor) = spawn_control(
-            Box::new(mock.clone()), registry.clone(),
+            Box::new(ObservedIdentity { mock: mock.clone(), called }), registry.clone(),
             OrgHandle::disabled("disconnect test"), cancel.clone(),
         );
         let mut services = methods::MethodServices::new(registry);
@@ -280,12 +358,11 @@ async fn daemon_disconnect_preserves_earlier_parked_survivor() {
                 text.into(), "session.send".into(),
                 serde_json::json!({"target":"%1", "text":text, "caller_server":socket}), None,
             )).await;
-            while mock.calls().iter().filter(|call| matches!(call,
+            identity_calls.recv().await.unwrap();
+            assert_eq!(mock.calls().iter().filter(|call| matches!(call,
                 MockCall::RawCommand { subcommand, args }
                     if subcommand == "display-message" && args.iter().any(|arg| arg == "#{socket_path}")
-            )).count() != index + 1 {
-                tokio::task::yield_now().await;
-            }
+            )).count(), index + 1);
             barrier(&control).await; // each send is parked before the next starts
         }
         assert!(input_calls(&mock).is_empty());
@@ -293,9 +370,8 @@ async fn daemon_disconnect_preserves_earlier_parked_survivor() {
         // DaemonServer removes this subscriber only after its handler finishes.
         // If the monitor was not attached, that requires the abandoned send's
         // deadline, by which time the earlier survivor has also expired.
-        while daemon.subscriber_count().await != 0 {
-            tokio::task::yield_now().await;
-        }
+        removed.acquire().await.unwrap().forget();
+        assert_eq!(daemon.subscriber_count().await, 0);
         untagged(&mock, "%1");
         mock.set_next_raw_output("0 1");
         release.send(()).unwrap();

@@ -49,14 +49,15 @@
 //! Wakes are a `watch` counter, moved when a fact changes: every consumer (A2's scheduler, B's confirmation
 //! wait) holds its own receiver from `subscribe`, so none misses a change.
 
-use super::message_history::{HistoryUpdate, MessageHistoryHandle};
+use super::message_history::{HistoryUpdate, MessageHistoryHandle, RecoveryGuard};
 use super::messages::{MessageClock, MessageError};
 use crate::control::reservation::PaneId;
 use atm_core::{Harness, LifecycleEvent, SessionId};
 use atm_org::{AgentId, DeliveryReceipt, MessageId};
+use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{atomic::AtomicBool, Arc, Mutex, MutexGuard, Weak},
 };
 use tokio::sync::watch;
 
@@ -84,6 +85,34 @@ pub struct AttemptEvidence {
     pub probably_landed: bool,
 }
 
+/// Sole owner of one claimed recovery. Predicate clones cannot keep it alive.
+#[derive(Debug)]
+pub(super) struct RecoveryClaim {
+    scope: AttemptScope,
+    guard: RecoveryGuard,
+    evidence: MessageEvidence,
+    history: MessageHistoryHandle,
+}
+
+impl RecoveryClaim {
+    pub(super) fn scope(&self) -> &AttemptScope {
+        &self.scope
+    }
+    pub(super) fn guard(&self) -> RecoveryGuard {
+        self.guard.clone()
+    }
+}
+
+impl Drop for RecoveryClaim {
+    fn drop(&mut self) {
+        self.guard.revoke();
+        self.evidence
+            .deregister_recovery(self.scope.message_id, &self.guard);
+        self.history
+            .deregister_recovery(self.scope.message_id, &self.guard);
+    }
+}
+
 /// References: one for each open message, and one for each finally failed
 /// message that still has a scope. The second kind is never evicted, so it
 /// bounds the attempted-and-failed messages of one log (see the module docs).
@@ -102,6 +131,7 @@ struct Scope {
 }
 #[derive(Debug)]
 struct Entry {
+    recovery_guard: Option<Weak<AtomicBool>>,
     expected: String,
     scopes: Vec<Scope>,
     receipt: Option<DeliveryReceipt>,
@@ -154,10 +184,12 @@ impl MessageEvidence {
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>, MessageError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MessageError::Unavailable("message evidence lock poisoned".into()))?;
+        let state = self.state.lock().map_err(|poisoned| {
+            for entry in poisoned.into_inner().messages.values() {
+                RecoveryGuard::revoke_registration(&entry.recovery_guard);
+            }
+            MessageError::Unavailable("message evidence lock poisoned".into())
+        })?;
         if let Some(reason) = &state.disabled {
             return Err(MessageError::Unavailable(reason.clone()));
         }
@@ -185,6 +217,9 @@ impl MessageEvidence {
     /// Reached at most once: `state` refuses a disabled store.
     fn disable(&self, state: &mut State, reason: &str) -> MessageError {
         tracing::error!(reason, "Message evidence disabled until restart");
+        for entry in state.messages.values() {
+            RecoveryGuard::revoke_registration(&entry.recovery_guard);
+        }
         state.disabled = Some(reason.into());
         self.wake();
         MessageError::Unavailable(reason.into())
@@ -215,6 +250,7 @@ impl MessageEvidence {
         state.messages.insert(
             id,
             Entry {
+                recovery_guard: None,
                 expected: expected_prompt,
                 scopes: Vec::new(),
                 receipt: None,
@@ -261,6 +297,7 @@ impl MessageEvidence {
             ));
         }
         if let Some(entry) = state.messages.get_mut(&scope.message_id) {
+            RecoveryGuard::revoke_registration(&entry.recovery_guard);
             entry.scopes.push(Scope {
                 identity: scope,
                 lazy_session: None,
@@ -291,6 +328,7 @@ impl MessageEvidence {
                 "message attempt sequence does not match".into(),
             ));
         }
+        RecoveryGuard::revoke_registration(&entry.recovery_guard);
         let changed = entry.probably_landed;
         entry.probably_landed = false;
         entry.released = true;
@@ -307,6 +345,69 @@ impl MessageEvidence {
         Ok((state.messages.iter())
             .filter_map(|(id, entry)| Some((*id, entry.receipt.clone()?)))
             .collect())
+    }
+
+    /// Claim under evidence→history locks, so receiving a veto cannot slip
+    /// between checking eligibility and registering its revocable guard.
+    pub(super) fn claim_recovery(
+        &self,
+        history: &MessageHistoryHandle,
+        scope: AttemptScope,
+        cancelled: bool,
+        now: DateTime<Utc>,
+    ) -> Result<RecoveryClaim, MessageError> {
+        let mut state = self.state()?;
+        let entry = state
+            .messages
+            .get_mut(&scope.message_id)
+            .ok_or_else(|| MessageError::Unavailable("message reference not registered".into()))?;
+        if entry
+            .scopes
+            .last()
+            .is_none_or(|last| last.identity != scope)
+        {
+            return Err(MessageError::Conflict(
+                "recovery evidence scope changed".into(),
+            ));
+        }
+        history.record(
+            HistoryUpdate::Evidence {
+                id: scope.message_id,
+                receipt: entry.receipt.clone(),
+                probably_landed: entry.probably_landed,
+            },
+            now,
+        )?;
+        let guard =
+            history.claim_recovery(scope.clone(), entry.receipt.is_some(), cancelled, now)?;
+        entry.recovery_guard = Some(guard.registration());
+        Ok(RecoveryClaim {
+            scope,
+            guard,
+            evidence: self.clone(),
+            history: history.clone(),
+        })
+    }
+
+    fn deregister_recovery(&self, id: MessageId, guard: &RecoveryGuard) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = state.messages.get_mut(&id) {
+            RecoveryGuard::deregister(&mut entry.recovery_guard, guard);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn recovery_registrations(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .messages
+            .values()
+            .filter(|entry| entry.recovery_guard.is_some())
+            .count()
     }
 
     /// An unknown or acknowledged ID is unavailable, as in `snapshot`: Ok(None)
@@ -341,6 +442,7 @@ impl MessageEvidence {
                     "message receipt does not match retained evidence".into(),
                 ));
             }
+            RecoveryGuard::revoke_registration(&entry.recovery_guard);
             state.scopes = state.scopes.saturating_sub(entry.scopes.len());
             state.messages.remove(&id);
         }
@@ -353,6 +455,9 @@ impl MessageEvidence {
     pub(crate) fn forget_unscoped(&self, id: MessageId) {
         if let Ok(mut state) = self.state() {
             if (state.messages.get(&id)).is_some_and(|entry| entry.scopes.is_empty()) {
+                if let Some(entry) = state.messages.get(&id) {
+                    RecoveryGuard::revoke_registration(&entry.recovery_guard);
+                }
                 state.messages.remove(&id);
             }
         }
@@ -475,6 +580,9 @@ impl MessageEvidence {
             // A message that was never attempted has no paste to have landed.
             if named && entry.receipt.is_none() && !entry.scopes.is_empty() {
                 entry.probably_landed = true;
+            }
+            if entry.probably_landed || entry.receipt.is_some() {
+                RecoveryGuard::revoke_registration(&entry.recovery_guard);
             }
             changed |= before != (entry.probably_landed, entry.receipt.is_some());
         }

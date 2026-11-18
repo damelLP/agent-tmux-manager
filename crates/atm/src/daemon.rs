@@ -3,6 +3,89 @@
 //! Provides utilities for checking if the daemon is running and
 //! starting it automatically if needed.
 
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use crate::{
+        control::{ControlFailure, ControlInput},
+        input::ClientCommand,
+    };
+    use tokio::sync::mpsc;
+
+    #[tokio::test(start_paused = true)]
+    async fn control_request_budget_includes_time_queued_offline() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = ControlHandle::new(tx);
+        let request = tokio::spawn(async move {
+            handle
+                .request(
+                    "task.list".into(),
+                    serde_json::json!({}),
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        let ClientCommand::Control(command) = rx.recv().await.unwrap() else {
+            panic!("control command")
+        };
+        assert!(matches!(command.input, ControlInput::Request { .. }));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(ControlFailure::Timeout)
+        ));
+        assert!(
+            command.reply.unwrap().1.is_closed(),
+            "expired command must not be admitted later"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_request_handles_command_and_reply_channel_closure() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let handle = ControlHandle::new(tx);
+        assert!(matches!(
+            handle
+                .request(
+                    "x".into(),
+                    serde_json::Value::Null,
+                    None,
+                    Duration::from_secs(30)
+                )
+                .await,
+            Err(ControlFailure::Closed)
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = ControlHandle::new(tx);
+        let request = tokio::spawn(async move {
+            handle
+                .request(
+                    "x".into(),
+                    serde_json::Value::Null,
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        drop(rx.recv().await.unwrap());
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(ControlFailure::Closed)
+        ));
+    }
+
+    #[test]
+    fn control_ids_never_wrap() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX);
+        assert!(matches!(
+            allocate_request_id(&counter),
+            Err(ControlFailure::IdExhausted)
+        ));
+    }
+}
+
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,6 +97,104 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use tracing::{debug, info};
 
 use crate::client::resolve_socket_path;
+use crate::control::{ControlFailure, ControlInput, RequestId};
+use crate::input::ClientCommand;
+use atm_protocol::{ClientMessage, ResponsePayload};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{mpsc, oneshot};
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_request_id(counter: &AtomicU64) -> Result<RequestId, ControlFailure> {
+    let mut id = counter.load(Ordering::Relaxed);
+    loop {
+        let next = id.checked_add(1).ok_or(ControlFailure::IdExhausted)?;
+        match counter.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(RequestId(id)),
+            Err(actual) => id = actual,
+        }
+    }
+}
+
+pub(crate) type RequestReply = oneshot::Sender<Result<ResponsePayload, ControlFailure>>;
+
+/// An opaque command submitted by [`ControlHandle`] to the session client.
+#[derive(Debug)]
+pub struct ControlCommand {
+    pub(crate) input: ControlInput,
+    pub(crate) reply: Option<(RequestId, RequestReply)>,
+}
+
+/// Optional control operations on the existing daemon connection, never a
+/// second socket or startup path. Requests are not retried on any failure.
+#[derive(Debug, Clone)]
+pub struct ControlHandle {
+    sender: mpsc::UnboundedSender<ClientCommand>,
+}
+
+impl ControlHandle {
+    /// Wraps the same command sender used for session discovery.
+    #[must_use]
+    pub fn new(sender: mpsc::UnboundedSender<ClientCommand>) -> Self {
+        Self { sender }
+    }
+
+    /// Issues one request within a total budget, including time queued offline.
+    /// Cancelling this future prevents admission if it has not yet been sent;
+    /// it cannot undo a request already accepted by the daemon.
+    pub async fn request(
+        &self,
+        method: String,
+        params: serde_json::Value,
+        from_pane: Option<String>,
+        budget: Duration,
+    ) -> Result<ResponsePayload, ControlFailure> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(budget)
+            .ok_or(ControlFailure::Timeout)?;
+        let id = allocate_request_id(&NEXT_REQUEST_ID)?;
+        let (reply, receive) = oneshot::channel();
+        self.submit(ControlCommand {
+            input: ControlInput::Request {
+                id,
+                message: ClientMessage::request(id.to_string(), method, params, from_pane),
+                deadline,
+            },
+            reply: Some((id, reply)),
+        })?;
+        tokio::time::timeout_at(deadline, receive)
+            .await
+            .map_err(|_| ControlFailure::Timeout)?
+            .map_err(|_| ControlFailure::Closed)?
+    }
+
+    /// Starts or replaces an optional watch. A new subscription explicitly
+    /// chooses its cursor; only transport reconnects resume the accepted cursor.
+    pub fn watch(&self, topics: Vec<String>, cursor: u64) -> Result<(), ControlFailure> {
+        self.submit(ControlCommand {
+            input: ControlInput::Watch {
+                topics,
+                cursor,
+                barrier: allocate_request_id(&NEXT_REQUEST_ID)?,
+            },
+            reply: None,
+        })
+    }
+
+    /// Clears the desired subscription, including across reconnects.
+    pub fn unwatch(&self) -> Result<(), ControlFailure> {
+        self.submit(ControlCommand {
+            input: ControlInput::Unwatch,
+            reply: None,
+        })
+    }
+
+    fn submit(&self, command: ControlCommand) -> Result<(), ControlFailure> {
+        self.sender
+            .send(ClientCommand::Control(command))
+            .map_err(|_| ControlFailure::Closed)
+    }
+}
 
 /// Returns the path to the daemon PID file.
 fn pid_file_path() -> PathBuf {

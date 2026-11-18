@@ -5,6 +5,8 @@
 //! Captured: tmux 3.6 and 3.8, 2026-11-14, private PTY focus/shell probes.
 //! Neither version exposes a foreground PID: the v2 PID slot is deliberately empty,
 //! never substituted with pane_pid (the root may be a shell wrapper).
+//! Compound frames: tmux 3.8 and 3.6a (package 3.6a-2ubuntu0.2, reports 3.6),
+//! 2026-11-16, sealed PTY renderer synchronized by wait-for; see compound fixtures.
 use super::{
     state::{Fence, State},
     CaptureFormat, ExpectedTag, PaneCapture, PaneId, PaneInspection, PaneKey, ReservationError,
@@ -23,6 +25,9 @@ pub(super) const COMMAND: &str =
 pub(super) const CLIENTS: &str = "#{client_flags}\t#{pane_id}";
 pub(super) const CLIENTS_MARKER: &str = "ATM-CLIENTS-v1";
 const END: &str = "ATM-END\t#{pane_id}";
+pub(super) const CAPTURE_MARKER: &str = "ATM-CAPTURE-v1";
+pub(super) const TAG_MARKER: &str = "ATM-TAG-v1";
+pub(super) const TAG_END: &str = "ATM-TAG-END-v1";
 pub(in crate::control) type Guard = Box<dyn FnOnce(&PaneCapture) -> bool + Send>;
 pub(in crate::control) enum Input {
     Key(PaneKey),
@@ -329,6 +334,9 @@ async fn tag(client: &dyn TmuxClient, pane: &PaneId) -> Result<Option<String>, R
         )
         .await
         .map_err(|source| tmux(pane, "read local tag", source))?;
+    decode_local_tag(pane, &output)
+}
+fn decode_local_tag(pane: &PaneId, output: &str) -> Result<Option<String>, ReservationError> {
     if output.is_empty() {
         return Ok(None);
     }
@@ -367,10 +375,20 @@ pub(super) async fn capture(
     pane: &PaneId,
     format: CaptureFormat,
 ) -> Result<PaneCapture, ReservationError> {
-    metadata(client, pane, false)
-        .await?
-        .ok_or_else(|| ReservationError::PaneGone { pane: pane.clone() })?;
+    let filter = format!("#{{==:#{{pane_id}},{pane}}}");
+    let metadata_format = FORMAT.replace(COMMAND, "");
     let mut args = vec![
+        "-a",
+        "-f",
+        &filter,
+        "-F",
+        &metadata_format,
+        ";",
+        "display-message",
+        "-p",
+        CAPTURE_MARKER,
+        ";",
+        "display-message",
         "-p",
         "-t",
         pane.as_str(),
@@ -402,13 +420,70 @@ pub(super) async fn capture(
         "-t",
         pane.as_str(),
         END,
+        ";",
+        "display-message",
+        "-p",
+        TAG_MARKER,
+        ";",
+        "show-options",
+        "-p",
+        "-q",
+        "-v",
+        "-t",
+        pane.as_str(),
+        "@atm-agent",
+        ";",
+        "display-message",
+        "-p",
+        TAG_END,
     ]);
-    let output = client
-        .raw_command("display-message", &args)
-        .await
-        .map_err(|source| tmux(pane, "capture viewport", source))?;
-    let mut capture = decode_capture(pane, &output, format)?;
-    capture.inspection.local_agent_tag = tag(client, pane).await?;
+    let output = match client.raw_command("list-panes", &args).await {
+        Ok(output) => output,
+        Err(source) => {
+            // A failed command list may lose its stdout. Diagnose positive
+            // absence only; never decode partial output or retry the capture.
+            metadata(client, pane, false)
+                .await?
+                .ok_or_else(|| ReservationError::PaneGone { pane: pane.clone() })?;
+            return Err(tmux(pane, "capture viewport", source));
+        }
+    };
+    decode_compound_capture(pane, &output, format)
+}
+
+fn decode_compound_capture(
+    pane: &PaneId,
+    output: &str,
+    format: CaptureFormat,
+) -> Result<PaneCapture, ReservationError> {
+    let fail = || observation(pane, "malformed compound capture");
+    let (presence, frame) = output
+        .split_once(&format!("{CAPTURE_MARKER}\n"))
+        .ok_or_else(fail)?;
+    if presence.is_empty() {
+        return Err(fail());
+    }
+    decode_metadata(pane, presence)?;
+    let (header, _) = frame.split_once('\n').ok_or_else(fail)?;
+    let inspection = decode_metadata(pane, &format!("{header}\n"))?;
+    // Skip the header and the entire viewport before recognizing trailers:
+    // terminal text may contain every marker, including the pane's end marker.
+    let viewport_end: usize = frame
+        .split_inclusive('\n')
+        .take(usize::from(inspection.pane.height) + 1)
+        .map(str::len)
+        .sum();
+    let trailer = frame.get(viewport_end..).ok_or_else(fail)?;
+    let tag_marker = format!("{TAG_MARKER}\n");
+    let end = format!("ATM-END\t{pane}\n{tag_marker}");
+    let (_, tag) = trailer.split_once(&end).ok_or_else(fail)?;
+    let framed = frame
+        .strip_suffix(tag)
+        .and_then(|s| s.strip_suffix(&tag_marker))
+        .ok_or_else(fail)?;
+    let mut capture = decode_capture(pane, framed, format)?;
+    let tag = tag.strip_suffix(&format!("{TAG_END}\n")).ok_or_else(fail)?;
+    capture.inspection.local_agent_tag = decode_local_tag(pane, tag)?;
     Ok(capture)
 }
 

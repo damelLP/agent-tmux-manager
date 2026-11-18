@@ -37,13 +37,15 @@ pub enum RpcError {
     Connection(String),
 }
 
-/// Connect, check capabilities, and issue exactly one request. Send uses one
-/// call; spawn uses separate prepare/split/type calls so it can print between
-/// split and type. Kill, interrupt, reply and peek use one call each.
-pub async fn call(method: &str, mut params: Value, budget: Duration) -> Result<Value, RpcError> {
-    if method.starts_with("session.")
-        || matches!(method, "agent.up" | "agent.adopt" | "agent.respawn")
-    {
+/// Caller identity shared by one-shot RPCs and the TUI's control connection.
+#[derive(Debug, Clone)]
+pub(super) struct CallerContext {
+    pub from_pane: Option<String>,
+    pub caller_server: String,
+}
+
+impl CallerContext {
+    pub(super) fn from_env() -> Result<Self, RpcError> {
         let path = caller_server_path(
             std::env::var_os("ATM_TMUX_SOCKET").as_deref(),
             std::env::var_os("TMUX").as_deref(),
@@ -60,12 +62,29 @@ pub async fn call(method: &str, mut params: Value, budget: Duration) -> Result<V
         let path = path
             .to_str()
             .ok_or_else(|| connection_error("tmux socket path is not UTF-8"))?;
-        if let Some(params) = params.as_object_mut() {
-            params.insert("caller_server".into(), Value::String(path.into()));
-        }
+        Ok(Self {
+            from_pane: super::spawn::non_empty_env("TMUX_PANE"),
+            caller_server: path.into(),
+        })
     }
+}
+
+/// Connect, check capabilities, and issue exactly one request. Send uses one
+/// call; spawn uses separate prepare/split/type calls so it can print between
+/// split and type. Kill, interrupt, reply and peek use one call each.
+pub async fn call(method: &str, mut params: Value, budget: Duration) -> Result<Value, RpcError> {
+    let from_pane = if method.starts_with("session.")
+        || matches!(method, "agent.up" | "agent.adopt" | "agent.respawn")
+    {
+        let caller = CallerContext::from_env()?;
+        if let Some(params) = params.as_object_mut() {
+            params.insert("caller_server".into(), Value::String(caller.caller_server));
+        }
+        caller.from_pane
+    } else {
+        super::spawn::non_empty_env("TMUX_PANE")
+    };
     let socket = atm_tui::client::resolve_socket_path();
-    let from_pane = super::spawn::non_empty_env("TMUX_PANE");
     call_with_startup(
         Arc::clone(&STARTUP_SLOT),
         &socket,

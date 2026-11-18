@@ -1,0 +1,41 @@
+Captured: Claude Code 2.1.326, 2026-11-17, sealed fake-API TUI.
+
+           Claude Code v2.1.326                           
+ ▐▂███▂█   Haiku 5.5 · API Usage Billing                  
+~▜██████~  /tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxx/native/project                                                        
+
+
+❯ /clear                                                                                                            
+
+❯ survey turn: reply with the neutral fixture response                                                              
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                          
+* Cogitating…                                             
+  ⎿  Tip: Use Plan Mode to prepare for a complex request before making changes. Press shift+tab twice to enable.    
+                                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                         
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents                                            

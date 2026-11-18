@@ -19,6 +19,12 @@ fn rollout_kit_contract() -> std::io::Result<()> {
     run_contract("900", "scripts/rollout_kit_test.py")
 }
 
+#[test]
+fn supervisor_kit_contract() -> std::io::Result<()> {
+    // hang guard only, scaled to suite size (85 methods ~110 s alone); not synchronization
+    run_contract("300", "scripts/supervisor_kit_test.py")
+}
+
 fn run_contract(limit: &str, script: &str) -> std::io::Result<()> {
     let output = std::process::Command::new("timeout")
         .args([limit, "python3", script])

@@ -158,6 +158,64 @@ async fn exchange(
     assert!(!dir.path().join("fallback").exists());
     output
 }
+// Synthetic: explicit measured redo versus an old daemon's unmeasured answer.
+#[tokio::test]
+async fn decide_overrule_explains_required_work_zero_repeat_and_legacy() {
+    let params = json!({"id":"d41","option":"no","note":null,"standing_rule":false});
+    let mut raw = resolved();
+    raw["decision"]["status"] = json!("overruled");
+    raw["decision"]["resolution"]["option"] = json!("no");
+    let mut measured = raw.clone();
+    measured["redo"] = json!({"required_count":1,"completed_count":0,"cancelled_count":0,"task_ids":["t14"],"next_after":null});
+    let out = exchange(
+        &["decide", "d41", "no"],
+        "decision.resolve",
+        params.clone(),
+        json!({"result":measured.clone()}),
+        true,
+        false,
+    )
+    .await;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(),"d41 overruled: no\nRedo required: t14. It is open and unassigned; no files were reverted.\nTasks redone for d41: 0/1 accepted again.\n");
+    measured["changed"] = json!(false);
+    let out = exchange(
+        &["decide", "d41", "no"],
+        "decision.resolve",
+        params.clone(),
+        json!({"result":measured}),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(String::from_utf8(out.stdout).unwrap(),"d41 overruled: no (unchanged)\nRedo already recorded: t14.\nTasks redone for d41: 0/1 accepted again.\n");
+    raw["redo"] = json!({"required_count":0,"completed_count":0,"cancelled_count":0,"task_ids":[],"next_after":null});
+    let out = exchange(
+        &["decide", "d41", "no"],
+        "decision.resolve",
+        params.clone(),
+        json!({"result":raw.clone()}),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(String::from_utf8(out.stdout).unwrap(),"d41 overruled: no\nRedo required: none. No files were reverted.\nTasks redone for d41: 0/0 accepted again.\n");
+    raw.as_object_mut().unwrap().remove("redo");
+    let out = exchange(
+        &["decide", "d41", "no"],
+        "decision.resolve",
+        params,
+        json!({"result":raw}),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "d41 overruled: no\nRedo: not recorded by this daemon.\n"
+    );
+}
+
 fn list_params() -> Value {
     json!({"statuses":null,"after":null,"limit":100,"count_only":false})
 }

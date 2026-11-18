@@ -58,6 +58,10 @@ impl OwnedChild {
     pub fn wait_with_output(mut self) -> std::io::Result<Output> {
         self.0.take().unwrap().wait_with_output()
     }
+
+    pub fn into_inner(mut self) -> Child {
+        self.0.take().unwrap()
+    }
 }
 
 impl Drop for OwnedChild {
@@ -76,20 +80,19 @@ pub fn run(command: &mut Command) -> Output {
     // Files retain arbitrarily large output without blocking the child on pipes.
     let mut stdout = tempfile::tempfile().unwrap();
     let mut stderr = tempfile::tempfile().unwrap();
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(stdout.try_clone().unwrap())
         .stderr(stderr.try_clone().unwrap())
         .spawn()
         .expect("spawn stand-in command");
-    if let Err(error) = wait_exit(child.id(), GUARD) {
-        // This unreaped child cannot have a reused PID.
-        let _ = child.kill();
-        let _ = child.wait();
+    let child = OwnedChild::new(child);
+    if let Err(error) = wait_exit(child.0.as_ref().unwrap().id(), GUARD) {
+        // The guard kills and reaps this unreaped child, including on unwind.
         panic!("stand-in command failed to exit: {command:?}: {error}");
     }
     let mut output = Output {
-        status: child.wait().unwrap(),
+        status: child.wait_with_output().unwrap().status,
         stdout: Vec::new(),
         stderr: Vec::new(),
     };

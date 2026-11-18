@@ -45,7 +45,7 @@ struct Action {
 }
 fn arb_action() -> impl Strategy<Value = Action> {
     (
-        (0u64..5, 0usize..8, 0usize..4, 0usize..3, 0usize..3),
+        (0u64..6, 0usize..8, 0usize..4, 0usize..3, 0usize..3),
         (any::<bool>(), any::<bool>(), any::<bool>()),
         (prop::option::of(0i64..12), 0i64..4),
     )
@@ -88,6 +88,7 @@ impl Action {
                 DecisionCommand::Request(request)
             }
             1 => DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                relayed_by: None,
                 decision_id,
                 option: option(self.option),
                 by: Address::System,
@@ -104,6 +105,15 @@ impl Action {
                 standing_rule: self.may_be_undone,
             }),
             3 => DecisionCommand::Expire { decision_id },
+            5 => DecisionCommand::Relay {
+                decision_id,
+                option: option(self.option),
+                by: if self.who.is_multiple_of(2) {
+                    builder()
+                } else {
+                    "p/other".parse().unwrap()
+                },
+            },
             _ => DecisionCommand::Withdraw(DecisionWithdrawal {
                 decision_id,
                 by: who(self.who),
@@ -139,6 +149,10 @@ impl History {
                 session_id: None,
             });
         }
+        history.apply(&OrgEvent::OwnerRelaySet(OwnerRelaySet {
+            by: Address::Owner,
+            agent: Some(builder()),
+        }));
         history
     }
     fn apply(&mut self, event: &OrgEvent) {
@@ -180,6 +194,7 @@ fn refusal_name(refusal: &Refusal) -> &'static str {
     match refusal {
         Refusal::Decision(DecisionRefusal::InvalidState { .. }) => "invalid state",
         Refusal::Decision(DecisionRefusal::MustWait { .. }) => "must wait",
+        Refusal::Decision(DecisionRefusal::AlreadyTaken { .. }) => "already taken",
         Refusal::Decision(DecisionRefusal::NotRecommended { .. }) => "not recommended",
         Refusal::Decision(DecisionRefusal::UnknownOption { .. }) => "unknown option",
         Refusal::Decision(DecisionRefusal::NotAllowed { .. }) => "not allowed",
@@ -198,7 +213,8 @@ fn refusal_name(refusal: &Refusal) -> &'static str {
         | Refusal::Away(_) => "not a decision refusal",
     }
 }
-const REFUSALS: [&str; 9] = [
+const REFUSALS: [&str; 10] = [
+    "already taken",
     "invalid state",
     "must wait",
     "not recommended",
@@ -229,7 +245,13 @@ fn check_decision(decision: &Decision) -> Result<(), TestCaseError> {
             request.may_be_undone,
             "taken though it may not be undone: {decision:?}"
         );
-        prop_assert_eq!(Some(&taken.option), request.recommended.as_ref());
+        if let Some(by) = &taken.relayed_by {
+            prop_assert_eq!(&taken.by, &Address::Owner);
+            prop_assert_eq!(by, &builder());
+            prop_assert!(request.options.contains(&taken.option));
+        } else {
+            prop_assert_eq!(Some(&taken.option), request.recommended.as_ref());
+        }
         prop_assert!(decision.taken_at.is_some());
     }
     if let Some(answer) = resolution {

@@ -31,22 +31,28 @@ pub fn observe_control_screen(
     cursor: Option<ScreenCursor>,
 ) -> ControlScreen {
     let mut result = ControlScreen::default();
-    result.facts = observe_screen(input, cursor);
+    let decoded;
+    let (text, styled) = match input {
+        ScreenInput::Plain(text) if cursor.is_none() => (text, None),
+        ScreenInput::Styled(text) => {
+            #[cfg(test)]
+            DECODE_COUNT.with(|count| count.set(count.get() + 1));
+            let Ok(screen) = StyledScreen::parse(text) else {
+                return result;
+            };
+            decoded = screen;
+            (decoded.text(), Some(&decoded))
+        }
+        _ => return result,
+    };
+    if text.chars().any(|c| c.is_control() && c != '\n') {
+        return result;
+    }
+    result.facts = inspect_prepared(text, styled).0;
     if result.facts.dialog != DialogState::None {
         return result;
     }
     result.dialog = ControlDialog::None;
-    let decoded;
-    let text = match input {
-        ScreenInput::Plain(text) => text,
-        ScreenInput::Styled(text) => {
-            let Ok(screen) = StyledScreen::parse(text) else {
-                return ControlScreen::default();
-            };
-            decoded = screen;
-            decoded.text()
-        }
-    };
     let lines: Vec<_> = text.lines().map(|s| s.trim_end_matches(' ')).collect();
     // The existing observer already proved the active editor. Find its upper
     // border (the rule preceding the final rule), excluding the draft itself.
@@ -96,6 +102,9 @@ pub fn observe_control_screen(
     };
     result
 }
+
+#[cfg(test)]
+mod decode_tests;
 
 fn transcript_block(block: &[&str]) -> bool {
     !block.is_empty()

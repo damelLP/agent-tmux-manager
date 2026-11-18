@@ -307,6 +307,7 @@ mod tests {
                 pane: "%7".into(),
             },
             OrgEvent::MessageSent(MessageContent {
+                delivery_notice: None,
                 from: Address::System,
                 to: Address::Agent(id.clone()),
                 kind: MessageKind::Note,
@@ -360,6 +361,7 @@ mod tests {
         let now = "2026-01-15T12:00:00Z".parse().unwrap();
         let id: AgentId = "project/worker".parse().unwrap();
         let note = MessageContent {
+            delivery_notice: None,
             from: Address::System,
             to: Address::Agent(id.clone()),
             kind: MessageKind::Note,

@@ -1,23 +1,14 @@
 use anyhow::{bail, Context, Result};
-use atm_tmux::{RealTmuxClient, TmuxClient, TmuxError};
-
-use super::spawn::{
-    build_spawn_command_for_harness, resolve_spawn_harness, shell_quote, tmux_shell_prefix,
+use atm_tmux::{RealTmuxClient, TmuxClient};
+#[cfg(test)]
+use atmd::control::workspace::run_shell_command_from_arg;
+use atmd::control::workspace::{
+    self, exact_session, run_shell_arg, workspace_script_path, WorkspaceHooks,
 };
+
+use super::spawn::{build_spawn_command_for_harness, resolve_spawn_harness, tmux_shell_prefix};
 #[cfg(test)]
 use super::TEST_ENV_LOCK;
-
-/// `run-shell`'s argument to run the script at `path` with `args`: each one
-/// `sh -c` word, with `#` doubled because run-shell format-expands its
-/// argument (tmux 3.8: `#S` becomes the session name).
-fn run_shell_arg(path: &std::path::Path, args: &[&str]) -> String {
-    let mut cmd = shell_quote(&path.display().to_string());
-    for arg in args {
-        cmd.push(' ');
-        cmd.push_str(&shell_quote(arg));
-    }
-    cmd.replace('#', "##")
-}
 
 /// [`run_shell_arg`] as one tmux command string, for `set-hook` and
 /// `bind-key`, which parse it: inside tmux's double quotes `'` is literal,
@@ -28,23 +19,9 @@ fn run_shell_command(path: &std::path::Path, args: &[&str]) -> String {
     run_shell_command_from_arg(&run_shell_arg(path, args))
 }
 
-/// Quote a shell command for tmux without escaping its deliberate formats.
-fn run_shell_command_from_arg(arg: &str) -> String {
-    let arg = arg
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-        .replace('\n', "\\n");
-    format!("run-shell \"{arg}\"")
-}
-
 // ============================================================================
 // Workspace Helpers
 // ============================================================================
-
-const SIDEBAR_PCT: u32 = 16;
-const SIDEBAR_MIN: u32 = 20;
-const SIDEBAR_MAX: u32 = 40;
 
 /// Resolves the tmux socket label used by workspace helpers.
 fn effective_tmux_socket(socket: &Option<String>) -> Option<String> {
@@ -55,30 +32,6 @@ fn effective_tmux_socket(socket: &Option<String>) -> Option<String> {
     })
 }
 
-/// Namespace scripts by their baked-in socket routing, not just the session.
-/// Hex preserves arbitrary labels in one lossless filesystem component.
-fn workspace_script_path(
-    base: &std::path::Path,
-    socket: Option<&str>,
-    session_name: &str,
-    kind: &str,
-) -> std::path::PathBuf {
-    let namespace = socket.map_or_else(
-        || "implicit".to_string(),
-        |label| {
-            format!(
-                "label-{}",
-                label
-                    .bytes()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            )
-        },
-    );
-    base.join(namespace)
-        .join(format!("{kind}-{session_name}.sh"))
-}
-
 /// Builds a tmux client for workspace orchestration.
 fn workspace_tmux_client(socket: &Option<String>) -> RealTmuxClient {
     effective_tmux_socket(socket)
@@ -86,47 +39,22 @@ fn workspace_tmux_client(socket: &Option<String>) -> RealTmuxClient {
         .unwrap_or_default()
 }
 
-/// Run a tmux command through the shared client abstraction, returning trimmed stdout.
-async fn tmux_run<C>(client: &C, args: &[&str]) -> Result<String>
-where
-    C: TmuxClient + ?Sized,
-{
-    let Some((subcommand, rest)) = args.split_first() else {
-        bail!("tmux command missing subcommand");
-    };
-    let output = client
-        .raw_command(subcommand, rest)
-        .await
-        .with_context(|| format!("tmux {:?} failed", args))?;
-    Ok(output.trim().to_string())
+// Preserve the CLI helpers' anyhow error-chain formatting at this boundary.
+async fn tmux_run<C: TmuxClient + ?Sized>(client: &C, args: &[&str]) -> Result<String> {
+    Ok(workspace::tmux_run(client, args).await?)
 }
 
-/// The `-t` target for exactly the session `name` (tmux 3.8). Without `=`
-/// tmux falls back to a prefix, so `ws` finds `ws2`. The trailing `:` makes
-/// it a session where `-t` takes a pane (`set-hook`), which would first try
-/// a bare name as a window of the caller's session, and ends the name
-/// before tmux reads a `.` in it as the window.pane separator.
-fn exact_session(name: &str) -> String {
-    format!("={name}:")
+async fn has_session<C: TmuxClient + ?Sized>(client: &C, session: &str) -> Result<bool> {
+    Ok(workspace::has_session(client, session).await?)
 }
 
-/// Whether tmux has `session`. Only tmux's own "no" (a failed command)
-/// means absent. A timeout, or tmux failing to run, stays an error: tmux
-/// didn't answer, so the session may well exist.
-async fn has_session<C>(client: &C, session: &str) -> Result<bool>
-where
-    C: TmuxClient + ?Sized,
-{
-    match tmux_run(client, &["has-session", "-t", &exact_session(session)]).await {
-        Ok(_) => Ok(true),
-        Err(e) if matches!(e.downcast_ref(), Some(TmuxError::CommandFailed { .. })) => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// Calculate sidebar width from terminal columns, clamped to [SIDEBAR_MIN, SIDEBAR_MAX].
-fn sidebar_width(cols: u16) -> u32 {
-    (cols as u32 * SIDEBAR_PCT / 100).clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+async fn inject_sidebar<C: TmuxClient + ?Sized>(
+    client: &C,
+    target_pane: &str,
+    session_name: &str,
+    cols: u16,
+) -> Result<String> {
+    Ok(workspace::inject_sidebar(client, target_pane, session_name, cols).await?)
 }
 
 /// Validate a session name (alphanumeric, -, _, . only).
@@ -148,7 +76,19 @@ fn default_session_name() -> String {
         .unwrap_or_else(|| "atm-workspace".to_string())
 }
 
-/// Write the resize-sidebar script and install the after-resize-window hook + prefix keybindings.
+/// Resolve environment-dependent hook inputs at the CLI boundary.
+fn workspace_hooks(socket: &Option<String>) -> WorkspaceHooks {
+    let socket = effective_tmux_socket(socket);
+    WorkspaceHooks {
+        tmux_prefix: tmux_shell_prefix(socket.clone()),
+        socket,
+        script_dir: dirs::data_local_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("atm"),
+    }
+}
+
+/// Keep attach's hook-install entry points while sharing their explicit-input effects.
 async fn install_resize_hooks<C>(
     client: &C,
     socket: &Option<String>,
@@ -157,149 +97,10 @@ async fn install_resize_hooks<C>(
 where
     C: TmuxClient + ?Sized,
 {
-    let socket = effective_tmux_socket(socket);
-    let tmux_prefix = tmux_shell_prefix(socket.clone());
-    let script_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("atm");
-    let script_path = workspace_script_path(
-        &script_dir,
-        socket.as_deref(),
-        session_name,
-        "resize-sidebar",
-    );
-    std::fs::create_dir_all(script_path.parent().unwrap_or(&script_dir))?;
-    std::fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\n\
-             # Exit silently: an empty target would resolve to the current window.\n\
-             [ -n \"$1\" ] || exit 0\n\
-             W=$({tmux} display-message -p -t \"$1\" '#{{window_width}}')\n\
-             S=$((W * {pct} / 100))\n\
-             [ $S -lt {min} ] && S={min}\n\
-             [ $S -gt {max} ] && S={max}\n\
-             for p in $({tmux} list-panes -t \"$1\" -F '#{{pane_id}}:#{{@atm-sidebar}}:#{{pane_width}}:#{{@atm-sidebar-tries}}'); do\n\
-               id=${{p%%:*}}; n=${{p##*:}}\n\
-               case $p in\n\
-                 *:1:$S:*) [ -n \"$n\" ] && {tmux} set-option -pu -t \"$id\" @atm-sidebar-tries;;\n\
-                 *:1:*) if [ \"$2\" = hook ]; then\n\
-                     [ \"${{n:-0}}\" -ge 5 ] && continue\n\
-                     {tmux} set-option -p -t \"$id\" @atm-sidebar-tries $((${{n:-0}} + 1))\n\
-                   fi\n\
-                   {tmux} resize-pane -t \"$id\" -x \"$S\";;\n\
-               esac\n\
-             done\n",
-            tmux = tmux_prefix,
-            pct = SIDEBAR_PCT,
-            min = SIDEBAR_MIN,
-            max = SIDEBAR_MAX,
-        ),
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-    // The hook/keybinding queue has its window even when child tmux calls
-    // would resolve current through a different client or leaked TMUX_PANE.
-    let hook_cmd = run_shell_command_from_arg(&format!(
-        "{} '#{{window_id}}'",
-        run_shell_arg(&script_path, &[])
-    ));
-    tmux_run(
-        client,
-        &[
-            "set-hook",
-            "-t",
-            &exact_session(session_name),
-            "after-resize-window",
-            &hook_cmd,
-        ],
-    )
-    .await?;
-    // Undo Claude Code teammate rebalances, which resize the first pane (our
-    // sidebar) to 30%. The script's own resize-pane re-fires this hook, so in
-    // `hook` mode it stops after 5 tries that don't reach the target width
-    // (e.g. a window too small to fit it); reaching the target resets the count.
-    let pane_hook_cmd = run_shell_command_from_arg(&format!(
-        "{} '#{{window_id}}' hook",
-        run_shell_arg(&script_path, &[])
-    ));
-    tmux_run(
-        client,
-        &[
-            "set-hook",
-            "-t",
-            &exact_session(session_name),
-            "after-resize-pane",
-            &pane_hook_cmd,
-        ],
-    )
-    .await?;
-    // NOTE: bind-key is global; the last workspace created wins for prefix-R.
-    tmux_run(client, &["bind-key", "-T", "prefix", "R", &hook_cmd]).await?;
-    // Focus the window's `@atm-sidebar` pane; pane indexes shift with layout changes.
-    tmux_run(
-        client,
-        &[
-            "bind-key",
-            "-T",
-            "prefix",
-            "a",
-            "run-shell",
-            "-C",
-            "select-pane -t '#{P:#{?#{@atm-sidebar},#{pane_id},}}'",
-        ],
-    )
-    .await?;
+    workspace::install_resize_hooks(client, session_name, &workspace_hooks(socket)).await?;
     Ok(())
 }
 
-/// Inject an ATM sidebar into a target pane. Returns the sidebar pane ID.
-async fn inject_sidebar<C>(
-    client: &C,
-    target_pane: &str,
-    session_name: &str,
-    cols: u16,
-) -> Result<String>
-where
-    C: TmuxClient + ?Sized,
-{
-    let width = sidebar_width(cols).to_string();
-    let atm_pane = tmux_run(
-        client,
-        &[
-            "split-window",
-            "-fhb",
-            "-t",
-            target_pane,
-            "-l",
-            &width,
-            "-P",
-            "-F",
-            "#{pane_id}",
-        ],
-    )
-    .await?;
-    // Tag with both a pane title (cosmetic) and a user option (for reliable detection).
-    // Pane titles can be overwritten by the shell if ATM crashes; @atm-sidebar persists.
-    tmux_run(
-        client,
-        &["select-pane", "-t", &atm_pane, "-T", "atm-sidebar"],
-    )
-    .await?;
-    tmux_run(
-        client,
-        &["set-option", "-p", "-t", &atm_pane, "@atm-sidebar", "1"],
-    )
-    .await?;
-    let atm_cmd = format!("atm --compact --tmux-session '{session_name}'");
-    tmux_run(client, &["send-keys", "-t", &atm_pane, &atm_cmd, "Enter"]).await?;
-    Ok(atm_pane)
-}
-
-/// Write the inject-sidebar script for the after-new-window hook.
 async fn install_new_window_hook<C>(
     client: &C,
     socket: &Option<String>,
@@ -308,63 +109,7 @@ async fn install_new_window_hook<C>(
 where
     C: TmuxClient + ?Sized,
 {
-    let socket = effective_tmux_socket(socket);
-    let tmux_prefix = tmux_shell_prefix(socket.clone());
-    let script_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("atm");
-    let script_path = workspace_script_path(
-        &script_dir,
-        socket.as_deref(),
-        session_name,
-        "inject-sidebar",
-    );
-    std::fs::create_dir_all(script_path.parent().unwrap_or(&script_dir))?;
-    std::fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\n\
-             # Exit silently: a nonzero run-shell exit displays an error in tmux.\n\
-             [ -n \"$1\" ] || exit 0\n\
-             W=$({tmux} display-message -p -t \"$1\" '#{{window_width}}')\n\
-             S=$((W * {pct} / 100))\n\
-             [ $S -lt {min} ] && S={min}\n\
-             [ $S -gt {max} ] && S={max}\n\
-             ORIG=$({tmux} display-message -p -t \"$1\" '#{{pane_id}}')\n\
-             PANE=$({tmux} split-window -hb -t \"$ORIG\" -l $S -P -F '#{{pane_id}}')\n\
-             {tmux} select-pane -t \"$PANE\" -T atm-sidebar\n\
-             {tmux} set-option -p -t \"$PANE\" @atm-sidebar 1\n\
-             {tmux} send-keys -t \"$PANE\" \"atm --compact --tmux-session '{session}'\" Enter\n\
-             {tmux} select-pane -t \"$ORIG\"\n",
-            tmux = tmux_prefix,
-            pct = SIDEBAR_PCT,
-            min = SIDEBAR_MIN,
-            max = SIDEBAR_MAX,
-            session = session_name,
-        ),
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-    // run-shell expands window_id to the new window even for new-window -d
-    // (tmux 3.6a and 3.8); hook_window is empty on both versions.
-    let hook_cmd = run_shell_command_from_arg(&format!(
-        "{} '#{{window_id}}'",
-        run_shell_arg(&script_path, &[])
-    ));
-    tmux_run(
-        client,
-        &[
-            "set-hook",
-            "-t",
-            &exact_session(session_name),
-            "after-new-window",
-            &hook_cmd,
-        ],
-    )
-    .await?;
+    workspace::install_new_window_hook(client, session_name, &workspace_hooks(socket)).await?;
     Ok(())
 }
 
@@ -445,79 +190,18 @@ pub(super) async fn cmd_workspace(name: Option<String>, isolate: bool, editor: b
         }
     }
 
-    // 4. Create session at current terminal size so absolute pane sizes
-    //    (like -l 30) are preserved when we attach later.
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let cols_str = cols.to_string();
-    let rows_str = rows.to_string();
-    let agent_pane = tmux_run(
+    // 4–10. Create at the caller's terminal size, preserving the split/launch/
+    // hook/focus sequence. Attaching stays local to the CLI.
+    let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
+    workspace::create_workspace(
         &client,
-        &[
-            "new-session",
-            "-d",
-            "-s",
-            &session_name,
-            "-x",
-            &cols_str,
-            "-y",
-            &rows_str,
-            "-P",
-            "-F",
-            "#{pane_id}",
-        ],
+        &session_name,
+        &agent_cmd,
+        editor,
+        terminal_size,
+        &workspace_hooks(&socket_name),
     )
     .await?;
-
-    // 5. Inject ATM sidebar on the left
-    inject_sidebar(&client, &agent_pane, &session_name, cols).await?;
-
-    // 6. Split: shell below the agent pane (20% height)
-    tmux_run(
-        &client,
-        &[
-            "split-window",
-            "-v",
-            "-t",
-            &agent_pane,
-            "-l",
-            "20%",
-            "-P",
-            "-F",
-            "#{pane_id}",
-        ],
-    )
-    .await?;
-
-    // 7. If --editor: split agent pane horizontally, editor on the left
-    if editor {
-        tmux_run(
-            &client,
-            &[
-                "split-window",
-                "-hb",
-                "-t",
-                &agent_pane,
-                "-l",
-                "50%",
-                "-P",
-                "-F",
-                "#{pane_id}",
-            ],
-        )
-        .await?;
-    }
-
-    // 8. Launch the configured harness in agent pane. Enter goes in its own
-    //    call: tmux reads an argument ending in `;` as a command separator
-    tmux_run(&client, &["send-keys", "-t", &agent_pane, &agent_cmd]).await?;
-    tmux_run(&client, &["send-keys", "-t", &agent_pane, "Enter"]).await?;
-
-    // 9. Install resize/new-window hooks + keybindings
-    install_resize_hooks(&client, &socket_name, &session_name).await?;
-    install_new_window_hook(&client, &socket_name, &session_name).await?;
-
-    // 10. Focus the agent pane and attach
-    tmux_run(&client, &["select-pane", "-t", &agent_pane]).await?;
     exec_attach(&socket_name, &session_name)
 }
 

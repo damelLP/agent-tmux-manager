@@ -433,6 +433,7 @@ mod tests {
                         option: "yes".into(),
                         note: Some("Always use this shape".into()),
                         standing_rule: true,
+                        relay: false,
                     },
                     caller,
                 )

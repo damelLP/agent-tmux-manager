@@ -70,6 +70,8 @@ pub fn observe_control_screen(
     let (text, styled) = match input {
         ScreenInput::Plain(text) if cursor.is_none() => (text, None),
         ScreenInput::Styled(text) => {
+            #[cfg(test)]
+            DECODE_COUNT.with(|count| count.set(count.get() + 1));
             let Ok(screen) = StyledScreen::parse(text) else {
                 return result;
             };
@@ -83,7 +85,8 @@ pub fn observe_control_screen(
     }
     let lines: Vec<_> = text.lines().map(|s| s.trim_end_matches(' ')).collect();
     let body = nonblank(&lines);
-    result.facts = observe_screen(input, cursor);
+    let (facts, draft) = inspect_prepared(text, styled);
+    result.facts = facts;
     if known_dialog(&lines) {
         result.dialog = if update_prompt(&body) {
             ControlDialog::LaunchSkip {
@@ -95,7 +98,7 @@ pub fn observe_control_screen(
     } else if let Some(dialog) = start_dialog(&body).or_else(|| hook_list(&body, text)) {
         result.dialog = dialog;
     } else if result.facts.dialog == DialogState::Other
-        && staged_draft_matches(input, CLEAR_COMMAND) == Some(true)
+        && draft_matches(draft.as_deref(), CLEAR_COMMAND) == Some(true)
         && styled.is_some_and(clear_completion)
     {
         result.dialog = ControlDialog::None;
@@ -351,3 +354,6 @@ const HOOK_ROWS: [(&str, &str); 14] = [
         "After a model request, including failures",
     ),
 ];
+
+#[cfg(test)]
+mod decode_tests;

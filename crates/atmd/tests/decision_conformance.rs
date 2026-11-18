@@ -516,6 +516,7 @@ async fn decision_lists_count_all_pages_and_keep_provisional_answers_visible() {
         .execute(
             OrgCommand::Decision(atm_org::DecisionCommand::TakeProvisionally(
                 atm_org::ProvisionalChoice {
+                    relayed_by: None,
                     decision_id: atm_org::DecisionId::new(4),
                     option: "yes".into(),
                     by: atm_org::Address::System,

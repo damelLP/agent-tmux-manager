@@ -1,5 +1,53 @@
 # Pi screen fixtures
 
+## Stage-only staged-reference contract (TR4 S0)
+
+Captured: pi 1.5.2, 2026-11-17, sealed stage-only private tmux 3.8.
+
+`screen_tr4s0_default_<80x40|120x40|28x40>_<state>_1.5.2` has sequential
+`capture-pane -p -e -N` (`.styled.txt`) and `-p -N` (`.plain.txt`)
+observations: 17 pairs, 34 files. Only identifying private paths/fragments
+become equal-cell `/tmp/xxx…` placeholders; SGR, allocated padding and physical
+rows remain unchanged. The pair is not atomic. Tests remove only provenance.
+
+Each geometry starts the installed stock CLI in a private filesystem/PID/tmux
+view, empty HOME/config, loopback-only network and disposable provider setup.
+`--offline`, `--no-session`, `--no-extensions`, `--no-mcp`, `--no-skills`,
+`--no-prompt-templates`, `--no-themes`, `--no-context-files`, `--no-tools` and
+`--no-approve` exclude owner resources and tools. The selected synthetic model
+uses a loopback provider which counts and immediately rejects any API POST;
+all capture inventories contain **zero requests**, hence no provider/model call.
+A whole-session watcher is ready before CLI launch. Automatic ATM start prompts
+are disabled. No reference/start line is submitted, no external route exists,
+and no missing optional tool is downloaded. Native startup warnings are retained.
+
+At 80/120 the real keyboard sequence is empty → pasted ordinary reference →
+Home → appended ` edited by a human` → wrong command ID → wrapped human edit →
+independently pasted start literal. Backspaces clear between drafts. The ordinary
+reference is `[m123456] Read: atm inbox --id m123456`; wrong ID changes only the
+final command token to `m123459`. The literal start line is
+`[m123456] New session: run the shell command atm me`. The wide wrapped control
+adds nine copies of ` neutral human edit`; it is not a canonical reference.
+At 28 columns the ordinary/start literals themselves wrap.
+
+| State | Styled 80/120 against canonical candidate | Styled 28 | Plain |
+|---|---|---|---|
+| empty | None | None | None |
+| reference / reference-home | Some(true) | reference: None | None |
+| edited / wrong-id | Some(false) | not captured | None |
+| wrapped edited reference | None, including full edited-literal query | not captured | None |
+| start-line literal | Some(true) | None | None |
+
+`tests/staged_reference.rs` pins each exact tri-state result. Synthetic controls
+are labeled: command-ID-only mutation, leading space, suffix, and history-only
+reference with wrong/empty editor. Full single-row authored edits match only
+their full literal; ordinary/start candidates cannot substitute for each other.
+All styled frames observe Empty or Draft / NotRunning / no dialog, with freshness
+Unknown. No false positive or unexpected staged-reference refusal was found.
+Wrapped refusal remains intentional; a match does not establish authorship,
+non-submission, safe Enter routing or permission to erase/submit. No production
+change or reconstruction of wrapped rows is part of these fixtures.
+
 ## Staged message references (P3)
 
 Captured: pi 1.5.0, 2026-11-14, sealed loopback-only private tmux

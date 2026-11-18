@@ -11,10 +11,13 @@ pub mod client;
 pub mod error;
 pub mod layout;
 pub mod mock;
+pub mod role;
+pub mod windows;
 
 pub use client::RealTmuxClient;
 pub use error::TmuxError;
 pub use mock::MockTmuxClient;
+pub use windows::PaneWindow;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -126,6 +129,16 @@ pub trait TmuxClient: Send + Sync {
 
     /// Lists all panes across all sessions.
     async fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError>;
+
+    /// Read pane/window links in one command on this client's tmux server.
+    /// Linked/grouped windows repeat once per session; callers may project them.
+    async fn list_pane_windows(&self) -> Result<Vec<PaneWindow>, TmuxError> {
+        windows::parse_pane_windows(
+            &self
+                .raw_command("list-panes", &["-a", "-F", windows::FORMAT])
+                .await?,
+        )
+    }
 
     /// Displays a popup overlay.
     ///

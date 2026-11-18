@@ -18,8 +18,7 @@ pub mod agent_handover;
 #[cfg(test)]
 mod agent_handover_tests;
 mod cost;
-// Pure decisions first; the flows that call them follow in their own commits.
-#[cfg_attr(not(test), allow(dead_code))]
+// Pure decisions shared by the lifecycle flows.
 mod agent_flow;
 #[cfg(test)]
 mod agent_flow_tests;
@@ -55,6 +54,9 @@ mod message_methods;
 pub mod message_notify;
 #[cfg(test)]
 mod message_persistence_tests;
+pub(crate) mod message_query;
+#[cfg(test)]
+mod message_query_tests;
 mod message_scheduler;
 #[cfg(test)]
 mod message_seam_tests;
@@ -62,7 +64,12 @@ mod message_seam_tests;
 mod message_service_tests;
 pub mod message_types;
 pub mod messages;
+mod org_tree;
+pub(crate) mod org_tree_methods;
 mod raw;
+pub(crate) mod report;
+pub(crate) mod reporting_line;
+pub mod return_digest;
 mod standing_rules;
 mod start_line;
 #[cfg(test)]
@@ -124,6 +131,8 @@ enum Request {
         reply: oneshot::Sender<Result<TaskCommit, OrgServiceError>>,
     },
     Snapshot(oneshot::Sender<OrgState>),
+    SnapshotAt(oneshot::Sender<Result<(OrgState, u64), OrgServiceError>>),
+    ReportSnapshot(oneshot::Sender<(u64, OrgState)>),
 }
 
 /// Cloneable actor handle. The high-water mark includes skipped unknown events
@@ -262,6 +271,26 @@ impl OrgHandle {
     pub async fn snapshot(&self) -> Result<OrgState, OrgServiceError> {
         let (reply, response) = oneshot::channel();
         self.submit(Request::Snapshot(reply))?;
+        tokio::time::timeout(DEADLINE, response)
+            .await
+            .map_err(|_| OrgServiceError::Timeout)?
+            .map_err(|_| self.closed_error())
+    }
+
+    /// The fold and its replay/commit high-water captured in one actor turn.
+    pub(crate) async fn snapshot_at(&self) -> Result<(OrgState, u64), OrgServiceError> {
+        let (reply, response) = oneshot::channel();
+        self.submit(Request::SnapshotAt(reply))?;
+        tokio::time::timeout(DEADLINE, response)
+            .await
+            .map_err(|_| OrgServiceError::Timeout)?
+            .map_err(|_| self.closed_error())?
+    }
+
+    // Report cursor and projection must be copied in the same actor turn.
+    async fn report_snapshot(&self) -> Result<(u64, OrgState), OrgServiceError> {
+        let (reply, response) = oneshot::channel();
+        self.submit(Request::ReportSnapshot(reply))?;
         tokio::time::timeout(DEADLINE, response)
             .await
             .map_err(|_| OrgServiceError::Timeout)?

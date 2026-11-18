@@ -363,7 +363,7 @@ fn idle_rule(
     answer
 }
 
-fn mail_on_its_way(state: &OrgState, agent: &AgentId) -> bool {
+pub(crate) fn mail_on_its_way(state: &OrgState, agent: &AgentId) -> bool {
     state
         .inbox(&Address::Agent(agent.clone()))
         .into_iter()
@@ -376,6 +376,144 @@ fn mail_on_its_way(state: &OrgState, agent: &AgentId) -> bool {
 }
 
 /// `None` when the calendar cannot hold the time.
-fn later(from: DateTime<Utc>, by: Duration) -> Option<DateTime<Utc>> {
+pub(crate) fn later(from: DateTime<Utc>, by: Duration) -> Option<DateTime<Utc>> {
     from.checked_add_signed(TimeDelta::from_std(by).ok()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MessageContent, MessageId, MessageKind, OrgEvent};
+
+    #[test]
+    fn mail_on_its_way_ignores_owner_system_other_agents_and_empty_inboxes() {
+        let now = DateTime::from_timestamp(0, 0).unwrap();
+        let agent: AgentId = "p/worker".parse().unwrap();
+        let other: AgentId = "p/other".parse().unwrap();
+        let mut state = OrgState::default();
+        state
+            .apply(
+                1,
+                now,
+                &OrgEvent::ProjectRegistered {
+                    project_id: "p".parse().unwrap(),
+                    root: "/p".into(),
+                },
+            )
+            .unwrap();
+        for (seq, id) in [(2, &agent), (3, &other)] {
+            state
+                .apply(
+                    seq,
+                    now,
+                    &OrgEvent::AgentAdopted {
+                        agent_id: id.clone(),
+                        pane: format!("%{seq}"),
+                        session_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(!mail_on_its_way(&state, &agent));
+
+        for (to, addressed) in [
+            (Address::Owner, false),
+            (Address::System, false),
+            (Address::Agent(other), false),
+            (Address::Agent(agent.clone()), true),
+        ] {
+            let message_id = MessageId::new(4);
+            let mut inbox = state.clone();
+            inbox
+                .apply(
+                    4,
+                    now,
+                    &OrgEvent::MessageSent(MessageContent {
+                        delivery_notice: None,
+                        from: Address::Owner,
+                        to: to.clone(),
+                        kind: MessageKind::Note,
+                        body: "Read this".into(),
+                        attachments: Vec::new(),
+                        task: None,
+                    }),
+                )
+                .unwrap();
+            // Apply committed facts to cover every address/status combination,
+            // including ones today's send policy would not create.
+            for (event, pending) in [
+                (
+                    OrgEvent::MessageDeliveryFailed {
+                        message_id,
+                        reason: "retry".into(),
+                        final_failure: false,
+                    },
+                    true,
+                ),
+                (
+                    OrgEvent::MessageDeliveryAttempted {
+                        message_id,
+                        attempt: 1,
+                        pane: "%2".into(),
+                    },
+                    true,
+                ),
+                (
+                    OrgEvent::MessageDelivered {
+                        message_id,
+                        session_id: SessionId::new("s1"),
+                        confirmation: "prompt".into(),
+                    },
+                    false,
+                ),
+                (
+                    OrgEvent::MessageDeliveryFailed {
+                        message_id,
+                        reason: "gone".into(),
+                        final_failure: true,
+                    },
+                    false,
+                ),
+            ] {
+                let mut one = inbox.clone();
+                one.apply(5, now, &event).unwrap();
+                assert_eq!(
+                    mail_on_its_way(&one, &agent),
+                    addressed && pending,
+                    "unread: {to}, pending={pending}"
+                );
+                one.apply(
+                    6,
+                    now,
+                    &OrgEvent::MessageRead {
+                        message_ids: vec![message_id],
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    mail_on_its_way(&one, &agent),
+                    addressed && pending,
+                    "read: {to}, pending={pending}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checked_time_addition_preserves_precision_and_rejects_both_overflows() {
+        let epoch = DateTime::from_timestamp(0, 0).unwrap();
+        for (from, by, expected) in [
+            (epoch, Duration::ZERO, Some(epoch)),
+            (epoch, Duration::new(60, 7), DateTime::from_timestamp(60, 7)),
+            (
+                DateTime::<Utc>::MAX_UTC,
+                Duration::ZERO,
+                Some(DateTime::<Utc>::MAX_UTC),
+            ),
+            (DateTime::<Utc>::MAX_UTC, Duration::from_nanos(1), None),
+            (epoch, Duration::MAX, None),
+        ] {
+            assert_eq!(later(from, by), expected, "{from} + {by:?}");
+        }
+    }
 }

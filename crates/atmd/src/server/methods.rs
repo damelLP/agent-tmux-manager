@@ -187,19 +187,51 @@ pub fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, MethodError
 /// The single registration point. Later handlers capture registry/control handles
 /// here; their addition never requires another connection dispatch arm.
 pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
+    router_with_reporting(
+        services,
+        crate::org::reporting_line::ReportingFiles::default(),
+    )
+}
+
+pub(crate) fn router_with_reporting(
+    services: MethodServices,
+    reporting: crate::org::reporting_line::ReportingFiles,
+) -> Result<MethodRouter, MethodError> {
     let mut router = MethodRouter::default();
     let agent_unavailable = services.org.status().err().map_or_else(
         || "named-agent operations are not configured".into(),
         |error| error.to_string(),
     );
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
+    crate::org::org_tree_methods::register_org_tree_method(
+        &mut router,
+        services.org.clone(),
+        services.registry.clone(),
+        reporting.clone(),
+    )?;
+    crate::org::report::register(
+        &mut router,
+        services.org.clone(),
+        reporting.clone(),
+        chrono::Utc::now,
+    )?;
     let handover_org = services.org.clone();
-    crate::org::tasks::register_task_methods(&mut router, services.org.clone())?;
-    let decisions = services.decisions.unwrap_or_else(|| {
-        crate::org::decisions::DecisionHandle::disabled("decision operations are not configured")
-    });
+    crate::org::tasks::register_task_methods_with_reporting(
+        &mut router,
+        services.org.clone(),
+        reporting.clone(),
+    )?;
+    let decisions = services
+        .decisions
+        .unwrap_or_else(|| {
+            crate::org::decisions::DecisionHandle::disabled(
+                "decision operations are not configured",
+            )
+        })
+        .with_reporting_files(reporting.clone());
     crate::org::away::register_away_methods(&mut router, decisions.clone())?;
     crate::org::decisions::register_decision_methods(&mut router, decisions)?;
+    crate::org::message_query::register(&mut router, services.org.clone(), reporting.clone())?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();
@@ -222,14 +254,15 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
         }
     })?;
 
-    register_control(&mut router, services.control)?;
+    crate::control::windows::register(&mut router, services.control.clone())?;
+    register_control(&mut router, services.control.clone())?;
     let agents = services
         .agents
         .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable));
     crate::org::agents::register_agent_methods(&mut router, agents.clone())?;
     let handovers = services.handovers.unwrap_or_else(|| {
         crate::org::agent_handover::Handovers::for_agents(
-            agents,
+            agents.clone(),
             handover_org,
             services.registry.clone(),
         )
@@ -238,12 +271,17 @@ pub fn router(services: MethodServices) -> Result<MethodRouter, MethodError> {
 
     crate::org::messages::register_message_methods(
         &mut router,
-        services.messages.unwrap_or_else(|| {
-            crate::org::messages::MessageHandle::disabled(
-                "confirmed-message operations are not configured",
-            )
-        }),
+        services
+            .messages
+            .unwrap_or_else(|| {
+                crate::org::messages::MessageHandle::disabled(
+                    "confirmed-message operations are not configured",
+                )
+            })
+            .with_reporting_files(reporting),
     )?;
+
+    super::health::register(&mut router, services.control, agents)?;
 
     // Add service-backed registrations above this finalization. The factory,
     // not callers, owns the complete capability snapshot used by daemon.info.
@@ -301,6 +339,36 @@ struct CaptureParams {
     tail: Option<usize>,
     #[serde(default)]
     prompt: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PanesParams {
+    session_name: String,
+    caller_server: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RolesParams {
+    caller_server: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleSetParams {
+    caller_server: String,
+    pane: String,
+    // Value (not Option) makes the field required while permitting explicit null.
+    role: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareLargestParams {
+    caller_server: String,
+    // Required like role_set's nullable role, not an omitted Option default.
+    caller_pane: Value,
 }
 
 #[derive(Deserialize)]
@@ -470,6 +538,121 @@ fn register_control(
             }
         },
     )?;
+    let panes = control.clone();
+    router.register(
+        "session.panes",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = panes.clone();
+            async move {
+                let p: PanesParams = parse_params(params)?;
+                if !std::path::Path::new(&p.caller_server).is_absolute() {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "caller_server must be an absolute path",
+                    ));
+                }
+                let ids = require_control(control, caller, Some(p.caller_server))?
+                    .session_panes(p.session_name)
+                    .await
+                    .map_err(control_error)?;
+                let mut pane_ids: Vec<_> = ids.into_iter().collect();
+                pane_ids.sort();
+                Ok(serde_json::json!({"pane_ids":pane_ids}))
+            }
+        },
+    )?;
+    let roles = control.clone();
+    router.register(
+        "session.roles",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = roles.clone();
+            async move {
+                let p: RolesParams = parse_params(params)?;
+                if !std::path::Path::new(&p.caller_server).is_absolute() {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "caller_server must be an absolute path",
+                    ));
+                }
+                let panes = require_control(control, caller, Some(p.caller_server))?
+                    .roles()
+                    .await
+                    .map_err(control_error)?;
+                let mut panes: Vec<_> = panes.into_iter().collect();
+                panes.sort();
+                Ok(serde_json::json!({"coordinator_panes":panes}))
+            }
+        },
+    )?;
+    let role_set = control.clone();
+    router.register(
+        "session.role_set",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = role_set.clone();
+            async move {
+                let p: RoleSetParams = parse_params(params)?;
+                if !std::path::Path::new(&p.caller_server).is_absolute() {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "caller_server must be an absolute path",
+                    ));
+                }
+                crate::control::reservation::PaneId::parse(p.pane.clone()).map_err(|error| {
+                    MethodError::new(error_code::INVALID_PARAMS, error.to_string())
+                })?;
+                let on = match &p.role {
+                    Value::Null => false,
+                    Value::String(role) if role == "coordinator" => true,
+                    _ => {
+                        return Err(MethodError::new(
+                            error_code::INVALID_PARAMS,
+                            "role must be coordinator or null",
+                        ))
+                    }
+                };
+                require_control(control, caller, Some(p.caller_server))?
+                    .role_set(p.pane.clone(), on)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"pane":p.pane,"role":p.role}))
+            }
+        },
+    )?;
+    let largest = control.clone();
+    router.register(
+        "session.spawn_prepare_largest",
+        Duration::from_secs(35),
+        move |caller, params| {
+            let control = largest.clone();
+            async move {
+                let p: PrepareLargestParams = parse_params(params)?;
+                if !std::path::Path::new(&p.caller_server).is_absolute() {
+                    return Err(MethodError::new(
+                        error_code::INVALID_PARAMS,
+                        "caller_server must be an absolute path",
+                    ));
+                }
+                let caller_pane = match p.caller_pane {
+                    Value::Null => None,
+                    Value::String(pane) => Some(pane),
+                    _ => {
+                        return Err(MethodError::new(
+                            error_code::INVALID_PARAMS,
+                            "caller_pane must be a string or null",
+                        ))
+                    }
+                };
+                let context = require_control(control, caller, Some(p.caller_server))?
+                    .prepare_spawn_largest(caller_pane)
+                    .await
+                    .map_err(control_error)?;
+                Ok(serde_json::json!({"target_pane":context.target_pane,"cwd":context.cwd}))
+            }
+        },
+    )?;
     let prepare = control.clone();
     router.register("session.spawn_prepare", Duration::from_secs(35), move |caller, params| {
         let control = prepare.clone();
@@ -520,6 +703,33 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Break caught: org.tree is registered with a generic/different budget.
+    // Stall its I/O boundary, retaining the production registration's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn org_tree_registered_budget_expires_at_twelve_seconds() {
+        use std::{future::Future, task::Poll};
+        let mut router = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
+        router.methods.get_mut("org.tree").unwrap().handler =
+            Arc::new(|_, _| Box::pin(std::future::pending()));
+        let mut call = Box::pin(router.call(context(), "org.tree", json!({})));
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        std::future::poll_fn(|cx| {
+            assert!(matches!(call.as_mut().poll(cx), Poll::Ready(Err(error)) if error.0.code == error_code::TIMEOUT));
+            Poll::Ready(())
+        }).await;
+    }
+
     fn context() -> CallContext {
         CallContext {
             client_id: CallerId("client".into()),
@@ -558,6 +768,501 @@ mod tests {
         services.control = Some(control.clone());
         services.org = org;
         (router(services).unwrap(), mock, cancel, task, control)
+    }
+
+    #[tokio::test]
+    async fn spawn_prepare_largest_requires_both_fields_and_advertises_when_disabled() {
+        let router = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
+        assert!(router
+            .names()
+            .iter()
+            .any(|name| name == "session.spawn_prepare_largest"));
+        for params in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"caller_pane":null}),
+            json!({"caller_server":"/private/server"}),
+            json!({"caller_server":null,"caller_pane":null}),
+            json!({"caller_server":7,"caller_pane":null}),
+            json!({"caller_server":"","caller_pane":null}),
+            json!({"caller_server":"relative","caller_pane":null}),
+            json!({"caller_server":"/private/server","caller_pane":7}),
+            json!({"caller_server":"/private/server","caller_pane":false}),
+            json!({"caller_server":"/private/server","caller_pane":[],"extra":true}),
+            json!({"caller_server":"/private/server","caller_pane":null,"extra":true}),
+        ] {
+            assert_eq!(
+                router
+                    .call(context(), "session.spawn_prepare_largest", params.clone())
+                    .await
+                    .unwrap_err()
+                    .0
+                    .code,
+                "invalid_params",
+                "{params}"
+            );
+        }
+        for caller in [Value::Null, json!(""), json!("%999")] {
+            assert_eq!(
+                router
+                    .call(
+                        context(),
+                        "session.spawn_prepare_largest",
+                        json!({"caller_server":"/private/server","caller_pane":caller})
+                    )
+                    .await
+                    .unwrap_err()
+                    .0
+                    .code,
+                "unavailable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_prepare_largest_preserves_selection_cwd_fallbacks_and_identity_order() {
+        use atm_tmux::{mock::MockCall, PaneInfo};
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("own.sock");
+        let foreign = dir.path().join("foreign.sock");
+        let alias = dir.path().join("alias.sock");
+        std::fs::write(&own, "").unwrap();
+        std::fs::write(&foreign, "").unwrap();
+        std::os::unix::fs::symlink(&own, &alias).unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().join("state"), org_cancel.clone()).await;
+        let (router, mock, cancel, task, control) = control_router(org.clone()).await;
+        let pane = |id: &str, session: &str, window, width, height| PaneInfo {
+            pane_id: id.into(),
+            session_name: session.into(),
+            window_index: window,
+            pane_pid: 1,
+            width,
+            height,
+            is_active: false,
+        };
+        let panes = vec![
+            pane("%1", "work", 0, 400, 100),
+            pane("%9", "work", 0, 80, 30),
+            pane("%2", "work", 1, 60, 40),
+            pane("%8", "other", 0, 600, 300),
+        ];
+        let identity = MockCall::RawCommand {
+            subcommand: "display-message".into(),
+            args: vec!["-p".into(), "#{socket_path}".into()],
+        };
+        for (caller, candidates, target, cwd) in [
+            (Some("%1"), panes.clone(), "%2", Some("/selected's cwd")),
+            (None, panes.clone(), "%8", None),
+            (Some("%999"), panes.clone(), "%8", None),
+            (Some(""), panes.clone(), "%8", None),
+            (
+                Some("%1"),
+                vec![panes[0].clone(), panes[3].clone()],
+                "%1",
+                None,
+            ),
+            (Some("%999"), vec![], "%999", None),
+            (Some(""), vec![], "", None),
+            (None, vec![], "%0", None),
+        ] {
+            mock.clear_calls();
+            mock.set_panes(candidates);
+            if let Some(cwd) = cwd {
+                mock.set_pane_cwd(target, cwd);
+            }
+            mock.set_next_raw_output(own.to_str().unwrap());
+            assert_eq!(
+                router
+                    .call(
+                        context(),
+                        "session.spawn_prepare_largest",
+                        json!({"caller_server":own,"caller_pane":caller})
+                    )
+                    .await
+                    .unwrap(),
+                json!({"target_pane":target,"cwd":cwd})
+            );
+            assert_eq!(
+                mock.calls(),
+                vec![
+                    identity.clone(),
+                    MockCall::ListPanes,
+                    MockCall::GetPaneCwd {
+                        pane: target.into()
+                    }
+                ]
+            );
+        }
+        for (server, allowed) in [
+            (&alias, true),
+            (&foreign, false),
+            (&dir.path().join("gone.sock"), false),
+        ] {
+            mock.clear_calls();
+            mock.set_next_raw_output(own.to_str().unwrap());
+            let result = router
+                .call(
+                    context(),
+                    "session.spawn_prepare_largest",
+                    json!({"caller_server":server,"caller_pane":"%1"}),
+                )
+                .await;
+            if allowed {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().0.code, "refused");
+                assert_eq!(
+                    mock.calls(),
+                    vec![identity.clone()],
+                    "foreign equal caller id must not read local panes or cwd"
+                );
+            }
+        }
+        control.flush_audits().await;
+        assert!(
+            org.tail(crate::org::TailParams::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "preparation must not audit"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
+    }
+
+    // Breaks if missing identity/role defaults to an unguarded read or clear,
+    // or malformed parameters reach the control service.
+    #[tokio::test]
+    async fn session_roles_validate_before_admission_and_advertise_when_disabled() {
+        let router = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
+        for method in ["session.roles", "session.role_set"] {
+            assert!(router.names().iter().any(|name| name == method));
+            let valid = if method == "session.roles" {
+                json!({"caller_server":"/private/server"})
+            } else {
+                json!({"caller_server":"/private/server","pane":"%7","role":null})
+            };
+            let mut invalid = vec![Value::Null, json!([]), json!({})];
+            for server in [Value::Null, json!(7), json!(""), json!("relative")] {
+                let mut params = valid.clone();
+                params["caller_server"] = server;
+                invalid.push(params);
+            }
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove("caller_server");
+            invalid.push(missing);
+            let mut extra = valid.clone();
+            extra["extra"] = json!(true);
+            invalid.push(extra);
+            if method == "session.role_set" {
+                let mut missing_role = valid.clone();
+                missing_role.as_object_mut().unwrap().remove("role");
+                invalid.push(missing_role);
+                let mut missing_pane = valid.clone();
+                missing_pane.as_object_mut().unwrap().remove("pane");
+                invalid.push(missing_pane);
+                for role in [
+                    json!("implementer"),
+                    json!("Coordinator"),
+                    json!(false),
+                    json!(1),
+                    json!({}),
+                ] {
+                    let mut params = valid.clone();
+                    params["role"] = role;
+                    invalid.push(params);
+                }
+                for pane in [
+                    Value::Null,
+                    json!(7),
+                    json!(""),
+                    json!("%"),
+                    json!("%00"),
+                    json!("%01"),
+                    json!("%١"),
+                    json!("work:0"),
+                    json!("%7;"),
+                    json!(" %7"),
+                ] {
+                    let mut params = valid.clone();
+                    params["pane"] = pane;
+                    invalid.push(params);
+                }
+            }
+            for params in invalid {
+                assert_eq!(
+                    router
+                        .call(context(), method, params.clone())
+                        .await
+                        .unwrap_err()
+                        .0
+                        .code,
+                    "invalid_params",
+                    "{method} {params}"
+                );
+            }
+            assert_eq!(
+                router
+                    .call(context(), method, valid)
+                    .await
+                    .unwrap_err()
+                    .0
+                    .code,
+                "unavailable"
+            );
+        }
+    }
+
+    // Breaks if role reads classify registry rows, lose exact-tag parsing or
+    // sorting, or either operation touches role data before the server guard.
+    #[tokio::test]
+    async fn session_roles_exact_tags_and_writes_follow_the_server_fence() {
+        use atm_tmux::mock::MockCall;
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("own.sock");
+        let other = dir.path().join("other.sock");
+        let alias = dir.path().join("alias.sock");
+        std::fs::write(&own, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        std::os::unix::fs::symlink(&own, &alias).unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().join("state"), org_cancel.clone()).await;
+        let (router, mock, cancel, task, control) = control_router(org.clone()).await;
+        let identity = MockCall::RawCommand {
+            subcommand: "display-message".into(),
+            args: vec!["-p".into(), "#{socket_path}".into()],
+        };
+        for (output, expected) in [
+            ("%7\tcoordinator\n%2\tcoordinator\n%7\tcoordinator\n%3\timplementer\n%4\tCoordinator\n%5\tcoordinator \n", json!(["%2","%7"])),
+            ("%2\t\n%7\timplementer\n", json!([])),
+            ("", json!([])),
+        ] {
+            mock.clear_calls();
+            mock.set_next_raw_output(own.to_str().unwrap());
+            mock.set_next_raw_output(output);
+            assert_eq!(router.call(context(), "session.roles", json!({"caller_server":own})).await.unwrap(),
+                json!({"coordinator_panes":expected}));
+            assert_eq!(mock.calls(), vec![identity.clone(), MockCall::RawCommand {
+                subcommand: "list-panes".into(), args: vec!["-a".into(), "-F".into(), "#{pane_id}\t#{@atm-role}".into()]
+            }]);
+        }
+        for role in [json!("coordinator"), Value::Null, Value::Null] {
+            mock.clear_calls();
+            mock.set_next_raw_output(own.to_str().unwrap());
+            assert_eq!(
+                router
+                    .call(
+                        context(),
+                        "session.role_set",
+                        json!({"caller_server":own,"pane":"%7","role":role})
+                    )
+                    .await
+                    .unwrap(),
+                json!({"pane":"%7","role":role})
+            );
+            let args = if role.is_null() {
+                vec!["-pu", "-t", "%7", "@atm-role"]
+            } else {
+                vec!["-p", "-t", "%7", "@atm-role", "coordinator"]
+            };
+            assert_eq!(
+                mock.calls(),
+                vec![
+                    identity.clone(),
+                    MockCall::RawCommand {
+                        subcommand: "set-option".into(),
+                        args: args.into_iter().map(str::to_owned).collect()
+                    }
+                ]
+            );
+        }
+        for method in ["session.roles", "session.role_set"] {
+            for (server, permitted) in [
+                (&alias, true),
+                (&other, false),
+                (&dir.path().join("missing.sock"), false),
+            ] {
+                mock.clear_calls();
+                mock.set_next_raw_output(own.to_str().unwrap());
+                let params = if method == "session.roles" {
+                    json!({"caller_server":server})
+                } else {
+                    json!({"caller_server":server,"pane":"%7","role":"coordinator"})
+                };
+                let result = router.call(context(), method, params).await;
+                if permitted {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(mock.call_count(), 2);
+                } else {
+                    assert_eq!(result.unwrap_err().0.code, "refused");
+                    assert_eq!(
+                        mock.calls(),
+                        vec![identity.clone()],
+                        "foreign equal pane id must not read/write local roles"
+                    );
+                }
+            }
+        }
+        control.flush_audits().await;
+        assert!(org
+            .tail(crate::org::TailParams::default())
+            .await
+            .unwrap()
+            .is_empty());
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
+    }
+
+    // Breaks if membership uses tmux prefix targets, leaks foreign-server ids,
+    // loses ordering/dedup, or treats an unmatched session as a failed read.
+    #[tokio::test]
+    async fn session_panes_exact_membership_and_server_fence() {
+        use atm_tmux::{mock::MockCall, PaneInfo};
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("own.sock");
+        let other = dir.path().join("other.sock");
+        let alias = dir.path().join("alias.sock");
+        std::fs::write(&own, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        std::os::unix::fs::symlink(&own, &alias).unwrap();
+        let org_cancel = tokio_util::sync::CancellationToken::new();
+        let org = crate::org::OrgHandle::open(dir.path().join("state"), org_cancel.clone()).await;
+        let (router, mock, cancel, task, control) = control_router(org.clone()).await;
+        let pane = |id: &str, session: &str, window_index| PaneInfo {
+            pane_id: id.into(),
+            session_name: session.into(),
+            window_index,
+            pane_pid: 1,
+            width: 80,
+            height: 24,
+            is_active: true,
+        };
+        mock.set_panes(vec![
+            pane("%2", "work", 1),
+            pane("%0", "work", 0),
+            pane("%1", "work-extra", 0),
+            pane("%3", "Work", 0),
+            pane("%0", "work", 0),
+        ]);
+        for (name, ids) in [
+            ("work", json!(["%0", "%2"])),
+            ("work-extra", json!(["%1"])),
+            ("Work", json!(["%3"])),
+            ("wor", json!([])),
+            ("missing", json!([])),
+            ("", json!([])),
+        ] {
+            mock.clear_calls();
+            mock.set_next_raw_output(own.to_str().unwrap());
+            assert_eq!(
+                router
+                    .call(
+                        context(),
+                        "session.panes",
+                        json!({"session_name":name,"caller_server":own})
+                    )
+                    .await
+                    .unwrap(),
+                json!({"pane_ids":ids})
+            );
+            assert_eq!(
+                mock.calls(),
+                vec![
+                    MockCall::RawCommand {
+                        subcommand: "display-message".into(),
+                        args: vec!["-p".into(), "#{socket_path}".into()],
+                    },
+                    MockCall::ListPanes
+                ]
+            );
+        }
+        for (server, permitted) in [
+            (&alias, true),
+            (&other, false),
+            (&dir.path().join("missing.sock"), false),
+        ] {
+            mock.clear_calls();
+            mock.set_next_raw_output(own.to_str().unwrap());
+            let result = router
+                .call(
+                    context(),
+                    "session.panes",
+                    json!({"session_name":"work","caller_server":server}),
+                )
+                .await;
+            if permitted {
+                assert_eq!(result.unwrap(), json!({"pane_ids":["%0","%2"]}));
+            } else {
+                assert_eq!(result.unwrap_err().0.code, "refused");
+                assert_eq!(
+                    mock.call_count(),
+                    1,
+                    "foreign identity must precede every membership read"
+                );
+                assert!(!mock.calls().contains(&MockCall::ListPanes));
+            }
+        }
+        control.flush_audits().await;
+        assert!(
+            org.tail(crate::org::TailParams::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "read-only membership must not audit"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        org_cancel.cancel();
+    }
+
+    // Breaks if an omitted/relative server bypasses the guard or misspelled
+    // fields silently select a different filter; validation precedes services.
+    #[tokio::test]
+    async fn session_panes_validates_required_server_before_service_admission() {
+        let router = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
+        assert!(router.names().iter().any(|name| name == "session.panes"));
+        for params in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"session_name":"work"}),
+            json!({"caller_server":"/private/server"}),
+            json!({"session_name":null,"caller_server":"/private/server"}),
+            json!({"session_name":7,"caller_server":"/private/server"}),
+            json!({"session_name":"work","caller_server":null}),
+            json!({"session_name":"work","caller_server":true}),
+            json!({"session_name":"work","caller_server":""}),
+            json!({"session_name":"work","caller_server":"relative"}),
+            json!({"session_name":"work","caller_server":"/private/server","extra":true}),
+        ] {
+            assert_eq!(
+                router
+                    .call(context(), "session.panes", params.clone())
+                    .await
+                    .unwrap_err()
+                    .0
+                    .code,
+                "invalid_params",
+                "{params}"
+            );
+        }
+        assert_eq!(
+            router
+                .call(
+                    context(),
+                    "session.panes",
+                    json!({"session_name":"work","caller_server":"/private/server"})
+                )
+                .await
+                .unwrap_err()
+                .0
+                .code,
+            "unavailable"
+        );
     }
 
     #[tokio::test]

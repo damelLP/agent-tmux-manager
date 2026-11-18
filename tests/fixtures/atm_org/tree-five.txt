@@ -1,0 +1,186 @@
+Needs you: 103 items; 0 unread for you; 0 unnamed sessions need attention; away since 2026-01-15T11:00:00Z
+  decision_pending d100 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d101 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d102 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d103 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d104 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d105 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d106 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d107 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d108 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d109 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d110 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d111 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d112 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d113 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d114 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d115 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d116 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d117 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d118 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d119 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d120 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d121 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d122 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d123 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d124 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d125 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d126 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d127 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d128 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d129 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d130 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d131 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d132 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d133 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d134 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d135 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d136 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d137 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d138 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d139 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d140 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d141 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d142 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d143 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d144 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d145 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d146 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d147 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d148 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d149 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d150 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d151 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d152 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d153 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d154 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d155 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d156 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d157 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d158 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d159 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d160 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d161 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d162 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d163 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d164 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d165 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d166 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d167 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d168 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d169 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d170 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d171 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d172 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d173 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d174 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d175 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d176 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d177 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d178 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d179 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d180 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d181 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d182 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d183 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d184 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d185 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d186 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d187 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d188 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d189 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d190 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d191 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d192 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d193 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d194 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d195 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d196 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d197 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d198 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  decision_pending d199 agent=alpha/lead project=alpha since=2026-01-15T12:00:00Z
+  +3 more
+Generated: 2026-01-15T12:05:00Z
+
+Project alpha (/fixtures/repos/alpha)
+  Seats:
+    alpha/lead [ready; harness=pi; context=12.25%; tasks=-] -> owner
+  Open tasks: 53
+    t100 [open; kind=work; agent=-; creator=alpha/lead] Work item 1
+    t101 [open; kind=work; agent=-; creator=alpha/lead] Work item 2
+    t102 [open; kind=work; agent=-; creator=alpha/lead] Work item 3
+    t103 [open; kind=work; agent=-; creator=alpha/lead] Work item 4
+    t104 [open; kind=work; agent=-; creator=alpha/lead] Work item 5
+    t105 [open; kind=work; agent=-; creator=alpha/lead] Work item 6
+    t106 [open; kind=work; agent=-; creator=alpha/lead] Work item 7
+    t107 [open; kind=work; agent=-; creator=alpha/lead] Work item 8
+    t108 [open; kind=work; agent=-; creator=alpha/lead] Work item 9
+    t109 [open; kind=work; agent=-; creator=alpha/lead] Work item 10
+    t110 [open; kind=work; agent=-; creator=alpha/lead] Work item 11
+    t111 [open; kind=work; agent=-; creator=alpha/lead] Work item 12
+    t112 [open; kind=work; agent=-; creator=alpha/lead] Work item 13
+    t113 [open; kind=work; agent=-; creator=alpha/lead] Work item 14
+    t114 [open; kind=work; agent=-; creator=alpha/lead] Work item 15
+    t115 [open; kind=work; agent=-; creator=alpha/lead] Work item 16
+    t116 [open; kind=work; agent=-; creator=alpha/lead] Work item 17
+    t117 [open; kind=work; agent=-; creator=alpha/lead] Work item 18
+    t118 [open; kind=work; agent=-; creator=alpha/lead] Work item 19
+    t119 [open; kind=work; agent=-; creator=alpha/lead] Work item 20
+    t120 [open; kind=work; agent=-; creator=alpha/lead] Work item 21
+    t121 [open; kind=work; agent=-; creator=alpha/lead] Work item 22
+    t122 [open; kind=work; agent=-; creator=alpha/lead] Work item 23
+    t123 [open; kind=work; agent=-; creator=alpha/lead] Work item 24
+    t124 [open; kind=work; agent=-; creator=alpha/lead] Work item 25
+    t125 [open; kind=work; agent=-; creator=alpha/lead] Work item 26
+    t126 [open; kind=work; agent=-; creator=alpha/lead] Work item 27
+    t127 [open; kind=work; agent=-; creator=alpha/lead] Work item 28
+    t128 [open; kind=work; agent=-; creator=alpha/lead] Work item 29
+    t129 [open; kind=work; agent=-; creator=alpha/lead] Work item 30
+    t130 [open; kind=work; agent=-; creator=alpha/lead] Work item 31
+    t131 [open; kind=work; agent=-; creator=alpha/lead] Work item 32
+    t132 [open; kind=work; agent=-; creator=alpha/lead] Work item 33
+    t133 [open; kind=work; agent=-; creator=alpha/lead] Work item 34
+    t134 [open; kind=work; agent=-; creator=alpha/lead] Work item 35
+    t135 [open; kind=work; agent=-; creator=alpha/lead] Work item 36
+    t136 [open; kind=work; agent=-; creator=alpha/lead] Work item 37
+    t137 [open; kind=work; agent=-; creator=alpha/lead] Work item 38
+    t138 [open; kind=work; agent=-; creator=alpha/lead] Work item 39
+    t139 [open; kind=work; agent=-; creator=alpha/lead] Work item 40
+    t140 [open; kind=work; agent=-; creator=alpha/lead] Work item 41
+    t141 [open; kind=work; agent=-; creator=alpha/lead] Work item 42
+    t142 [open; kind=work; agent=-; creator=alpha/lead] Work item 43
+    t143 [open; kind=work; agent=-; creator=alpha/lead] Work item 44
+    t144 [open; kind=work; agent=-; creator=alpha/lead] Work item 45
+    t145 [open; kind=work; agent=-; creator=alpha/lead] Work item 46
+    t146 [open; kind=work; agent=-; creator=alpha/lead] Work item 47
+    t147 [open; kind=work; agent=-; creator=alpha/lead] Work item 48
+    t148 [open; kind=work; agent=-; creator=alpha/lead] Work item 49
+    t149 [open; kind=work; agent=-; creator=alpha/lead] Work item 50
+    +3 more
+  Decisions: 103 pending, 0 provisional
+
+Project beta (/fixtures/repos/beta)
+  Seats:
+    beta/worker [down; harness=-; context=-; tasks=-] -> gamma/chief
+  Open tasks: 0
+  Decisions: 0 pending, 0 provisional
+
+Project delta (/fixtures/repos/delta)
+  Seats: none
+  Open tasks: 0
+  Decisions: 0 pending, 0 provisional
+
+Project epsilon (/fixtures/repos/epsilon)
+  Seats:
+    epsilon/worker [ready; harness=pi; context=100%; tasks=-] -> owner
+  Open tasks: 0
+  Decisions: 0 pending, 0 provisional
+
+Project gamma (/fixtures/folders/gamma)
+  Seats:
+    gamma/chief [ready; harness=pi; context=0%; tasks=-] -> owner
+  Open tasks: 0
+  Decisions: 0 pending, 0 provisional
+
+Unplaced tasks: 1
+  t9000 [open; kind=errand; agent=-; creator=system] Triage queue

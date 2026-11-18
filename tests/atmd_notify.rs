@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 use atm_protocol::{ClientMessage, DaemonMessage};
 
+#[path = "support/control.rs"]
+mod control_support;
+
 /// The hook payloads of one Claude Code TUI session, as Claude wrote them
 /// to the hook's stdin. Captured: Claude Code 2.1.310, 2026-10-24, the run
 /// described under "Captured payloads" in atm-claude-adapter's crate docs.
@@ -41,6 +44,7 @@ impl Daemon {
         for sub in ["state", "home", "tmux"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
+        let mut events = control_support::LogEvents::new(&log);
         let child = Command::new(env!("CARGO_BIN_EXE_atmd"))
             .arg("start")
             .env("ATM_SOCKET", &socket)
@@ -59,15 +63,8 @@ impl Daemon {
             .spawn()
             .expect("start atmd");
         let daemon = Self { child, socket, log };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while UnixStream::connect(&daemon.socket).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "atmd never listened\n{}",
-                daemon.log()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        events.listening(Some(daemon.child.id()));
+        UnixStream::connect(&daemon.socket).expect("atmd never listened");
         daemon
     }
 
@@ -79,7 +76,9 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        if control_support::process::wait_exit(self.child.id(), Duration::from_secs(30)).is_ok() {
+            let _ = self.child.wait();
+        }
     }
 }
 

@@ -82,8 +82,10 @@ there; `tests/setup_pi_package.rs` fails if the two drift apart.
 | `ATM_SOCKET`  | `/tmp/atm.sock`  | Daemon socket path                        |
 | `ATM_DEBUG`   | unset            | When `1`, append debug to `/tmp/pi-atm.log` |
 
-If `atmd` is not running (socket missing), the extension is a no-op —
-pi keeps working unaffected.
+If `atmd` is not running, pi keeps working unaffected. The extension
+buffers up to 256 frames (dropping oldest) and retries every 1000ms without
+blocking pi. A pending connection has a 10s guard; an established idle
+connection has no inactivity timeout.
 
 ## Forwarded events
 
@@ -99,6 +101,7 @@ Only events that drive `LifecycleEvent` translation are forwarded
 | pi event                | Reason forwarded                                      |
 |-------------------------|-------------------------------------------------------|
 | `session_start`         | → `LifecycleEvent::SessionStart`                      |
+| `atm_idle` (extension-generated) | → `LifecycleEvent::Idle`, real identity only after handshake and queued frames drain |
 | `session_shutdown`      | → `LifecycleEvent::SessionEnd`                        |
 | `agent_start`           | → `LifecycleEvent::WorkingStart`                      |
 | `agent_settled`         | → `LifecycleEvent::WorkingEnd`, after automatic continuation/recovery finishes (payload cut to `{}`) |
@@ -131,7 +134,7 @@ The envelope keeps session identity, pid, pane and model, plus `usage`
 on `context`/`turn_end`. Older extension frames remain supported.
 This is not a general frame-size cap: other event bodies can still be large,
 and delivery remains best-effort during outages. It does not add heartbeat
-or idle reconnect resynchronization.
+or periodic state replay.
 
 Maintainers can run the socket-level frame tests without pi installed:
 `node --disable-warning=ExperimentalWarning --test tests/pi_event_frames.mjs tests/pi_turn_lifecycle.mjs`
@@ -159,8 +162,26 @@ publication is deferred to stage 2.
 
 An input consumed by a later extension handler can still leave the row
 Working without an agent run. A consumer before pi-atm short-circuits it
-without an input frame; busy input does not clear work. Idle reconnect
-registration and standalone-dialog resolution remain separate gaps.
+without an input frame; busy input does not clear work. The same pending-input
+veto applies to idle dialog resolution below.
+
+### Idle identity after reconnect
+
+After handshake and FIFO backpressure clear, each connection gets at most
+one `atm_idle` snapshot, using the current live session id/model, pid and
+pane. It requires measured idle, no pending messages and no native UI or
+wrapped select dialog. Missing/stale context fails closed. The snapshot
+contains no usage, prompt, receipt, turn end or fabricated session start;
+it upgrades discovered pending identity but does not supply launch proof.
+A vetoed snapshot is consumed, not retried as a heartbeat.
+
+Every interactive input sets a conservative veto. Only genuine
+`agent_start`, `agent_settled` or `session_start` clears it: a later input
+handler can still be running while pi reports idle. **Limitation:** input
+consumed or rejected without a run withholds idle recovery until the next
+genuine run/session boundary. Timers and idle=true never clear that veto.
+Shutdown disposes the instance's sockets/queue/timers; late callbacks and
+old select completions cannot reconnect or emit into the next session.
 
 ## Permission-gate integration
 
@@ -169,8 +190,17 @@ happens *inside* an extension's `tool_call` handler via
 `ctx.ui.select(...)`. pi-atm patches `ctx.ui.select` on the runner's
 shared `uiContext` — so any extension (notably pi-amplike) that opens
 a dialog automatically tells atmd "needs input now" before awaiting
-the user, and "back to working" after. amplike doesn't need to know
-about atm; atm doesn't need to know about amplike.
+the user. Overlapping selects share one open/final-resolved span, so an
+inner completion cannot clear attention while a sibling is still open.
+After the final completion (selection, Esc or error), the extension measures
+the live `ctx.isIdle()`: true returns the row to Idle; false keeps Working.
+Missing measurements/older frames keep the legacy Working fallback; an
+invalidated context suppresses late reporting without changing the result/error.
+Every interactive input vetoes that measurement until the next genuine
+`agent_start`, `agent_settled` or `session_start`, even if pi reports idle.
+An input consumed without a run therefore also withholds dialog idle recovery.
+Native UI notifications remain local; no prompt, receipt or turn is fabricated.
+amplike doesn't need to know about atm; atm doesn't need to know about amplike.
 
 ## Live test
 

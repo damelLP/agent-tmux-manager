@@ -4,7 +4,8 @@
 //!
 //! Nothing here is a second stand-in or daemon fixture. Waits use committed
 //! events (`Watch`), stand-in events after a cursor taken before the action,
-//! RPC answers, or bounded polls on tmux state and daemon log lines.
+//! RPC answers, registered daemon-log writes, or private tmux hooks.
+//! Scheduler-only presentation polls remain explicitly deferred.
 //! "Nothing was typed" needs a fence showing the daemon decided: a committed
 //! event, or the scheduler's return after a refused attempt. The lifecycle
 //! rig checks the journal together with a styled screen comparison.
@@ -12,7 +13,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Output, Stdio};
+use std::process::{ChildStdin, Output, Stdio};
 use std::time::Duration;
 
 use atm_core::SessionStatus;
@@ -20,7 +21,7 @@ use atm_protocol::{ClientMessage, DaemonMessage, ResponsePayload};
 use serde_json::{json, Value};
 
 use crate::lifecycle::{self, checked, AgentRig};
-use crate::stand_in::{self, StandInMode, StandInPane};
+use crate::stand_in::{self, StandInMode, StandInPane, StandInRig};
 
 /// A hang guard for one awaited event, never a delay.
 const GUARD: Duration = Duration::from_secs(60);
@@ -439,18 +440,31 @@ pub struct Watch {
     reader: BufReader<UnixStream>,
     log: PathBuf,
     next: usize,
+    cursor: u64,
     pub seen: Vec<Value>,
 }
 
 impl Watch {
     /// A watch of every committed event after `cursor`.
     pub fn open(rig: &MessageRig, cursor: u64) -> Self {
-        let mut writer = UnixStream::connect(rig.test.rig.socket()).unwrap();
+        Self::on(&rig.test.rig, cursor)
+    }
+
+    /// Register before the action; replay from the supplied committed cursor
+    /// also covers an action that completes before the next receive.
+    pub fn on(rig: &StandInRig, cursor: u64) -> Self {
+        Self::at(&rig.socket(), rig.root().join("daemon.log"), cursor)
+    }
+
+    fn at(socket: &Path, log: PathBuf, cursor: u64) -> Self {
+        let mut writer = UnixStream::connect(socket).unwrap();
         writer.set_read_timeout(Some(GUARD)).unwrap();
+        writer.set_write_timeout(Some(GUARD)).unwrap();
         let mut watch = Self {
             reader: BufReader::new(writer.try_clone().unwrap()),
-            log: rig.test.rig.root().join("daemon.log"),
+            log,
             next: 0,
+            cursor,
             seen: Vec::new(),
         };
         for message in [
@@ -485,7 +499,11 @@ impl Watch {
     fn read(&mut self, what: &str) {
         let frame = self.frame(what);
         if frame["type"] == "event" {
-            self.seen.push(frame);
+            let seq = frame["seq"].as_u64().expect("committed event sequence");
+            if seq > self.cursor {
+                self.cursor = seq;
+                self.seen.push(frame);
+            }
         }
     }
 
@@ -505,13 +523,11 @@ impl Watch {
     /// Read up to the log's end as it is now, so that `seen` holds every
     /// event committed before this call.
     pub fn catch_up(&mut self, rig: &MessageRig) {
-        let end = rig.test.cursor();
-        while self
-            .seen
-            .last()
-            .map_or(0, |e| e["seq"].as_u64().expect("event seq"))
-            < end
-        {
+        self.catch_up_to(rig.test.cursor());
+    }
+
+    pub fn catch_up_to(&mut self, end: u64) {
+        while self.cursor < end {
             self.read("the log's end");
         }
     }
@@ -526,7 +542,8 @@ impl Watch {
 /// owner's focus. It exists only on that server, addressed by its socket;
 /// the client and the program that holds its pty end in `Drop`.
 pub struct FocusClient {
-    child: Child,
+    child: Option<stand_in::process::OwnedChild>,
+    pid: u32,
     stdin: Option<ChildStdin>,
 }
 
@@ -600,6 +617,13 @@ impl FocusClient {
         ]));
         checked(tmux.tmux(&["select-window", "-t", &pane.pane_id]));
         let socket = rig.test.server();
+        // Install before attachment: wait-for retains an already-delivered hook.
+        checked(tmux.tmux(&[
+            "set-hook",
+            "-g",
+            "client-attached",
+            "wait-for -S fixture-attached",
+        ]));
         // `command` clears the environment: no TMUX or TMUX_PANE reaches it.
         let mut child = tmux
             .command(Path::new("python3"))
@@ -610,11 +634,15 @@ impl FocusClient {
             .stderr(Stdio::null())
             .spawn()
             .expect("start the focus client");
+        let pid = child.id();
         let stdin = child.stdin.take();
-        let client = Self { child, stdin };
-        tmux.wait("one attached client on the pane", || {
-            client.flags(rig).is_some()
-        });
+        let client = Self {
+            child: Some(stand_in::process::OwnedChild::new(child)),
+            pid,
+            stdin,
+        };
+        checked(tmux.tmux(&["wait-for", "fixture-attached"]));
+        assert!(client.flags(rig).is_some());
         assert_eq!(size(rig), before, "attaching resized the stand-in's pane");
         assert_eq!(tmux.capture_styled(pane), screen);
         assert_eq!(
@@ -640,14 +668,24 @@ impl FocusClient {
 
     /// Report focus in or out, and wait until tmux says so for the client.
     pub fn focus(&mut self, rig: &MessageRig, focused: bool) {
+        let hook = if focused {
+            "client-focus-in"
+        } else {
+            "client-focus-out"
+        };
+        checked(
+            rig.test
+                .rig
+                .tmux(&["set-hook", "-g", hook, "wait-for -S fixture-focus"]),
+        );
         let line: &[u8] = if focused { b"in\n" } else { b"out\n" };
         let stdin = self.stdin.as_mut().expect("focus client input");
         stdin.write_all(line).unwrap();
         stdin.flush().unwrap();
-        rig.test.rig.wait("the client's focus flag", || {
-            self.flags(rig)
-                .is_some_and(|(flags, _)| flags.iter().any(|flag| flag == "focused") == focused)
-        });
+        checked(rig.test.rig.tmux(&["wait-for", "fixture-focus"]));
+        assert!(self
+            .flags(rig)
+            .is_some_and(|(flags, _)| flags.iter().any(|flag| flag == "focused") == focused));
     }
 }
 
@@ -655,9 +693,67 @@ impl Drop for FocusClient {
     fn drop(&mut self) {
         // End of input: the program hangs up its client and exits.
         drop(self.stdin.take());
-        if stand_in::process::wait_exit(self.child.id(), Duration::from_secs(30)).is_err() {
-            let _ = self.child.kill();
+        let _ = stand_in::process::wait_exit(self.pid, Duration::from_secs(30));
+        // OwnedChild explicitly kills and reaps, even if the graceful guard failed.
+        drop(self.child.take());
+    }
+}
+
+#[cfg(test)]
+pub mod watch_tests {
+    use super::*;
+
+    pub fn replay_live_overlap_keeps_each_sequence_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("watch.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut writer, _) = listener.accept().unwrap();
+            writer.set_read_timeout(Some(GUARD)).unwrap();
+            writer.set_write_timeout(Some(GUARD)).unwrap();
+            let mut reader = BufReader::new(writer.try_clone().unwrap());
+            for kind in ["connect", "watch"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(frame["type"], kind);
+                if kind == "watch" {
+                    assert_eq!(frame["cursor"], 5);
+                }
+            }
+            writeln!(writer, "{}", json!({"type":"connected"})).unwrap();
+            for (seq, body) in [
+                (5, "covered"),
+                (6, "replay-a"),
+                (7, "replay-b"),
+                (7, "overlap"),
+                (8, "live"),
+            ] {
+                writeln!(
+                    writer,
+                    "{}",
+                    json!({"type":"event", "seq":seq, "kind":"msg.sent", "body":{"body":body}})
+                )
+                .unwrap();
+            }
+        });
+        let mut watch = Watch::at(&socket, dir.path().join("daemon.log"), 5);
+        // All frames, including the live overlap, arrive before the waiter.
+        peer.join().unwrap();
+        watch.catch_up_to(5); // No event needed at an already-covered cursor.
+        for (seq, body) in [(6, "replay-a"), (7, "replay-b"), (8, "live")] {
+            let event = watch.wait("ordered replay and live events", |_| true);
+            assert_eq!(event["seq"], seq);
+            assert_eq!(event["body"]["body"], body);
         }
-        let _ = self.child.wait();
+        watch.catch_up_to(8);
+        assert_eq!(
+            watch
+                .seen
+                .iter()
+                .map(|e| e["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [6, 7, 8]
+        );
     }
 }

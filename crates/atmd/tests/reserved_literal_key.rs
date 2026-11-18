@@ -419,6 +419,14 @@ async fn literal_key_guarded_expires_during_pacing_without_late_input() {
 async fn literal_key_guarded_missing_or_bad_capture_never_sends() {
     for metadata in ["", "malformed\n"] {
         let mock = MockTmuxClient::new();
+        if metadata.is_empty() {
+            mock.set_next_error(TmuxError::CommandFailed {
+                command: "list-panes".into(),
+                stderr: "can't find pane: %0".into(),
+            });
+            // Failed compound stdout is discarded; empty metadata diagnoses absence.
+            mock.set_next_raw_output("discarded failed stdout");
+        }
         mock.set_next_raw_output(metadata);
         let (control, cancel, task) = actor(mock.clone());
         let result = control

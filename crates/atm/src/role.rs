@@ -8,12 +8,7 @@ use atm_tmux::{TmuxClient, TmuxError};
 /// Parses `pane_id<TAB>role` rows, ignoring unset or unknown roles.
 #[must_use]
 pub fn parse_coordinator_panes(output: &str) -> HashSet<String> {
-    output
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .filter(|(_, role)| *role == "coordinator")
-        .map(|(pane, _)| pane.to_string())
-        .collect()
+    atm_tmux::role::parse_coordinator_panes(output)
 }
 
 /// A tagged pane makes a coordinator unless the session's parent shares it.
@@ -42,7 +37,8 @@ pub fn coordinators_first(tree: &mut [TreeNode], panes: &HashSet<String>) {
         match node {
             TreeNode::Project { children, .. }
             | TreeNode::Worktree { children, .. }
-            | TreeNode::Team { children, .. } => {
+            | TreeNode::Team { children, .. }
+            | TreeNode::Window { children, .. } => {
                 children.sort_by_key(|node| {
                     !matches!(node, TreeNode::Agent { session, .. }
                         if is_coordinator(session, None, panes))
@@ -58,10 +54,7 @@ pub fn coordinators_first(tree: &mut [TreeNode], panes: &HashSet<String>) {
 pub async fn coordinator_panes<C: TmuxClient + ?Sized>(
     client: &C,
 ) -> Result<HashSet<String>, TmuxError> {
-    let output = client
-        .raw_command("list-panes", &["-a", "-F", "#{pane_id}\t#{@atm-role}"])
-        .await?;
-    Ok(parse_coordinator_panes(&output))
+    atm_tmux::role::coordinator_panes(client).await
 }
 
 /// Sets or removes the pane option, never a window/session option.
@@ -70,13 +63,7 @@ pub async fn set_coordinator<C: TmuxClient + ?Sized>(
     pane: &str,
     on: bool,
 ) -> Result<(), TmuxError> {
-    let args: &[&str] = if on {
-        &["-p", "-t", pane, "@atm-role", "coordinator"]
-    } else {
-        &["-pu", "-t", pane, "@atm-role"]
-    };
-    client.raw_command("set-option", args).await?;
-    Ok(())
+    atm_tmux::role::set_coordinator(client, pane, on).await
 }
 
 #[cfg(test)]

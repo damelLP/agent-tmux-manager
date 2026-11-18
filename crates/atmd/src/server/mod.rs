@@ -37,6 +37,7 @@
 //! - Server errors are logged and allow continued operation
 
 mod connection;
+pub(crate) mod health;
 pub mod methods;
 pub mod stop;
 
@@ -48,7 +49,7 @@ pub use connection::{
 use connection::subscriber_key;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,8 +60,6 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-use atm_core::SessionId;
 
 use crate::registry::RegistryHandle;
 
@@ -135,16 +134,6 @@ impl DaemonServer {
             connection_counter: AtomicU64::new(0),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    /// Creates a server with the default socket path.
-    pub fn with_default_path(registry: RegistryHandle, cancel_token: CancellationToken) -> Self {
-        Self::new(DEFAULT_SOCKET_PATH, registry, cancel_token)
-    }
-
-    /// Returns the socket path.
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
     }
 
     /// Runs the server.
@@ -228,6 +217,7 @@ impl DaemonServer {
         } else {
             None
         };
+        let message_tap = services.message_tap.clone();
         let result = self.run_with_services(services).await;
         decisions_cancel.cancel();
         // Reserved work stops at once and its cleanups run while control and
@@ -250,6 +240,11 @@ impl DaemonServer {
             },
         };
         let stop_work = || {
+            // Revoke before stopping workers or cancelling their message token;
+            // a queued actor capture must not submit after the shutdown fact.
+            if let Some((_, history)) = &message_tap {
+                let _ = history.revoke_recoveries();
+            }
             if let Some(control) = &own_control {
                 control.stop_reserved_work();
             }
@@ -395,35 +390,6 @@ impl DaemonServer {
         });
     }
 
-    /// Adds a subscriber for event broadcasts.
-    pub async fn add_subscriber(
-        &self,
-        client_id: String,
-        writer: SubscriberWriter,
-        filter: Option<SessionId>,
-    ) -> Result<(), ServerError> {
-        let mut subs = self.subscribers.write().await;
-
-        if subs.len() >= MAX_TUI_CLIENTS {
-            return Err(ServerError::TooManyClients {
-                max: MAX_TUI_CLIENTS,
-            });
-        }
-
-        subs.insert(client_id.clone(), Subscriber { writer, filter });
-        debug!(client_id = %client_id, "Added subscriber");
-
-        Ok(())
-    }
-
-    /// Removes a subscriber.
-    pub async fn remove_subscriber(&self, client_id: &str) {
-        let mut subs = self.subscribers.write().await;
-        if subs.remove(client_id).is_some() {
-            debug!(client_id = %client_id, "Removed subscriber");
-        }
-    }
-
     /// Returns the number of active subscribers.
     pub async fn subscriber_count(&self) -> usize {
         self.subscribers.read().await.len()
@@ -560,6 +526,229 @@ pub enum ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atm_core::SessionId;
+
+    mod subscriber_lifetime {
+        use super::*;
+        use atm_protocol::{ClientMessage, DaemonMessage};
+        use std::{future::Future, os::fd::AsFd, task::Poll};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+        use tokio::sync::oneshot;
+
+        struct HandlerDropped(Option<oneshot::Sender<()>>);
+
+        impl Drop for HandlerDropped {
+            fn drop(&mut self) {
+                if let Some(done) = self.0.take() {
+                    let _ = done.send(());
+                }
+            }
+        }
+
+        struct Connection {
+            server: DaemonServer,
+            tasks: JoinSet<()>,
+            peer: BufReader<UnixStream>,
+            handler_dropped: oneshot::Receiver<()>,
+            _dir: tempfile::TempDir,
+        }
+
+        async fn send(peer: &mut BufReader<UnixStream>, message: ClientMessage) {
+            peer.get_mut()
+                .write_all(format!("{}\n", serde_json::to_string(&message).unwrap()).as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn receive(peer: &mut BufReader<UnixStream>) -> DaemonMessage {
+            let mut line = String::new();
+            assert_ne!(peer.read_line(&mut line).await.unwrap(), 0);
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn connection() -> Connection {
+            let dir = tempfile::tempdir().unwrap();
+            let server = DaemonServer::new(
+                dir.path().join("subscriber.sock"),
+                crate::registry::spawn_registry(),
+                CancellationToken::new(),
+            );
+            let (done, handler_dropped) = oneshot::channel();
+            let dropped = HandlerDropped(Some(done));
+            let mut router = methods::MethodRouter::default();
+            // Only the handler owns this router. Its drop signals that the
+            // handler's writer has dropped, without a production test seam.
+            router
+                .register("drop-barrier", Duration::from_secs(60), move |_, _| {
+                    let _guard = &dropped;
+                    std::future::ready(Ok(serde_json::Value::Null))
+                })
+                .unwrap();
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let mut tasks = JoinSet::new();
+            server.handle_connection(
+                &mut tasks,
+                ours,
+                1,
+                Arc::new(router),
+                &server.method_services,
+            );
+            let mut peer = BufReader::new(peer);
+            send(&mut peer, ClientMessage::connect(None)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::Connected { .. }
+            ));
+            send(&mut peer, ClientMessage::subscribe(None)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::SessionList { .. }
+            ));
+            send(&mut peer, ClientMessage::ping(1)).await;
+            assert!(matches!(
+                receive(&mut peer).await,
+                DaemonMessage::Pong { seq: 1 }
+            ));
+            Connection {
+                server,
+                tasks,
+                peer,
+                handler_dropped,
+                _dir: dir,
+            }
+        }
+
+        fn assert_peer_open(peer: &BufReader<UnixStream>) {
+            // Read the nonblocking socket directly, not Tokio's cached readiness:
+            // the drop barrier need not give the reactor another turn before EOF.
+            let fd = peer.get_ref().as_fd().try_clone_to_owned().unwrap();
+            let mut socket = std::os::unix::net::UnixStream::from(fd);
+            let mut byte = [0];
+            assert_eq!(
+                std::io::Read::read(&mut socket, &mut byte)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock,
+                "membership must keep the peer open after the handler drops"
+            );
+        }
+
+        async fn assert_peer_eof(peer: &mut BufReader<UnixStream>) {
+            let mut line = String::new();
+            assert_eq!(peer.read_line(&mut line).await.unwrap(), 0, "{line:?}");
+        }
+
+        async fn disconnect(half_close: bool) {
+            timeout(Duration::from_secs(60), async {
+                let Connection {
+                    server,
+                    mut tasks,
+                    mut peer,
+                    handler_dropped,
+                    _dir,
+                } = connection().await;
+                let members = server.subscribers.read().await;
+                assert_eq!(members.len(), 1);
+                if half_close {
+                    peer.get_mut().shutdown().await.unwrap();
+                } else {
+                    send(&mut peer, ClientMessage::disconnect()).await;
+                }
+                handler_dropped.await.unwrap();
+                // The read guard blocks the real enclosing task's removal,
+                // but not the handler or the joining of its forwarder.
+                assert_peer_open(&peer);
+                drop(members);
+                tasks.join_next().await.unwrap().unwrap();
+                assert_eq!(server.subscriber_count().await, 0);
+                assert_peer_eof(&mut peer).await;
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn protocol_disconnect_keeps_writer_until_membership_removal() {
+            disconnect(false).await;
+        }
+
+        #[tokio::test]
+        async fn half_close_keeps_writer_until_membership_removal() {
+            disconnect(true).await;
+        }
+
+        #[tokio::test]
+        async fn shutdown_cleanup_drops_last_writer_before_connection_drain() {
+            timeout(Duration::from_secs(60), async {
+                let Connection {
+                    server,
+                    mut tasks,
+                    mut peer,
+                    handler_dropped,
+                    _dir,
+                } = connection().await;
+                let _listener = UnixListener::bind(&server.socket_path).unwrap();
+                let members = server.subscribers.read().await;
+                let mut cleanup = Box::pin(server.cleanup());
+                // Queue shutdown's clear before the connection's removal.
+                // RwLock's FIFO queue supplies the order, not a scheduler wait.
+                std::future::poll_fn(|cx| {
+                    assert!(cleanup.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                send(&mut peer, ClientMessage::disconnect()).await;
+                handler_dropped.await.unwrap();
+                assert_peer_open(&peer);
+                server.cancel_token.cancel();
+                drop(members);
+                std::future::poll_fn(|cx| {
+                    assert!(cleanup.as_mut().poll(cx).is_ready());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(!server.socket_path.exists());
+                // No task turn intervened: cleanup, not the still-undrained
+                // connection's removal, released the last writer clone.
+                assert!(tasks.try_join_next().is_none());
+                assert_peer_eof(&mut peer).await;
+                drain_connections(tasks).await;
+                assert_eq!(server.subscriber_count().await, 0);
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn unsubscribe_removes_membership_without_closing_peer() {
+            timeout(Duration::from_secs(60), async {
+                let Connection {
+                    server,
+                    tasks,
+                    mut peer,
+                    _dir,
+                    ..
+                } = connection().await;
+                send(
+                    &mut peer,
+                    ClientMessage::new(atm_protocol::MessageType::Unsubscribe),
+                )
+                .await;
+                send(&mut peer, ClientMessage::ping(2)).await;
+                assert!(matches!(
+                    receive(&mut peer).await,
+                    DaemonMessage::Pong { seq: 2 }
+                ));
+                assert_eq!(server.subscriber_count().await, 0);
+                server.cancel_token.cancel();
+                drain_connections(tasks).await;
+                assert_peer_eof(&mut peer).await;
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn reminders_start_only_when_their_notes_can_be_delivered() {
@@ -859,6 +1048,7 @@ mod tests {
         }))
         .await;
         let sent = run(OrgCommand::SendMessage(MessageContent {
+            delivery_notice: None,
             from: Address::Owner,
             to: Address::Agent(worker.clone()),
             kind: MessageKind::Note,

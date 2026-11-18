@@ -30,14 +30,10 @@ use tokio_util::sync::CancellationToken;
 const BUDGET: Duration = Duration::from_secs(5);
 const CAPACITY: usize = 32;
 
-// Configuration is consumed by admission now; launch inputs remain for slice B.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "launch fields await lifecycle flows")
-)]
 #[derive(Debug, Clone)]
 pub(super) struct PreparedAgent {
     pub agent_id: AgentId,
+    #[cfg(test)]
     pub root: PathBuf,
     pub role: RoleSpec,
     pub cwd: PathBuf,
@@ -254,6 +250,7 @@ fn resolve(input: Input, state: OrgState) -> Result<Resolution, AgentError> {
     let output = match role {
         Some((role, cwd, trust_dirs)) => Output::Prepared(Box::new(PreparedAgent {
             agent_id,
+            #[cfg(test)]
             root,
             role,
             cwd,

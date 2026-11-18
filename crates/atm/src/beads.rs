@@ -80,11 +80,107 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    use std::sync::{mpsc, Arc, Mutex};
-    use std::time::Instant;
+    use std::sync::{Arc, Condvar, Mutex};
+    use tokio::sync::mpsc;
 
     const SHORT: Duration = Duration::from_millis(20);
-    const LONG: Duration = Duration::from_secs(5);
+    const LONG: Duration = Duration::from_secs(60);
+
+    struct CountedRead {
+        admissions: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CountedRead {
+        fn clone(&self) -> Self {
+            // BeadsReader clones the read closure synchronously when it admits
+            // a thread, before that thread can be delayed by the OS scheduler.
+            self.admissions.fetch_add(1, SeqCst);
+            Self {
+                admissions: self.admissions.clone(),
+                calls: self.calls.clone(),
+            }
+        }
+    }
+
+    impl CountedRead {
+        fn entered(&self) {
+            self.calls.fetch_add(1, SeqCst);
+        }
+    }
+
+    struct HeldReads {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        entered: mpsc::UnboundedReceiver<String>,
+        admissions: Arc<AtomicUsize>,
+    }
+
+    impl Drop for HeldReads {
+        fn drop(&mut self) {
+            // Also release every owned worker when an assertion unwinds.
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+    }
+
+    fn held_reads(
+        dirs: &'static [&'static str],
+        calls: Arc<AtomicUsize>,
+    ) -> (
+        BeadsReader<impl Fn(&str) -> Vec<BeadsTask> + Clone + Send>,
+        HeldReads,
+    ) {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let counted = CountedRead {
+            admissions: admissions.clone(),
+            calls,
+        };
+        let (enter, entered) = mpsc::unbounded_channel();
+        let held = gate.clone();
+        let reader = BeadsReader::new(move |dir: &str| {
+            counted.entered();
+            let _ = enter.send(dir.to_string());
+            if dirs.contains(&dir) {
+                drop(
+                    held.1
+                        .wait_while(held.0.lock().unwrap(), |released| !*released)
+                        .unwrap(),
+                );
+            }
+            vec![task(dir)]
+        });
+        (
+            reader,
+            HeldReads {
+                gate,
+                entered,
+                admissions,
+            },
+        )
+    }
+
+    async fn entered<F>(reader: &mut BeadsReader<F>, held: &mut HeldReads, dir: &str)
+    where
+        F: Fn(&str) -> Vec<BeadsTask> + Clone + Send + 'static,
+    {
+        {
+            let read = reader.poll(Some(dir), LONG);
+            tokio::pin!(read);
+            let first = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(read.as_mut(), cx))
+            })
+            .await;
+            assert!(first.is_pending(), "held read completed");
+        }
+        assert_eq!(
+            tokio::time::timeout(LONG, held.entered.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(dir)
+        );
+    }
 
     fn task(id: &str) -> BeadsTask {
         BeadsTask {
@@ -138,67 +234,67 @@ mod tests {
     #[tokio::test]
     async fn test_hung_read_never_starts_a_second_read_of_its_dir() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&calls);
-        // Never returns, like a read of a FIFO with no writer or a hung mount.
-        let mut reader = BeadsReader::new(move |_: &str| -> Vec<BeadsTask> {
-            counter.fetch_add(1, SeqCst);
-            loop {
-                std::thread::park();
-            }
-        });
-
+        let (mut reader, mut held) = held_reads(&["/a", "/b"], calls.clone());
+        entered(&mut reader, &mut held, "/a").await;
+        entered(&mut reader, &mut held, "/b").await;
+        tokio::time::pause();
         for dir in ["/a", "/b", "/a", "/b", "/a"] {
             assert!(reader.poll(Some(dir), SHORT).await.is_none(), "{dir}");
         }
-
-        // One read per directory. The reads' threads may start late on a
-        // loaded host; a third read, wrongly started by any of the polls,
-        // would have run by now.
-        let deadline = Instant::now() + LONG;
-        while calls.load(SeqCst) < 2 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let fenced_at = tokio::time::Instant::now();
+        // Admission is synchronous: even a third thread that has not started
+        // would already have cloned the read closure. Both workers stay held.
+        assert_eq!(held.admissions.load(SeqCst), 2);
+        assert_eq!(reader.pending.len(), 2);
+        assert_eq!(calls.load(SeqCst), 2);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            fenced_at,
+            "read admission needed a settling delay"
+        );
+        tokio::time::resume();
+        drop(held);
+        for dir in ["/a", "/b"] {
+            assert_eq!(
+                summary(reader.poll(Some(dir), LONG).await),
+                read_of(dir, Some(dir))
+            );
         }
-        tokio::time::sleep(SHORT).await;
         assert_eq!(calls.load(SeqCst), 2);
     }
 
     #[tokio::test]
     async fn test_hung_read_in_one_dir_does_not_block_another() {
-        // /a never returns, like a project on a hung mount; /b is healthy.
-        let mut reader = BeadsReader::new(|dir: &str| -> Vec<BeadsTask> {
-            if dir == "/a" {
-                loop {
-                    std::thread::park();
-                }
-            }
-            vec![task(dir)]
-        });
-
+        // /a stays held, like a project on a hung mount; /b is healthy.
+        let (mut reader, mut held) = held_reads(&["/a"], Arc::new(AtomicUsize::new(0)));
+        entered(&mut reader, &mut held, "/a").await;
+        tokio::time::pause();
         assert!(reader.poll(Some("/a"), SHORT).await.is_none());
+        tokio::time::resume();
         let polled = reader.poll(Some("/b"), LONG).await;
         assert_eq!(summary(polled), read_of("/b", Some("/b")));
+        tokio::time::pause();
         assert!(
             reader.poll(Some("/a"), SHORT).await.is_none(),
             "/a still hung"
+        );
+        tokio::time::resume();
+        drop(held);
+        assert_eq!(
+            summary(reader.poll(Some("/a"), LONG).await),
+            read_of("/a", Some("/a"))
         );
     }
 
     #[tokio::test]
     async fn test_late_result_returns_when_its_dir_is_polled_again() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&calls);
-        let (release, gate) = mpsc::channel::<()>();
-        let gate = Arc::new(Mutex::new(gate));
-        let mut reader = BeadsReader::new(move |dir: &str| {
-            counter.fetch_add(1, SeqCst);
-            if dir == "/a" {
-                let _ = gate.lock().unwrap().recv(); // returns once `release` drops
-            }
-            vec![task(dir)]
-        });
-
+        let (mut reader, mut held) = held_reads(&["/a"], calls.clone());
+        entered(&mut reader, &mut held, "/a").await;
+        tokio::time::pause();
         assert!(reader.poll(Some("/a"), SHORT).await.is_none(), "slow read");
-        drop(release);
+        tokio::time::resume();
+        drop(held);
 
         // The selection moved to /b meanwhile: /b reads on its own.
         let polled = reader.poll(Some("/b"), LONG).await;

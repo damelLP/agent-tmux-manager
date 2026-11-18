@@ -35,7 +35,7 @@ use crate::{
             SessionObservation,
         },
         message_scheduler::Effects,
-        message_service_tests::{guarded, until, utc, worker},
+        message_service_tests::{guarded, spawn_polled, until, utc, worker, ObservedTmux},
         messages::{recipient_observation, spawn_service_for_test, MessageClock, MessageHandle},
         OrgHandle, Request,
     },
@@ -73,8 +73,444 @@ const NOT_STARTED: EffectCertainty = EffectCertainty::NotStarted;
 const APPLIED: EffectCertainty = EffectCertainty::Applied;
 const UNKNOWN: EffectCertainty = EffectCertainty::Unknown;
 
+// Catch a lost exit fact or a producer that grants permission to an
+// uncommitted/uncertain input. This tests the real cleanup update, no I/O.
+#[test]
+fn recovery_exit_update_requires_committed_sequence() {
+    for (attempt, seq, want) in [
+        (AttemptCommit::Absent, None, false),
+        (AttemptCommit::Absent, Some(9), false),
+        (AttemptCommit::Unknown, None, false),
+        (AttemptCommit::Unknown, Some(9), false),
+        (AttemptCommit::Committed, None, false),
+        (AttemptCommit::Committed, Some(9), true),
+    ] {
+        for paste in [NOT_STARTED, APPLIED, UNKNOWN] {
+            for enter in [NOT_STARTED, APPLIED, UNKNOWN] {
+                for cancelled in [false, true] {
+                    let progress = Progress {
+                        attempt,
+                        seq,
+                        number: 1,
+                        before: 8,
+                        paste,
+                        enter,
+                        format: None,
+                        settled: Some(Settled::Held),
+                    };
+                    let update = attempt_exit_update(MessageId::new(3), progress, cancelled);
+                    assert_eq!(update.is_some(), want, "{attempt:?}/{seq:?}");
+                    if let Some(update) = update {
+                        let HistoryUpdate::AttemptExited {
+                            id,
+                            attempt_seq,
+                            paste: p,
+                            enter: e,
+                            cancelled: c,
+                        } = update
+                        else {
+                            panic!("cleanup produced something other than original exit facts");
+                        };
+                        assert_eq!(
+                            (id, attempt_seq, p, e, c),
+                            (MessageId::new(3), 9, paste, enter, cancelled)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn assert_no_recovery(rig: &Rig, id: MessageId) {
+    assert_eq!(
+        rig.rt.history.recovery_candidate(id, rig.now()).unwrap(),
+        None
+    );
+}
+
 fn pane() -> PaneId {
     PaneId::parse("%1").unwrap()
+}
+
+async fn recovery_original(start: bool) -> (Rig, MessageId, u64) {
+    // Injected policy time makes exactly one unknown look precede the bound;
+    // synchronization remains the returned original work/cleanup, not a delay.
+    let settings = DeliverySettings {
+        guard_poll_interval: Duration::from_secs(3),
+        ..DeliverySettings::default()
+    };
+    let mut rig = Rig::start(
+        Fold::Service,
+        true,
+        DeliveryPolicy::new(settings).unwrap(),
+        None,
+    )
+    .await;
+    let id = if start {
+        rig.ready_start_line().await
+    } else {
+        rig.ready_message().await
+    };
+    rig.script(&vec![pi(IDLE); 4]);
+    rig.deliver(id).await.unwrap();
+    assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 0));
+    let seq = rig.snapshot(id).last_attempt_seq.unwrap();
+    assert!(rig
+        .rt
+        .history
+        .recovery_candidate(id, rig.now())
+        .unwrap()
+        .is_some());
+    (rig, id, seq)
+}
+
+async fn recovery_enter_not_sent_original() -> (Rig, MessageId, u64) {
+    let settings = DeliverySettings {
+        guard_poll_interval: Duration::from_secs(3),
+        ..DeliverySettings::default()
+    };
+    let mut rig = Rig::start(
+        Fold::Service,
+        true,
+        DeliveryPolicy::new(settings).unwrap(),
+        None,
+    )
+    .await;
+    let id = rig.ready_message().await;
+    let focused = with(staged(id), |capture| capture.focused = Some(true));
+    rig.script(&[pi(IDLE), pi(IDLE), focused, staged(id)]);
+    rig.deliver(id).await.unwrap();
+    assert_eq!((rig.pastes(), rig.keys()), (1, 0));
+    assert_eq!(rig.snapshot(id).hold, Some(ExecutorHold::EnterNotSent));
+    let seq = rig.snapshot(id).last_attempt_seq.unwrap();
+    assert!(rig
+        .rt
+        .history
+        .recovery_candidate(id, rig.now())
+        .unwrap()
+        .is_some());
+    (rig, id, seq)
+}
+
+fn recovery_registry_empty(rig: &Rig) {
+    assert_eq!(rig.rt.history.recovery_registrations().unwrap(), 0);
+    assert_eq!(rig.rt.evidence.recovery_registrations(), 0);
+}
+
+async fn recovery_capture_entered(
+    hold: &mut CaptureHold,
+    task: &mut JoinHandle<Result<(), MessageError>>,
+) {
+    tokio::select! {
+        () = hold.entered() => {},
+        result = guarded(task) => panic!("recovery returned before final capture: {result:?}"),
+    }
+}
+
+// Break caught: the executor never recovers, repastes, or spends attempt 2.
+#[tokio::test(start_paused = true)]
+async fn recovery_renderer_release_uses_original_attempt_once() {
+    for start in [false, true] {
+        let (rig, id, seq) = recovery_original(start).await;
+        let text = delivery_line(id, &rig.snapshot(id).message.content);
+        rig.script(&[drafted(&text), drafted(&text)]);
+        let mut held = rig.capture_barrier.arm(0);
+        let mut task = rig.spawn_deliver(id);
+        recovery_capture_entered(&mut held, &mut task).await;
+        drop(held); // actual renderer/capture release event
+        guarded(task).await.unwrap().unwrap();
+        assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 1, 0));
+        assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+        assert_eq!(
+            rig.snapshot(id)
+                .message
+                .last_attempt
+                .as_ref()
+                .unwrap()
+                .attempt,
+            1
+        );
+        assert_no_recovery(&rig, id);
+        recovery_registry_empty(&rig);
+        rig.script(&[drafted(&text)]);
+        let _ = rig.deliver(id).await;
+        assert_eq!(
+            (rig.pastes(), rig.keys()),
+            (1, 1),
+            "a second recovery sent input"
+        );
+        recovery_registry_empty(&rig);
+    }
+}
+
+// Break caught: the final guarded capture is skipped or a refused key is retried.
+#[tokio::test(start_paused = true)]
+async fn recovery_changes_at_final_capture_send_no_key() {
+    for case in [
+        "edit",
+        "wrong_id",
+        "history",
+        "wrapped",
+        "plain",
+        "unknown",
+        "focus",
+        "unknown_focus",
+        "dialog",
+        "copy",
+        "running",
+        "unknown_turn",
+        "tag",
+        "root",
+        "foreground",
+        "sync",
+        "input_off",
+        "dead",
+        "paste_off",
+        "empty",
+    ] {
+        let (rig, id, seq) = recovery_original(false).await;
+        let mut changed = staged(id);
+        match case {
+            "edit" => changed = drafted(&format!("{} human", inbox_reference(id))),
+            "wrong_id" => changed = drafted("[m999] Read: atm inbox --id m999"),
+            "history" => changed = showing(&inbox_reference(id)),
+            "wrapped" => {
+                // Synthetic: substitute the live ID in a real wrapped capture;
+                // retain its separate physical rows, never reconstruct a draft.
+                changed = p3_pi(include_str!("../../../atm-pi-adapter/tests/fixtures/screen_tr4s0_default_28x40_reference_1.5.2.styled.txt"), 28);
+                changed.text = changed.text.replace("m123456", &id.to_string());
+            }
+            "plain" => changed.format = CaptureFormat::Plain,
+            "unknown" => changed = pi("unrecognized editor\n"),
+            "focus" => changed.focused = Some(true),
+            "unknown_focus" => changed.focused = None,
+            "dialog" => changed = pi(POPUP),
+            "copy" => changed.inspection.in_mode = true,
+            "running" => changed = pi(include_str!("../../../atm-pi-adapter/tests/fixtures/screen_styled_p1_R-state-001-120x40_1.5.0.txt")),
+            "unknown_turn" => changed = pi("unknown turn\n"),
+            "tag" => changed.inspection.local_agent_tag = Some("demo/other".into()),
+            "root" => changed.inspection.pane.pane_pid = 999,
+            "foreground" => changed.inspection.foreground_command = Some("sh".into()),
+            "sync" => changed.inspection.synchronized = true,
+            "input_off" => changed.inspection.input_off = true,
+            "dead" => changed.inspection.dead = true,
+            "paste_off" => changed.inspection.bracketed_paste = Some(false),
+            "empty" => changed = pi(IDLE),
+            _ => unreachable!(),
+        }
+        rig.script(&[staged(id), changed]);
+        let _ = rig.deliver(id).await;
+        // A wrong capture format can fail the transport before consuming all
+        // scripted logical reads; only input/claim outcomes are the contract.
+        assert_eq!((rig.pastes(), rig.keys()), (1, 0), "{case}");
+        assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+        assert_no_recovery(&rig, id);
+        recovery_registry_empty(&rig);
+        rig.script(&[staged(id)]);
+        let _ = rig.deliver(id).await;
+        assert_eq!(
+            (rig.pastes(), rig.keys()),
+            (1, 0),
+            "{case}: a second recovery sent input"
+        );
+        recovery_registry_empty(&rig);
+    }
+}
+
+// Break caught: receipt/rebind/cancel after queueing the final capture still sends Enter.
+#[tokio::test(start_paused = true)]
+async fn recovery_veto_after_final_capture_entry_sends_no_key() {
+    for veto in ["receipt", "rebind", "away_back", "cancel"] {
+        let (rig, id, seq) = recovery_original(false).await;
+        rig.script(&[staged(id), staged(id)]);
+        let mut held = rig.capture_barrier.arm(1);
+        let mut task = rig.spawn_deliver(id);
+        recovery_capture_entered(&mut held, &mut task).await;
+        match veto {
+            "receipt" => rig.prompt("s1", inbox_reference(id)),
+            "cancel" => {
+                // Use the real daemon shutdown source, not a test-side revoke.
+                // Injected services stay independently alive, so aborting work
+                // cannot mask a missing veto while the final capture is held.
+                let dir = tempfile::tempdir().unwrap();
+                let mut services =
+                    crate::server::methods::MethodServices::new(rig.rt.registry.clone());
+                services.org = rig.org.clone();
+                services.control = Some(rig.rt.control.clone());
+                services.agents = Some(rig.rt.agents.clone());
+                services.messages = rig.messages.clone();
+                services.message_tap = Some((rig.rt.evidence.clone(), rig.rt.history.clone()));
+                let shutdown = CancellationToken::new();
+                shutdown.cancel(); // parent signal, distinct from messages' token
+                let server = crate::server::DaemonServer::with_services(
+                    dir.path().join("atm.sock"),
+                    services,
+                    shutdown,
+                );
+                guarded(server.run()).await.unwrap();
+                assert!(!rig.rt.cancel.is_cancelled());
+            }
+            "rebind" | "away_back" => {
+                let next = rig
+                    .commit(OrgCommand::Adopt {
+                        agent_id: worker(),
+                        pane: "%1".into(),
+                        session_id: Some("s2".into()),
+                    })
+                    .await;
+                rig.folded(next).await;
+                if veto == "away_back" {
+                    let restored = rig
+                        .commit(OrgCommand::Adopt {
+                            agent_id: worker(),
+                            pane: "%1".into(),
+                            session_id: Some("s1".into()),
+                        })
+                        .await;
+                    rig.folded(restored).await;
+                }
+            }
+            _ => unreachable!(),
+        }
+        drop(held);
+        let _ = guarded(task).await.unwrap();
+        assert_eq!((rig.pastes(), rig.keys()), (1, 0), "{veto}");
+        if veto == "receipt" {
+            assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
+        } else {
+            assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+        }
+        recovery_registry_empty(&rig);
+    }
+}
+
+// Break caught: a no-Enter refusal changes the hold and its lifetime notice key.
+#[tokio::test(start_paused = true)]
+async fn recovery_refusal_preserves_original_enter_not_sent() {
+    for final_capture in [false, true] {
+        let (rig, id, seq) = recovery_enter_not_sent_original().await;
+        let focused = with(staged(id), |capture| capture.focused = Some(true));
+        if final_capture {
+            rig.script(&[staged(id), focused]);
+        } else {
+            rig.script(&[focused]);
+        }
+        assert!(rig.deliver(id).await.is_err());
+        let snapshot = rig.snapshot(id);
+        assert_eq!(
+            snapshot.hold,
+            Some(ExecutorHold::EnterNotSent),
+            "final={final_capture}"
+        );
+        assert_eq!(snapshot.last_attempt_seq, Some(seq));
+        assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
+        assert_eq!((rig.pastes(), rig.keys()), (1, 0));
+        assert_no_recovery(&rig, id);
+        recovery_registry_empty(&rig);
+    }
+}
+
+// Break caught: cancellation wins after tmux took a key, but leaves no audit.
+#[tokio::test(start_paused = true)]
+async fn recovery_cancelled_enter_is_audited_and_stays_unknown() {
+    let (mut rig, id, seq) = recovery_enter_not_sent_original().await;
+    rig.script(&[staged(id), staged(id)]);
+    rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+    let task = rig.spawn_deliver(id);
+    guarded(rig.tmux_gate.entered()).await;
+    assert_eq!((rig.pastes(), rig.keys()), (1, 1));
+    // Effect already happened; its reply is held. The biased cancel arm must
+    // audit uncertainty, not infer that tmux did nothing from a lost reply.
+    rig.rt.cancel.cancel();
+    rig.tmux_gate.release();
+    assert!(guarded(task).await.unwrap().is_err());
+    assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+    assert_eq!(
+        rig.snapshot(id).hold,
+        Some(ExecutorHold::InputOutcomeUnknown)
+    );
+    assert_eq!((rig.pastes(), rig.keys()), (1, 1));
+    assert_no_recovery(&rig, id);
+    recovery_registry_empty(&rig);
+    guarded(rig.rt.control.flush_audits()).await;
+    guarded(rig.org.snapshot()).await.unwrap();
+    let mut audits = Vec::new();
+    while let Ok(event) = rig.committed.try_recv() {
+        if event.kind == "control.sent" {
+            audits.push(event);
+        }
+    }
+    assert_eq!(audits.len(), 1, "the uncertain Enter needs one audit");
+    let audit = audits.first().unwrap();
+    assert_eq!(audit.body["action"]["message"], id.to_string());
+    assert_eq!(audit.body["action"]["op"], "enter");
+    assert_eq!(audit.body["action"]["outcome"], "error");
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_unknown_enter_never_repeats() {
+    let (rig, id, seq) = recovery_original(false).await;
+    rig.script(&[staged(id), staged(id)]);
+    rig.tmux_gate
+        .fail_next_after_effect(Effect::SendKeys)
+        .unwrap();
+    assert!(rig.deliver(id).await.is_err());
+    assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 1, 0));
+    assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+    assert_no_recovery(&rig, id);
+    recovery_registry_empty(&rig);
+}
+
+// Break caught: recovery acknowledges a receipt before Delivered can fold.
+#[tokio::test(start_paused = true)]
+async fn recovery_receipt_commit_failure_keeps_receipt() {
+    let (mut rig, id, seq) = recovery_original(false).await;
+    rig.script(&[staged(id), staged(id)]);
+    rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+    let task = rig.spawn_deliver(id);
+    guarded(rig.tmux_gate.entered()).await;
+    rig.prompt("s1", inbox_reference(id));
+    rig.hold(); // in-memory append-entry gate, never a filesystem wait
+    rig.tmux_gate.release();
+    guarded(task).await.unwrap().unwrap();
+    assert_eq!((rig.pastes(), rig.keys()), (1, 1));
+    assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivering);
+    let receipt = rig
+        .rt
+        .evidence
+        .receipt(id)
+        .unwrap()
+        .expect("uncommitted receipt stays retained");
+    recovery_registry_empty(&rig);
+    rig.release();
+    // Accepted writes still run after their callers timed out; a FIFO fence
+    // proves the late Delivered fold without another key or confirmation window.
+    guarded(rig.org.snapshot()).await.unwrap();
+    rig.folded(rig.org.status().unwrap()).await;
+    assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
+    assert_eq!(rig.rt.evidence.receipt(id).unwrap(), Some(receipt.clone()));
+    rig.rt.evidence.acknowledge(id, &receipt).unwrap();
+    assert_eq!((rig.pastes(), rig.keys()), (1, 1));
+    recovery_registry_empty(&rig);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_stalled_capture_consumes_once_and_holds() {
+    let (rig, id, seq) = recovery_original(false).await;
+    rig.script(&[staged(id)]);
+    let mut held = rig.capture_barrier.arm(0);
+    let mut task = rig.spawn_deliver(id);
+    recovery_capture_entered(&mut held, &mut task).await;
+    tokio::time::advance(ATTEMPT_WORK_BUDGET).await;
+    drop(held);
+    let _ = guarded(task).await.unwrap();
+    assert_eq!((rig.pastes(), rig.keys()), (1, 0));
+    assert_eq!(rig.snapshot(id).last_attempt_seq, Some(seq));
+    assert!(rig.snapshot(id).hold.is_some());
+    assert_no_recovery(&rig, id);
+    recovery_registry_empty(&rig);
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +1229,107 @@ fn attempt_session_table() {
 // The rig
 // ---------------------------------------------------------------------------
 
+/// One actual compound-capture return, held by an event, not a timer/poll.
+type PendingCapture = (usize, oneshot::Sender<()>, oneshot::Receiver<()>);
+#[derive(Clone, Default)]
+struct CaptureBarrier(Arc<Mutex<Option<PendingCapture>>>);
+
+struct CaptureHold {
+    entered: Option<oneshot::Receiver<()>>,
+    release: Option<oneshot::Sender<()>>,
+}
+
+impl CaptureBarrier {
+    fn arm(&self, skip: usize) -> CaptureHold {
+        let (entered, entry) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let mut state = self.0.lock().unwrap();
+        assert!(state.is_none(), "capture gate already armed");
+        *state = Some((skip, entered, released));
+        CaptureHold {
+            entered: Some(entry),
+            release: Some(release),
+        }
+    }
+}
+
+impl CaptureHold {
+    async fn entered(&mut self) {
+        guarded(self.entered.take().unwrap()).await.unwrap();
+    }
+}
+
+impl Drop for CaptureHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+struct CaptureTmux<C> {
+    inner: C,
+    barrier: CaptureBarrier,
+}
+type CaptureCall<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, TmuxError>> + Send + 'a>>;
+macro_rules! capture_forward {
+    ($method:ident <$($lt:lifetime),*> ($($arg:ident : $ty:ty),*) -> $result:ty) => {
+        fn $method<'s, $($lt,)* 'async_trait>(&'s self, $($arg: $ty),*) -> CaptureCall<'async_trait, $result>
+        where 's: 'async_trait, $($lt: 'async_trait,)* Self: 'async_trait {
+            Box::pin(atm_tmux::TmuxClient::$method(&self.inner, $($arg),*))
+        }
+    };
+}
+impl<C: atm_tmux::TmuxClient> atm_tmux::TmuxClient for CaptureTmux<C> {
+    fn raw_command<'s, 'c, 'a, 'v, 'async_trait>(
+        &'s self,
+        command: &'c str,
+        args: &'a [&'v str],
+    ) -> CaptureCall<'async_trait, String>
+    where
+        's: 'async_trait,
+        'c: 'async_trait,
+        'a: 'async_trait,
+        'v: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let hold = if args.contains(&"ATM-CAPTURE-v1") {
+                let mut state = self.barrier.0.lock().unwrap();
+                match state.as_mut() {
+                    Some((skip, _, _)) if *skip == 0 => state.take(),
+                    Some((skip, _, _)) => {
+                        *skip -= 1;
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let result = self.inner.raw_command(command, args).await;
+            if let Some((_, entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            result
+        })
+    }
+    capture_forward!(split_window<'a, 'b, 'c, 'd>(target: &'a str, size: &'b str, direction: atm_tmux::PaneDirection, command: Option<&'c str>, cwd: Option<&'d str>, detached: bool) -> String);
+    capture_forward!(get_pane_cwd<'a>(pane: &'a str) -> Option<String>);
+    capture_forward!(new_window<'a, 'b>(session: &'a str, command: Option<&'b str>) -> String);
+    capture_forward!(kill_pane<'a>(pane: &'a str) -> ());
+    capture_forward!(resize_pane<'a>(pane: &'a str, width: Option<u16>, height: Option<u16>) -> ());
+    capture_forward!(send_keys<'a, 'b>(pane: &'a str, keys: &'b str) -> ());
+    capture_forward!(paste_text<'a, 'b>(pane: &'a str, text: &'b str) -> ());
+    capture_forward!(list_panes<>() -> Vec<PaneInfo>);
+    capture_forward!(display_popup<'a, 'b, 'c>(width: &'a str, height: &'b str, command: &'c str) -> ());
+    capture_forward!(select_pane<'a>(pane: &'a str) -> ());
+    capture_forward!(capture_pane<'a>(pane: &'a str) -> Vec<String>);
+    capture_forward!(new_session<'a>(name: &'a str) -> String);
+}
+
 /// How committed events reach history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fold {
@@ -815,6 +1352,9 @@ struct Rig {
     /// The control actor's client: `tmux`, with a paste's or a key's return
     /// held or failed when a test arms it.
     tmux_gate: GatedTmux,
+    capture_barrier: CaptureBarrier,
+    /// Raw-call completion generation and the remaining scripted reads.
+    read_events: watch::Receiver<(u64, usize)>,
     /// Keeps the service (the fold loop) alive.
     messages: Option<MessageHandle>,
     /// Every committed envelope from the first one on.
@@ -907,8 +1447,26 @@ impl Rig {
             crate::registry::spawn_registry_with_cancel(registry_stop.clone());
         let tmux = ScriptedTmuxClient::new();
         let tmux_gate = GatedTmux::new(tmux.clone());
+        let (read_done, read_events) = watch::channel((0_u64, 0_usize));
+        let read_script = tmux.clone();
+        let capture_barrier = CaptureBarrier::default();
+        let client = ObservedTmux {
+            inner: CaptureTmux {
+                inner: tmux_gate.clone(),
+                barrier: capture_barrier.clone(),
+            },
+            on_raw: Arc::new(move |_, pending| {
+                if !pending {
+                    let remaining = read_script.pending_reads(&pane()).unwrap();
+                    read_done.send_modify(|event| {
+                        event.0 = event.0.wrapping_add(1);
+                        event.1 = remaining;
+                    });
+                }
+            }),
+        };
         let (control, _task) = spawn_control(
-            Box::new(tmux_gate.clone()),
+            Box::new(client),
             registry.clone(),
             org.clone(),
             cancel.clone(),
@@ -1032,6 +1590,8 @@ impl Rig {
             rt,
             tmux,
             tmux_gate,
+            capture_barrier,
+            read_events,
             messages,
             committed: folding,
             gate,
@@ -1143,6 +1703,7 @@ impl Rig {
 
     fn message(to: AgentId) -> OrgCommand {
         OrgCommand::SendMessage(MessageContent {
+            delivery_notice: None,
             from: Address::Owner,
             to: Address::Agent(to),
             kind: MessageKind::Note,
@@ -1249,10 +1810,18 @@ impl Rig {
         self.tmux.pending_reads(&pane()).unwrap()
     }
 
+    async fn capture_consumed_since(&self, generation: u64) {
+        let mut completed = self.read_events.clone();
+        guarded(completed.wait_for(|event| event.0 != generation && event.1 == 0))
+            .await
+            .unwrap();
+        assert_eq!(self.reads(), 0, "cleanup has not consumed its capture");
+    }
+
     /// Run the executor once for the message, as the recipient's slot.
     fn spawn_deliver(&self, id: MessageId) -> JoinHandle<Result<(), MessageError>> {
         let deadline = Instant::now() + ATTEMPT_WORK_BUDGET;
-        tokio::spawn(deliver(self.rt.clone(), id, deadline))
+        spawn_polled(deliver(self.rt.clone(), id, deadline))
     }
 
     async fn deliver(&self, id: MessageId) -> Result<(), MessageError> {
@@ -1284,13 +1853,23 @@ impl Rig {
         release
     }
 
-    /// The executor is past its first checks: it registers the reference
-    /// right before it asks for its reservation.
+    /// spawn_deliver polls the actual executor through registration before
+    /// spawning: registration precedes its first await (the reservation).
     async fn admission_requested(&self, id: MessageId) {
-        until("the executor registered the reference", || {
-            self.rt.evidence.snapshot(id).is_ok()
-        })
-        .await;
+        assert!(self.rt.evidence.snapshot(id).is_ok());
+    }
+
+    /// An arm is a retained evidence event, including an event before this wait.
+    async fn armed_since(&self, changes: u64) {
+        let mut evidence = self.rt.evidence.subscribe();
+        guarded(evidence.wait_for(|current| *current != changes))
+            .await
+            .unwrap();
+        assert_ne!(
+            self.wakes(),
+            changes,
+            "the executor has not armed its scope"
+        );
     }
 
     /// Evidence's change counter: an arm moves it.
@@ -1404,6 +1983,7 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.tmux_gate.release();
     }
 }
 
@@ -1943,7 +2523,7 @@ async fn unbound_codex_attempt_keeps_the_excluded_session_in_both_scopes() {
     assert_eq!(envelope.kind, "msg.delivery_attempted");
     rig.apply(&envelope);
     rig.fold_rest();
-    until("the lazy scope was armed", || rig.wakes() != wakes).await;
+    rig.armed_since(wakes).await;
     let scope = AttemptScope {
         harness: Harness::Codex,
         session_id: None,
@@ -2132,10 +2712,8 @@ async fn unavailable_org_causes_no_paste() {
     let id = rig.ready_message().await;
     rig.script(&[pi(IDLE), pi(IDLE)]);
     rig.org_stop.cancel();
-    until("the organisation writer stopped", || {
-        rig.org.requests.is_closed()
-    })
-    .await;
+    guarded(rig.org.requests.closed()).await;
+    assert!(rig.org.requests.is_closed());
 
     let delivered = rig.deliver(id).await;
 
@@ -2382,9 +2960,9 @@ async fn unpinned_harness_is_a_lost_observation() {
 }
 
 /// Whatever the one guarded paste answers, it is called once. Every tmux
-/// call is counted: three reads per capture or guard, and one for a guard
-/// or capture whose first read fails. A possible effect is followed by
-/// cleanup's one token capture; a refusal by none. After the applied paste
+/// call is counted: one per successful capture or guard, and two for a
+/// failed capture including its diagnostic metadata read. A possible effect
+/// is followed by cleanup's one token capture; a refusal by none. After the applied paste
 /// tmux fails the first look at the editor, so the attempt ends there.
 #[tokio::test(start_paused = true)]
 async fn one_paste_guarded_call_per_deliver() {
@@ -2394,12 +2972,12 @@ async fn one_paste_guarded_call_per_deliver() {
     let cases = [
         // (the frames after the first capture, pastes, tmux calls, held)
         // The guard allows, the paste lands, cleanup looks for the token.
-        ("applied", vec![pi(IDLE)], 1, 3 + 3 + 1 + 1 + 1, true),
-        ("the guard refused", vec![focused()], 0, 3 + 3, false),
-        ("a foreign tag", vec![foreign], 0, 3 + 3, false),
+        ("applied", vec![pi(IDLE)], 1, 1 + 1 + 1 + 2 + 2, true),
+        ("the guard refused", vec![focused()], 0, 1 + 1, false),
+        ("a foreign tag", vec![foreign], 0, 1 + 1, false),
         // tmux fails the guard's own capture: the actor reports that like a
         // failed send, so the outcome is unknown. Cleanup's capture fails too.
-        ("tmux failed", vec![], 0, 3 + 1 + 1, true),
+        ("tmux failed", vec![], 0, 1 + 2 + 2, true),
     ];
     for (case, frames, pastes, calls, held) in cases {
         let mut rig = Rig::attempt().await;
@@ -2725,6 +3303,7 @@ async fn draft_appears_on_second_frame_then_one_enter() {
     let snapshot = rig.snapshot(id);
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
     assert_eq!(snapshot.hold, Some(ExecutorHold::TokenVisible));
+    assert_no_recovery(&rig, id);
     // The attempt and the Enter's audit: no failure was written.
     rig.rt.control.flush_audits().await;
     guarded(rig.org.snapshot()).await.unwrap();
@@ -2789,6 +3368,10 @@ async fn draft_never_appears_holds_without_enter() {
     let snapshot = rig.snapshot(id);
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
     assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
+    assert_eq!(
+        rig.rt.history.recovery_candidate(id, rig.now()).unwrap(),
+        Some(scope(id, snapshot.last_attempt_seq.unwrap()))
+    );
     rig.rt.control.flush_audits().await;
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);
@@ -2866,10 +3449,10 @@ async fn enter_unknown_outcome_sends_no_second_key() {
         if readable {
             assert_eq!(rig.reads(), 3 * 3, "{case}");
         } else {
-            // Three captures and the paste, then one failed read each for
-            // the Enter guard and for cleanup's capture.
+            // Three one-call captures and the paste, then a failed compound
+            // call plus diagnostic each for the Enter guard and cleanup.
             let made = rig.tmux.mock().calls().len() - calls;
-            assert_eq!(made, 3 * 3 + 1 + 1 + 1, "{case}");
+            assert_eq!(made, 3 + 1 + 2 + 2, "{case}");
         }
         let hold = if readable {
             ExecutorHold::EnterNotSent
@@ -2935,10 +3518,15 @@ async fn confirmation_watch_wake_rechecks_retained_receipt() {
     assert!(!attempt.is_finished());
     assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivering);
 
+    let receipt_at = Instant::now();
     rig.prompt("s1", inbox_reference(id));
     // Still no time passes: the wake ends the wait, not the window's end.
-    until("the receipt ended the wait", || attempt.is_finished()).await;
     guarded(attempt).await.unwrap().unwrap();
+    assert_eq!(
+        Instant::now(),
+        receipt_at,
+        "receipt completion used the timer"
+    );
     assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
     assert!(rig.typed(id), "{:?}", rig.effects());
 }
@@ -2952,15 +3540,18 @@ async fn receipt_before_enter_sends_no_key() {
     let id = rig.ready_message().await;
     // The look that would allow the Enter; its guard has no frame.
     rig.script(&[pi(IDLE), pi(IDLE), staged(id)]);
+    rig.tmux_gate.hold_next(Effect::PasteText).unwrap();
     let attempt = rig.spawn_deliver(id);
-    rig.pasted().await;
+    guarded(rig.tmux_gate.entered()).await;
     rig.prompt("s1", inbox_reference(id));
+    rig.tmux_gate.release();
 
     guarded(attempt).await.unwrap().unwrap();
 
     assert_eq!((rig.pastes(), rig.keys(), rig.reads()), (1, 0, 0));
     assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Delivered);
     assert!(rig.rt.evidence.snapshot(id).is_err());
+    assert_no_recovery(&rig, id);
 }
 
 /// The registry row of a new session on the worker's pane.
@@ -3275,6 +3866,7 @@ async fn timeout_after_uncertain_paste_holds() {
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
     assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
     assert!(snapshot.live.last_paste_at > recorded);
+    assert_no_recovery(&rig, id);
     rig.tmux_gate.release();
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);
@@ -3306,6 +3898,7 @@ async fn paste_sent_then_failed_holds() {
     let snapshot = rig.snapshot(id);
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
     assert_eq!(snapshot.hold, Some(ExecutorHold::EnterNotSent));
+    assert_no_recovery(&rig, id);
     guarded(rig.org.snapshot()).await.unwrap();
     assert_eq!(rig.org.status().unwrap(), before + 1);
 }
@@ -3336,6 +3929,7 @@ async fn timeout_after_enter_holds() {
     let snapshot = rig.snapshot(id);
     assert_eq!(snapshot.message.status, DeliveryStatus::Delivering);
     assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
+    assert_no_recovery(&rig, id);
     rig.tmux_gate.release();
     rig.rt.control.flush_audits().await;
     guarded(rig.org.snapshot()).await.unwrap();
@@ -3358,8 +3952,11 @@ async fn held_enter_with_visible_cleanup_token_has_unknown_outcome() {
     guarded(rig.tmux_gate.entered()).await;
     assert!(rig.typed(id), "{:?}", rig.effects());
 
+    let read_generation = rig.read_events.borrow().0;
     tokio::time::advance(Duration::from_secs(3)).await;
-    until("cleanup consumed its token capture", || rig.reads() == 0).await;
+    rig.capture_consumed_since(read_generation).await;
+    // Completion is retained, so a late waiter neither misses it nor reads again.
+    rig.capture_consumed_since(read_generation).await;
     rig.tmux_gate.release();
     let delivered = guarded(attempt).await.unwrap();
 
@@ -3376,6 +3973,7 @@ async fn held_enter_with_visible_cleanup_token_has_unknown_outcome() {
     assert_eq!(snapshot.hold, Some(ExecutorHold::InputOutcomeUnknown));
     rig.rt.control.flush_audits().await;
     guarded(rig.org.snapshot()).await.unwrap();
+    assert_no_recovery(&rig, id);
     // Work never received/classified the key's result: no returned-call audit,
     // no Delivered or DeliveryFailed, just the committed attempt.
     assert_eq!(rig.org.status().unwrap(), before + 1);
@@ -3912,7 +4510,7 @@ async fn activity_after_zero_effect_failure_stays_retryable() {
         let other = || "something else the session was told".to_string();
         if early {
             // Armed, and parked before the paste guard's paced capture.
-            until("the attempt was armed", || rig.wakes() != armed).await;
+            rig.armed_since(armed).await;
             rig.prompt("s1", other());
         }
         guarded(attempt).await.unwrap().unwrap();
@@ -4059,7 +4657,9 @@ async fn org_stall_in_cleanup_holds_without_quarantine() {
     let (before, armed) = (rig.org.status().unwrap(), rig.wakes());
     let attempt = rig.spawn_deliver(id);
     // The attempt is committed and armed; every later append stalls.
-    until("the attempt was armed", || rig.wakes() != armed).await;
+    rig.armed_since(armed).await;
+    // The retained arm also completes a waiter registered after the event.
+    rig.armed_since(armed).await;
     rig.hold();
 
     guarded(attempt).await.unwrap().unwrap();

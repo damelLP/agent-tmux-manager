@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: true
+      publish_atm_comms:
+        description: 'Publish crate: atm-comms'
+        required: false
+        type: boolean
+        default: true
       publish_atm_protocol:
         description: 'Publish crate: atm-protocol'
         required: false
@@ -54,6 +59,11 @@ on:
         default: true
       publish_atm_tui:
         description: 'Publish crate: atm-tui'
+        required: false
+        type: boolean
+        default: true
+      publish_atm_chat:
+        description: 'Publish crate: atm-chat'
         required: false
         type: boolean
         default: true
@@ -280,23 +290,25 @@ jobs:
           EVENT_JSON="$GITHUB_EVENT_PATH"
 
           # Publish crates in dependency order so crates.io can resolve internal dependencies.
-          ORIGINAL_ORDER=("atm-core" "atm-org" "atm-protocol" "atm-tmux" "atm-claude-adapter" "atm-pi-adapter" "atm-codex-adapter" "atmd" "atm-tui" "atm")
+          ORIGINAL_ORDER=("atm-core" "atm-org" "atm-comms" "atm-protocol" "atm-tmux" "atm-claude-adapter" "atm-pi-adapter" "atm-codex-adapter" "atmd" "atm-tui" "atm-chat" "atm")
 
           selected=()
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             # Using jq (available on GitHub ubuntu runners) to read the dispatch inputs.
-            for box in publish_atm_core publish_atm_org publish_atm_protocol publish_atm_tmux publish_atm_claude_adapter publish_atm_pi_adapter publish_atm_codex_adapter publish_atm_tui publish_atmd publish_atm; do
+            for box in publish_atm_core publish_atm_org publish_atm_comms publish_atm_protocol publish_atm_tmux publish_atm_claude_adapter publish_atm_pi_adapter publish_atm_codex_adapter publish_atm_tui publish_atm_chat publish_atmd publish_atm; do
               val=$(jq -r --arg k "$box" '.inputs[$k] // "false"' "$EVENT_JSON" 2>/dev/null || echo "false")
               if [ "$(echo "$val" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
                 case "$box" in
                   publish_atm_core) selected+=("atm-core");;
                   publish_atm_org) selected+=("atm-org");;
+                  publish_atm_comms) selected+=("atm-comms");;
                   publish_atm_protocol) selected+=("atm-protocol");;
                   publish_atm_tmux) selected+=("atm-tmux");;
                   publish_atm_claude_adapter) selected+=("atm-claude-adapter");;
                   publish_atm_pi_adapter) selected+=("atm-pi-adapter");;
                   publish_atm_codex_adapter) selected+=("atm-codex-adapter");;
                   publish_atm_tui) selected+=("atm-tui");;
+                  publish_atm_chat) selected+=("atm-chat");;
                   publish_atmd) selected+=("atmd");;
                   publish_atm) selected+=("atm");;
                 esac

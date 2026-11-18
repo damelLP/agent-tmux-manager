@@ -296,6 +296,9 @@ where
             "#!/bin/sh\n\
              # Exit silently: a nonzero run-shell exit displays an error in tmux.\n\
              [ -n \"$1\" ] || exit 0\n\
+             # The reserved chat window stays separate from workspace sidebars.\n\
+             NAME=$({tmux} display-message -p -t \"$1\" '#{{window_name}}') || exit 0\n\
+             [ \"$NAME\" = chat ] && exit 0\n\
              W=$({tmux} display-message -p -t \"$1\" '#{{window_width}}')\n\
              S=$((W * {pct} / 100))\n\
              [ $S -lt {min} ] && S={min}\n\
@@ -649,6 +652,94 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), "occupied");
     }
 
+    // Catches injecting into reserved chat, skipping similarly named ordinary
+    // windows, or mutating an implicit window after a missing/failed target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_hook_skips_only_reserved_chat_window() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("chosen-tmux");
+        let log = dir.path().join("calls");
+        std::fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+shift
+case $1 in
+  display-message) case $* in
+    *window_name*) case $4 in
+      @71) echo chat;;
+      @72) echo Chat;;
+      @73) echo chat-notes;;
+      @74) printf '%s\n' 'work $(false) "quoted" spaces';;
+      @75) exit 1;;
+    esac;;
+    *window_width*) echo 250;;
+    *) echo '%6';;
+  esac;;
+  split-window) echo '%8';;
+esac
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = WorkspaceHooks {
+            script_dir: dir.path().join("scripts"),
+            socket: None,
+            tmux_prefix: format!("'{}' --chosen", fake.display()),
+        };
+        install_new_window_hook(&MockTmuxClient::new(), "ws", &hooks)
+            .await
+            .unwrap();
+        for (target, inject) in [
+            (None, false),
+            (Some(""), false),
+            (Some("@71"), false),
+            (Some("@72"), true),
+            (Some("@73"), true),
+            (Some("@74"), true),
+            (Some("@75"), false),
+        ] {
+            std::fs::write(&log, "").unwrap();
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .arg(hooks.script_dir.join("implicit/inject-sidebar-ws.sh"))
+                .args(target)
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+                .await
+                .expect("script hang guard")
+                .expect("run generated script");
+            assert!(
+                output.status.success() && output.stdout.is_empty() && output.stderr.is_empty(),
+                "{target:?}: {output:?}"
+            );
+            let calls = std::fs::read_to_string(&log).unwrap();
+            let mut expected = Vec::new();
+            if let Some(target) = target.filter(|target| !target.is_empty()) {
+                expected.push(format!(
+                    "--chosen display-message -p -t {target} #{{window_name}}"
+                ));
+                if inject {
+                    expected.extend([
+                        format!("--chosen display-message -p -t {target} #{{window_width}}"),
+                        format!("--chosen display-message -p -t {target} #{{pane_id}}"),
+                        "--chosen split-window -hb -t %6 -l 40 -P -F #{pane_id}".into(),
+                        "--chosen select-pane -t %8 -T atm-sidebar".into(),
+                        "--chosen set-option -p -t %8 @atm-sidebar 1".into(),
+                        "--chosen send-keys -t %8 atm --compact --tmux-session 'ws' Enter".into(),
+                        "--chosen select-pane -t %6".into(),
+                    ]);
+                }
+            }
+            assert_eq!(calls.lines().collect::<Vec<_>>(), expected, "{target:?}");
+        }
+    }
+
     // Runs the generated artifacts: catches using the daemon's implicit tmux
     // instead of the caller-supplied prefix, and lost window/pane targets.
     #[cfg(unix)]
@@ -659,7 +750,7 @@ mod tests {
         let fake = dir.path().join("chosen-tmux");
         let log = dir.path().join("calls");
         std::fs::write(&fake, format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nshift\ncase $1 in\ndisplay-message) case $* in *window_width*) echo 250;; *) echo '%6';; esac;;\nlist-panes) echo '%7:1:20:';;\nsplit-window) echo '%8';;\nesac\n", log.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nshift\ncase $1 in\ndisplay-message) case $* in *window_name*) echo work;; *window_width*) echo 250;; *) echo '%6';; esac;;\nlist-panes) echo '%7:1:20:';;\nsplit-window) echo '%8';;\nesac\n", log.display()
         )).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let hooks = WorkspaceHooks {
@@ -690,6 +781,7 @@ mod tests {
             "--chosen display-message -p -t @71 #{window_width}",
             "--chosen list-panes -t @71 -F #{pane_id}:#{@atm-sidebar}:#{pane_width}:#{@atm-sidebar-tries}",
             "--chosen resize-pane -t %7 -x 40",
+            "--chosen display-message -p -t @71 #{window_name}",
             "--chosen display-message -p -t @71 #{window_width}",
             "--chosen display-message -p -t @71 #{pane_id}",
             "--chosen split-window -hb -t %6 -l 40 -P -F #{pane_id}",

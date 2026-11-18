@@ -179,6 +179,12 @@ impl TmuxClient for RealTmuxClient {
         self.run(subcommand, args).await
     }
 
+    async fn load_buffer(&self, text: &str) -> Result<(), TmuxError> {
+        self.run_with_stdin("load-buffer", &["-"], Some(text))
+            .await
+            .map(|_| ())
+    }
+
     async fn split_window(
         &self,
         target: &str,

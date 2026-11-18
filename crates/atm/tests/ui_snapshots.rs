@@ -15,7 +15,7 @@
 use std::{sync::Mutex, time::Duration};
 
 use atm_core::{SessionId, SessionStatus, SessionView};
-use atm_tui::app::{App, AppState};
+use atm_tui::app::{App, AppState, AppView};
 use atm_tui::beads::BeadsTask;
 use atm_tui::error::TuiError;
 use atm_tui::ui::{
@@ -24,7 +24,7 @@ use atm_tui::ui::{
     session_list::{render_compact_session_list, render_session_list},
     status_bar::{render_compact_footer, render_footer, render_header},
 };
-use atm_tui::work::{WorkEffect, WorkInput, WorkOrg, WorkWindows};
+use atm_tui::work::{WorkEffect, WorkGrouping, WorkInput, WorkOrg, WorkWindows};
 use chrono::{DateTime, Utc};
 use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
 
@@ -122,6 +122,7 @@ fn make_session(
 // Intentional UI: only the named parent gets a waiting-decision mark.
 fn decision_mark_app() -> App {
     let mut app = App::new();
+    app.view = AppView::Sessions;
     let parent = SessionView {
         id: "parent".into(),
         id_short: "parent".into(),
@@ -160,6 +161,7 @@ fn waiting_decision_compact() {
 
 fn make_app_with_sessions() -> App {
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = AppState::Connected;
     app.update_sessions(vec![
         make_session(
@@ -311,6 +313,7 @@ fn session_list_two_agents_in_one_project() {
 #[test]
 fn session_list_attention_needed_row() {
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = AppState::Connected;
     app.blink_visible = true;
     app.update_sessions(vec![make_session(
@@ -333,6 +336,7 @@ fn session_list_attention_needed_row() {
 #[test]
 fn session_list_multi_project_with_worktrees() {
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = AppState::Connected;
     // Two projects, one with two worktrees → exercises the worktree-grouping branch
     app.update_sessions(vec![
@@ -390,6 +394,7 @@ fn session_list_collapsed_with_attention_count() {
     // agent count badge "(2)" plus the bubbled-up attention "!" marker —
     // a combination that doesn't appear in any expanded-tree snapshot.
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = AppState::Connected;
     app.blink_visible = true;
     app.update_sessions(vec![
@@ -455,6 +460,7 @@ fn session_list_subagent_nesting() {
     parent.child_session_ids = vec![child.id.clone()];
 
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = AppState::Connected;
     app.update_sessions(vec![parent, child]);
 
@@ -482,6 +488,7 @@ fn rejected_state(reason: &str) -> AppState {
 fn session_list_disconnected_rejected() {
     // The reason replaces "Lost connection" and wraps to the list's width.
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = rejected_state(VERSION_REJECTION);
     let buf = render_buffer(36, 18, |frame, area| {
         render_session_list(frame, area, &app);
@@ -493,6 +500,7 @@ fn session_list_disconnected_rejected() {
 fn session_list_connected_empty() {
     // Connected to the daemon, but no agent has reported yet.
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = AppState::Connected;
     let buf = render_buffer(64, 16, |frame, area| {
         render_session_list(frame, area, &app);
@@ -505,6 +513,7 @@ fn compact_session_list_connected_empty() {
     // The sidebar reuses the empty state at as little as 20 columns
     // (SIDEBAR_MIN), where it clips: the steps must still read.
     let mut app = App::new();
+    app.view = AppView::Sessions;
     app.state = AppState::Connected;
     let buf = render_buffer(20, 16, |frame, area| {
         render_compact_session_list(frame, area, &app);
@@ -774,6 +783,7 @@ fn make_filtered_app() -> App {
     );
     let mut app = App::new();
     app.state = AppState::Connected;
+    app.view = AppView::Sessions;
     app.update_sessions(vec![lead, mate, other]);
     app.start_search();
     for c in "sonnet".chars() {
@@ -847,6 +857,8 @@ fn work_load(app: &mut App, effects: Vec<WorkEffect>, windows: WorkWindows, org:
 }
 fn work_app() -> App {
     let mut app = App::new();
+    app.view = AppView::Sessions;
+    app.work_grouping = WorkGrouping::Windows;
     let mut parent = make_session(
         "parent01",
         "/fixtures/alpha",
@@ -944,13 +956,13 @@ fn work_windows_with_marks() {
     let buf = work_buffer(&work_app(), false);
     let text = buffer_text(&buf);
     assert!(
-        text.contains("Work · 2 windows, 4 agents")
+        text.contains("Work | Sessions · 2 windows, 4 agents")
             && text.contains("2 open")
             && text.contains("?1")
     );
     assert!(
         text.contains("watcher")
-            && text.contains("◐ t41 Watch the login +1")
+            && text.contains("Watch the login +1")
             && text.contains("cp/work-a")
     );
     insta::assert_debug_snapshot!(buf);
@@ -976,7 +988,7 @@ fn work_no_window_group() {
     );
     let buf = work_buffer(&app, false);
     assert!(
-        buffer_text(&buf).contains("Work · 0 windows, 4 agents")
+        buffer_text(&buf).contains("Work | Sessions · 0 windows, 4 agents")
             && buffer_text(&buf).contains("(no window)")
     );
     insta::assert_debug_snapshot!(buf);
@@ -1022,6 +1034,108 @@ fn work_stale() {
     assert!(buffer_text(&buf).contains("stale 12s"));
     insta::assert_debug_snapshot!(buf);
 }
+fn unavailable_work_app(windows_failed: bool, org_failed: bool, first: bool) -> App {
+    let mut app = work_app();
+    let effects = if first {
+        app.work = Default::default();
+        let _ = app.reduce_work(
+            WorkInput::Capabilities {
+                methods: vec!["session.windows".into(), "org.tree".into()],
+                watch: false,
+            },
+            Duration::ZERO,
+        );
+        app.reduce_work(WorkInput::Shown, Duration::ZERO)
+    } else {
+        app.reduce_work(WorkInput::Refresh, Duration::ZERO)
+    };
+    for effect in effects {
+        let input = match effect {
+            WorkEffect::RequestWindows(generation) => WorkInput::WindowsReply {
+                generation,
+                result: if windows_failed {
+                    Err(atm_tui::work::WorkFailure("untrusted windows error".into()))
+                } else {
+                    Ok(work_windows(false))
+                },
+            },
+            WorkEffect::RequestOrg(generation) => WorkInput::OrgReply {
+                generation,
+                result: if org_failed {
+                    Err(atm_tui::work::WorkFailure("untrusted org error".into()))
+                } else {
+                    Ok(work_org())
+                },
+            },
+            _ => continue,
+        };
+        let _ = app.reduce_work(input, Duration::ZERO);
+    }
+    app
+}
+
+// Break caught: a failed first source has no successful timestamp, so stale cannot explain missing data.
+#[test]
+fn work_windows_unavailable() {
+    let buf = work_buffer(&unavailable_work_app(true, false, true), false);
+    assert!(
+        buffer_text(&buf).contains("Work | Sessions · windows unavailable · 0 windows, 4 agents")
+    );
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_org_unavailable() {
+    let buf = work_buffer(&unavailable_work_app(false, true, true), false);
+    assert!(buffer_text(&buf).contains("Work | Sessions · org unavailable · 2 windows, 4 agents"));
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_sources_unavailable() {
+    let buf = work_buffer(&unavailable_work_app(true, true, true), false);
+    assert!(buffer_text(&buf)
+        .contains("Work | Sessions · windows/org unavailable · 0 windows, 4 agents"));
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn compact_work_windows_unavailable() {
+    let buf = work_buffer(&unavailable_work_app(true, false, true), true);
+    assert!(buffer_text(&buf).contains("Work | Sessions · unavailable"));
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn compact_work_org_unavailable() {
+    let buf = work_buffer(&unavailable_work_app(false, true, true), true);
+    assert!(buffer_text(&buf).contains("Work | Sessions · unavailable"));
+    insta::assert_debug_snapshot!(buf);
+}
+
+// Break caught: failures destroy good rows/marks or unavailable status bleeds into Sessions/recovery.
+#[test]
+fn work_unavailable_retains_cached_data_and_clears_on_recovery() {
+    let mut app = unavailable_work_app(true, true, false);
+    for compact in [false, true] {
+        let text = buffer_text(&work_buffer(&app, compact));
+        assert!(text.contains(if compact {
+            "Work | Sessions · unavailable"
+        } else {
+            "Work | Sessions · windows/org unavailable"
+        }));
+        assert!(text.contains("Watch the login +1"));
+        assert!(!text.contains("untrusted"));
+    }
+    let _ = app.toggle_work_view(Duration::ZERO);
+    assert_eq!(work_buffer(&app, false), {
+        let mut good = work_app();
+        let _ = good.toggle_work_view(Duration::ZERO);
+        work_buffer(&good, false)
+    });
+    let effects = app.toggle_work_view(Duration::ZERO);
+    work_load(&mut app, effects, work_windows(false), work_org());
+    for compact in [false, true] {
+        assert!(!buffer_text(&work_buffer(&app, compact)).contains("unavailable"));
+    }
+}
+
 #[test]
 fn work_needs_newer_daemon() {
     let mut app = work_app();
@@ -1039,7 +1153,7 @@ fn work_needs_newer_daemon() {
 #[test]
 fn compact_work_list() {
     let buf = work_buffer(&work_app(), true);
-    assert!(buffer_text(&buf).contains("watcher") && buffer_text(&buf).contains("2 open"));
+    assert!(buffer_text(&buf).contains("Watch the login") && buffer_text(&buf).contains("2 open"));
     insta::assert_debug_snapshot!(buf);
 }
 
@@ -1049,9 +1163,12 @@ fn work_pane_marks_belong_only_to_parentless_rows() {
     let app = work_app();
     for compact in [false, true] {
         let text = buffer_text(&work_buffer(&app, compact));
-        let parent = text.lines().find(|line| line.contains("watcher")).unwrap();
+        let parent = text
+            .lines()
+            .find(|line| line.contains("Watch the login +1"))
+            .unwrap();
         assert!(
-            parent.contains("t41") && parent.contains('?') && parent.contains('!'),
+            parent.contains("+1") && parent.contains('?') && parent.contains('!'),
             "{parent}"
         );
         let child = text.lines().find(|line| line.contains("child001")).unwrap();
@@ -1134,10 +1251,285 @@ fn work_counts_empty_filter_and_capabilities_leave_sessions_unchanged() {
         app.push_search_char(c);
     }
     app.collapse_all();
-    assert!(buffer_text(&work_buffer(&app, false)).contains("Work · 1 windows, 1 agents"));
+    assert!(
+        buffer_text(&work_buffer(&app, false)).contains("Work | Sessions · 1 windows, 1 agents")
+    );
     app.clear_filter();
     app.replace_sessions(vec![]);
-    assert!(buffer_text(&work_buffer(&app, false)).contains("Work · 0 windows, 0 agents"));
+    assert!(
+        buffer_text(&work_buffer(&app, false)).contains("Work | Sessions · 0 windows, 0 agents")
+    );
+}
+
+// Synthetic: one cross-repo reporting thread plus an unbound window row.
+fn thread_snapshot_app(broken: bool) -> App {
+    let mut app = work_app();
+    app.work_grouping = WorkGrouping::Threads;
+    let org = serde_json::from_value(serde_json::json!({"seq":42,"projects":[
+        {"seats":[{"agent_id":"alpha/watcher","pane":"%7","manager":"owner","tasks":["t41","t42"]}],
+         "tasks":[{"task_id":"t41","title":"Watch the login"},{"task_id":"t42","title":"Check docs"}]},
+        {"seats":[{"agent_id":"beta/reviewer","pane":"%10","manager":"alpha/watcher","line_error":if broken {Some("broken")} else {None},"tasks":[]}],"tasks":[]}
+    ],"needs_owner":{"items":[{"kind":"decision_pending","agent_id":"alpha/watcher"},{"kind":"seat_attention","agent_id":"alpha/watcher"}]}})).unwrap();
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, work_windows(false), org);
+    app
+}
+
+// Break caught: a fallback window borrows the title or task/decision totals of a thread elsewhere in it.
+#[test]
+fn thread_window_fallback_keeps_only_its_own_marks() {
+    let app = thread_snapshot_app(false);
+    for compact in [false, true] {
+        let text = buffer_text(&work_buffer(&app, compact));
+        let fallback = text
+            .lines()
+            .find(|line| line.contains("3 support"))
+            .unwrap();
+        assert!(
+            !fallback.contains("open") && !fallback.contains('?') && !fallback.contains('!'),
+            "{fallback}"
+        );
+    }
+}
+
+// Break caught: Work names/metadata displace the task headline, or the compact path omits it.
+#[test]
+fn task_headline_precedes_agent_in_both_layouts() {
+    let app = thread_snapshot_app(false);
+    for compact in [false, true] {
+        let text = buffer_text(&work_buffer(&app, compact));
+        let row = text
+            .lines()
+            .find(|line| line.contains("Watch the login +1"));
+        assert!(row.is_some(), "missing task-first row: {text}");
+        let row = row.unwrap();
+        if !compact {
+            assert!(
+                row.find("Watch the login").unwrap() < row.find("watcher").unwrap(),
+                "{row}"
+            );
+        }
+        assert!(row.contains("?1") && row.contains('!'), "{row}");
+        assert!(!row.contains("t41"));
+    }
+}
+
+// Break caught: another pane's task/name is used for a selected seat in the same window.
+#[test]
+fn task_caption_follows_the_selected_seat_not_its_neighbour() {
+    let mut app = thread_snapshot_app(false);
+    for (id, caption, other) in [
+        ("parent01", "Watch the login", "reviewer"),
+        ("review01", "reviewer", "Watch the login"),
+    ] {
+        app.selected_index = app.tree_rows.iter().position(|row|matches!(&row.kind,atm_core::TreeRowKind::Agent {session} if session.id.as_str() == id)).unwrap();
+        for compact in [false, true] {
+            let text = buffer_text(&work_buffer(&app, compact));
+            let selected = text.lines().find(|line| line.starts_with("│>")).unwrap();
+            assert!(
+                selected.contains(caption) && !selected.contains(other),
+                "{selected}"
+            );
+        }
+    }
+}
+
+// Break caught: capped task titles invent captions/counts, or shared-pane children inherit seat marks.
+#[test]
+fn capped_title_and_child_marks_remain_honest() {
+    let mut app = thread_snapshot_app(false);
+    let mut org = work_org();
+    org.projects.first_mut().unwrap().tasks.clear();
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, work_windows(false), org);
+    let text = buffer_text(&work_buffer(&app, false));
+    let row = text.lines().find(|line| line.contains("watcher")).unwrap();
+    assert!(
+        row.contains("t41") && row.contains("+1") && row.contains("?1"),
+        "{row}"
+    );
+    assert!(!text.contains("Watch the login"));
+    let child = text.lines().find(|line| line.contains("child001")).unwrap();
+    assert!(!child.contains("watcher") && !child.contains("t41") && !child.contains('?'));
+}
+
+// Break caught: empty/rejected/old/failed render branches bypass the common tab title.
+#[test]
+fn tabs_visible_in_empty_rejected_old_and_unavailable_states() {
+    let mut empty = App::new();
+    empty.state = AppState::Connected;
+    let mut sessions = App::new();
+    sessions.view = AppView::Sessions;
+    let mut rejected = work_app();
+    rejected.state = rejected_state("unsupported protocol");
+    let mut old = work_app();
+    let _ = old.reduce_work(
+        WorkInput::Capabilities {
+            methods: vec![],
+            watch: false,
+        },
+        Duration::ZERO,
+    );
+    for app in [
+        empty,
+        sessions,
+        rejected,
+        old,
+        unavailable_work_app(true, true, true),
+    ] {
+        for compact in [false, true] {
+            let buf = work_buffer(&app, compact);
+            let text = buffer_text(&buf);
+            assert!(
+                text.lines().next().unwrap().contains("Work | Sessions"),
+                "{text}"
+            );
+            assert_eq!(buf.area.height, 12);
+        }
+    }
+}
+
+// Break caught: long/wide/control headlines eat count badges or tab labels at sidebar widths.
+#[test]
+fn compact_titles_preserve_names_and_badges_at_40_and_20() {
+    let mut app = thread_snapshot_app(false);
+    let mut org = work_org();
+    org.projects
+        .first_mut()
+        .unwrap()
+        .tasks
+        .first_mut()
+        .unwrap()
+        .title = "界\u{1b} Long headline that cannot fit".repeat(12);
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, work_windows(false), org);
+    for width in [20, 40] {
+        for compact in [false, true] {
+            let buf = render_buffer(width, 12, |frame, area| {
+                if compact {
+                    render_compact_session_list(frame, area, &app)
+                } else {
+                    render_session_list(frame, area, &app)
+                }
+            });
+            let text = buffer_text(&buf);
+            assert!(
+                text.lines().next().unwrap().contains("Work | Sessions"),
+                "{text}"
+            );
+            let row = text.lines().find(|line| line.contains("+1")).unwrap();
+            assert!(row.contains("?1") && row.contains('!'), "{row}");
+            assert!(buf
+                .content
+                .iter()
+                .all(|cell| !cell.symbol().chars().any(char::is_control)));
+            assert_eq!(buf[(2, 0)].fg, ratatui::style::Color::Cyan);
+            assert!(buf[(2, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED));
+            assert_eq!(buf[(9, 0)].fg, ratatui::style::Color::DarkGray);
+            assert!(buf[(9, 0)].modifier.contains(ratatui::style::Modifier::DIM));
+        }
+    }
+}
+
+// Break caught: a capped long task ID consumes the mandatory task/decision/attention counts.
+#[test]
+fn capped_long_task_ids_do_not_hide_required_counts() {
+    let mut app = work_app();
+    let mut org = work_org();
+    let project = org.projects.first_mut().unwrap();
+    project.tasks.clear();
+    project
+        .seats
+        .first_mut()
+        .unwrap()
+        .tasks
+        .first_mut()
+        .unwrap()
+        .0 = "long-id".repeat(40);
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, work_windows(false), org);
+    for width in [20, 40] {
+        for compact in [false, true] {
+            let buf = render_buffer(width, 12, |frame, area| {
+                if compact {
+                    render_compact_session_list(frame, area, &app)
+                } else {
+                    render_session_list(frame, area, &app)
+                }
+            });
+            let text = buffer_text(&buf);
+            let row = text.lines().find(|line| line.contains("+1"));
+            assert!(row.is_some(), "task count hidden: {text}");
+            let row = row.unwrap();
+            assert!(row.contains("?1") && row.contains('!'), "{row}");
+        }
+    }
+}
+
+// Break caught: caption metadata is promoted to headline styling, or active tab styling is lost.
+#[test]
+fn task_agent_and_repo_are_dim_secondary_cells() {
+    let app = thread_snapshot_app(false);
+    let buf = work_buffer(&app, false);
+    let text = buffer_text(&buf);
+    let (y, row) = text
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Watch the login +1"))
+        .unwrap();
+    for word in ["watcher", "alpha/cp/work-a"] {
+        let x = ratatui::text::Span::raw(&row[..row.find(word).unwrap()]).width();
+        assert_eq!(
+            buf[(x as u16, y as u16)].fg,
+            ratatui::style::Color::DarkGray
+        );
+        assert!(buf[(x as u16, y as u16)]
+            .modifier
+            .contains(ratatui::style::Modifier::DIM));
+    }
+    assert!(buf[(2, 0)]
+        .modifier
+        .contains(ratatui::style::Modifier::REVERSED));
+    let mut sessions = app;
+    let _ = sessions.toggle_work_view(Duration::ZERO);
+    let buf = work_buffer(&sessions, false);
+    assert_eq!(buf[(2, 0)].fg, ratatui::style::Color::DarkGray);
+    assert_eq!(buf[(9, 0)].fg, ratatui::style::Color::Cyan);
+    assert!(buf[(9, 0)]
+        .modifier
+        .contains(ratatui::style::Modifier::REVERSED));
+}
+
+#[test]
+fn tabs_work_default_full() {
+    let mut app = App::new();
+    app.state = AppState::Connected;
+    let buf = work_buffer(&app, false);
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn tabs_work_default_compact_40() {
+    let mut app = App::new();
+    app.state = AppState::Connected;
+    let buf = work_buffer(&app, true);
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_threads_cross_repo_full() {
+    let buf = work_buffer(&thread_snapshot_app(false), false);
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_threads_cross_repo_compact_40() {
+    let buf = work_buffer(&thread_snapshot_app(false), true);
+    insta::assert_debug_snapshot!(buf);
+}
+#[test]
+fn work_threads_broken_line_window_fallback() {
+    let buf = work_buffer(&thread_snapshot_app(true), false);
+    insta::assert_debug_snapshot!(buf);
 }
 
 #[test]

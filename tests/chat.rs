@@ -106,12 +106,75 @@ async fn fifo_log_cannot_hang_chat_startup_or_runtime_shutdown() {
     let path = std::ffi::CString::new(state.path().join("tui.log").as_os_str().as_encoded_bytes())
         .unwrap();
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-    let output = cli_with_state(&["chat", "--thread", "alpha/chief"], Some(state.path())).await;
-    assert!(!output.status.success());
+    let script = r#"
+import fcntl, os, pty, select, signal, struct, subprocess, sys, termios
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 120, 0, 0))
+before = termios.tcgetattr(slave)
+def setup():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+child = None
+reader = None
+def hung(*_): raise TimeoutError('FIFO terminal event guard')
+signal.signal(signal.SIGALRM, hung)
+try:
+    signal.alarm(90)
+    child = subprocess.Popen([sys.argv[1], 'chat'], stdin=slave, stdout=slave,
+        stderr=slave, preexec_fn=setup)
+    output = bytearray()
+    fd = os.pidfd_open(child.pid)
+    try:
+        while b'\x1b[?25l' not in output:
+            ready = select.select([master, fd], [], [], 90)[0]
+            assert ready, 'first fallback frame guard'
+            if master in ready: output.extend(os.read(master, 65536))
+            assert fd not in ready, ('chat exited instead of drawing without a log', output)
+        # The opener stays blocked until the no-log frame really reached the tty.
+        reader = os.open(os.path.join(os.environ['ATM_STATE_DIR'], 'tui.log'), os.O_RDONLY | os.O_NONBLOCK)
+        os.write(master, b'q')
+        while True:
+            ready = select.select([master, fd], [], [], 60)[0]
+            assert ready, 'chat exit guard'
+            if master in ready: output.extend(os.read(master, 65536))
+            if fd in ready: break
+    finally:
+        os.close(fd)
+    assert child.wait(timeout=60) == 0, output
+    assert termios.tcgetattr(slave) == before, 'raw terminal survived no-log chat'
+    warning = b'chat measurements unavailable: log file could not be opened'
+    assert output.count(warning) == 1, output
+    assert b'chat log initialization timed out' not in output, output
+    assert b'Warning: Failed' not in output, output
+finally:
+    signal.alarm(0)
+    if child is not None and child.poll() is None:
+        child.kill()
+        child.wait(timeout=60)
+    if reader is not None: os.close(reader)
+    os.close(master)
+    os.close(slave)
+"#;
+    run_pty_script(script, state.path()).await;
+}
+
+// Break caught: the worker and foreground both print about one failed log open.
+#[tokio::test]
+async fn unavailable_log_warns_once_before_terminal_setup() {
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir(state.path().join("tui.log")).unwrap();
+    let output = cli_with_state(&["chat"], Some(state.path())).await;
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        error.contains("chat log initialization timed out"),
+    assert_eq!(
+        error
+            .matches("chat measurements unavailable: log file could not be opened")
+            .count(),
+        1,
         "{error}"
+    );
+    assert!(
+        !error.contains("Warning: Failed"),
+        "worker diagnostic escaped: {error}"
     );
 }
 
@@ -354,6 +417,43 @@ async fn frame_predicate_has_one_guard_despite_periodic_draw_noise() {
     );
 }
 
+// Scoped subscribers still share process-global callsite interests. Run each
+// trace assertion alone, with a positive check that its exact child case ran.
+#[must_use]
+fn trace_case_in_child(case: &str) -> bool {
+    use std::io::{Read, Seek};
+    if std::env::var("ATM_CHAT_TRACE_CASE").as_deref() == Ok(case) {
+        return false;
+    }
+    let mut output = tempfile::tempfile().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", case, "--nocapture"])
+        .env("ATM_CHAT_TRACE_CASE", case)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::null())
+        .stdout(output.try_clone().unwrap())
+        .stderr(output.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let child = stand_in::process::OwnedChild::new(child);
+    // The inherited idle-trace meter takes a real minute; this is only an exit
+    // guard. Reuse the event-based wait and owner so failure/unwind reaps too.
+    stand_in::process::wait_exit(pid, Duration::from_secs(180)).unwrap();
+    let status = child.wait_with_output().unwrap().status;
+    output.rewind().unwrap();
+    let mut text = String::new();
+    output.read_to_string(&mut text).unwrap();
+    assert!(status.success(), "trace child {case}: {status}\n{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+        "expected exactly one child test for {case}: {text}"
+    );
+    true
+}
+
 fn run_id(pid: u32) -> chat::ChatRunId {
     chat::ChatRunId::new("2026-01-01T00:00:00Z".parse().unwrap(), pid)
 }
@@ -429,6 +529,7 @@ impl Peer {
     }
 }
 struct Script {
+    tmux: atm_tmux::MockTmuxClient,
     frame_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     _root: tempfile::TempDir,
     listener: UnixListener,
@@ -457,6 +558,7 @@ impl Script {
         );
         let client = tokio::spawn(async move { client.run().await });
         Self {
+            tmux: atm_tmux::MockTmuxClient::new(),
             frame_count: Default::default(),
             _root: root,
             listener,
@@ -502,11 +604,11 @@ impl Script {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let frame_count = self.frame_count.clone();
+        let tmux = self.tmux.clone();
         let driver = tokio::spawn(
             async move {
                 let mut traced_frame = None;
                 let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
-                let tmux = atm_tmux::MockTmuxClient::new();
                 let result = chat::drive(
                     &mut terminal,
                     config,
@@ -722,6 +824,20 @@ async fn shutdown_joins_stalled_readers() {
     rig.stop().await;
 }
 
+// Synthetic compatibility fixtures retain every original row, including broken
+// framing, while adding the option column captured on tmux 3.8.
+fn focus_rows(setting: &str, clients: &str) -> String {
+    clients
+        .split_inclusive('\n')
+        .map(|line| {
+            let (row, end) = line
+                .strip_suffix('\n')
+                .map_or((line, ""), |row| (row, "\n"));
+            format!("{row}\t{setting}{end}")
+        })
+        .collect()
+}
+
 // Break caught: sticky focus, control-only clients, wrong pane or malformed evidence permits acknowledgment.
 #[tokio::test]
 async fn unfocused_locked_or_focus_off_cannot_ack() {
@@ -750,13 +866,17 @@ async fn unfocused_locked_or_focus_off_cannot_ack() {
     ];
     for (option, clients, want) in cases {
         let tmux = atm_tmux::MockTmuxClient::new();
-        tmux.set_next_raw_output(option);
-        tmux.set_next_raw_output(clients);
+        let setting = match option {
+            "on" => "1",
+            "off" => "0",
+            other => other,
+        };
+        tmux.set_next_raw_output(&focus_rows(setting, clients));
         let (visible, hint) = chat::visibility(&tmux, Some("%7")).await;
         assert_eq!(visible, want, "{option:?} {clients:?}");
         assert_eq!(hint.is_none(), want);
         if option == "on" {
-            assert!(tmux.calls().iter().any(|call| matches!(call,atm_tmux::mock::MockCall::RawCommand {subcommand,args} if subcommand=="list-clients" && args==&["-F","#{client_flags}\t#{pane_id}\t#{pane_in_mode}"])));
+            assert!(tmux.calls().iter().any(|call| matches!(call,atm_tmux::mock::MockCall::RawCommand {subcommand,args} if subcommand=="list-clients" && args==&["-F","#{client_flags}\t#{pane_id}\t#{pane_in_mode}\t#{focus-events}"])));
         }
     }
     let tmux = atm_tmux::MockTmuxClient::new();
@@ -770,9 +890,142 @@ async fn unfocused_locked_or_focus_off_cannot_ack() {
 #[tokio::test]
 async fn popup_over_chat_retains_the_documented_visibility_limit() {
     let tmux = atm_tmux::MockTmuxClient::new();
-    tmux.set_next_raw_output("on\n");
-    tmux.set_next_raw_output("attached,focused,UTF-8\t%0\t0\n");
+    tmux.set_next_raw_output("attached,focused,UTF-8\t%0\t0\t1\n");
     assert_eq!(chat::visibility(&tmux, Some("%0")).await, (true, None));
+}
+
+// Break caught: a separate option read defeats one-command observations, or an
+// expanded option field is ignored when deciding whether a drawn frame is seen.
+#[tokio::test]
+async fn visibility_reads_focus_setting_in_one_command() {
+    let tmux = atm_tmux::MockTmuxClient::new();
+    tmux.set_next_raw_output("attached,focused,UTF-8\t%7\t0\t1\n");
+    assert_eq!(chat::visibility(&tmux, Some("%7")).await, (true, None));
+    assert_eq!(tmux.calls().len(), 1);
+}
+
+// Break caught: an older tmux's empty option expansion silently disables Ack,
+// or cached focus bypasses the option check on a later observation.
+#[tokio::test]
+async fn visibility_empty_focus_field_checks_the_option_each_time() {
+    for option in ["on\n", "off\n", "unknown\n", ""] {
+        let tmux = atm_tmux::MockTmuxClient::new();
+        for _ in 0..2 {
+            tmux.set_next_raw_output("attached,focused\t%7\t0\t\n");
+            tmux.set_next_raw_output(option);
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                chat::visibility(&tmux, Some("%7")).await.0,
+                option == "on\n"
+            );
+        }
+        assert_eq!(tmux.calls().len(), 4);
+        assert!(
+            matches!(&tmux.calls()[1],atm_tmux::mock::MockCall::RawCommand {subcommand,args} if subcommand=="show-options" && args==&["-s","-v","focus-events"])
+        );
+    }
+}
+
+// Break caught: off/unknown/mixed focus evidence is treated as an unsupported
+// empty expansion and upgraded by a permissive fallback.
+#[tokio::test]
+async fn visibility_malformed_or_mixed_focus_fields_fail_closed() {
+    for rows in [
+        "focused\t%7\t0\t0\n",
+        "focused\t%7\t0\ton\n",
+        "focused\t%7\t0\t2\n",
+        "focused\t%7\t0\t1\nattached\t%8\t0\t0\n",
+        "focused\t%7\t0\t1\nattached\t%8\t0\t\n",
+        "focused\t%7\t0\t\nattached\t%8\t0\t1\n",
+    ] {
+        let tmux = atm_tmux::MockTmuxClient::new();
+        tmux.set_next_raw_output(rows);
+        tmux.set_next_raw_output("on\n");
+        assert!(!chat::visibility(&tmux, Some("%7")).await.0, "{rows:?}");
+        assert_eq!(
+            tmux.calls().len(),
+            1,
+            "malformed evidence must not fall back"
+        );
+    }
+}
+
+// Measure the real controller over 61 virtual seconds, not calls to visibility().
+// A Pending-poll event fences each tick; q/driver completion fences every call.
+#[tokio::test(start_paused = true)]
+async fn visibility_idle_driver_minute() {
+    let tmux = atm_tmux::MockTmuxClient::new();
+    for _ in 0..256 {
+        tmux.set_next_raw_output("attached,focused,UTF-8\t%7\t0\t1\n");
+    }
+    let probe = tmux.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_env_filter("atm::chat=info")
+        .with_writer(std::io::sink)
+        .finish();
+    let (polled, mut processed) = mpsc::unbounded_channel();
+    let (commands, _requests) = mpsc::unbounded_channel();
+    let (input, events) = mpsc::unbounded_channel();
+    let driver = tokio::spawn(async move {
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        let drive = chat::drive(
+            &mut terminal,
+            ChatConfig {
+                initial_thread: None,
+                caller_pane: Some("%7".into()),
+            },
+            ControlHandle::new(commands),
+            events,
+            &probe,
+            CancellationToken::new(),
+            run_id(30),
+            |_| {},
+        );
+        tokio::pin!(drive);
+        std::future::poll_fn(|context| {
+            let result = std::future::Future::poll(drive.as_mut(), context);
+            if result.is_pending() {
+                let _ = polled.send(tokio::time::Instant::now());
+            }
+            result
+        })
+        .with_subscriber(subscriber)
+        .await
+    });
+    guarded(processed.recv()).await.unwrap();
+    tmux.clear_calls();
+    let start = tokio::time::Instant::now();
+    for _ in 0..61 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let tick = tokio::time::Instant::now();
+        guarded(async { while processed.recv().await.unwrap() < tick {} }).await;
+    }
+    input
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    guarded(driver).await.unwrap().unwrap();
+    let elapsed = start.elapsed().as_secs_f64();
+    let calls = tmux.calls();
+    let options = calls.iter().filter(|call|matches!(call,atm_tmux::mock::MockCall::RawCommand {subcommand,..} if subcommand=="show-options")).count();
+    let clients = calls.iter().filter(|call|matches!(call,atm_tmux::mock::MockCall::RawCommand {subcommand,..} if subcommand=="list-clients")).count();
+    println!("VISIBILITY_METER virtual_seconds={elapsed:.0} commands={} commands_per_virtual_minute={:.3} options={options} clients={clients}",calls.len(),calls.len() as f64*60.0/elapsed);
+    assert!(
+        !calls.is_empty(),
+        "the real controller must observe visibility"
+    );
+    assert_eq!(options, 0);
+    assert_eq!(clients, calls.len());
+    assert!(
+        calls.len() <= 62,
+        "unexpected extra observations: {}",
+        calls.len()
+    );
 }
 
 // Break caught: unchecked defaults hide missing fences or discard decision/binding facts.
@@ -801,6 +1054,9 @@ fn checked_tree_and_history_decode_preserve_scopes() {
 // Break caught: appending runs joins reused token 3 to the wrong committed count/id.
 #[test]
 fn trace_tokens_are_scoped_to_run_id() {
+    if trace_case_in_child("trace_tokens_are_scoped_to_run_id") {
+        return;
+    }
     use std::{
         io::Write,
         sync::{Arc, Mutex},
@@ -940,6 +1196,56 @@ async fn stop_chat(
         .unwrap();
     assert!(guarded(driver).await.unwrap().0.is_ok());
     rig.stop().await;
+}
+
+// Break caught: the controller puts selected body text back into raw argv or
+// accidentally pastes it instead of using the bounded stdin buffer operation.
+#[tokio::test]
+async fn copy_selected_body_uses_the_stdin_buffer_operation() {
+    let mut rig = Script::new();
+    let (mut peer, driver, mut frames) = ready_chat(&mut rig).await;
+    let body = "- literal λ\nsecond line;";
+    rig.event_tx
+        .send(Event::Control(atm_tui::control::ControlNotice::Event(
+            DaemonMessage::event(
+                "org".into(),
+                41,
+                "2026-01-01T00:00:00Z".into(),
+                "msg.sent".into(),
+                json!({}),
+            ),
+        )))
+        .unwrap();
+    for _ in 0..2 {
+        let MessageType::Request { id, method, .. } = peer.recv().await else {
+            panic!("message refresh")
+        };
+        let value = match method.as_str() {
+            "msg.history" => {
+                json!({"seq":41,"snapshot_seq":41,"messages":[incoming(body)],"next_cursor":null})
+            }
+            "msg.inbox" => inbox(),
+            other => panic!("unexpected copy setup {other}"),
+        };
+        peer.ok(id, value).await;
+    }
+    let frame = matching_frame(&mut frames, |frame| {
+        frame.visible_ids.contains(&"m5".parse().unwrap())
+    })
+    .await;
+    rig.event_tx
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    matching_frame(&mut frames, |next| next.generation > frame.generation).await;
+    stop_chat(&mut rig, driver).await;
+    let copies: Vec<_> = rig.tmux.calls().into_iter().filter(|call| !matches!(call,atm_tmux::mock::MockCall::RawCommand {subcommand,..} if subcommand=="list-clients")).collect();
+    assert_eq!(
+        copies,
+        vec![atm_tmux::mock::MockCall::LoadBuffer { text: body.into() }]
+    );
 }
 
 // Composition check for the internal watch marker: an actual no-id catch-up
@@ -1146,6 +1452,14 @@ impl std::io::Write for MeterWriter {
 // NEVER a sleep/absence timeout; the final resize is a processed FIFO frame fence.
 #[tokio::test]
 async fn idle_driver_minute_has_no_redundant_draws_or_trace_records() {
+    if tokio::task::spawn_blocking(|| {
+        trace_case_in_child("idle_driver_minute_has_no_redundant_draws_or_trace_records")
+    })
+    .await
+    .unwrap()
+    {
+        return;
+    }
     let (presented, mut observed) = mpsc::unbounded_channel();
     let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let writer = MeterWriter {
@@ -1526,8 +1840,7 @@ async fn presented_to_ack_then_canonical_refresh() {
         "attached,focused\t%7\t1\n",
     ] {
         let tmux = atm_tmux::MockTmuxClient::new();
-        tmux.set_next_raw_output("on");
-        tmux.set_next_raw_output(clients);
+        tmux.set_next_raw_output(&focus_rows("1", clients));
         let (visible, hint) = chat::visibility(&tmux, Some("%7")).await;
         let mut displayed = None;
         terminal
@@ -1551,8 +1864,7 @@ async fn presented_to_ack_then_canonical_refresh() {
         .unwrap();
     let report = report.unwrap();
     let tmux = atm_tmux::MockTmuxClient::new();
-    tmux.set_next_raw_output("on");
-    tmux.set_next_raw_output("attached,focused\t%7\t0\n");
+    tmux.set_next_raw_output("attached,focused\t%7\t0\t1\n");
     let (visible, hint) = chat::visibility(&tmux, Some("%7")).await;
     let effects = state.reduce(
         ChatInput::Presented {
@@ -1708,6 +2020,9 @@ fn actual_report(state: &atm_chat::ChatState, width: u16, height: u16) -> FrameR
 // changes must still be logged, with the original run/generation/read fields.
 #[test]
 fn frame_trace_only_records_read_or_visible_id_set_changes() {
+    if trace_case_in_child("frame_trace_only_records_read_or_visible_id_set_changes") {
+        return;
+    }
     let file = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -1761,6 +2076,9 @@ fn frame_trace_only_records_read_or_visible_id_set_changes() {
 // and regain with actual message IDs must still produce their changed sets.
 #[test]
 fn presented_trace_only_records_effectively_visible_id_set_changes() {
+    if trace_case_in_child("presented_trace_only_records_effectively_visible_id_set_changes") {
+        return;
+    }
     let file = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -1799,6 +2117,9 @@ fn presented_trace_only_records_effectively_visible_id_set_changes() {
 // Break caught: canonical no-op session updates append another idle-seat line.
 #[test]
 fn idle_seat_trace_only_records_binding_or_phase_changes() {
+    if trace_case_in_child("idle_seat_trace_only_records_binding_or_phase_changes") {
+        return;
+    }
     let file = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -1840,6 +2161,9 @@ fn idle_seat_trace_only_records_binding_or_phase_changes() {
 // Review regression: blocked/attention is not a completed Working->Idle turn.
 #[test]
 fn trace_attention_is_not_an_idle_turn() {
+    if trace_case_in_child("trace_attention_is_not_an_idle_turn") {
+        return;
+    }
     let file = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -1925,6 +2249,11 @@ fn watch_failure_preserves_the_supported_envelope_marker_and_rpc_methods() {
 // messages (which can contain bodies/paths) into the run-scoped trace.
 #[test]
 fn watch_failure_trace_records_the_real_error_class_without_free_form_content() {
+    if trace_case_in_child(
+        "watch_failure_trace_records_the_real_error_class_without_free_form_content",
+    ) {
+        return;
+    }
     let file = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -1967,6 +2296,9 @@ fn watch_failure_trace_records_the_real_error_class_without_free_form_content() 
 // joined across stale session state or another appended process run.
 #[test]
 fn trace_connection_gaps_keep_run_scope() {
+    if trace_case_in_child("trace_connection_gaps_keep_run_scope") {
+        return;
+    }
     let file = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -1988,6 +2320,9 @@ fn trace_connection_gaps_keep_run_scope() {
 
 #[test]
 fn turn_trace_binding_keys_distinguish_rebinds_without_logging_paths() {
+    if trace_case_in_child("turn_trace_binding_keys_distinguish_rebinds_without_logging_paths") {
+        return;
+    }
     let file = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -2199,8 +2534,7 @@ impl DrivenChat {
             let tmux = atm_tmux::MockTmuxClient::new();
             // Controlled focus sink: finite test input, not a live tmux/client claim.
             for _ in 0..10_000 {
-                tmux.set_next_raw_output("on\n");
-                tmux.set_next_raw_output(&format!("attached,focused,UTF-8\t{pane}\t0\n"));
+                tmux.set_next_raw_output(&format!("attached,focused,UTF-8\t{pane}\t0\t1\n"));
             }
             let config = ChatConfig {
                 initial_thread: Some(target.parse().unwrap()),

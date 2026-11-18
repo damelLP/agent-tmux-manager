@@ -24,6 +24,7 @@ pub enum AgentListFormat {
 }
 #[derive(Debug, Subcommand)]
 pub enum AgentAction {
+    /// Start a named agent from its role in a new tmux pane
     Up {
         #[arg(value_parser = parse_name)]
         name: String,
@@ -32,6 +33,7 @@ pub enum AgentAction {
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
+    /// Register an existing pane as a named agent without restarting its program
     Adopt {
         #[arg(value_parser = parse_name)]
         name: String,
@@ -42,6 +44,7 @@ pub enum AgentAction {
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
+    /// Clear an agent's current context in its existing pane
     Clear {
         #[arg(value_parser = super::agent_target::parse_agent)]
         agent: String,
@@ -53,6 +56,7 @@ pub enum AgentAction {
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
+    /// Ask an agent to save its state to its memory file, then clear its context
     Handover {
         #[arg(value_parser = super::agent_target::parse_agent)]
         agent: String,
@@ -63,6 +67,7 @@ pub enum AgentAction {
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
+    /// Restart an agent in a new pane, closing its old pane if present
     Respawn {
         #[arg(value_parser = super::agent_target::parse_agent)]
         agent: String,
@@ -71,16 +76,19 @@ pub enum AgentAction {
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
+    /// Take an agent down, leaving its pane open unless --kill is passed
     Down {
         #[arg(value_parser = super::agent_target::parse_agent)]
         agent: String,
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Close the pane and its program; without it the seat is released and the program keeps running
         #[arg(long)]
         kill: bool,
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
+    /// List named agents and their status, optionally filtered by project
     List {
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -165,6 +173,7 @@ pub(super) async fn cmd_agent_with_lookup_budget(
     action: AgentAction,
     lookup_budget: Duration,
 ) -> anyhow::Result<()> {
+    let show_release_note = matches!(&action, AgentAction::Down { kill: false, .. });
     let (value, json, columns, list) = match action {
         AgentAction::Up {
             name,
@@ -326,6 +335,12 @@ pub(super) async fn cmd_agent_with_lookup_budget(
             }
         } else {
             writeln!(out, "{}", row(&value, columns))?;
+            if show_release_note {
+                writeln!(
+                    out,
+                    "Without --kill, any existing pane and its program keep running; --kill closes them instead."
+                )?;
+            }
         }
         Ok(())
     })

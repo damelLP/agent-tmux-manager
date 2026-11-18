@@ -97,7 +97,12 @@ fn work_reduce_visible_polling_and_inflight_triggers_coalesce() {
     assert!(org_effects.contains(&WorkEffect::Watch {
         cursor: 42,
         topics: vec![
-            "task.".into(),
+            "task.created".into(),
+            "task.assigned".into(),
+            "task.state_changed".into(),
+            "task.submitted".into(),
+            "task.review_started".into(),
+            "task.verdict".into(),
             "decision.".into(),
             "agent.".into(),
             "msg.delivery_failed".into()
@@ -176,7 +181,7 @@ fn work_reduce_org_events_throttle_to_five_seconds_and_fallback_at_sixty() {
         let _ = state.reduce(
             WorkInput::WatchEvent {
                 seq,
-                kind: "task.changed".into(),
+                kind: "task.assigned".into(),
             },
             at(6),
         );
@@ -296,13 +301,19 @@ fn work_reduce_capabilities_missing_cursor_and_watch_failure_degrade_without_ses
     assert!(state
         .reduce(WorkInput::WatchFailed, at(61))
         .contains(&WorkEffect::Unwatch));
-    let tick = state.reduce(WorkInput::Wake, at(120));
+    let retry = state.reduce(WorkInput::Wake, at(71));
+    assert!(!has_watch(&retry, 80));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&retry, false), Some(90)), at(71)),
+        90
+    ));
+    let tick = state.reduce(WorkInput::Wake, at(131));
     let org_id = requested(&tick, false);
     assert!(!state
-        .reduce(org_reply(org_id, Some(90)), at(120))
+        .reduce(org_reply(org_id, Some(100)), at(131))
         .iter()
         .any(|e| matches!(e, WorkEffect::Watch { .. })));
-    capabilities(&mut state, 121, &["session.windows"]);
+    capabilities(&mut state, 132, &["session.windows"]);
     assert!(state.org().is_none());
     assert!(state.no_org_data());
     // Before the first capability notice, Shown bootstraps the opt-in control transport.
@@ -499,6 +510,466 @@ fn work_marks_join_seats_and_tasks_by_identity_and_aggregate_each_pane_once() {
     assert_eq!(first.id, TaskId("t99".into()));
     assert_eq!(first.title, None);
 }
+// Break caught: accounting/metadata events dirty org polling even through a wider union.
+#[test]
+fn work_reduce_usage_and_cost_do_not_dirty_org() {
+    for kind in [
+        "task.usage_observed",
+        "task.cost_recorded",
+        "task.attached",
+        "task.reminded",
+        "task.flagged",
+    ] {
+        let mut state = loaded();
+        let _ = state.reduce(
+            WorkInput::WatchEvent {
+                seq: 43,
+                kind: kind.into(),
+            },
+            at(1),
+        );
+        assert!(
+            !state
+                .reduce(WorkInput::Wake, at(5))
+                .iter()
+                .any(|e| matches!(e, WorkEffect::RequestOrg(_))),
+            "{kind}"
+        );
+    }
+}
+
+// Break caught: the daemon still receives a broad task topic and forwards usage noise.
+#[test]
+fn work_reduce_watch_topics_exclude_accounting_and_metadata() {
+    let mut state = WorkState::default();
+    capabilities(&mut state, 0, &["session.windows", "org.tree"]);
+    let shown = state.reduce(WorkInput::Shown, at(0));
+    let reply = state.reduce(org_reply(requested(&shown, false), Some(42)), at(0));
+    let topics = reply
+        .iter()
+        .find_map(|e| match e {
+            WorkEffect::Watch { topics, .. } => Some(topics),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        topics,
+        &[
+            "task.created",
+            "task.assigned",
+            "task.state_changed",
+            "task.submitted",
+            "task.review_started",
+            "task.verdict",
+            "decision.",
+            "agent.",
+            "msg.delivery_failed"
+        ]
+    );
+    // Every retained task kind still invalidates current marks; covered events do not.
+    for kind in topics.iter().filter(|t| t.starts_with("task.")) {
+        let mut state = loaded();
+        let _ = state.reduce(
+            WorkInput::WatchEvent {
+                seq: 42,
+                kind: kind.clone(),
+            },
+            at(1),
+        );
+        assert!(!state
+            .reduce(WorkInput::Wake, at(2))
+            .iter()
+            .any(|e| matches!(e, WorkEffect::RequestOrg(_))));
+        let _ = state.reduce(
+            WorkInput::WatchEvent {
+                seq: 43,
+                kind: kind.clone(),
+            },
+            at(2),
+        );
+        assert!(
+            state
+                .reduce(WorkInput::Wake, at(5))
+                .iter()
+                .any(|e| matches!(e, WorkEffect::RequestOrg(_))),
+            "{kind}"
+        );
+    }
+}
+
+// Break caught: a busy seat's accounting stream turns the minute fallback into 5 s reads.
+#[test]
+fn work_reduce_busy_usage_keeps_minute_fallback() {
+    let mut state = loaded();
+    let mut org_counts = [0; 2];
+    let mut window_counts = [0; 2];
+    for second in 1..=120 {
+        let minute = if second <= 60 { 0 } else { 1 };
+        for input in [
+            WorkInput::WatchEvent {
+                seq: 42 + second,
+                kind: "task.usage_observed".into(),
+            },
+            WorkInput::Wake,
+        ] {
+            let effects = state.reduce(input, at(second));
+            for effect in effects {
+                match effect {
+                    WorkEffect::RequestOrg(id) => {
+                        org_counts[minute] += 1;
+                        let _ = state.reduce(org_reply(id, Some(42 + second)), at(second));
+                    }
+                    WorkEffect::RequestWindows(id) => {
+                        window_counts[minute] += 1;
+                        let _ = state.reduce(window_reply(id, "ok"), at(second));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(org_counts, [1, 1]);
+    assert_eq!(window_counts, [20, 20]);
+}
+
+fn has_watch(effects: &[WorkEffect], cursor: u64) -> bool {
+    effects
+        .iter()
+        .any(|e| matches!(e, WorkEffect::Watch { cursor: seq, .. } if *seq == cursor))
+}
+
+// Break caught: WatchFailed permanently latches Work off, or retry spins before its deadline.
+#[test]
+fn work_reduce_watch_failure_retries_after_ten_seconds() {
+    let mut state = loaded();
+    assert!(state
+        .reduce(WorkInput::WatchFailed, at(1))
+        .contains(&WorkEffect::Unwatch));
+    let before = state.reduce(WorkInput::Wake, at(10));
+    assert!(!has_watch(&before, 42));
+    assert!(before.contains(&WorkEffect::WakeAt(at(11))));
+    let retry = state.reduce(WorkInput::Wake, at(11));
+    assert!(!has_watch(&retry, 42));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&retry, false), Some(50)), at(11)),
+        50
+    ));
+    assert!(!has_watch(&state.reduce(WorkInput::Wake, at(11)), 50));
+    let _ = state.reduce(WorkInput::WatchFailed, at(11));
+    assert!(!has_watch(&state.reduce(WorkInput::Wake, at(20)), 50));
+    let retry = state.reduce(WorkInput::Wake, at(21));
+    assert!(!has_watch(&retry, 50));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&retry, false), Some(60)), at(21)),
+        60
+    ));
+    // A pre-failure fallback completion cannot bypass the delay or supply the retry cursor.
+    let mut state = loaded();
+    let due = state.reduce(WorkInput::Wake, at(60));
+    let _ = state.reduce(WorkInput::WatchFailed, at(61));
+    assert!(!has_watch(
+        &state.reduce(org_reply(requested(&due, false), Some(80)), at(62)),
+        80
+    ));
+    let retry = state.reduce(WorkInput::Wake, at(71));
+    assert!(!has_watch(&retry, 80));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&retry, false), Some(90)), at(72)),
+        90
+    ));
+}
+
+// Break caught: a pre-failure flight or cached cursor installs Watch during slow reconnect.
+#[test]
+fn work_reduce_failed_watch_requires_a_post_failure_org_read() {
+    let mut state = loaded();
+    let before_failure = state.reduce(WorkInput::Refresh, at(1));
+    let old_org = requested(&before_failure, false);
+    let _ = state.reduce(WorkInput::WatchFailed, at(1));
+    let old_reply = state.reduce(org_reply(old_org, Some(60)), at(5));
+    assert!(!old_reply
+        .iter()
+        .any(|e| matches!(e, WorkEffect::Watch { .. })));
+    let retry = state.reduce(WorkInput::Wake, at(11));
+    assert!(
+        !retry.iter().any(|e| matches!(e, WorkEffect::Watch { .. })),
+        "retry must read before watching: {retry:?}"
+    );
+    let fresh_org = requested(&retry, false);
+    assert!(has_watch(
+        &state.reduce(org_reply(fresh_org, Some(90)), at(12)),
+        90
+    ));
+    assert!(!has_watch(&state.reduce(WorkInput::Wake, at(12)), 90));
+}
+
+// Break caught: the first capabilities after a failed bootstrap watch installs its cached cursor.
+#[test]
+fn work_reduce_first_capabilities_after_failure_also_requires_fresh_org() {
+    let mut state = WorkState::default();
+    let shown = state.reduce(WorkInput::Shown, at(0));
+    let _ = state.reduce(window_reply(requested(&shown, true), "ok"), at(0));
+    let _ = state.reduce(org_reply(requested(&shown, false), Some(42)), at(0));
+    let _ = state.reduce(WorkInput::WatchFailed, at(1));
+    let caps = capabilities(&mut state, 2, &["session.windows", "org.tree"]);
+    assert!(!has_watch(&caps, 42));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&caps, false), Some(90)), at(3)),
+        90
+    ));
+}
+
+// Break caught: an occupied old read makes the retry deadline spin, or a failed retry loses recovery.
+#[test]
+fn work_reduce_watch_retry_waits_for_retained_flight_and_retries_read_errors() {
+    let mut state = loaded();
+    let initial = state.reduce(WorkInput::Refresh, at(1));
+    let _ = state.reduce(WorkInput::WatchFailed, at(1));
+    let blocked = state.reduce(WorkInput::Wake, at(11));
+    assert!(!blocked
+        .iter()
+        .any(|e| matches!(e, WorkEffect::Watch { .. } | WorkEffect::RequestOrg(_))));
+    assert!(!blocked
+        .iter()
+        .any(|e| matches!(e, WorkEffect::WakeAt(t) if *t <= at(11))));
+    let released = state.reduce(org_reply(requested(&initial, false), Some(60)), at(12));
+    assert_eq!(
+        state.org().unwrap().seq,
+        Some(42),
+        "obsolete flight cannot refresh the watch floor"
+    );
+    assert!(!has_watch(&released, 60));
+    let retry = requested(&released, false);
+    let failure = state.reduce(
+        WorkInput::OrgReply {
+            generation: retry,
+            result: Err(WorkFailure("offline".into())),
+        },
+        at(13),
+    );
+    assert!(!failure
+        .iter()
+        .any(|e| matches!(e, WorkEffect::Watch { .. } | WorkEffect::RequestOrg(_))));
+    let early = state.reduce(WorkInput::Wake, at(22));
+    assert!(!early.iter().any(|e| matches!(e, WorkEffect::RequestOrg(_))));
+    assert!(early.contains(&WorkEffect::WakeAt(at(23))));
+    let retry = state.reduce(WorkInput::Wake, at(23));
+    assert!(!has_watch(&retry, 42));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&retry, false), Some(90)), at(24)),
+        90
+    ));
+}
+
+// Break caught: an early post-failure event read supplies a cached cursor instead of the due retry read.
+#[test]
+fn work_reduce_early_event_read_cannot_replace_the_retry_read() {
+    let mut state = loaded();
+    let _ = state.reduce(WorkInput::WatchFailed, at(1));
+    let _ = state.reduce(
+        WorkInput::WatchEvent {
+            seq: 43,
+            kind: "task.assigned".into(),
+        },
+        at(2),
+    );
+    let early = state.reduce(WorkInput::Wake, at(5));
+    let reply = state.reduce(org_reply(requested(&early, false), Some(60)), at(6));
+    assert!(!has_watch(&reply, 60));
+    let retry = state.reduce(WorkInput::Wake, at(11));
+    assert!(!has_watch(&retry, 60));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&retry, false), Some(90)), at(12)),
+        90
+    ));
+}
+
+// Break caught: ineligible retries spin an overdue wake, or reconnect watches pre-reconnect data.
+#[test]
+fn work_reduce_watch_retry_disarms_when_ineligible() {
+    for mode in ["hidden", "windows", "org", "watch", "cursor"] {
+        let mut state = loaded();
+        let _ = state.reduce(WorkInput::WatchFailed, at(1));
+        match mode {
+            "hidden" => {
+                let _ = state.reduce(WorkInput::Hidden, at(2));
+            }
+            "windows" => {
+                capabilities(&mut state, 2, &["org.tree"]);
+            }
+            "org" => {
+                capabilities(&mut state, 2, &["session.windows"]);
+            }
+            "watch" => {
+                let _ = state.reduce(
+                    WorkInput::Capabilities {
+                        methods: vec!["session.windows".into(), "org.tree".into()],
+                        watch: false,
+                    },
+                    at(2),
+                );
+            }
+            "cursor" => {
+                let due = state.reduce(WorkInput::Wake, at(60));
+                let _ = state.reduce(org_reply(requested(&due, false), None), at(60));
+                let _ = state.reduce(WorkInput::WatchFailed, at(61));
+            }
+            _ => unreachable!(),
+        }
+        for second in [100, 101] {
+            let effects = state.reduce(WorkInput::Wake, at(second));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, WorkEffect::Watch { .. })),
+                "{mode}"
+            );
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, WorkEffect::WakeAt(t) if *t <= at(second))),
+                "{mode}: {effects:?}"
+            );
+        }
+    }
+    let mut state = loaded();
+    let _ = state.reduce(WorkInput::WatchFailed, at(1));
+    let reconnect = capabilities(&mut state, 2, &["session.windows", "org.tree"]);
+    assert!(!has_watch(&reconnect, 42));
+    assert!(!has_watch(&state.reduce(WorkInput::Wake, at(20)), 42));
+    assert!(has_watch(
+        &state.reduce(org_reply(requested(&reconnect, false), Some(90)), at(20)),
+        90
+    ));
+    for input in [WorkInput::Refresh, WorkInput::Shown] {
+        let mut state = loaded();
+        let _ = state.reduce(WorkInput::WatchFailed, at(1));
+        if matches!(input, WorkInput::Shown) {
+            let _ = state.reduce(WorkInput::Hidden, at(2));
+        }
+        let effects = state.reduce(input, at(2));
+        assert!(has_watch(
+            &state.reduce(org_reply(requested(&effects, false), Some(91)), at(2)),
+            91
+        ));
+    }
+}
+
+// Break caught: failed first reads have no availability signal, or retries hide it before success.
+#[test]
+fn work_reduce_source_failures_are_visible_until_success() {
+    for non_ok in [false, true] {
+        let mut state = WorkState::default();
+        capabilities(&mut state, 0, &["session.windows", "org.tree"]);
+        let initial = state.reduce(WorkInput::Shown, at(0));
+        let w = requested(&initial, true);
+        let _ = state.reduce(
+            if non_ok {
+                window_reply(w, "unavailable")
+            } else {
+                WorkInput::WindowsReply {
+                    generation: w,
+                    result: Err(WorkFailure("failed".into())),
+                }
+            },
+            at(1),
+        );
+        let _ = state.reduce(
+            WorkInput::OrgReply {
+                generation: requested(&initial, false),
+                result: Err(WorkFailure("failed".into())),
+            },
+            at(1),
+        );
+        assert!(state.windows_unavailable() && state.org_unavailable());
+        assert!(state.windows().is_empty() && state.org().is_none());
+        assert_eq!(
+            state.stale_age(at(1000)),
+            None,
+            "failure does not invent freshness"
+        );
+        let retry = state.reduce(WorkInput::Refresh, at(2));
+        assert!(state.windows_unavailable() && state.org_unavailable());
+        let _ = state.reduce(
+            WorkInput::WindowsReply {
+                generation: requested(&retry, true),
+                result: Ok(WorkWindows {
+                    state: "ok".into(),
+                    windows: vec![],
+                }),
+            },
+            at(2),
+        );
+        assert!(!state.windows_unavailable() && state.org_unavailable());
+        let _ = state.reduce(org_reply(requested(&retry, false), Some(80)), at(2));
+        assert!(!state.windows_unavailable() && !state.org_unavailable());
+    }
+    let mut state = loaded();
+    let refresh = state.reduce(WorkInput::Refresh, at(11));
+    let _ = state.reduce(
+        window_reply(requested(&refresh, true), "unknown_state"),
+        at(12),
+    );
+    let _ = state.reduce(
+        WorkInput::OrgReply {
+            generation: requested(&refresh, false),
+            result: Err(WorkFailure("failed".into())),
+        },
+        at(12),
+    );
+    assert!(state.windows_unavailable() && state.org_unavailable());
+    assert_eq!(state.windows().len(), 2);
+    assert_eq!(state.org().unwrap().seq, Some(42));
+    assert_eq!(state.stale_age(at(12)), Some(at(12)));
+}
+
+// Break caught: obsolete replies set/clear status, or unsupported methods look like source failures.
+#[test]
+fn work_reduce_obsolete_failures_do_not_change_availability() {
+    for hidden in [false, true] {
+        let mut state = loaded();
+        let old = state.reduce(WorkInput::Refresh, at(1));
+        if hidden {
+            let _ = state.reduce(WorkInput::Hidden, at(2));
+        } else {
+            capabilities(&mut state, 2, &["session.windows", "org.tree"]);
+        }
+        let _ = state.reduce(window_reply(requested(&old, true), "unavailable"), at(3));
+        let _ = state.reduce(
+            WorkInput::OrgReply {
+                generation: requested(&old, false),
+                result: Err(WorkFailure("obsolete".into())),
+            },
+            at(3),
+        );
+        assert!(!state.windows_unavailable() && !state.org_unavailable());
+    }
+    let mut state = loaded();
+    let old = state.reduce(WorkInput::Refresh, at(1));
+    let w = requested(&old, true);
+    let o = requested(&old, false);
+    let _ = state.reduce(window_reply(w, "unavailable"), at(1));
+    let _ = state.reduce(
+        WorkInput::OrgReply {
+            generation: o,
+            result: Err(WorkFailure("failed".into())),
+        },
+        at(1),
+    );
+    let _ = state.reduce(window_reply(w, "ok"), at(2));
+    let _ = state.reduce(org_reply(o, Some(100)), at(2));
+    assert!(
+        state.windows_unavailable() && state.org_unavailable(),
+        "duplicate successes cannot clear failures"
+    );
+    capabilities(&mut state, 3, &["session.windows"]);
+    assert!(state.windows_unavailable() && !state.org_unavailable());
+    assert!(state.no_org_data());
+    capabilities(&mut state, 4, &[]);
+    assert!(!state.windows_unavailable() && !state.org_unavailable());
+    assert!(state.needs_newer_daemon());
+}
+
 // Break caught: projected badges do not recognize each of the four explicit attention causes.
 #[test]
 fn work_marks_attention_causes_are_explicit_and_missing_org_cursor_is_accepted() {

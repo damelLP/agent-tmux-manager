@@ -229,6 +229,8 @@ pub(crate) fn decode_tree(
 /// exclude control clients and modes, and never trust sticky focus with focus off.
 /// Verified tmux 3.6a/3.8, 2026-11-18: pane_in_mode is 0/1 for normal/copy.
 /// Popup-over-chat has identical formats on both; that known limit is in README.
+/// Verified tmux 3.8, 2026-11-18: focus-events expands as 0/1 in client rows.
+/// An empty expansion checks the option separately for older tmux compatibility.
 pub(crate) async fn visibility<C: TmuxClient>(
     tmux: &C,
     pane: Option<&str>,
@@ -242,19 +244,13 @@ pub(crate) async fn visibility<C: TmuxClient>(
     let Some(pane) = pane else {
         return unavailable();
     };
-    let Ok(option) = tmux
-        .raw_command("show-options", &["-s", "-v", "focus-events"])
-        .await
-    else {
-        return unavailable();
-    };
-    if option.trim() != "on" {
-        return unavailable();
-    }
     let Ok(clients) = tmux
         .raw_command(
             "list-clients",
-            &["-F", "#{client_flags}\t#{pane_id}\t#{pane_in_mode}"],
+            &[
+                "-F",
+                "#{client_flags}\t#{pane_id}\t#{pane_in_mode}\t#{focus-events}",
+            ],
         )
         .await
     else {
@@ -264,11 +260,18 @@ pub(crate) async fn visibility<C: TmuxClient>(
         return unavailable();
     }
     let mut visible = false;
+    let mut focus_setting = None;
     for row in clients.lines() {
         let parts: Vec<_> = row.split('\t').collect();
-        let [flags, active, mode] = parts.as_slice() else {
+        let [flags, active, mode, focus] = parts.as_slice() else {
             return unavailable();
         };
+        if !matches!(*focus, "" | "0" | "1")
+            || focus_setting.is_some_and(|setting| setting != *focus)
+        {
+            return unavailable();
+        }
+        focus_setting = Some(*focus);
         if mode.is_empty() || !mode.bytes().all(|byte| byte.is_ascii_digit()) {
             return unavailable();
         }
@@ -299,6 +302,19 @@ pub(crate) async fn visibility<C: TmuxClient>(
             .iter()
             .any(|name| matches!(*name, "control-mode" | "control"));
         visible |= !control && flags.contains(&"focused") && *active == pane && *mode == "0";
+    }
+    if focus_setting == Some("") {
+        let Ok(option) = tmux
+            .raw_command("show-options", &["-s", "-v", "focus-events"])
+            .await
+        else {
+            return unavailable();
+        };
+        if option.trim() != "on" {
+            return unavailable();
+        }
+    } else if focus_setting == Some("0") {
+        return unavailable();
     }
     if visible {
         (true, None)
@@ -743,7 +759,7 @@ where
                     let available=pane.is_some();
                     copy=Some(Box::pin(async move {
                         if !available {return Err(ChatFailure::Unavailable("outside tmux".into()))}
-                        tmux.raw_command("set-buffer",&["--",&body]).await.map(|_|()).map_err(|_|ChatFailure::Unavailable("tmux buffer unavailable".into()))
+                        tmux.load_buffer(&body).await.map_err(|_|ChatFailure::Unavailable("tmux buffer unavailable".into()))
                     }));
                 }
             }

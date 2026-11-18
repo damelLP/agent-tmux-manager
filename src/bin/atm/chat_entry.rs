@@ -91,8 +91,9 @@ async fn open_log(
     let (send, receive) = tokio::sync::oneshot::channel();
     // An existing tui.log can be a FIFO or live on a stuck filesystem. A
     // spawn_blocking task would keep runtime shutdown waiting forever. Exactly
-    // one startup thread is allowed; a timeout fails BEFORE terminal setup, so
-    // neither late diagnostics nor a stuck worker can corrupt a running screen.
+    // one startup thread is allowed. On timeout detach it and continue without
+    // a log; the caller supplies a silent opener so late errors cannot corrupt
+    // the running screen or keep runtime shutdown waiting.
     let worker = std::thread::Builder::new()
         .name("atm-chat-log".into())
         .spawn(move || {
@@ -101,9 +102,9 @@ async fn open_log(
                 open().filter(|file| file.metadata().is_ok_and(|metadata| metadata.is_file()));
             let _ = send.send(file);
         })?;
-    let result = tokio::time::timeout(budget, receive)
-        .await
-        .map_err(|_| anyhow!("chat log initialization timed out"))?;
+    let Ok(result) = tokio::time::timeout(budget, receive).await else {
+        return Ok(None);
+    };
     // The notification follows all I/O; only the thread's return remains.
     let _ = worker.join();
     Ok(result.unwrap_or(None))
@@ -112,7 +113,11 @@ async fn open_log(
 pub(super) async fn cmd_chat(args: ChatArgs) -> Result<()> {
     let run = ChatRunId::new(Utc::now(), std::process::id());
     // Logging is initialized before raw mode; errors cannot corrupt the screen.
-    let log = open_log(super::create_log_file, Duration::from_secs(30)).await?;
+    let log = open_log(
+        || super::create_log_file_with_warning(|_| {}),
+        Duration::from_secs(30),
+    )
+    .await?;
     if let Some(file) = log {
         if tracing_subscriber::fmt()
             .with_ansi(false)
@@ -179,6 +184,43 @@ pub(super) async fn cmd_chat(args: ChatArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Break caught: timeout aborts startup, or waits for a blocked opener. The
+    // worker is event-held until after the continuation result is collected.
+    #[tokio::test]
+    async fn log_timeout_continues_while_worker_is_stalled() {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let (finished, exited) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(open_log(
+            move || {
+                let _ = started.send(());
+                let _ = held.recv();
+                let _ = finished.send(());
+                None
+            },
+            Duration::from_secs(30),
+        ));
+        tokio::time::timeout(Duration::from_secs(60), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let result = task.await.unwrap();
+        // Release before asserting, so RED/unwinding cannot strand this worker.
+        release.send(()).unwrap();
+        exited.await.unwrap();
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_log_returns_without_measurements() {
+        assert!(open_log(|| None, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn log_sink_with_a_reader_must_still_be_a_regular_file() {

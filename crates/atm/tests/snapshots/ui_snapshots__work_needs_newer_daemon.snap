@@ -1,12 +1,11 @@
 ---
 source: crates/atm/tests/ui_snapshots.rs
-assertion_line: 1037
 expression: buf
 ---
 Buffer {
     area: Rect { x: 0, y: 0, width: 100, height: 12 },
     content: [
-        "┌ Work · 2 windows, 4 agents ──────────────────────────────────────────────────────────────────────┐",
+        "┌ Work | Sessions · 2 windows, 4 agents ───────────────────────────────────────────────────────────┐",
         "│Work needs a newer atmd. w: Sessions                                                              │",
         "│                                                                                                  │",
         "│                                                                                                  │",
@@ -21,5 +20,9 @@ Buffer {
     ],
     styles: [
         x: 0, y: 0, fg: Yellow, bg: Reset, underline: Reset, modifier: NONE,
+        x: 2, y: 0, fg: Cyan, bg: Reset, underline: Reset, modifier: BOLD | REVERSED,
+        x: 6, y: 0, fg: Yellow, bg: Reset, underline: Reset, modifier: NONE,
+        x: 9, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: DIM,
+        x: 17, y: 0, fg: Yellow, bg: Reset, underline: Reset, modifier: NONE,
     ]
 }

@@ -5,7 +5,7 @@
 
 use crate::app::{App, AppState, AppView};
 use crate::ui::theme::{context_color, status_background, status_color, status_icon};
-use crate::work::{work_marks, PaneId, WindowId, WorkMarks};
+use crate::work::{work_marks, PaneId, SeatId, WindowId, WindowMarks, WorkGrouping, WorkMarks};
 use atm_core::{SessionView, TreeRow, TreeRowKind};
 use ratatui::{
     layout::Rect,
@@ -14,7 +14,6 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
-use std::borrow::Cow;
 
 /// Renders the session list as a tree in the left panel.
 ///
@@ -37,12 +36,18 @@ pub fn render_session_list(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, row)| {
-            let item = create_tree_row_item(row, idx == app.selected_index, app, &marks);
+            let item = create_tree_row_item(
+                row,
+                idx == app.selected_index,
+                app,
+                &marks,
+                area.width.saturating_sub(2),
+            );
             dim_if_filter_context(item, row, app)
         })
         .collect();
 
-    let title = list_title(app);
+    let title = list_title(app, area.width);
 
     let list = List::new(items).block(
         Block::default()
@@ -89,10 +94,19 @@ pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
                     });
                     create_group_line(&indent, label, row, is_selected)
                 }
-                TreeRowKind::Team { name } => create_group_line(&indent, name, row, is_selected),
-                TreeRowKind::Window { id, label } => {
-                    create_window_line(&indent, id, label, row, is_selected, &marks)
+                TreeRowKind::Team { name } if app.view == AppView::Work => {
+                    create_thread_line(&indent, name, row, is_selected, app, &marks, inner_width)
                 }
+                TreeRowKind::Team { name } => create_group_line(&indent, name, row, is_selected),
+                TreeRowKind::Window { id, label } => create_window_line(
+                    &indent,
+                    (id, label),
+                    row,
+                    is_selected,
+                    app,
+                    &marks,
+                    inner_width,
+                ),
                 TreeRowKind::Agent { session } => create_view_agent_line(
                     &indent,
                     session,
@@ -100,6 +114,7 @@ pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
                     app,
                     &marks,
                     Some(inner_width),
+                    inner_width,
                 ),
             };
 
@@ -113,7 +128,7 @@ pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let title = list_title(app);
+    let title = list_title(app, area.width);
 
     let list = List::new(items).block(
         Block::default()
@@ -125,12 +140,50 @@ pub fn render_compact_session_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, area);
 }
 
-fn list_title(app: &App) -> String {
+fn list_title(app: &App, width: u16) -> Line<'static> {
+    let tab = |label, view| {
+        Span::styled(
+            label,
+            if app.view == view {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
+            },
+        )
+    };
+    let mut line = Line::from(vec![
+        Span::raw(" "),
+        tab("Work", AppView::Work),
+        Span::raw(" | "),
+        tab("Sessions", AppView::Sessions),
+    ]);
     if app.view == AppView::Sessions {
-        return format!(" Sessions ({}) ", app.session_count());
+        line.spans
+            .push(Span::raw(format!(" ({}) ", app.session_count())));
+        return line;
     }
     let (windows, agents) = app.work_counts();
-    let mut title = format!(" Work · {windows} windows, {agents} agents");
+    let unavailable = match (app.work.windows_unavailable(), app.work.org_unavailable()) {
+        (true, true) => " · windows/org unavailable",
+        (true, false) => " · windows unavailable",
+        (false, true) => " · org unavailable",
+        (false, false) => "",
+    };
+    let unavailable = if width < 60 && !unavailable.is_empty() {
+        " · unavailable"
+    } else {
+        unavailable
+    };
+    let threads = if app.work_grouping == WorkGrouping::Threads && app.work.org().is_some() {
+        format!(" · {} threads", app.work_thread_count())
+    } else {
+        String::new()
+    };
+    let mut title = format!("{unavailable}{threads} · {windows} windows, {agents} agents");
     if app.work.no_org_data() {
         title.push_str(" · no org data");
     }
@@ -138,7 +191,8 @@ fn list_title(app: &App) -> String {
         title.push_str(&format!(" · stale {}s", age.as_secs()));
     }
     title.push(' ');
-    title
+    line.spans.push(Span::raw(title));
+    line
 }
 fn render_list_state(frame: &mut Frame, area: Rect, app: &App) -> bool {
     let rejected = matches!(
@@ -149,7 +203,7 @@ fn render_list_state(frame: &mut Frame, area: Rect, app: &App) -> bool {
         }
     );
     if shows_empty_state(app) && (app.view == AppView::Sessions || rejected) {
-        render_empty_state(frame, area, &app.state);
+        render_empty_state(frame, area, &app.state, list_title(app, area.width));
         return true;
     }
     if app.view == AppView::Work && app.work.needs_newer_daemon() {
@@ -160,7 +214,7 @@ fn render_list_state(frame: &mut Frame, area: Rect, app: &App) -> bool {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(list_title(app)),
+                        .title(list_title(app, area.width)),
                 ),
             area,
         );
@@ -172,7 +226,29 @@ fn view_marks(app: &App) -> WorkMarks {
     if app.view == AppView::Work {
         app.work
             .org()
-            .map(|org| work_marks(org, app.work.windows()))
+            .map(|org| {
+                let mut marks = work_marks(org, app.work.windows());
+                if app.work_grouping == WorkGrouping::Threads {
+                    for window in app.work.windows() {
+                        let total = marks.by_window.entry(window.id.clone()).or_default();
+                        *total = WindowMarks::default();
+                        for pane in window
+                            .panes
+                            .iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                        {
+                            if let Some(mark) = marks
+                                .by_pane
+                                .get(pane)
+                                .filter(|m| !marks.threads.contains_key(&m.agent_id))
+                            {
+                                total.include(mark);
+                            }
+                        }
+                    }
+                }
+                marks
+            })
             .unwrap_or_default()
     } else {
         WorkMarks::default()
@@ -189,39 +265,226 @@ fn work_text(text: &str) -> String {
         })
         .collect()
 }
-fn create_window_line(
-    indent: &str,
-    id: &str,
-    label: &str,
-    row: &TreeRow,
-    selected: bool,
-    marks: &WorkMarks,
+// Work clips escaped text by display cells; Sessions keeps its existing truncation contract.
+fn clip_work(text: &str, width: usize) -> String {
+    let text = work_text(text);
+    if Span::raw(&text).width() <= width {
+        return text;
+    }
+    let ellipsis = if width > 3 { "..." } else { "" };
+    let mut remaining = width.saturating_sub(ellipsis.len());
+    let mut clipped = String::new();
+    for c in text.chars() {
+        let cells = Span::raw(c.to_string()).width();
+        if cells > remaining {
+            break;
+        }
+        clipped.push(c);
+        remaining = remaining.saturating_sub(cells);
+    }
+    clipped.push_str(ellipsis);
+    clipped
+}
+
+fn work_caption(
+    mut prefix: Line<'static>,
+    headline: &str,
+    badges: Line<'static>,
+    detail: String,
+    width: u16,
 ) -> Line<'static> {
-    let mark = marks.by_window.get(&WindowId(id.into()));
-    let quiet = TreeRow {
-        needs_attention: false,
-        ..row.clone()
-    };
-    let mut line = create_group_line(indent, &work_text(label), &quiet, selected);
+    let budget = usize::from(width)
+        .saturating_sub(prefix.width())
+        .saturating_sub(badges.width());
+    prefix.spans.push(Span::styled(
+        clip_work(headline, budget),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+    prefix.spans.extend(badges.spans);
+    let remaining = usize::from(width).saturating_sub(prefix.width());
+    prefix.spans.push(Span::styled(
+        clip_work(&detail, remaining),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    ));
+    prefix
+}
+
+fn group_badges(row: &TreeRow, mark: Option<&WindowMarks>) -> Line<'static> {
+    let mut spans = Vec::new();
+    if !row.is_expanded && row.agent_count > 0 {
+        spans.push(Span::styled(
+            format!(" ({})", row.agent_count),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if let Some(mark) = mark {
         if mark.tasks_open > 0 {
-            line.spans.push(Span::styled(
+            spans.push(Span::styled(
                 format!(" {} open", mark.tasks_open),
                 Style::default().fg(Color::Cyan),
             ));
         }
         if mark.decisions_waiting > 0 {
-            line.spans.push(Span::styled(
+            spans.push(Span::styled(
                 format!(" ?{}", mark.decisions_waiting),
                 Style::default().fg(Color::Yellow),
             ));
         }
     }
-    if row.needs_attention || mark.is_some_and(|mark| mark.attention) {
-        line.spans
-            .push(Span::styled(" !", Style::default().fg(Color::Yellow)));
+    if row.needs_attention || mark.is_some_and(|m| m.attention) {
+        spans.push(Span::styled(" !", Style::default().fg(Color::Yellow)));
     }
-    line
+    Line::from(spans)
+}
+
+fn thread_headline<'a>(name: &'a str, marks: &'a WorkMarks) -> &'a str {
+    marks
+        .by_seat
+        .get(&SeatId(name.into()))
+        .map(|m| m.task_headline.as_deref().unwrap_or(&m.name))
+        .unwrap_or(name)
+}
+
+fn create_thread_line(
+    indent: &str,
+    name: &str,
+    row: &TreeRow,
+    selected: bool,
+    app: &App,
+    marks: &WorkMarks,
+    width: u16,
+) -> Line<'static> {
+    let id = SeatId(name.into());
+    let headline = thread_headline(name, marks);
+    let repos: std::collections::BTreeSet<_> = marks
+        .threads
+        .iter()
+        .filter(|(_, lead)| *lead == &id)
+        .filter_map(|(seat, _)| seat.0.rsplit_once('/').map(|(repo, _)| repo))
+        .collect();
+    let windows: Vec<_> = app
+        .work
+        .windows()
+        .iter()
+        .filter(|window| {
+            window.panes.iter().any(|pane| {
+                marks
+                    .by_pane
+                    .get(pane)
+                    .and_then(|m| marks.threads.get(&m.agent_id))
+                    == Some(&id)
+            })
+        })
+        .map(|w| w.name.as_str())
+        .collect();
+    let short = marks.by_seat.get(&id).map_or(name, |m| m.name.as_str());
+    let detail = format!(
+        "{} · {} · {}",
+        if headline == short {
+            String::new()
+        } else {
+            format!(" · {short}")
+        },
+        repos.into_iter().collect::<Vec<_>>().join(", "),
+        windows.join(", ")
+    );
+    work_group_line(
+        indent,
+        headline,
+        row,
+        selected,
+        marks.by_thread.get(&id),
+        detail,
+        width,
+    )
+}
+
+fn work_group_line(
+    indent: &str,
+    headline: &str,
+    row: &TreeRow,
+    selected: bool,
+    mark: Option<&WindowMarks>,
+    detail: String,
+    width: u16,
+) -> Line<'static> {
+    let icon = if !row.has_children {
+        " "
+    } else if row.is_expanded {
+        "▼"
+    } else {
+        "▸"
+    };
+    let prefix = Line::from(vec![
+        Span::styled(
+            if selected { ">" } else { " " },
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("{indent}{icon} ")),
+    ]);
+    work_caption(prefix, headline, group_badges(row, mark), detail, width)
+}
+
+fn create_window_line(
+    indent: &str,
+    window: (&str, &str),
+    row: &TreeRow,
+    selected: bool,
+    app: &App,
+    marks: &WorkMarks,
+    width: u16,
+) -> Line<'static> {
+    let (id, label) = window;
+    let leads = (app.work_grouping == WorkGrouping::Windows)
+        .then(|| app.work.windows().iter().find(|w| w.id.0 == id))
+        .flatten()
+        .and_then(|window| {
+            window
+                .panes
+                .iter()
+                .map(|pane| {
+                    marks
+                        .by_pane
+                        .get(pane)
+                        .and_then(|m| marks.threads.get(&m.agent_id))
+                })
+                .collect::<Option<std::collections::BTreeSet<_>>>()
+        });
+    let (headline, detail) = match leads.as_ref() {
+        Some(leads) if leads.len() == 1 => leads.first().map_or((label, String::new()), |lead| {
+            (
+                thread_headline(&lead.0, marks),
+                format!(" · {} · {label}", lead.0),
+            )
+        }),
+        Some(leads) if leads.len() > 1 => (
+            "Work threads",
+            format!(
+                " · {} · {label}",
+                leads
+                    .iter()
+                    .map(|id| id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
+        _ => (label, String::new()),
+    };
+    work_group_line(
+        indent,
+        headline,
+        row,
+        selected,
+        marks.by_window.get(&WindowId(id.into())),
+        detail,
+        width,
+    )
 }
 fn create_view_agent_line(
     indent: &str,
@@ -230,6 +493,7 @@ fn create_view_agent_line(
     app: &App,
     marks: &WorkMarks,
     compact: Option<u16>,
+    width: u16,
 ) -> Line<'static> {
     let work = app.view == AppView::Work;
     // In-process children share a pane; only a parent-less row may impersonate its seat.
@@ -241,72 +505,112 @@ fn create_view_agent_line(
     } else {
         None
     };
-    let mut display = Cow::Borrowed(session);
-    if let Some(mark) = mark {
-        let name = work_text(&mark.name);
-        display.to_mut().id_short = name.clone();
-        if compact.is_some() {
-            display.to_mut().worktree_branch = Some(name);
-        }
-    }
     let attention = mark.is_some_and(|mark| mark.attention);
     let waiting =
         app.has_waiting_decision(session) || mark.is_some_and(|mark| mark.decisions_waiting > 0);
     let coordinator = app.is_coordinator(session);
-    let mut line = match compact {
-        Some(width) => create_compact_agent_line(
-            indent,
-            &display,
-            selected,
-            app.blink_visible,
-            width.saturating_sub(if attention { 2 } else { 0 }),
-            coordinator,
-            waiting,
-        ),
-        None => create_agent_line(
-            indent,
-            &display,
-            selected,
-            app.blink_visible,
-            coordinator,
-            waiting,
-        ),
-    };
     if !work {
-        return line;
+        return match compact {
+            Some(width) => create_compact_agent_line(
+                indent,
+                session,
+                selected,
+                app.blink_visible,
+                width,
+                coordinator,
+                waiting,
+            ),
+            None => create_agent_line(
+                indent,
+                session,
+                selected,
+                app.blink_visible,
+                coordinator,
+                waiting,
+            ),
+        };
+    }
+    let name = mark.map_or(session.id_short.as_str(), |m| m.name.as_str());
+    let task = mark.and_then(|m| m.first_task.as_ref());
+    let task_headline = mark.and_then(|m| m.task_headline.as_deref());
+    let headline = task_headline.unwrap_or(name);
+    let mut badges = Vec::new();
+    if let Some(mark) = mark.filter(|m| m.tasks_open > 1) {
+        badges.push(Span::styled(
+            format!(" +{}", mark.tasks_open.saturating_sub(1)),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if waiting {
+        let count = mark.map_or(1, |m| m.decisions_waiting.max(1));
+        badges.push(Span::styled(
+            format!(" ?{count}"),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     if attention {
-        line.spans
-            .push(Span::styled(" !", Style::default().fg(Color::Yellow)));
+        badges.push(Span::styled(" !", Style::default().fg(Color::Yellow)));
     }
-    if let Some(mark) = mark {
-        if let Some(task) = &mark.first_task {
-            let mut text = format!(" ◐ {}", work_text(&task.id.0));
-            if let Some(title) = &task.title {
-                text.push_str(&format!(" {}", work_text(title)));
-            }
-            if mark.tasks_open > 1 {
-                text.push_str(&format!(" +{}", mark.tasks_open.saturating_sub(1)));
-            }
-            line.spans
-                .push(Span::styled(text, Style::default().fg(Color::Cyan)));
+    if coordinator {
+        badges.push(Span::styled(" C", Style::default().fg(Color::Cyan)));
+    }
+    let prefix = Line::from(vec![
+        Span::styled(
+            if selected { ">" } else { " " },
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(indent.to_string()),
+        Span::styled(
+            format!("{} ", status_icon(session.status, app.blink_visible)),
+            Style::default()
+                .fg(status_color(session.status))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    if let Some(task) = task.filter(|_| task_headline.is_none()) {
+        // Capped IDs are useful detail, but may not push required count markers off-screen.
+        let budget = usize::from(width)
+            .saturating_sub(prefix.width())
+            .saturating_sub(Span::raw(work_text(headline)).width())
+            .saturating_sub(badges.iter().map(Span::width).sum());
+        if budget > 0 {
+            badges.insert(
+                0,
+                Span::styled(
+                    clip_work(&format!(" ◐ {}", task.id.0), budget),
+                    Style::default().fg(Color::Cyan),
+                ),
+            );
         }
     }
-    // Compact unnamed rows already use their branch as their name; do not repeat it.
-    if compact.is_none() || mark.is_some() || session.worktree_branch.is_none() {
-        if let Some(branch) = session.worktree_branch.as_deref().or_else(|| {
+    let agent = if headline == name {
+        String::new()
+    } else {
+        format!(" · {name}")
+    };
+    let repo = session
+        .project_root
+        .as_deref()
+        .and_then(|p| p.rsplit('/').find(|s| !s.is_empty()))
+        .unwrap_or("");
+    let branch = session
+        .worktree_branch
+        .as_deref()
+        .or_else(|| {
             session
                 .worktree_path
                 .as_deref()
-                .map(|path| path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path))
-        }) {
-            line.spans.push(Span::styled(
-                format!(" {}", work_text(branch)),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-    }
-    line
+                .and_then(|p| p.rsplit('/').find(|s| !s.is_empty()))
+        })
+        .unwrap_or("");
+    let detail = format!(
+        "{agent} [{}] {:.0}% · {repo}/{branch}",
+        harness_label(&session.harness),
+        session.context_percentage
+    );
+    work_caption(prefix, headline, Line::from(badges), detail, width)
 }
 
 /// Dims an agent row shown only as the ancestor of a filter match.
@@ -323,6 +627,7 @@ fn create_tree_row_item(
     is_selected: bool,
     app: &App,
     marks: &WorkMarks,
+    width: u16,
 ) -> ListItem<'static> {
     let indent = "  ".repeat(row.depth as usize);
 
@@ -334,12 +639,15 @@ fn create_tree_row_item(
                 .unwrap_or_else(|| path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path));
             create_group_line(&indent, label, row, is_selected)
         }
+        TreeRowKind::Team { name } if app.view == AppView::Work => {
+            create_thread_line(&indent, name, row, is_selected, app, marks, width)
+        }
         TreeRowKind::Team { name } => create_group_line(&indent, name, row, is_selected),
         TreeRowKind::Window { id, label } => {
-            create_window_line(&indent, id, label, row, is_selected, marks)
+            create_window_line(&indent, (id, label), row, is_selected, app, marks, width)
         }
         TreeRowKind::Agent { session } => {
-            create_view_agent_line(&indent, session, is_selected, app, marks, None)
+            create_view_agent_line(&indent, session, is_selected, app, marks, None, width)
         }
     };
 
@@ -618,8 +926,8 @@ fn shows_empty_state(app: &App) -> bool {
 /// * `frame` - The frame to render into
 /// * `area` - The rectangular area for the empty state
 /// * `state` - Current connection state
-fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState) {
-    let (title, lines) = match state {
+fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState, title: Line<'static>) {
+    let (_, lines) = match state {
         AppState::Connected => (
             " No Sessions ",
             vec![

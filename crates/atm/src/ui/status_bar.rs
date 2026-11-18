@@ -117,7 +117,9 @@ pub fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     for entry in crate::keybinding::KEYBINDING_HINTS {
         // Skip entries not shown in footer
-        if entry.footer_key.is_empty() {
+        if entry.footer_key.is_empty()
+            || (app.show_help && matches!(entry.footer_key, "gt/gT" | "w"))
+        {
             continue;
         }
 
@@ -187,10 +189,12 @@ pub fn render_compact_footer(frame: &mut Frame, area: Rect, app: &App) {
         format!("/{}\u{258c}", app.filter_query)
     } else if app.filter_matches.is_some() {
         filter_indicator(app)
-    } else if app.pick_mode {
-        "? help [pick]".to_string()
-    } else {
+    } else if app.show_help {
         "? help".to_string()
+    } else if app.pick_mode {
+        "gt/gT tabs  w alias  ? help [pick]".to_string()
+    } else {
+        "gt/gT tabs  w alias  ? help".to_string()
     };
     let paragraph = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);

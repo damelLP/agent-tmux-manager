@@ -504,10 +504,16 @@ enum ListFormat {
 // ============================================================================
 
 fn create_log_file() -> Option<std::fs::File> {
+    create_log_file_with_warning(|warning| eprintln!("{warning}"))
+}
+
+fn create_log_file_with_warning(warn: impl FnOnce(String)) -> Option<std::fs::File> {
     let log_dir = atmd::eventlog::state_dir();
 
     if let Err(e) = fs::create_dir_all(&log_dir) {
-        eprintln!("Warning: Failed to create log directory {log_dir:?}: {e}");
+        warn(format!(
+            "Warning: Failed to create log directory {log_dir:?}: {e}"
+        ));
         return None;
     }
 
@@ -516,7 +522,9 @@ fn create_log_file() -> Option<std::fs::File> {
     match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(file) => Some(file),
         Err(e) => {
-            eprintln!("Warning: Failed to open log file {log_path:?}: {e}");
+            warn(format!(
+                "Warning: Failed to open log file {log_path:?}: {e}"
+            ));
             None
         }
     }

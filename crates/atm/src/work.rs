@@ -19,7 +19,31 @@ id!(PaneId);
 id!(SeatId);
 id!(TaskId);
 
+#[path = "work_threads.rs"]
+mod threads;
+pub(crate) use threads::build_work_threads;
+
+/// Work keeps physical windows reachable without adding another tab.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkGrouping {
+    #[default]
+    Threads,
+    Windows,
+}
+
 pub const NO_WINDOW: &str = "__no_window__";
+// atmd matches prefixes. Accounting/files/reminder audits do not change Work marks.
+const WORK_TOPICS: &[&str] = &[
+    "task.created",
+    "task.assigned",
+    "task.state_changed",
+    "task.submitted",
+    "task.review_started",
+    "task.verdict",
+    "decision.",
+    "agent.",
+    "msg.delivery_failed",
+];
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkWindow {
     pub id: WindowId,
@@ -55,6 +79,15 @@ fn agents(nodes: Vec<TreeNode>) -> Vec<TreeNode> {
         })
         .collect()
 }
+fn newest_agent_first(a: &TreeNode, b: &TreeNode) -> std::cmp::Ordering {
+    match (a, b) {
+        (TreeNode::Agent { session: a, .. }, TreeNode::Agent { session: b, .. }) => {
+            b.started_at.cmp(&a.started_at)
+        }
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 fn restore_parents(nodes: &mut [TreeNode], originals: &BTreeMap<&str, &SessionView>) {
     for node in nodes {
         if let TreeNode::Agent { session, subagents } = node {
@@ -124,12 +157,7 @@ pub fn build_work_tree(sessions: &[SessionView], windows: &[WorkWindow]) -> Vec<
             built = atm_core::build_tree(&group);
         }
         let mut children = agents(built);
-        children.sort_by(|a, b| match (a, b) {
-            (TreeNode::Agent { session: a, .. }, TreeNode::Agent { session: b, .. }) => {
-                b.started_at.cmp(&a.started_at)
-            }
-            _ => std::cmp::Ordering::Equal,
-        });
+        children.sort_by(newest_agent_first);
         restore_parents(&mut children, &originals);
         tree.push(TreeNode::Window {
             id: id.0,
@@ -157,6 +185,10 @@ pub struct WorkProject {
 pub struct WorkSeat {
     pub agent_id: SeatId,
     pub pane: Option<PaneId>,
+    #[serde(default)]
+    pub manager: Option<SeatId>,
+    #[serde(default)]
+    pub line_error: Option<String>,
     pub tasks: Vec<TaskId>,
 }
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +215,8 @@ pub struct PaneMarks {
     pub agent_id: SeatId,
     pub name: String,
     pub first_task: Option<TaskMark>,
+    /// First known assigned task title; independent of the first task's capped ID mark.
+    pub task_headline: Option<String>,
     pub tasks_open: usize,
     pub decisions_waiting: usize,
     pub attention: bool,
@@ -193,10 +227,21 @@ pub struct WindowMarks {
     pub decisions_waiting: usize,
     pub attention: bool,
 }
+impl WindowMarks {
+    pub(crate) fn include(&mut self, mark: &PaneMarks) {
+        self.tasks_open += mark.tasks_open;
+        self.decisions_waiting += mark.decisions_waiting;
+        self.attention |= mark.attention;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkMarks {
     pub by_pane: BTreeMap<PaneId, PaneMarks>,
     pub by_window: BTreeMap<WindowId, WindowMarks>,
+    pub by_seat: BTreeMap<SeatId, PaneMarks>,
+    pub threads: BTreeMap<SeatId, SeatId>,
+    pub by_thread: BTreeMap<SeatId, WindowMarks>,
 }
 
 #[must_use]
@@ -207,56 +252,65 @@ pub fn work_marks(org: &WorkOrg, windows: &[WorkWindow]) -> WorkMarks {
         .flat_map(|p| p.tasks.iter())
         .map(|t| (&t.task_id, &t.title))
         .collect();
-    let mut marks = WorkMarks::default();
-    for seat in org.projects.iter().flat_map(|p| &p.seats) {
-        let Some(pane) = &seat.pane else { continue };
+    let mut marks = WorkMarks {
+        threads: threads::reporting_threads(org),
+        ..Default::default()
+    };
+    for seat in threads::unique_seats(org).values() {
         let needs: Vec<_> = org
             .needs_owner
             .items
             .iter()
             .filter(|item| item.agent_id.as_ref() == Some(&seat.agent_id))
             .collect();
-        marks
-            .by_pane
-            .entry(pane.clone())
-            .or_insert_with(|| PaneMarks {
-                agent_id: seat.agent_id.clone(),
-                name: seat
-                    .agent_id
-                    .0
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&seat.agent_id.0)
-                    .into(),
-                first_task: seat.tasks.first().map(|id| TaskMark {
-                    id: id.clone(),
-                    title: tasks.get(id).map(|title| (*title).clone()),
-                }),
-                tasks_open: seat.tasks.len(),
-                decisions_waiting: needs
-                    .iter()
-                    .filter(|item| {
-                        matches!(
-                            item.kind.as_str(),
-                            "decision_pending" | "decision_provisional"
-                        )
-                    })
-                    .count(),
-                attention: needs.iter().any(|item| {
+        let mark = PaneMarks {
+            agent_id: seat.agent_id.clone(),
+            name: seat
+                .agent_id
+                .0
+                .rsplit('/')
+                .next()
+                .unwrap_or(&seat.agent_id.0)
+                .into(),
+            first_task: seat.tasks.first().map(|id| TaskMark {
+                id: id.clone(),
+                title: tasks.get(id).map(|title| (*title).clone()),
+            }),
+            task_headline: seat
+                .tasks
+                .iter()
+                .find_map(|id| tasks.get(id).map(|title| (*title).clone())),
+            tasks_open: seat.tasks.len(),
+            decisions_waiting: needs
+                .iter()
+                .filter(|item| {
                     matches!(
                         item.kind.as_str(),
-                        "seat_stuck" | "seat_attention" | "delivery_failed" | "line_broken"
+                        "decision_pending" | "decision_provisional"
                     )
-                }),
-            });
+                })
+                .count(),
+            attention: needs.iter().any(|item| {
+                matches!(
+                    item.kind.as_str(),
+                    "seat_stuck" | "seat_attention" | "delivery_failed" | "line_broken"
+                )
+            }),
+        };
+        if let Some(lead) = marks.threads.get(&seat.agent_id) {
+            let total = marks.by_thread.entry(lead.clone()).or_default();
+            total.include(&mark);
+        }
+        if let Some(pane) = &seat.pane {
+            marks.by_pane.insert(pane.clone(), mark.clone());
+        }
+        marks.by_seat.insert(seat.agent_id.clone(), mark);
     }
     for window in windows {
         let mut value = WindowMarks::default();
         for pane in window.panes.iter().collect::<BTreeSet<_>>() {
             if let Some(mark) = marks.by_pane.get(pane) {
-                value.tasks_open += mark.tasks_open;
-                value.decisions_waiting += mark.decisions_waiting;
-                value.attention |= mark.attention;
+                value.include(mark);
             }
         }
         marks.by_window.insert(window.id.clone(), value);
@@ -391,7 +445,11 @@ pub struct WorkState {
     org_supported: bool,
     watch_supported: bool,
     watching: bool,
-    watch_failed: bool,
+    watch_retry_at: Option<Duration>,
+    // No retry Watch until its post-failure org read succeeds.
+    watch_refresh_required: bool,
+    windows_unavailable: bool,
+    org_unavailable: bool,
     counter: u64,
     window_poll: Poll,
     org_poll: Poll,
@@ -407,7 +465,10 @@ impl Default for WorkState {
             org_supported: true,
             watch_supported: false,
             watching: false,
-            watch_failed: false,
+            watch_retry_at: None,
+            watch_refresh_required: false,
+            windows_unavailable: false,
+            org_unavailable: false,
             counter: 0,
             window_poll: Poll::default(),
             org_poll: Poll::default(),
@@ -424,6 +485,14 @@ impl WorkState {
     #[must_use]
     pub fn no_org_data(&self) -> bool {
         self.known && !self.org_supported
+    }
+    #[must_use]
+    pub fn windows_unavailable(&self) -> bool {
+        self.windows_supported && self.windows_unavailable
+    }
+    #[must_use]
+    pub fn org_unavailable(&self) -> bool {
+        self.windows_supported && self.org_supported && self.org_unavailable
     }
     #[must_use]
     pub fn windows(&self) -> &[WorkWindow] {
@@ -460,21 +529,26 @@ impl WorkState {
             self.watching = false;
         }
     }
+    fn watch_retry(&self) -> Option<Duration> {
+        self.watch_retry_at.filter(|_| {
+            self.org_supported
+                && self.watch_supported
+                && self.org.as_ref().and_then(|c| c.value.seq).is_some()
+        })
+    }
     fn watch(&mut self, effects: &mut Vec<WorkEffect>) {
         if self.visible
             && self.windows_supported
             && self.org_supported
             && self.watch_supported
-            && !self.watch_failed
+            && !self.watch_refresh_required
+            && self.watch_retry_at.is_none()
             && !self.watching
         {
             if let Some(cursor) = self.org.as_ref().and_then(|c| c.value.seq) {
                 effects.push(WorkEffect::Watch {
                     cursor,
-                    topics: ["task.", "decision.", "agent.", "msg.delivery_failed"]
-                        .into_iter()
-                        .map(Into::into)
-                        .collect(),
+                    topics: WORK_TOPICS.iter().map(|topic| (*topic).into()).collect(),
                 });
                 self.watching = true;
             }
@@ -486,23 +560,27 @@ impl WorkState {
         match input {
             WorkInput::Shown if !self.visible => {
                 self.visible = true;
-                self.watch_failed = false;
+                self.watch_retry_at = None;
+                self.watch_refresh_required = false;
                 self.window_poll.trigger(now);
                 self.org_poll.trigger(now);
             }
             WorkInput::Hidden => {
                 self.visible = false;
+                self.watch_retry_at = None;
+                self.watch_refresh_required = false;
                 self.window_poll.suspend();
                 self.org_poll.suspend();
                 self.unwatch(&mut effects);
             }
             WorkInput::Capabilities { methods, watch } => {
-                let reconnect = self.known;
+                let reconnect = self.known || self.watch_refresh_required;
                 self.known = true;
                 self.windows_supported = methods.iter().any(|m| m == "session.windows");
                 self.org_supported = methods.iter().any(|m| m == "org.tree");
                 self.watch_supported = watch;
-                self.watch_failed = false;
+                self.watch_retry_at = None;
+                self.watch_refresh_required = false;
                 if reconnect || !self.windows_supported {
                     self.window_poll.suspend();
                     self.org_poll.suspend();
@@ -526,7 +604,8 @@ impl WorkState {
                 }
             }
             WorkInput::Refresh if self.visible && self.windows_supported => {
-                self.watch_failed = false;
+                self.watch_retry_at = None;
+                self.watch_refresh_required = false;
                 self.window_poll.trigger(now);
                 self.org_poll.trigger(now);
             }
@@ -538,6 +617,7 @@ impl WorkState {
                     && self.visible
                     && self.windows_supported
                 {
+                    self.windows_unavailable = !matches!(&result, Ok(value) if value.state == "ok");
                     if let Ok(value) = result {
                         if value.state == "ok" {
                             self.windows = Some(Cached {
@@ -554,21 +634,25 @@ impl WorkState {
                     && self.windows_supported
                     && self.org_supported
                 {
+                    self.org_unavailable = result.is_err();
                     if let Ok(value) = result {
                         if value.seq.is_none() {
                             self.unwatch(&mut effects);
                         }
                         self.org = Some(Cached { value, at: now });
+                        if self.watch_retry_at.is_none() {
+                            self.watch_refresh_required = false;
+                        }
                         self.watch(&mut effects);
+                    } else if self.watch_refresh_required && self.watch_retry_at.is_none() {
+                        self.watch_retry_at = Some(now.saturating_add(Duration::from_secs(10)));
                     }
                 }
             }
             WorkInput::WatchEvent { seq, kind }
                 if self.visible && self.windows_supported && self.org_supported =>
             {
-                if ["task.", "decision.", "agent.", "msg.delivery_failed"]
-                    .iter()
-                    .any(|prefix| kind.starts_with(prefix))
+                if WORK_TOPICS.iter().any(|prefix| kind.starts_with(prefix))
                     && self
                         .org
                         .as_ref()
@@ -584,12 +668,22 @@ impl WorkState {
                 }
             }
             WorkInput::WatchFailed => {
-                self.watch_failed = true;
+                self.watch_retry_at = Some(now.saturating_add(Duration::from_secs(10)));
+                self.watch_refresh_required = true;
+                // Retain the slot and normal polling schedule, but no pre-failure
+                // reply may install a Watch on a later connection.
+                if let Some(read) = &mut self.org_poll.flight {
+                    read.valid = false;
+                }
                 self.unwatch(&mut effects);
             }
             _ => {}
         }
         if self.visible && self.windows_supported {
+            let retry_due = self.watch_retry().is_some_and(|at| at <= now);
+            if retry_due {
+                self.org_poll.trigger(now);
+            }
             self.window_poll.tick(now);
             if let Some(id) = self
                 .window_poll
@@ -603,6 +697,9 @@ impl WorkState {
                     self.org_poll
                         .start(now, Duration::from_secs(60), &mut self.counter)
                 {
+                    if retry_due {
+                        self.watch_retry_at = None;
+                    }
                     effects.push(WorkEffect::RequestOrg(id));
                 }
             }
@@ -611,6 +708,10 @@ impl WorkState {
                 .deadline()
                 .into_iter()
                 .chain(self.org_poll.deadline().filter(|_| self.org_supported))
+                .chain(
+                    self.watch_retry()
+                        .filter(|_| self.org_poll.flight.is_none()),
+                )
                 .min();
             if let Some(at) = deadline {
                 effects.push(WorkEffect::WakeAt(at));

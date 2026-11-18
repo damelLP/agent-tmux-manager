@@ -16,6 +16,9 @@ pub enum MockCall {
         subcommand: String,
         args: Vec<String>,
     },
+    LoadBuffer {
+        text: String,
+    },
     SplitWindow {
         target: String,
         size: String,
@@ -242,6 +245,12 @@ impl TmuxClient for MockTmuxClient {
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
         })?;
         Ok(output)
+    }
+
+    async fn load_buffer(&self, text: &str) -> Result<(), TmuxError> {
+        self.record(MockCall::LoadBuffer {
+            text: text.to_owned(),
+        })
     }
 
     async fn split_window(
@@ -537,6 +546,27 @@ mod tests {
             &calls[0],
             MockCall::DisplayPopup { command, .. } if command == "atm"
         ));
+    }
+
+    #[tokio::test]
+    async fn load_buffer_records_literal_text_and_returns_errors() {
+        let mock = MockTmuxClient::new();
+        let text = format!("- λ\n{}", "x".repeat(16_384));
+        mock.load_buffer(&text).await.unwrap();
+        mock.set_next_error(TmuxError::NotFound);
+        assert!(matches!(
+            mock.load_buffer("").await,
+            Err(TmuxError::NotFound)
+        ));
+        assert_eq!(
+            mock.calls(),
+            vec![
+                MockCall::LoadBuffer { text },
+                MockCall::LoadBuffer {
+                    text: String::new()
+                }
+            ]
+        );
     }
 
     #[tokio::test]

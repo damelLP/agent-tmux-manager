@@ -33,6 +33,7 @@ mod agent_screen;
 #[cfg(test)]
 mod agent_screen_tests;
 mod agent_types;
+mod agent_unreadable;
 pub mod agents;
 #[cfg(test)]
 mod agents_tests;

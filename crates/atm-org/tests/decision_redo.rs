@@ -161,6 +161,86 @@ fn redo_requires_reassigned_accepted_result_and_exact_repeat_does_not_reset() {
     assert_eq!(w.replay(), w.state);
 }
 
+// Break caught: settling a descendant's task leaves frozen redo outstanding forever.
+#[test]
+fn carry_back_does_not_settle_pending_decision_redo() {
+    let mut w = World::new();
+    let owner = support::decision_world::owner;
+    let d = w.request("alpha/lead", false);
+    let parent = w.create(Some(d), None, None);
+    let original = w.create(None, Some(parent), None);
+    w.assign(&original, "beta/lead").unwrap();
+    w.away();
+    w.take(d);
+    w.answer(d, "large").unwrap();
+    assert!(w
+        .state
+        .decision_redo(d)
+        .unwrap()
+        .required
+        .unwrap()
+        .contains(&original));
+    w.assign(&original, "beta/lead").unwrap();
+    let fix = w.create(None, None, None);
+    w.assign(&fix, "beta/lead").unwrap();
+    let review = w.create(None, None, Some(fix.clone()));
+    w.assign(&review, "gamma/chief").unwrap();
+    for (id, who) in [
+        (&fix, "beta/lead"),
+        (&review, "gamma/chief"),
+        (&original, "beta/lead"),
+    ] {
+        w.run(OrgCommand::Task(TaskCommand::Submit {
+            task_id: id.clone(),
+            what: TaskSubmission::Result,
+            files: vec![],
+            by: TaskActor {
+                who: who.parse().unwrap(),
+                manager_of: None,
+            },
+        }));
+    }
+    w.step(OrgCommand::Task(TaskCommand::Verdict {
+        task_id: fix.clone(),
+        verdict: TaskVerdict::Accepted,
+        review_task: Some(review.clone()),
+        note: None,
+        by: owner(),
+    }))
+    .unwrap();
+    w.run(OrgCommand::Task(TaskCommand::Verdict {
+        task_id: original.clone(),
+        verdict: TaskVerdict::ChangesRequested,
+        review_task: None,
+        note: None,
+        by: owner(),
+    }));
+    w.run(OrgCommand::Down {
+        agent_id: "beta/lead".parse().unwrap(),
+        reason: "fixture".into(),
+    });
+    let len = w.records.len();
+    let error = w
+        .step(OrgCommand::Task(TaskCommand::CarryBack {
+            task_id: original.clone(),
+            fix_task: fix,
+            review_task: review,
+            note: "Fix includes the new answer".into(),
+            by: owner(),
+        }))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("cannot carry back task {original}: it still needs decision redo")
+    );
+    assert_eq!(w.records.len(), len);
+    assert_eq!(
+        w.state.task(&original).unwrap().state,
+        TaskState::ChangesRequested
+    );
+    assert!(w.state.decision_redo(d).unwrap().completed.is_empty());
+}
+
 // Break caught: missing redo metadata is interpreted as a new destructive action.
 #[test]
 fn legacy_numbers_are_unrecorded_and_keep_caller() {

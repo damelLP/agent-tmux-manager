@@ -59,6 +59,16 @@ impl OrgState {
             .collect();
         Some(progress)
     }
+    pub(crate) fn task_needs_decision_redo(&self, id: &TaskId) -> bool {
+        self.redo_history.values().any(|record| {
+            let progress = &record.progress;
+            progress
+                .required
+                .as_ref()
+                .is_some_and(|ids| ids.contains(id))
+                && !progress.completed.contains(id)
+        })
+    }
     /// Exact committed msg.sent content is the completion marker, not delivery.
     #[must_use]
     pub fn redo_notices(&self) -> Vec<MessageContent> {
@@ -136,6 +146,7 @@ impl OrgState {
             );
             self.task_mut(task_id)?
                 .reopen_for_overrule(id, &resolution.option, at);
+            self.invalidate_accepted_result_review(task_id);
         }
         self.redo_history.insert(
             id,

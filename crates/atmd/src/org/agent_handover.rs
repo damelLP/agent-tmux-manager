@@ -17,7 +17,8 @@
 //! | Admission | the agent is ready with a bound session and no handover of it runs | Preflight refusal queues no request; after dispatch a request may be queued or delivered even when handover fails; nothing is cleared. |
 //! | Save requested | the request's delivery is confirmed | delivery failed for good, or the deadline: the request stays queued, a later handover reuses it, the owner's give-up cancels it |
 //! | Saving | the session is idle and the memory file has changed | the turn ended and the file did not change; the deadline; the agent or its session went away |
-//! | Saved | `agent.clear` answers | every refusal of `agent.clear`, with "saved its state" in front |
+//! | Saved | the same pane and session pass clear preflight | transient no-effect refusals retry for up to 20 s; changes of identity and every post-effect error stop |
+//! | Cleared | the new binding has the exact start-line receipt | otherwise the outcome does not claim resume, even though the command acknowledged clear |
 //!
 //! Nothing is cleared unless the file changed. Changed means: a regular file
 //! whose length or modification time differs from what was read before the
@@ -37,32 +38,35 @@
 //! Anyone may ask (attribution, not protection), also an agent about itself.
 //! An agent calls from inside its own turn, which must end before the request
 //! can be delivered, so that call answers `started` at once and the handover
-//! carries on. If it then fails, the agent's manager gets one note. A caller
-//! that waits gets the refusal as its answer and no note. A caller that goes
-//! away does not stop the handover; if its call has ended by the time the
-//! handover fails, the manager gets that same note. The daemon ends a call
-//! when the caller's socket closes (the connection drops this method's wait
-//! then) and at the method's deadline. A client that only half-closes keeps
-//! its call, and gets the answer.
+//! carries on. A waiting caller gets an error or physical-clear reply as
+//! before; only unclaimed failures before Saved get a note. After Saved,
+//! the job tells the manager once, independent of the RPC. It watches the
+//! committed evidence for 30 s after clear, without a pane reservation.
 //!
 //! The handover policy in `atm_org::idle` is not asked: a command may hand
 //! over at any context share.
 //!
 //! # Limits
 //!
-//! - A daemon restart loses a running handover. Its request is still
-//!   delivered and nothing is cleared; a new handover reuses an open request.
+//! - A daemon restart loses in-flight work and the outcome note, not any
+//!   effects or logs that already happened. A new handover reuses an open save request.
 //! - The note at the context line is remembered per agent in memory, so a
 //!   restart can repeat one note for a session.
-//! - The manager comes from the role as it was at `agent up`. An adopted
-//!   agent has no role on record and its notes go to the owner.
+//! - Outcome routing reads the current role with a bounded budget, falling
+//!   back to the role at up and then the owner. The separate context-line
+//!   note is unchanged.
 
 use super::{
     agent_context::{detached_read, manager_address, paths},
-    agents::{AgentError, AgentHandle, ClearParams, ClearResult},
+    agent_lifecycle::{ClearAttempt, ClearOutcome, SavedSeat},
+    agents::{AgentError, AgentHandle},
+    reporting_line::outcome_manager,
+    start_line::StartLineDisposition,
     OrgHandle,
 };
 use crate::{
+    control::reservation::PaneId,
+    eventlog::Envelope,
     registry::{RegistryHandle, SessionEvent},
     server::methods::{parse_params, CallContext, MethodError, MethodRouter},
 };
@@ -90,11 +94,16 @@ use tokio::{
     sync::{broadcast, oneshot, Semaphore},
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 /// The save may take this long: queueing, delivery and the save turn.
 pub const HANDOVER_TIMEOUT_MS: RangeInclusive<u64> = 30_000..=1_800_000;
 /// The clear after the save gets `agent.clear`'s longest timeout.
-const CLEAR_TIMEOUT_MS: u64 = 120_000;
+const CLEAR_TIMEOUT: Duration = Duration::from_secs(120);
+const CLEAR_RETRY: Duration = Duration::from_secs(20);
+const FIRST_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_BACKOFF: Duration = Duration::from_secs(4);
+const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest save, the clear, and room for the answer.
 const METHOD_DEADLINE: Duration = Duration::from_secs(1_800 + 150);
 
@@ -230,7 +239,7 @@ pub(super) fn save_progress(facts: SaveFacts, changed: bool) -> SaveProgress {
     }
 }
 
-type Answer<T> = Pin<Box<dyn Future<Output = Result<T, AgentError>> + Send>>;
+pub(super) type Answer<T> = Pin<Box<dyn Future<Output = Result<T, AgentError>> + Send>>;
 /// Resolves when a handover's save has taken too long.
 pub(super) type Deadline = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -238,7 +247,13 @@ pub(super) type Deadline = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub(super) trait Clearer: Send + Sync + 'static {
     /// Named-agent operations can run at all.
     fn available(&self) -> Answer<()>;
-    fn clear(&self, agent: AgentId) -> Answer<ClearResult>;
+    fn clear(
+        &self,
+        target: SavedSeat,
+        retry_before: Option<Instant>,
+        finish_by: Instant,
+    ) -> Answer<ClearAttempt>;
+    fn clear_wait(&self, _target: &SavedSeat, _reason: Option<String>) {}
 }
 
 impl Clearer for AgentHandle {
@@ -246,15 +261,29 @@ impl Clearer for AgentHandle {
         let agents = self.clone();
         Box::pin(async move { agents.reconciled().await })
     }
-    fn clear(&self, agent: AgentId) -> Answer<ClearResult> {
+    fn clear(
+        &self,
+        target: SavedSeat,
+        retry_before: Option<Instant>,
+        finish_by: Instant,
+    ) -> Answer<ClearAttempt> {
         let agents = self.clone();
-        Box::pin(async move {
-            let params = ClearParams {
-                agent,
-                timeout_ms: CLEAR_TIMEOUT_MS,
-            };
-            agents.clear(params).await
-        })
+        Box::pin(async move { agents.clear_handover(target, retry_before, finish_by).await })
+    }
+    fn clear_wait(&self, target: &SavedSeat, reason: Option<String>) {
+        self.set_handover_wait(target, reason);
+    }
+}
+
+/// Clear the list overlay even if a retained job is dropped.
+struct ClearWait<'a> {
+    clearer: &'a dyn Clearer,
+    target: &'a SavedSeat,
+}
+
+impl Drop for ClearWait<'_> {
+    fn drop(&mut self) {
+        self.clearer.clear_wait(self.target, None);
     }
 }
 
@@ -299,6 +328,11 @@ pub struct Handovers {
     clearer: Arc<dyn Clearer>,
     running: Arc<Mutex<BTreeSet<AgentId>>>,
     files: Arc<Semaphore>,
+    stop: CancellationToken,
+}
+
+fn agent_service_stopped() -> MethodError {
+    AgentError::Unavailable("agent service stopped".into()).into()
 }
 
 fn registry_stopped() -> MethodError {
@@ -313,16 +347,33 @@ impl Handovers {
     /// The service that clears through `agents`.
     #[must_use]
     pub fn for_agents(agents: AgentHandle, org: OrgHandle, registry: RegistryHandle) -> Self {
-        Self::new(org, registry, Arc::new(agents))
+        let stop = agents.stop_token();
+        Self::new(org, registry, Arc::new(agents), stop)
     }
 
-    pub(super) fn new(org: OrgHandle, registry: RegistryHandle, clearer: Arc<dyn Clearer>) -> Self {
+    pub(super) fn new(
+        org: OrgHandle,
+        registry: RegistryHandle,
+        clearer: Arc<dyn Clearer>,
+        stop: CancellationToken,
+    ) -> Self {
         Self {
             org,
             registry,
             clearer,
             running: Arc::default(),
             files: Arc::new(Semaphore::new(1)),
+            stop,
+        }
+    }
+
+    /// A retained job owns handles that keep the broadcast senders alive.
+    /// Stop it with the agent service, not with its RPC caller or those channels.
+    pub(super) async fn until_stopped<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.stop.cancelled() => None,
+            result = work => Some(result),
         }
     }
 
@@ -362,52 +413,144 @@ impl Handovers {
         deadline: Deadline,
     ) -> Result<HandoverResult, MethodError> {
         let agent = p.agent.clone();
-        let Admitted { job, own, manager } = self.admit(p, caller, deadline).await?;
-        let org = self.org.clone();
+        let admitted = self
+            .until_stopped(self.admit(p, caller, deadline, None))
+            .await
+            .ok_or_else(agent_service_stopped)??;
+        let service = self.clone();
         let (answer, waiting) = oneshot::channel();
         tokio::spawn(async move {
-            let mut answer = Some(answer);
-            let result = async {
-                let job = job.await?;
-                // Self must end its turn before delivery. Acknowledge only
-                // after both writes; this task still owns every later step.
-                if own {
-                    if let Some(answer) = answer.take() {
-                        let _ = answer.send(Ok(HandoverResult {
-                            agent_id: job.agent.clone(),
-                            message_id: job.message_id,
-                            state: HandoverState::Started,
-                            session_id: None,
-                        }));
-                    }
-                }
-                job.run().await
-            }
-            .await;
-            let unclaimed = match answer {
-                Some(answer) => answer.send(result),
-                None => Err(result),
-            };
-            // A waiting caller gets the error, or an unclaimed failure is
-            // told to the manager once, including admission write failures.
-            if let Err(Err(error)) = unclaimed {
-                let note = MessageContent {
-                    delivery_notice: None,
-                    from: Address::System,
-                    to: manager,
-                    kind: MessageKind::Note,
-                    body: format!("handover of {agent} did not complete: {}", error.0.message),
-                    attachments: Vec::new(),
-                    task: None,
-                };
-                if let Err(error) = org.execute(OrgCommand::SendMessage(note), Utc::now()).await {
-                    tracing::warn!(%agent, %error, "Handover failure note was not recorded");
-                }
-            }
+            service
+                .until_stopped(service.finish_admitted(
+                    &agent,
+                    admitted,
+                    NoteOrigin::Command,
+                    Some(answer),
+                ))
+                .await;
         });
-        waiting
-            .await
-            .map_err(|_| AgentError::Internal("handover task stopped".into()))?
+        waiting.await.map_err(|_| {
+            if self.stop.is_cancelled() {
+                agent_service_stopped()
+            } else {
+                AgentError::Internal("handover task stopped".into()).into()
+            }
+        })?
+    }
+
+    /// The RPC answer and the notice deliberately have different proof bars.
+    /// Release the reply after the physical clear, not after the resume turn.
+    pub(super) async fn finish_admitted(
+        &self,
+        agent: &AgentId,
+        admitted: Admitted,
+        origin: NoteOrigin,
+        mut reply: Option<HandoverReply>,
+    ) {
+        let Admitted { job, own, manager } = admitted;
+        let mut job = match job.await {
+            Ok(job) => job,
+            Err(error) => {
+                self.unsaved_failure(agent, manager, &origin, reply, error)
+                    .await;
+                return;
+            }
+        };
+        if own {
+            if let Some(reply) = reply.take() {
+                let _ = reply.send(Ok(HandoverResult {
+                    agent_id: agent.clone(),
+                    message_id: job.message_id,
+                    state: HandoverState::Started,
+                    session_id: None,
+                }));
+            }
+        }
+        let result = job.run().await;
+        let prefix = origin.prefix(agent, job.context_before);
+        let save = job.message_id;
+        let body = match result {
+            Ok(cleared) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Ok(cleared));
+                }
+                match job.confirm().await {
+                    Ok((new, resume)) => format!(
+                        "{prefix} complete: saved ({save}); cleared and bound {} -> {new}; resume prompt {resume} delivered.", job.session
+                    ),
+                    Err(reason) => format!("{prefix} did not complete: saved ({save}); clear confirmed; resume not confirmed: {reason}."),
+                }
+            }
+            Err(mut error) if job.saved_confirmed => {
+                let suffix = if job.retry_expired && matches!(origin, NoteOrigin::Automatic { .. })
+                {
+                    " Nothing more is tried automatically in this session. Inspect atm agent list."
+                } else {
+                    ""
+                };
+                let body = format!(
+                    "{prefix} did not complete: saved ({save}); {}.{suffix}",
+                    error.0.message
+                );
+                if let Some(reply) = reply {
+                    error.0.message =
+                        format!("{agent} saved its state ({save}); {}", error.0.message);
+                    let _ = reply.send(Err(error));
+                }
+                body
+            }
+            Err(error) => {
+                self.unsaved_failure(agent, manager, &origin, reply, error)
+                    .await;
+                return;
+            }
+        };
+        // The next handover may start once the proof/terminal outcome is
+        // decided. Publishing the notice does not need the claim.
+        drop(job);
+        self.publish_outcome(agent, manager, body).await;
+    }
+
+    async fn unsaved_failure(
+        &self,
+        agent: &AgentId,
+        manager: Address,
+        origin: &NoteOrigin,
+        reply: Option<HandoverReply>,
+        error: MethodError,
+    ) {
+        let body = match origin {
+            NoteOrigin::Command => format!("handover of {agent} did not complete: {error}"),
+            NoteOrigin::Automatic { why, .. } => format!(
+                "automatic handover of {agent} ({why}) did not complete: {error}. Nothing more is tried \
+                 in this session. By hand: atm agent handover {agent}"),
+        };
+        if reply.is_none_or(|reply| reply.send(Err(error)).is_err()) {
+            self.publish_outcome(agent, manager, body).await;
+        }
+    }
+
+    async fn publish_outcome(&self, agent: &AgentId, fallback: Address, body: String) {
+        let to = self.outcome_manager(agent, fallback).await;
+        let note = MessageContent {
+            delivery_notice: None,
+            from: Address::System,
+            to,
+            kind: MessageKind::Note,
+            body,
+            attachments: Vec::new(),
+            task: None,
+        };
+        if let Err(error) = self.execute(OrgCommand::SendMessage(note)).await {
+            tracing::warn!(%agent, %error, "Handover outcome note was not recorded");
+        }
+    }
+
+    async fn outcome_manager(&self, id: &AgentId, fallback: Address) -> Address {
+        let Ok(state) = self.org.snapshot().await else {
+            return fallback;
+        };
+        outcome_manager(&state, id, fallback, self.files.clone()).await
     }
 
     /// Preflight only: refusal here queues no request. The returned work
@@ -418,6 +561,7 @@ impl Handovers {
         p: HandoverParams,
         caller: CallContext,
         deadline: Deadline,
+        expected: Option<&SessionId>,
     ) -> Result<Admitted, MethodError> {
         self.clearer.available().await?;
         // Subscribed before anything is read or sent: what follows is an
@@ -441,6 +585,12 @@ impl Handovers {
                 p.agent
             ))
         })?;
+        if expected.is_some_and(|expected| *expected != session) {
+            return Err(refused(format!(
+                "agent {} changed sessions before automatic handover",
+                p.agent
+            )));
+        }
         let (_, memory) = paths(&state, agent)?;
         let own = caller
             .from_pane
@@ -452,6 +602,19 @@ impl Handovers {
         let request = save_request(&p.agent, &memory);
         let open = open_save_request(&state, &request);
         let pane = agent.pane.clone();
+        let context_before = if expected.is_none() {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                self.registry.get_session(session.clone()),
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.context_percentage)
+            .filter(|share| share.is_finite() && *share > 0.)
+        } else {
+            None
+        };
         let service = self.clone();
         // Unpolled until a retained owner exists: caller loss cannot land
         // between a queued request and ownership of the remaining work.
@@ -514,10 +677,41 @@ impl Handovers {
                 rows,
                 facts,
                 needs_input: false,
+                context_before,
+                saved_confirmed: false,
+                retry_expired: false,
+                completion: None,
                 _running: running,
             })
         });
         Ok(Admitted { job, own, manager })
+    }
+}
+
+type HandoverReply = oneshot::Sender<Result<HandoverResult, MethodError>>;
+
+pub(super) enum NoteOrigin {
+    Command,
+    Automatic {
+        why: String,
+        idle_share: Option<f64>,
+    },
+}
+
+impl NoteOrigin {
+    fn prefix(&self, agent: &AgentId, context_before: Option<f64>) -> String {
+        match self {
+            Self::Command => match context_before {
+                Some(share) => format!("handover of {agent} (context {share:.0}%)"),
+                None => format!("handover of {agent}"),
+            },
+            Self::Automatic { why, idle_share } => match idle_share {
+                Some(share) => {
+                    format!("automatic handover of {agent} ({why}; context {share:.0}%)")
+                }
+                None => format!("automatic handover of {agent} ({why})"),
+            },
+        }
     }
 }
 
@@ -547,37 +741,179 @@ pub(super) struct Job {
     facts: SaveFacts,
     /// The session's last status was "needs input": a dialog holds the turn.
     needs_input: bool,
+    context_before: Option<f64>,
+    saved_confirmed: bool,
+    retry_expired: bool,
+    completion: Option<ClearOutcome>,
     _running: Running,
 }
 
 impl Job {
-    pub(super) async fn run(mut self) -> Result<HandoverResult, MethodError> {
+    pub(super) async fn run(&mut self) -> Result<HandoverResult, MethodError> {
         self.saved().await?;
-        self.service
+        let saved = self
+            .service
             .execute(OrgCommand::Saved {
                 agent_id: self.agent.clone(),
                 message_id: self.message_id,
             })
             .await?;
-        let cleared = self
-            .service
-            .clearer
-            .clear(self.agent.clone())
-            .await
-            .map_err(|error| {
-                let mut error = MethodError::from(error);
-                error.0.message = format!(
-                    "{} saved its state ({}); {}",
-                    self.agent, self.message_id, error.0.message
-                );
-                error
-            })?;
+        let saved_seq = saved
+            .first()
+            .ok_or_else(|| AgentError::Internal("the saved audit committed no event".into()))?
+            .seq;
+        self.saved_confirmed = true;
+        let cleared = self.clear_saved(saved_seq).await?;
+        let session_id = cleared.result.session_id.clone();
+        self.completion = Some(cleared);
         Ok(HandoverResult {
             agent_id: self.agent.clone(),
             message_id: self.message_id,
             state: HandoverState::Cleared,
-            session_id: cleared.session_id,
+            session_id,
         })
+    }
+
+    async fn confirm(&mut self) -> Result<(SessionId, MessageId), String> {
+        let Some(clear) = &self.completion else {
+            return Err("the start line could not be identified".into());
+        };
+        use StartLineDisposition::{Off, Track, Unidentified};
+        let resume = match clear.start_line {
+            Track(id) => id,
+            Off => return Err("start lines are disabled".into()),
+            Unidentified => return Err("the start line could not be identified".into()),
+        };
+        let ready = clear
+            .ready_seq
+            .ok_or_else(|| evidence_unavailable("no clear Ready record"))?;
+        // The Ready write returned this cursor under the reservation. Capture
+        // it there; a later snapshot cannot tell this clear from another one.
+        let mut events = self
+            .service
+            .org
+            .watch(vec!["agent.".into(), "msg.".into()], ready)
+            .map_err(evidence_unavailable)?;
+        let mut facts = ResumeFacts {
+            bound: clear.result.session_id.clone(),
+            receipt: None,
+        };
+        let deadline = tokio::time::sleep(RESUME_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut deadline => return Err(format!("no matching new binding and receipt for start line {resume} within 30 s")),
+                event = events.next() => {
+                    let event = event.map_err(evidence_unavailable)?.ok_or_else(|| evidence_unavailable("watch stopped"))?;
+                    if let Some(session) = facts.apply(&event, &self.agent, &self.session, resume)? {
+                        return Ok((session, resume));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn clear_saved(&mut self, saved_seq: u64) -> Result<ClearOutcome, MethodError> {
+        let target =
+            SavedSeat {
+                agent: self.agent.clone(),
+                pane: PaneId::parse(self.pane.clone().ok_or_else(|| {
+                    AgentError::Refused(format!("agent {} has no pane", self.agent))
+                })?)
+                .map_err(AgentError::from)?,
+                session: self.session.clone(),
+            };
+        let clearer = self.service.clearer.clone();
+        let _reset = ClearWait {
+            clearer: clearer.as_ref(),
+            target: &target,
+        };
+        let finish_by = Instant::now() + CLEAR_TIMEOUT;
+        let mut cutoff = None;
+        let mut last = "the editor is not empty and idle";
+        let mut delay = FIRST_BACKOFF;
+        loop {
+            match clearer.clear(target.clone(), cutoff, finish_by).await? {
+                ClearAttempt::Cleared(result) => return Ok(result),
+                ClearAttempt::Expired => break,
+                ClearAttempt::Blocked(reason) => last = reason,
+            }
+            let now = Instant::now();
+            let at = *cutoff.get_or_insert_with(|| {
+                tracing::debug!(agent=%target.agent, pane=%target.pane, session=%target.session,
+                    save=%self.message_id, refusal=last, "Handover clear waiting");
+                (now + CLEAR_RETRY).min(finish_by)
+            });
+            clearer.clear_wait(
+                &target,
+                Some(format!(
+                    "handover saved ({}); waiting for a safe editor to clear: {last}",
+                    self.message_id
+                )),
+            );
+            if !self
+                .next_clear_check(&target, saved_seq, at, now + delay)
+                .await
+                .map_err(|error| match error {
+                    AgentError::Unavailable(reason) => MethodError::new(error_code::UNAVAILABLE, format!(
+                        "could not wait for another screen observation ({reason}); last clear refusal: {}",
+                        target.refusal(last),
+                    )),
+                    error => error.into(),
+                })?
+            {
+                break;
+            }
+            delay = (delay * 2).min(MAX_BACKOFF);
+        }
+        self.retry_expired = true;
+        Err(retry_expired(&target, last).into())
+    }
+
+    /// One session wake or a bounded backoff sample, never concurrent with a
+    /// preflight. Expiry wins even when both channels are continuously ready.
+    async fn next_clear_check(
+        &mut self,
+        target: &SavedSeat,
+        saved_seq: u64,
+        cutoff: Instant,
+        retry_at: Instant,
+    ) -> Result<bool, AgentError> {
+        loop {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(cutoff) => return Ok(false),
+                event = self.committed.recv() => match event {
+                    Ok(event) if event.seq > saved_seq && lifecycle_of(&event, &target.agent) => return Err(target.changed()),
+                    Ok(_) => {},
+                    Err(error) => return Err(AgentError::Unavailable(format!("handover lifecycle evidence: {error}"))),
+                },
+                () = tokio::time::sleep_until(retry_at) => break,
+                row = self.rows.recv() => {
+                    let row = row.map_err(|error| AgentError::Unavailable(format!("session registry evidence: {error}")))?;
+                    if target.row_wake(&row)? {
+                        break;
+                    }
+                },
+            }
+        }
+        // Coalesce only after inspecting the backlog, including when the
+        // timer won. A move or removal still matters if the row came back.
+        for _ in 0..=self.rows.len() {
+            match self.rows.try_recv() {
+                Ok(row) => {
+                    target.row_wake(&row)?;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => {
+                    return Err(AgentError::Unavailable(format!(
+                        "session registry evidence: {error}"
+                    )))
+                }
+            }
+        }
+        Ok(Instant::now() < cutoff)
     }
 
     /// Returns once the save turn has ended with the memory file changed.
@@ -735,6 +1071,97 @@ impl Job {
             format!("{reason}; nothing was cleared"),
         )
     }
+}
+
+fn evidence_unavailable(error: impl std::fmt::Display) -> String {
+    format!("committed evidence unavailable ({error})")
+}
+
+// The watch is in commit order. Only its first new binding belongs to an
+// unbound clear; a later lifecycle change cannot supply the missing proof.
+#[derive(Debug, Default)]
+pub(super) struct ResumeFacts {
+    pub bound: Option<SessionId>,
+    pub receipt: Option<SessionId>,
+}
+
+impl ResumeFacts {
+    pub(super) fn apply(
+        &mut self,
+        event: &Envelope,
+        agent: &AgentId,
+        old: &SessionId,
+        resume: MessageId,
+    ) -> Result<Option<SessionId>, String> {
+        let body = |key: &str| event.body.get(key).and_then(serde_json::Value::as_str);
+        let session = || {
+            body("session_id")
+                .map(SessionId::new)
+                .filter(|id| !id.is_pending() && id != old)
+        };
+        if lifecycle_of(event, agent) {
+            if event.kind == "agent.session_bound" && self.bound.is_none() {
+                self.bound = Some(session().ok_or("the agent left the cleared lifecycle")?);
+            } else {
+                return Err("the agent left the cleared lifecycle".into());
+            }
+        }
+        let mismatched =
+            || format!("start line {resume} was not confirmed in the replacement session");
+        if body("message_id") == Some(resume.to_string().as_str()) {
+            if event.kind == "msg.delivered" {
+                self.receipt = Some(
+                    session()
+                        .filter(|_| body("confirmation") == Some("prompt_submit_exact_reference"))
+                        .ok_or_else(mismatched)?,
+                );
+            } else if event.kind == "msg.delivery_failed"
+                && event
+                    .body
+                    .get("final_failure")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            {
+                return Err(format!(
+                    "start line {resume} failed: {}",
+                    body("reason").unwrap_or("no reason recorded")
+                ));
+            }
+        }
+        match (&self.bound, &self.receipt) {
+            (Some(bound), Some(receipt)) if bound == receipt => Ok(Some(bound.clone())),
+            (Some(_), Some(_)) => Err(mismatched()),
+            _ => Ok(None),
+        }
+    }
+}
+
+fn retry_expired(target: &SavedSeat, last: &str) -> AgentError {
+    AgentError::Refused(format!(
+        "clear retry window expired; last clear refusal: {}",
+        target.refusal(last)
+    ))
+}
+
+/// Committed lifecycle changes; the save/saved notices are not transitions.
+fn lifecycle_of(event: &Envelope, id: &AgentId) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "agent.up_requested"
+            | "agent.adopted"
+            | "agent.pane_created"
+            | "agent.session_bound"
+            | "agent.session_lost"
+            | "agent.editor_ready"
+            | "agent.revalidation_requested"
+            | "agent.clear_requested"
+            | "agent.down"
+            | "agent.stuck"
+    ) && event
+        .body
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(id.to_string().as_str())
 }
 
 /// Always advertised; with agents or persistence disabled it answers unavailable.

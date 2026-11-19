@@ -19,10 +19,12 @@
 //! this is another reason downgrading a newer log is not a safety guarantee.
 //!
 //! `msg.sent.delivery_notice` optionally records `{source_message_id, reason}`
-//! on a system-to-owner note. The note and its lifetime semantic key commit in
-//! one record; serialized SendMessage repeats emit nothing. Absent/null metadata
-//! reads as None and is omitted on write, preserving older bodies byte-for-byte.
-//! Older readers ignore the field but cannot preserve deduplication. Old unkeyed
+//! on a system note. Its lifetime key is independent of the note's audience:
+//! normally the owner, or a registered agent for a routable reason on ordinary
+//! mail to a different named seat. Absent/null metadata reads as None and is
+//! omitted on write, preserving older bodies byte-for-byte. Readers that only
+//! accept owner-addressed keys must be upgraded before any routed note is written.
+//! Pre-key readers ignore the field and cannot preserve deduplication. Unkeyed
 //! notes do not claim keys and may be followed by one keyed note after upgrade.
 
 use crate::{
@@ -66,6 +68,16 @@ pub enum MessageKind {
 pub struct DeliveryNotice {
     pub source_message_id: MessageId,
     pub reason: String,
+}
+
+impl DeliveryNotice {
+    /// Whether this reason may be routed to a manager. The organisation fold
+    /// separately validates the notice's source and both addresses.
+    #[must_use]
+    pub fn may_route_to_manager(&self) -> bool {
+        matches!(self.reason.as_str(), "unobserved" | "evidence_unavailable")
+            || matches!(self.reason.split_once('.'), Some(("blocked" | "hold", cause)) if !cause.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

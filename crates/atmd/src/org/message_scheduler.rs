@@ -5,7 +5,8 @@
 //! for an attempt the executor returned from, persists late receipts (for a
 //! finally failed message too), serves the owner's retry and give-up, takes a
 //! fresh observation, and evaluates the real policy on history's snapshot for
-//! every open message in FIFO order. A job never sends input: on PasteNow or
+//! every open message in delivery order (an open clear start line first,
+//! then FIFO). A job never sends input: on PasteNow or
 //! one eligible held-draft recovery it takes one of the eight admission permits
 //! and calls the executor once, and
 //! nothing else is decided for that recipient until the executor has returned
@@ -64,6 +65,7 @@
 //! unattempted message after thirty minutes. Lost observations and new turns
 //! restart the eligibility clock, not the lifetime notice key.
 
+use super::agent_unreadable::ScreenSample;
 use super::agents::{AgentHandle, Recipient};
 use super::message_delivery::{attempt_session, deliver, observation, ATTEMPT_WORK_BUDGET};
 use super::message_history::{
@@ -75,7 +77,6 @@ use super::messages::{
     focus_notice, Address, DeliveryPhase, DeliveryStatus, MessageContent, MessageError, MessageId,
     MessageKind, MessageRuntime, Service, FOCUS_NOTICE_REASON,
 };
-use super::start_line::delivery_line;
 use super::OrgServiceError;
 use crate::{
     control::{
@@ -87,7 +88,8 @@ use crate::{
 use atm_core::{DialogState, InputState, ScreenFacts, TurnState};
 use atm_org::{
     delivery::{
-        busy_notice_due, next_delivery, DeliveryStep, FailureReason, WaitReason, BUSY_NOTICE_AFTER,
+        busy_notice_due, next_delivery, DeliveryStep, FailureReason, PaneLiveness, WaitReason,
+        BUSY_NOTICE_AFTER,
     },
     Agent, AgentId, AgentStatus, DeliveryNotice, DeliveryReceipt, OrgCommand,
 };
@@ -128,8 +130,8 @@ pub(super) type Deliver = Arc<
 >;
 /// A fresh observation of one recipient, or why there is none. It takes no
 /// reservation and sends nothing.
-pub(super) type Observe =
-    Arc<dyn Fn(Agent) -> Boxed<Result<RecipientObservation, MessageError>> + Send + Sync>;
+type Observed = (RecipientObservation, Option<Instant>);
+pub(super) type Observe = Arc<dyn Fn(Agent) -> Boxed<Result<Observed, MessageError>> + Send + Sync>;
 
 #[derive(Clone)]
 pub(super) struct Effects {
@@ -161,12 +163,33 @@ async fn observe(
     control: ControlHandle,
     agents: AgentHandle,
     agent: Agent,
-) -> Result<RecipientObservation, MessageError> {
+) -> Result<Observed, MessageError> {
     let recipient = (agents.recipient(&agent.id).await)
         .map_err(|error| MessageError::Unavailable(error.to_string()))?;
     let format = recipient.screen.capture_format();
     let capture = control.observe(&recipient.pane, format).await?;
-    observed(&agent.id, &recipient, &capture)
+    let at = Instant::now();
+    let screen = recipient.screen;
+    let control = screen.control(&capture, &recipient.baseline);
+    let episode = if matches!(recipient.status, AgentStatus::Starting | AgentStatus::Ready) {
+        agents
+            .screens()
+            .zip(ScreenSample::read(
+                screen,
+                &recipient.baseline,
+                &capture,
+                &recipient.pane,
+                Some(&agent.id.to_string()),
+                recipient.session_id.as_ref(),
+                &control,
+            ))
+            .and_then(|(tracker, sample)| {
+                tracker.record(&agent.id, sample, at, recipient.cursor, None)
+            })
+    } else {
+        None
+    };
+    observed(&agent.id, &recipient, &capture, control.facts).map(|seen| (seen, episode))
 }
 
 /// What one recipient answer and one capture of its pane say, through the
@@ -183,6 +206,7 @@ pub(super) fn observed(
     agent: &AgentId,
     recipient: &Recipient,
     capture: &PaneCapture,
+    facts: ScreenFacts,
 ) -> Result<RecipientObservation, MessageError> {
     if capture.inspection.local_agent_tag.as_deref() != Some(agent.to_string().as_str()) {
         return Err(MessageError::Conflict(format!(
@@ -197,7 +221,7 @@ pub(super) fn observed(
             recipient.session.as_ref().map(|row| &row.id),
         )?;
     }
-    observation(recipient, capture)
+    observation(recipient, capture, Some(facts))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +591,7 @@ struct Job {
     effects: Effects,
     recipient: AgentId,
     observed: Option<Instant>,
+    unreadable_episode: Option<Instant>,
     /// The last recorded observation's focus sample; None when it was lost.
     focused: Option<bool>,
     /// Inspection hint only; the claimed executor repeats every final guard.
@@ -589,6 +614,7 @@ impl Job {
             effects,
             recipient,
             observed: None,
+            unreadable_episode: None,
             focused: None,
             recovery_ready: false,
             lost: None,
@@ -719,7 +745,7 @@ impl Job {
                 phase: Some(phase),
                 reason,
                 retry_at,
-                // The inbox reads the FIFO predecessor from history itself.
+                // The inbox reads the delivery predecessor from history itself.
                 blocked_by: None,
             },
         );
@@ -737,6 +763,7 @@ impl Job {
             // Said positively, so that the agent's applied status decides,
             // not the unknown focus of a pane that does not exist.
             self.focused = Some(false);
+            self.unreadable_episode = None;
             self.recovery_ready = false;
             self.lost = None;
             let observation = RecipientObservation {
@@ -767,7 +794,7 @@ impl Job {
             .unwrap_or(Err(MessageError::Timeout));
         self.observed = Some(Instant::now());
         let now = rt.clock.now()?;
-        let recorded = observed.and_then(|observation| {
+        let recorded = observed.and_then(|(observation, episode)| {
             let focused = observation.focused;
             let recovery_ready = observation.presence == PanePresence::Alive
                 && observation.facts.input == InputState::Draft
@@ -781,11 +808,12 @@ impl Job {
             };
             rt.history
                 .record(update, now)
-                .map(|()| (focused, recovery_ready))
+                .map(|()| (focused, recovery_ready, episode))
         });
         match recorded {
-            Ok((focused, recovery_ready)) => {
+            Ok((focused, recovery_ready, episode)) => {
                 self.focused = focused;
+                self.unreadable_episode = episode;
                 self.recovery_ready = recovery_ready;
                 self.lost = None;
             }
@@ -796,6 +824,7 @@ impl Job {
                 // cannot take the loss fails the step that follows.
                 tracing::debug!(%recipient, %error, "Recipient observation lost");
                 self.focused = None;
+                self.unreadable_episode = None;
                 self.recovery_ready = false;
                 let since = Instant::now();
                 (self.lost).get_or_insert(Lost { since, told: None });
@@ -927,7 +956,23 @@ impl Job {
                 let text = blocked_reason(reason, snapshot.hold);
                 self.show(id, DeliveryPhase::Blocked, Some(text.clone()), None);
                 let tag = blocked_notice_tag(reason, snapshot.hold);
-                self.blocked_notice(id, &tag, &text, latched).await?;
+                // Starting is a state, not proof that parsing is what kept
+                // the agent from becoming Ready. Only these Unknown guards
+                // from this job's attributable frame can be the same cause.
+                let duplicate = reason == FailureReason::ReadinessTimeout
+                    && snapshot.live.pane == PaneLiveness::Alive
+                    && snapshot.live.copy_mode == Some(false)
+                    && snapshot.live.dialog_open.is_none()
+                    && rt
+                        .agents
+                        .screens()
+                        .zip(self.unreadable_episode)
+                        .is_some_and(|(screens, episode)| {
+                            screens.reported(&snapshot.recipient, episode)
+                        });
+                if !duplicate {
+                    self.blocked_notice(id, &tag, &text, latched).await?;
+                }
                 if reason == FailureReason::ProbablyDelivered
                     && snapshot.blocked_by.is_none()
                     && rt
@@ -969,18 +1014,10 @@ impl Job {
     ) -> Result<Next, MessageError> {
         let service = self.service.clone();
         let snapshot = service.rt.history.snapshot(id, now)?;
-        if matches!(
-            snapshot.message.status,
-            DeliveryStatus::Delivered | DeliveryStatus::Failed
-        ) {
-            // Settled while this round ran: delivered and acknowledged, or
-            // failed for good and forgotten. Expecting it again would hold
-            // its reference for ever.
-            return Ok(Next::Change);
-        }
-        let line = delivery_line(id, &snapshot.message.content);
-        let Err(error) = service.rt.evidence.register(id, line) else {
-            return Ok(Next::Again);
+        let error = match service.rt.register_for_delivery(&snapshot.message, now) {
+            Ok(true) => return Ok(Next::Again),
+            Ok(false) => return Ok(Next::Change),
+            Err(error) => error,
         };
         let text = error.to_string();
         self.show(id, DeliveryPhase::Blocked, Some(text.clone()), None);
@@ -1056,6 +1093,12 @@ impl Job {
             permit = rt.admissions.clone().acquire_owned() => permit
                 .map_err(|_| MessageError::Unavailable("message admissions closed".into()))?,
         };
+        // The last snapshot may predate an ack while admission was parked.
+        // The writer still arbitrates a cancellation after this check.
+        let status = rt.history.snapshot(id, rt.clock.now()?)?.message.status;
+        if matches!(status, DeliveryStatus::Delivered | DeliveryStatus::Failed) {
+            return Ok(Next::Again);
+        }
         self.show(id, DeliveryPhase::Delivering, None, None);
         let deadline = Instant::now() + ATTEMPT_WORK_BUDGET;
         let delivered = (self.effects.deliver)(rt.clone(), id, deadline).await;
@@ -1225,7 +1268,8 @@ impl Job {
     ) -> Result<(), MessageError> {
         let behind: Vec<MessageId> = (self.service.open(&self.recipient).unwrap_or_default())
             .into_iter()
-            .filter(|other| *other > id)
+            .skip_while(|other| *other != id)
+            .skip(1)
             .collect();
         let body = blocked_notice(id, reason, &behind, latched);
         self.publish(id, tag, note(body)).await

@@ -54,6 +54,30 @@
 use atm_core::{ContextUsage, LifecycleEvent, SessionDomain, StatusLineData, TokenCount};
 use serde::Deserialize;
 
+/// A compact version token suitable for a user-facing diagnostic.
+fn version_token(value: &str) -> bool {
+    value.len() <= 64
+        && value.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+}
+
+#[must_use]
+pub fn session_version(session: &SessionDomain) -> Option<&str> {
+    session
+        .claude_code_version
+        .as_deref()
+        .filter(|v| version_token(v))
+}
+
+/// A partial or invalid status update must not erase a reported version.
+pub fn remember_session_version(session: &mut SessionDomain, data: &StatusLineData) {
+    if let Some(version) = data.version.as_ref().filter(|v| version_token(v)) {
+        session.claude_code_version = Some(version.clone());
+    }
+}
+
 /// Raw status line JSON structure from Claude Code.
 ///
 /// Written in c2a89f0 on 2026-01-25 from "validated integration testing

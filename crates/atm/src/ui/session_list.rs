@@ -341,6 +341,13 @@ fn group_badges(row: &TreeRow, mark: Option<&WindowMarks>) -> Line<'static> {
     Line::from(spans)
 }
 
+fn append_work_detail(detail: &mut String, part: &str) {
+    if !part.is_empty() {
+        detail.push_str(" · ");
+        detail.push_str(part);
+    }
+}
+
 fn thread_headline<'a>(name: &'a str, marks: &'a WorkMarks) -> &'a str {
     marks
         .by_seat
@@ -365,6 +372,7 @@ fn create_thread_line(
         .iter()
         .filter(|(_, lead)| *lead == &id)
         .filter_map(|(seat, _)| seat.0.rsplit_once('/').map(|(repo, _)| repo))
+        .filter(|repo| !repo.is_empty())
         .collect();
     let windows: Vec<_> = app
         .work
@@ -380,18 +388,18 @@ fn create_thread_line(
             })
         })
         .map(|w| w.name.as_str())
+        .filter(|name| !name.is_empty())
         .collect();
     let short = marks.by_seat.get(&id).map_or(name, |m| m.name.as_str());
-    let detail = format!(
-        "{} · {} · {}",
-        if headline == short {
-            String::new()
-        } else {
-            format!(" · {short}")
-        },
-        repos.into_iter().collect::<Vec<_>>().join(", "),
-        windows.join(", ")
+    let mut detail = String::new();
+    if headline != short {
+        append_work_detail(&mut detail, short);
+    }
+    append_work_detail(
+        &mut detail,
+        &repos.into_iter().collect::<Vec<_>>().join(", "),
     );
+    append_work_detail(&mut detail, &windows.join(", "));
     work_group_line(
         indent,
         headline,
@@ -444,17 +452,17 @@ fn create_window_line(
     let leads = (app.work_grouping == WorkGrouping::Windows)
         .then(|| app.work.windows().iter().find(|w| w.id.0 == id))
         .flatten()
-        .and_then(|window| {
+        .map(|window| {
             window
                 .panes
                 .iter()
-                .map(|pane| {
+                .filter_map(|pane| {
                     marks
                         .by_pane
                         .get(pane)
                         .and_then(|m| marks.threads.get(&m.agent_id))
                 })
-                .collect::<Option<std::collections::BTreeSet<_>>>()
+                .collect::<std::collections::BTreeSet<_>>()
         });
     let (headline, detail) = match leads.as_ref() {
         Some(leads) if leads.len() == 1 => leads.first().map_or((label, String::new()), |lead| {
@@ -585,7 +593,7 @@ fn create_view_agent_line(
             );
         }
     }
-    let agent = if headline == name {
+    let agent = if headline == name || name.is_empty() {
         String::new()
     } else {
         format!(" · {name}")
@@ -593,23 +601,31 @@ fn create_view_agent_line(
     let repo = session
         .project_root
         .as_deref()
-        .and_then(|p| p.rsplit('/').find(|s| !s.is_empty()))
-        .unwrap_or("");
+        .and_then(|p| p.rsplit('/').find(|s| !s.is_empty()));
     let branch = session
         .worktree_branch
         .as_deref()
+        .filter(|branch| !branch.is_empty())
         .or_else(|| {
             session
                 .worktree_path
                 .as_deref()
                 .and_then(|p| p.rsplit('/').find(|s| !s.is_empty()))
-        })
-        .unwrap_or("");
-    let detail = format!(
-        "{agent} [{}] {:.0}% · {repo}/{branch}",
+        });
+    let mut detail = format!(
+        "{agent} [{}] {:.0}%",
         harness_label(&session.harness),
         session.context_percentage
     );
+    if let Some(repo) = repo {
+        append_work_detail(&mut detail, repo);
+        if let Some(branch) = branch {
+            detail.push('/');
+            detail.push_str(branch);
+        }
+    } else if let Some(branch) = branch {
+        append_work_detail(&mut detail, branch);
+    }
     work_caption(prefix, headline, Line::from(badges), detail, width)
 }
 
@@ -1041,7 +1057,217 @@ fn render_empty_state(frame: &mut Frame, area: Rect, state: &AppState, title: Li
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atm_core::SessionStatus;
+    use crate::work::{WorkEffect, WorkInput, WorkOrg, WorkWindow, WorkWindows};
+    use atm_core::{SessionStatus, TreeNodeId};
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn load_caption_windows(app: &mut App, windows: Vec<WorkWindow>) {
+        let generation = app
+            .work
+            .reduce(WorkInput::Shown, Duration::ZERO)
+            .into_iter()
+            .find_map(|effect| match effect {
+                WorkEffect::RequestWindows(generation) => Some(generation),
+                _ => None,
+            })
+            .unwrap();
+        let _ = app.work.reduce(
+            WorkInput::WindowsReply {
+                generation,
+                result: Ok(WorkWindows {
+                    state: "ok".into(),
+                    windows,
+                }),
+            },
+            Duration::ZERO,
+        );
+    }
+
+    fn expanded_group(node_id: TreeNodeId, kind: TreeRowKind) -> TreeRow {
+        TreeRow {
+            depth: 0,
+            node_id,
+            kind,
+            is_expanded: true,
+            agent_count: 1,
+            needs_attention: false,
+            has_children: true,
+        }
+    }
+
+    // Break caught: unknown panes erase known leads, or a mixed window picks a lead by pane order.
+    #[test]
+    fn window_headline_ignores_unattributed_panes() {
+        let org: WorkOrg = serde_json::from_value(json!({"projects":[{
+            "seats":[
+                {"agent_id":"alpha/lead","pane":"%1","manager":"owner","tasks":["t1"]},
+                {"agent_id":"alpha/one","pane":"%2","manager":"alpha/lead","tasks":[]},
+                {"agent_id":"alpha/two","pane":"%4","manager":"alpha/lead","tasks":[]},
+                {"agent_id":"beta/lead","pane":"%5","manager":"owner","tasks":[]},
+                {"agent_id":"beta/one","pane":null,"manager":"beta/lead","tasks":[]}
+            ],"tasks":[{"task_id":"t1","title":"Alpha task"}]
+        }],"needs_owner":{"items":[]}}))
+        .unwrap();
+        let mut app = App::new();
+        load_caption_windows(
+            &mut app,
+            serde_json::from_value(json!([
+                {"id":"@1","name":"one","links":[],"panes":["%1","%2","%3"]},
+                {"id":"@2","name":"mix","links":[],"panes":["%6","%5","%4"]},
+                {"id":"@3","name":"plain","links":[],"panes":["%7"]}
+            ]))
+            .unwrap(),
+        );
+        let marks = work_marks(&org, app.work.windows());
+        for (id, label, headline, detail, badge) in [
+            (
+                "@1",
+                "1 one",
+                "Alpha task",
+                " · alpha/lead · 1 one",
+                " 1 open",
+            ),
+            (
+                "@2",
+                "2 mix",
+                "Work threads",
+                " · alpha/lead, beta/lead · 2 mix",
+                "",
+            ),
+            ("@3", "3 plain", "3 plain", "", ""),
+        ] {
+            let row = expanded_group(
+                TreeNodeId::Window(id.into()),
+                TreeRowKind::Window {
+                    id: id.into(),
+                    label: label.into(),
+                },
+            );
+            app.work_grouping = WorkGrouping::Windows;
+            let line = create_window_line("", (id, label), &row, false, &app, &marks, 100);
+            assert_eq!(line.to_string(), format!(" ▼ {headline}{badge}{detail}"));
+            let secondary = line.spans.last().unwrap();
+            assert_eq!(secondary.content, detail);
+            assert_eq!(secondary.style.fg, Some(Color::DarkGray));
+            assert!(secondary.style.add_modifier.contains(Modifier::DIM));
+
+            app.work_grouping = WorkGrouping::Threads;
+            assert_eq!(
+                create_window_line("", (id, label), &row, false, &app, &marks, 100).to_string(),
+                format!(" ▼ {label}{badge}"),
+            );
+        }
+    }
+
+    // Break caught: missing path components leave a slash or a dangling separator in Work.
+    #[test]
+    fn work_agent_detail_joins_present_repo_and_branch() {
+        let app = App::new();
+        let marks = WorkMarks::default();
+        for (project, branch, worktree, want) in [
+            (
+                Some("/fixtures/repo"),
+                Some("main"),
+                None,
+                " [pi] 0% · repo/main",
+            ),
+            (Some("/fixtures/repo"), None, None, " [pi] 0% · repo"),
+            (None, Some("dev"), None, " [pi] 0% · dev"),
+            (None, None, None, " [pi] 0%"),
+            (
+                Some("/fixtures/repo"),
+                Some(""),
+                Some("/fixtures/tree/"),
+                " [pi] 0% · repo/tree",
+            ),
+            (
+                Some("/fixtures/repo"),
+                Some("cp/work-a"),
+                None,
+                " [pi] 0% · repo/cp/work-a",
+            ),
+        ] {
+            let session = SessionView {
+                id_short: "r".into(),
+                harness: "pi".into(),
+                status: SessionStatus::Idle,
+                project_root: project.map(Into::into),
+                worktree_branch: branch.map(Into::into),
+                worktree_path: worktree.map(Into::into),
+                ..Default::default()
+            };
+            let line = create_view_agent_line("  ", &session, false, &app, &marks, None, 100);
+            assert_eq!(
+                line.spans.last().unwrap().content,
+                want,
+                "{project:?}/{branch:?}/{worktree:?}"
+            );
+        }
+
+        let session = SessionView {
+            id_short: "r".into(),
+            harness: "pi".into(),
+            status: SessionStatus::Idle,
+            tmux_pane: Some("%1".into()),
+            ..Default::default()
+        };
+        for (title, want) in [("Work item", " · r [pi] 0%"), ("r", " [pi] 0%")] {
+            let org: WorkOrg = serde_json::from_value(json!({"projects":[{
+                "seats":[{"agent_id":"repo/r","pane":"%1","tasks":["t1"]}],
+                "tasks":[{"task_id":"t1","title":title}]
+            }],"needs_owner":{"items":[]}}))
+            .unwrap();
+            let marks = work_marks(&org, &[]);
+            let line = create_view_agent_line("  ", &session, false, &app, &marks, None, 100);
+            assert_eq!(line.spans.last().unwrap().content, want, "{title}");
+        }
+    }
+
+    // Break caught: absent name/repo/window chunks add dots or an empty comma item.
+    #[test]
+    fn work_thread_detail_joins_present_name_repos_and_windows() {
+        for (id, title, with_windows, want) in [
+            ("lead", None, false, ""),
+            ("repo/solo", None, false, " · repo"),
+            ("lead", None, true, " · ops"),
+            ("repo/lead", Some("Work item"), true, " · lead · repo · ops"),
+        ] {
+            let mut app = App::new();
+            let windows = if with_windows {
+                serde_json::from_value(json!([
+                    {"id":"@1","name":"ops","links":[],"panes":["%5"]},
+                    {"id":"@2","name":"","links":[],"panes":["%6"]}
+                ]))
+                .unwrap()
+            } else {
+                vec![]
+            };
+            load_caption_windows(&mut app, windows);
+            let tasks = title
+                .map(|s| json!([{"task_id":"t1","title":s}]))
+                .unwrap_or(json!([]));
+            let assigned = if title.is_some() { vec!["t1"] } else { vec![] };
+            let org: WorkOrg = serde_json::from_value(json!({"projects":[{
+                "seats":[
+                    {"agent_id":id,"pane":"%5","manager":"owner","tasks":assigned},
+                    {"agent_id":"/worker","pane":"%6","manager":id,"tasks":[]}
+                ],"tasks":tasks
+            }],"needs_owner":{"items":[]}}))
+            .unwrap();
+            let marks = work_marks(&org, app.work.windows());
+            let row = expanded_group(
+                TreeNodeId::Team(id.into()),
+                TreeRowKind::Team { name: id.into() },
+            );
+            let line = create_thread_line("", id, &row, false, &app, &marks, 100);
+            assert_eq!(
+                line.spans.last().unwrap().content,
+                want,
+                "{id}, windows={with_windows}"
+            );
+        }
+    }
 
     #[test]
     fn coordinator_span_precedes_badge_or_name_without_reserving_untagged_space() {

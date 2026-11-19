@@ -18,11 +18,15 @@
 //! zero remains delayed until summary persistence. Nonzero decreases are live.
 
 use super::agent_flow::{adopt_baseline, classify_pane, PaneShape};
-use super::agent_lifecycle::{deadline_answer, pin, stuck_record};
+use super::agent_lifecycle::{deadline_answer, pin, stuck_record, ClearAttempt, SavedSeat};
 pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
 pub use super::agent_types::*;
-use super::{agent_project::AgentProjects, OrgHandle, OrgServiceError};
+use super::{
+    agent_project::AgentProjects,
+    agent_unreadable::{foreground_session, ScreenEpisodes, ScreenSample},
+    OrgHandle, OrgServiceError,
+};
 use crate::control::reservation::{
     CaptureFormat, PaneId, Quarantine, Reservation, ReservationKind, ReservationRequest, WaitPolicy,
 };
@@ -31,7 +35,10 @@ use crate::{
     control::service::ControlHandle,
     registry::{RegistryHandle, SessionEvent},
 };
-use atm_core::{DialogState, Harness, InputState, Money, SessionId, SessionView, TurnState};
+use atm_core::{
+    harness_control::ControlDialog, DialogState, Harness, InputState, Money, SessionId,
+    SessionView, TurnState,
+};
 use atm_org::{Agent, OrgCommand, OrgState};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -138,16 +145,20 @@ pub(super) type SpawnEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// An agent's pane, its baseline, and the refusal reason of its last observation.
 type PaneRecord = (String, PaneBaseline, Option<String>);
+type HandoverWaits = Arc<std::sync::Mutex<BTreeMap<AgentId, (SavedSeat, String)>>>;
 
 #[derive(Clone)]
 pub(super) struct AgentRuntime {
     pub org: OrgHandle,
     pub registry: RegistryHandle,
     pub control: ControlHandle,
+    pub(super) screens: Arc<ScreenEpisodes>,
     /// Each agent's pane, what was recorded about its processes, and why its
     /// last observation found every input to it refused, if it did. In
     /// memory only; written under the agent's reservation.
     baselines: Arc<std::sync::Mutex<HashMap<AgentId, PaneRecord>>>,
+    /// A display-only reason for a saved handover that has not admitted Clear.
+    handover_waits: HandoverWaits,
     /// Reads a pane's root process from procfs; scripted in tests.
     pub proc: super::agent_proc::ProcReader,
     /// The `ATM_SPAWN_*` overrides of the daemon's start environment.
@@ -207,6 +218,9 @@ impl AgentRuntime {
 
     /// Drop what was recorded about an agent's pane; it has left that pane.
     pub(super) fn forget_baseline(&self, agent: &AgentId) {
+        if let Ok(cursor) = self.org.status() {
+            self.screens.invalidate(agent, cursor);
+        }
         if let Ok(mut baselines) = self.baselines.lock() {
             baselines.remove(agent);
         }
@@ -216,6 +230,7 @@ impl AgentRuntime {
 /// What a delivery needs to know about its recipient, read in one call.
 #[derive(Debug, Clone)]
 pub struct Recipient {
+    pub(super) cursor: u64,
     /// The agent's recorded status, from the same snapshot as everything
     /// else here. An answer is not permission: only a Ready agent takes input.
     pub status: AgentStatus,
@@ -260,6 +275,7 @@ struct AgentService {
     ready: watch::Receiver<Option<Result<(), String>>>,
     errors: watch::Receiver<BTreeMap<AgentId, ObservationFailure>>,
     lifecycle: Option<mpsc::Sender<LifecycleJob>>,
+    stop: CancellationToken,
 }
 
 type Reply = Box<dyn FnOnce() + Send>;
@@ -285,6 +301,10 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
+    pub(super) fn screens(&self) -> Option<&ScreenEpisodes> {
+        Some(&self.inner.runtime.as_ref()?.screens)
+    }
+
     #[cfg(test)]
     pub(super) fn observation_events(&self) -> broadcast::Receiver<ObservationProgress> {
         self.inner.runtime.as_ref().unwrap().progress.subscribe()
@@ -327,8 +347,13 @@ impl AgentHandle {
                 ready,
                 errors: watch::channel(BTreeMap::new()).1,
                 lifecycle: None,
+                stop: CancellationToken::new(),
             }),
         }
+    }
+
+    pub(super) fn stop_token(&self) -> CancellationToken {
+        self.inner.stop.clone()
     }
 
     /// Snapshot the sender held by this service, not a second admission lane.
@@ -531,6 +556,47 @@ impl AgentHandle {
             .ok_or_else(|| self.unavailable(operation))
     }
     pub async fn clear(&self, p: ClearParams) -> Result<ClearResult, AgentError> {
+        match self
+            .clear_once(p.agent, ClearMode::Standalone(p.timeout_ms))
+            .await?
+        {
+            ClearAttempt::Cleared(cleared) => Ok(cleared.result),
+            ClearAttempt::Blocked(_) | ClearAttempt::Expired => Err(AgentError::Internal(
+                "standalone clear returned a handover-only wait".into(),
+            )),
+        }
+    }
+
+    pub(super) async fn clear_handover(
+        &self,
+        saved: SavedSeat,
+        retry_before: Option<Instant>,
+        finish_by: Instant,
+    ) -> Result<ClearAttempt, AgentError> {
+        self.clear_once(
+            saved.agent.clone(),
+            ClearMode::Handover {
+                saved,
+                retry_before,
+                finish_by,
+            },
+        )
+        .await
+    }
+
+    pub(super) fn set_handover_wait(&self, saved: &SavedSeat, reason: Option<String>) {
+        if let Some(rt) = &self.inner.runtime {
+            if let Ok(mut waits) = rt.handover_waits.lock() {
+                if let Some(reason) = reason {
+                    waits.insert(saved.agent.clone(), (saved.clone(), reason));
+                } else {
+                    waits.remove(&saved.agent);
+                }
+            }
+        }
+    }
+
+    async fn clear_once(&self, id: AgentId, mode: ClearMode) -> Result<ClearAttempt, AgentError> {
         const OPERATION: &str = "agent.clear";
         if !matches!(*self.inner.ready.borrow(), Some(Ok(()))) {
             return Err(self.unavailable(OPERATION));
@@ -540,26 +606,62 @@ impl AgentHandle {
             .runtime
             .as_ref()
             .ok_or_else(|| self.unavailable(OPERATION))?;
-        let state = rt.org.snapshot().await?;
-        let agent = state
-            .agent(&p.agent)
-            .ok_or_else(|| AgentError::NotFound(format!("agent {} was not found", p.agent)))?;
-        let pane = agent.pane.as_ref().map(PaneId::parse).transpose()?;
+        let (pane, saved, retry_before, finish_by) = match mode {
+            ClearMode::Standalone(timeout_ms) => {
+                let state = rt.org.snapshot().await?;
+                let agent = state
+                    .agent(&id)
+                    .ok_or_else(|| AgentError::NotFound(format!("agent {id} was not found")))?;
+                let pane = agent.pane.as_ref().map(PaneId::parse).transpose()?;
+                (
+                    pane,
+                    None,
+                    None,
+                    Instant::now() + Duration::from_millis(timeout_ms),
+                )
+            }
+            ClearMode::Handover {
+                saved,
+                retry_before,
+                finish_by,
+            } => (
+                Some(saved.pane.clone()),
+                Some(saved),
+                retry_before,
+                finish_by,
+            ),
+        };
+        let wait = if retry_before.is_some() {
+            WaitPolicy::Refuse
+        } else {
+            WaitPolicy::Wait
+        };
         let request = ReservationRequest::new(
-            p.agent.clone(),
+            id.clone(),
             pane.clone(),
             ReservationKind::Clear,
-            WaitPolicy::Wait,
-            Instant::now() + Duration::from_millis(p.timeout_ms),
+            wait,
+            finish_by,
         );
         let waiting = super::agent_lifecycle::Waiting::default();
         let (work, cleanup) = (rt.clone(), rt.clone());
-        let (id, why) = (p.agent.clone(), waiting.clone());
-        let (record, whose) = (waiting.clone(), p.agent.clone());
+        let (whose, why) = (id.clone(), waiting.clone());
+        let (record, cleaning) = (waiting.clone(), id.clone());
+        let saved_handover = saved.is_some();
         self.lifecycle(
             request,
-            move |r| async move { work.clear(&r, &p.agent, pane.as_ref(), &waiting).await },
-            move |_, _| async move { cleanup.settle_clear(&id, &why).await },
+            move |r| async move {
+                work.clear(
+                    &r,
+                    &id,
+                    pane.as_ref(),
+                    &waiting,
+                    saved.as_ref(),
+                    retry_before,
+                )
+                .await
+            },
+            move |_, _| async move { cleanup.settle_clear(&cleaning, &why, saved_handover).await },
         )
         .await
         .map_err(|error| deadline_answer(error, &whose, stuck_record(&record)))
@@ -733,6 +835,14 @@ impl AgentHandle {
                             entry.reason = Some(refusal);
                         }
                     }
+                    if let Some(reason) = rt.handover_waits.lock().ok().and_then(|waits| {
+                        waits
+                            .get(&a.id)
+                            .filter(|(saved, _)| saved.matches(a))
+                            .map(|(_, reason)| reason.clone())
+                    }) {
+                        entry.reason = Some(reason);
+                    }
                     if let Some(ObservationFailure { reason: error, .. }) =
                         self.inner.errors.borrow().get(&a.id)
                     {
@@ -764,7 +874,7 @@ impl AgentHandle {
             .runtime
             .as_ref()
             .ok_or_else(|| self.unavailable(OPERATION))?;
-        let state = rt.org.snapshot().await?;
+        let (state, cursor) = rt.org.snapshot_at().await?;
         let found = state
             .agent(agent)
             .ok_or_else(|| AgentError::NotFound(format!("agent {agent} was not found")))?;
@@ -796,6 +906,7 @@ impl AgentHandle {
             )));
         }
         Ok(Recipient {
+            cursor,
             status: found.status,
             session_id: found.session_id.clone(),
             pane: PaneId::parse(pane)?,
@@ -826,6 +937,15 @@ impl AgentHandle {
         .await
         .map_err(|_| AgentError::Timeout)?
     }
+}
+
+enum ClearMode {
+    Standalone(u64),
+    Handover {
+        saved: SavedSeat,
+        retry_before: Option<Instant>,
+        finish_by: Instant,
+    },
 }
 
 impl AgentRuntime {
@@ -873,7 +993,7 @@ impl AgentRuntime {
                     rt.progress("entered", Some(id.clone()));
                     // A queued observation never retains a ready decision across clear or
                     // respawn. A changed pane needs a newly acquired reservation.
-                    let state = rt.org.snapshot().await?;
+                    let (state, cursor) = rt.org.snapshot_at().await?;
                     let Some(agent) = state.agent(&id) else {
                         return Ok(());
                     };
@@ -885,7 +1005,7 @@ impl AgentRuntime {
                             && agent.session_id == candidate.binding
                             && agent.excluded_session_id == candidate.excluded
                     });
-                    rt.inspect(&r, &state, agent, bind, initial).await
+                    rt.inspect(&r, &state, agent, bind, initial, cursor).await
                 },
                 move |_, _| async move {
                     // FIFO behind accepted commands, including ones whose reply was lost.
@@ -904,6 +1024,7 @@ impl AgentRuntime {
         agent: &Agent,
         bind: Option<BindingCandidate>,
         initial: bool,
+        cursor: u64,
     ) -> Result<(), AgentError> {
         // Registry failure is never evidence that every agent is gone.
         self.rows().await?;
@@ -1129,17 +1250,19 @@ impl AgentRuntime {
         };
         #[cfg(test)]
         self.progress("capture", Some(agent.id.clone()));
+        let pane_id = PaneId::parse(pane)?;
         let capture = r
             .capture(
-                &PaneId::parse(pane)?,
+                &pane_id,
                 screen.map_or(CaptureFormat::Plain, AgentScreen::capture_format),
             )
             .await?;
-        let rows = self.rows().await?;
-        let live: Vec<_> = rows
-            .iter()
-            .filter(|row| matches_agent(agent, row) && row.harness == harness.short_tag())
-            .collect();
+        let at = Instant::now();
+        let rows = self.pane_sessions(&pane_id).await?;
+        let roots = rows.iter().filter(|row| {
+            matches_agent(agent, &row.view) && row.view.harness == harness.short_tag()
+        });
+        let live: Vec<_> = roots.clone().map(|row| &row.view).collect();
         // The adopt rule also needs a live row of the agent's harness, and the
         // pane must still be the agent's on the capture.
         let pinned = pinnable
@@ -1151,16 +1274,43 @@ impl AgentRuntime {
             .and_then(|((screen, (root, command)), processes)| {
                 pin(screen, (*root, command), processes, &capture)
             });
-        let baseline = match pinned {
-            Some((baseline, _)) => {
-                self.record_baseline(agent.id.clone(), pane, baseline.clone());
-                baseline
+        let (baseline, control, cold) = match pinned {
+            Some((baseline, control)) => {
+                if control.dialog != ControlDialog::Unknown {
+                    self.record_baseline(agent.id.clone(), pane, baseline.clone());
+                }
+                (baseline, Some(control), true)
             }
-            None => stored,
+            None => {
+                let control = screen.map(|s| s.control(&capture, &stored));
+                (stored, control, false)
+            }
         };
-        // Unknown unless the recorded harness is the pane's foreground program.
-        let facts = screen
-            .map(|screen| screen.facts(&capture, &baseline))
+        if matches!(agent.status, AgentStatus::Ready | AgentStatus::Starting) {
+            if let Some(read) = screen.zip(control.as_ref()).and_then(|(screen, control)| {
+                ScreenSample::read(
+                    screen,
+                    &baseline,
+                    &capture,
+                    &pane_id,
+                    Some(&agent.id.to_string()),
+                    agent.session_id.as_ref(),
+                    control,
+                )
+            }) {
+                let foreground = processes
+                    .as_ref()
+                    .filter(|_| cold && read.unreadable)
+                    .and_then(|facts| foreground_session(roots, facts, agent.session_id.as_ref()));
+                if !cold || !read.unreadable || foreground.is_some() {
+                    self.screens.record(&agent.id, read, at, cursor, foreground);
+                }
+            }
+        }
+        // An unrecognized cold read is diagnostic evidence only; no pin.
+        let facts = control
+            .filter(|c| !cold || c.dialog != ControlDialog::Unknown)
+            .map(|c| c.facts)
             .unwrap_or_default();
         let parents = live.iter().filter(|row| !row.id.is_pending()).count();
         let safe = !capture.inspection.dead
@@ -1377,6 +1527,22 @@ pub fn spawn_agents(
     control: ControlHandle,
     cancel: CancellationToken,
 ) -> (AgentHandle, JoinHandle<()>) {
+    spawn_agents_configured(
+        org,
+        registry,
+        control,
+        cancel,
+        atm_org::delivery::DeliverySettings::default().readiness_timeout,
+    )
+}
+
+pub(crate) fn spawn_agents_configured(
+    org: OrgHandle,
+    registry: RegistryHandle,
+    control: ControlHandle,
+    cancel: CancellationToken,
+    readiness_timeout: Duration,
+) -> (AgentHandle, JoinHandle<()>) {
     let proc = super::agent_proc::procfs_reader();
     // Read once: a launch takes its overrides from the daemon's start.
     let env: HashMap<String, String> = std::env::vars_os()
@@ -1384,7 +1550,15 @@ pub fn spawn_agents(
         .filter(|(key, _)| key.starts_with("ATM_SPAWN_"))
         .collect();
     let spawn_env: SpawnEnv = Arc::new(move |key| env.get(key).cloned());
-    spawn_agents_with(org, registry, control, cancel, proc, spawn_env)
+    spawn_agents_with(
+        org,
+        registry,
+        control,
+        cancel,
+        proc,
+        spawn_env,
+        readiness_timeout,
+    )
 }
 
 /// [`spawn_agents`] with the procfs reader given, so tests can script it.
@@ -1395,12 +1569,15 @@ pub(super) fn spawn_agents_with(
     cancel: CancellationToken,
     proc: super::agent_proc::ProcReader,
     spawn_env: SpawnEnv,
+    readiness_timeout: Duration,
 ) -> (AgentHandle, JoinHandle<()>) {
     let rt = AgentRuntime {
         org,
         registry,
         control,
+        screens: Arc::new(ScreenEpisodes::new(readiness_timeout)),
         baselines: Arc::default(),
+        handover_waits: Arc::default(),
         proc,
         spawn_env,
         #[cfg(test)]
@@ -1419,12 +1596,14 @@ pub(super) fn spawn_agents_with(
             ready,
             errors: error_state,
             lifecycle: Some(lifecycle),
+            stop: cancel.clone(),
         }),
     };
     // Subscribe before the initial snapshot: events arriving during inspection
     // remain wakeups, never cached readiness decisions.
     let events = rt.registry.subscribe();
     let committed = rt.org.committed.subscribe();
+    let screens = tokio::spawn(ScreenEpisodes::run(rt.clone(), cancel.clone()));
     let task = tokio::spawn(async move {
         let result = observer(rt, events, committed, &send, &errors, &cancel).await;
         let reason = result
@@ -1432,6 +1611,7 @@ pub(super) fn spawn_agents_with(
             .map_or_else(|| "agent service stopped".into(), |error| error.to_string());
         send.send_replace(Some(Err(reason)));
         cancel.cancel();
+        let _ = screens.await;
         let _ = project_task.await;
         let _ = dispatcher.await;
     });
@@ -1747,12 +1927,15 @@ async fn observer(
             event = committed.recv() => {
                 match event {
                     Ok(event) if event.kind.starts_with("agent.") => {
+                        let id: Option<AgentId> = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok());
+                        if !matches!(event.kind.as_str(), "agent.revalidation_requested" | "agent.editor_ready") {
+                            if let Some(id) = &id { rt.screens.invalidate(id, event.seq); }
+                        }
                         routes.dirty = true;
                         match rt.org.snapshot().await {
                             Ok(state) => routes.refresh(&state),
                             Err(error) => tracing::warn!(%error, "Agent routing refresh deferred"),
                         }
-                        let id: Option<AgentId> = event.body.get("agent_id").and_then(serde_json::Value::as_str).and_then(|id| id.parse().ok());
                         if matches!(event.kind.as_str(), "agent.up_requested" | "agent.adopted" | "agent.pane_created") {
                             if let Some(id) = id {
                                 pull_in(&BTreeSet::from([id.clone()]), &backoff, &mut next_observation);

@@ -2132,6 +2132,7 @@ fn harness_row(id: &str, child: bool, harness: Harness) -> crate::registry::Pane
         view: atm_core::SessionView::from_domain(&row),
         pid: None,
         start: None,
+        harness_version: None,
     }
 }
 

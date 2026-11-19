@@ -57,6 +57,7 @@
 //! | working, waiting, blocked, submit | only the task's agent |
 //! | assign, start review, back to open, cancel | authority |
 //! | the verdict | authority, but never the task's own agent |
+//! | carry back a reviewed fix | owner or strict manager of the Down assignee |
 //! | reminded, flagged, cost recorded | reports of the daemon; no caller |
 //!
 //! A caller without the right is refused even where nothing would change.
@@ -113,8 +114,8 @@
 
 use crate::command::nonempty;
 use crate::{
-    Address, AgentId, ApplyError, DecisionId, IdError, OrgEvent, OrgState, ProjectId, Refusal,
-    TaskId,
+    Address, AgentId, AgentStatus, ApplyError, DecisionId, IdError, OrgEvent, OrgState, ProjectId,
+    Refusal, TaskId,
 };
 use atm_core::Money;
 use chrono::{DateTime, Utc};
@@ -408,6 +409,13 @@ pub enum TaskCommand {
         note: Option<String>,
         by: TaskActor,
     },
+    CarryBack {
+        task_id: TaskId,
+        fix_task: TaskId,
+        review_task: TaskId,
+        note: String,
+        by: TaskActor,
+    },
     Attach {
         task_id: TaskId,
         file: TaskFile,
@@ -440,6 +448,11 @@ pub enum TaskRefusal {
         task_id: TaskId,
         who: Address,
         operation: &'static str,
+    },
+    #[error("cannot carry back task {task_id}: {reason}")]
+    CannotCarryBack {
+        task_id: TaskId,
+        reason: &'static str,
     },
     #[error("a task cannot be set to {state:?} directly")]
     NotSettable { state: TaskState },
@@ -512,6 +525,7 @@ impl TaskCommand {
             }
             Self::Assign { task_id, .. }
             | Self::StartReview { task_id, .. }
+            | Self::CarryBack { task_id, .. }
             | Self::Reminded { task_id, .. }
             | Self::Flagged { task_id, .. } => Ok(Some(task_id)),
         }
@@ -573,6 +587,22 @@ impl TaskCommand {
                 verdict,
                 review_task,
                 note,
+                by: by.who,
+            }),
+            Self::CarryBack {
+                task_id,
+                fix_task,
+                review_task,
+                note,
+                by,
+            } => OrgEvent::TaskVerdict(TaskVerdictGiven {
+                task_id,
+                verdict: TaskVerdict::Accepted,
+                review_task: None,
+                note: Some(format!(
+                    "Accepted via fix {fix_task} (review {review_task}); {}",
+                    note.trim()
+                )),
                 by: by.who,
             }),
             Self::Attach { task_id, file, by } => OrgEvent::TaskAttached(TaskAttached {
@@ -674,15 +704,15 @@ impl Task {
     fn is_agent(&self, who: &Address) -> bool {
         matches!((&self.agent_id, who), (Some(agent), Address::Agent(caller)) if agent == caller)
     }
+    fn strict_manager(&self, by: &TaskActor) -> bool {
+        matches!(&by.who, Address::Agent(_))
+            && !self.is_agent(&by.who)
+            && self.agent_id.is_some()
+            && self.agent_id == by.manager_of
+    }
     /// The creator, the owner and a strict manager of the current agent.
     fn authority(&self, by: &TaskActor, operation: &'static str) -> Result<(), TaskRefusal> {
-        let manager = matches!(&by.who, Address::Agent(_))
-            && !self.is_agent(&by.who)
-            && by
-                .manager_of
-                .as_ref()
-                .is_some_and(|id| self.agent_id.as_ref() == Some(id));
-        if manager || by.who == Address::Owner || by.who == self.creator {
+        if self.strict_manager(by) || by.who == Address::Owner || by.who == self.creator {
             Ok(())
         } else {
             Err(self.not_allowed(&by.who, operation))
@@ -734,6 +764,75 @@ impl OrgState {
         Ok(review)
     }
 
+    fn check_carry_back(
+        &self,
+        task_id: &TaskId,
+        fix_id: &TaskId,
+        review_id: &TaskId,
+        note: &str,
+        by: &TaskActor,
+    ) -> Result<(), Refusal> {
+        let task = self.require_task(task_id)?;
+        let owner = by.who == Address::Owner;
+        if !owner && !task.strict_manager(by) {
+            return Err(task.not_allowed(&by.who, "carry back").into());
+        }
+        if task.state != TaskState::ChangesRequested {
+            return Err(task.refuse("carry back").into());
+        }
+        let refuse = |reason| TaskRefusal::CannotCarryBack {
+            task_id: task.id.clone(),
+            reason,
+        };
+        match task.kind {
+            TaskKind::Review => return Err(refuse("review tasks cannot be carried back").into()),
+            TaskKind::Unknown => return Err(refuse("its kind must be known").into()),
+            _ => {}
+        }
+        let assignee = task.agent_id.as_ref().and_then(|id| self.agent(id));
+        if assignee.map(|a| a.status) != Some(AgentStatus::Down) {
+            return Err(refuse("it has no down assignee").into());
+        }
+        let needs = match task.measure {
+            TaskMeasure::Unknown => Some("a known measure"),
+            TaskMeasure::Owner if !owner => Some("the owner's verdict"),
+            _ => None,
+        };
+        if let Some(needs) = needs {
+            return Err(TaskRefusal::Measure {
+                task_id: task.id.clone(),
+                needs,
+            }
+            .into());
+        }
+        nonempty("note", note)?;
+        if self.task_needs_decision_redo(&task.id) {
+            return Err(refuse("it still needs decision redo").into());
+        }
+        let fix = self.require_task(fix_id)?;
+        let review = self.require_task(review_id)?;
+        let project = task.project(task.agent_id.as_ref());
+        if &task.id == fix_id
+            || project.is_none()
+            || project != fix.project(fix.agent_id.as_ref())
+            || matches!(fix.kind, TaskKind::Review | TaskKind::Unknown)
+            || fix.state != TaskState::Accepted
+            || self.accepted_result_reviews.get(fix_id) != Some(review_id)
+            || review.kind != TaskKind::Review
+            || review.judges.as_ref() != Some(fix_id)
+            || review.state != TaskState::Accepted
+            || fix.agent_id.is_none()
+            || review.agent_id.is_none()
+            || fix.agent_id == review.agent_id
+        {
+            return Err(refuse(
+                "a distinct same-project fix and its accepted result review are required",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// The task policy of the module docs. `event` is `command.event()`, whose
     /// references decide has already checked.
     pub(crate) fn decide_task(
@@ -744,7 +843,7 @@ impl OrgState {
         use TaskState as S;
         if let Some(id) = command.known_values()? {
             let task = self.require_task(id)?;
-            if task.state == S::Unknown {
+            if task.state == S::Unknown && !matches!(command, TaskCommand::CarryBack { .. }) {
                 return Err(task.refuse("change").into());
             }
             if matches!(
@@ -952,6 +1051,16 @@ impl OrgState {
                     })
                 }));
                 return Ok(events);
+            }
+            TaskCommand::CarryBack {
+                task_id,
+                fix_task,
+                review_task,
+                note,
+                by,
+            } => {
+                self.check_carry_back(task_id, fix_task, review_task, note, by)?;
+                true
             }
             TaskCommand::Attach { task_id, file, .. } => {
                 nonempty("file path", &file.path)?;

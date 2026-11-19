@@ -5,7 +5,7 @@
 //! recorder, or on the clock being asked for a time; nothing sleeps.
 
 use super::super::agent_auto_handover::{
-    outcome_note, settle, spawn_watch, start_lines, still_shows, why, Attempt, Timer,
+    return_attempt, spawn_watch, start_lines, still_shows, why, Timer,
 };
 use super::super::start_line::start_line;
 use super::*;
@@ -297,9 +297,6 @@ async fn admission_automatic_write_failures_keep_the_attempt_and_report_once() {
         let mut rig = Rig::new().await;
         let mut gate = rig.gate(boundary);
         let mut auto = Auto::with_rig(rig, ON).await;
-        // This independent idle timer is a terminal barrier: after dealing with
-        // an outcome, the watcher asks for this wake again before selecting.
-        auto.admission_timer().await;
         auto.rig.share("s1", 630).await;
         auto.rig.turn("s1").await;
         let held = gate.take().await;
@@ -319,13 +316,26 @@ async fn admission_automatic_write_failures_keep_the_attempt_and_report_once() {
                 (reply, *message_id, audit_failure(*message_id))
             }
         };
-        // spawn does not poll inline: reaching the write proves the watcher's
-        // look returned and it is selecting with the timer already installed.
-        while auto.asked.try_recv().is_ok() {}
+        assert_eq!(auto.started(), 1);
         reply
             .send(Err(super::super::OrgServiceError::Timeout))
             .unwrap();
-        auto.asked_for(after(2700)).await;
+        // The retained shared handover sends its own notice; wait for that
+        // actual commit, not an unrelated cycle through the policy watcher.
+        tokio::time::timeout(GUARD, async {
+            loop {
+                let event = auto.fence.recv().await.unwrap();
+                if event.kind == "msg.sent"
+                    && event.body["body"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("automatic handover of p/worker"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
         let state = auto.rig.state().await;
         let notes: Vec<_> = state
             .messages()
@@ -390,10 +400,11 @@ async fn admission_automatic_preflight_refusal_stays_silent_and_allows_retry() {
         }
         fn clear(
             &self,
-            agent: AgentId,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<ClearResult, AgentError>> + Send>>
-        {
-            self.recorder.clear(agent)
+            target: SavedSeat,
+            retry_before: Option<tokio::time::Instant>,
+            finish_by: tokio::time::Instant,
+        ) -> Answer<ClearAttempt> {
+            self.recorder.clear(target, retry_before, finish_by)
         }
     }
     let mut rig = Rig::new().await;
@@ -406,6 +417,7 @@ async fn admission_automatic_preflight_refusal_stays_silent_and_allows_retry() {
             gate: Mutex::new(Some((entered, released))),
             recorder: rig.recorder.clone(),
         }),
+        rig.service_stop.clone(),
     );
     let mut auto = Auto::with_rig(rig, ON).await;
     auto.admission_timer().await;
@@ -437,84 +449,20 @@ async fn admission_automatic_preflight_refusal_stays_silent_and_allows_retry() {
 
 // The pure parts.
 
-fn attempt(session: &str) -> Attempt {
-    Attempt {
-        agent: id("worker"),
-        session: SessionId::new(session),
-        why: "context 63%, line 60%".into(),
-        memory: "/p/.atm/memory/worker.md".into(),
-    }
-}
-
-fn done() -> HandoverResult {
-    HandoverResult {
-        agent_id: id("worker"),
-        message_id: MessageId::new(12),
-        state: HandoverState::Cleared,
-        session_id: Some(SessionId::new("s2")),
-    }
-}
-
 #[test]
-fn an_admitted_handover_ends_in_one_note_to_the_manager_and_keeps_the_attempt() {
-    let lead = Address::Agent(id("lead"));
-    let attempted = BTreeMap::from([(id("worker"), SessionId::new("s1"))]);
-    let note = |to: Address, body: &str| MessageContent {
-        delivery_notice: None,
-        from: Address::System,
-        to,
-        kind: MessageKind::Note,
-        body: body.into(),
-        attachments: Vec::new(),
-        task: None,
-    };
-    let mut after_done = attempted.clone();
-    assert_eq!(
-        settle(
-            &mut after_done,
-            attempt("s1"),
-            Ok((lead.clone(), Ok(done())))
-        ),
-        Some(note(
-            lead,
-            "automatic handover of p/worker done (context 63%, line 60%): it saved to \
-             /p/.atm/memory/worker.md (m12) and has a new session."
-        ))
-    );
-    assert_eq!(after_done, attempted);
-    let failed = MethodError::new(error_code::REFUSED, "it did not save; nothing was cleared");
-    let mut after_failure = attempted.clone();
-    assert_eq!(
-        settle(
-            &mut after_failure,
-            attempt("s1"),
-            Ok((Address::Owner, Err(failed)))
-        ),
-        Some(note(
-            Address::Owner,
-            "automatic handover of p/worker (context 63%, line 60%) did not complete: it did \
-             not save; nothing was cleared. Nothing more is tried in this session. By hand: \
-             atm agent handover p/worker"
-        ))
-    );
-    assert_eq!(after_failure, attempted);
-}
-
-#[test]
-fn a_handover_refused_at_admission_gets_no_note_and_gives_the_attempt_back() {
-    let refused = || Err(MethodError::new(error_code::CONFLICT, "already running"));
+fn a_handover_refused_at_admission_gives_only_its_attempt_back() {
     let mut attempted = BTreeMap::from([
         (id("worker"), SessionId::new("s1")),
         (id("lead"), SessionId::new("lead-1")),
     ]);
-    assert_eq!(settle(&mut attempted, attempt("s1"), refused()), None);
+    return_attempt(&mut attempted, &id("worker"), &SessionId::new("s1"));
     assert_eq!(
         attempted,
         BTreeMap::from([(id("lead"), SessionId::new("lead-1"))])
     );
     // The agent has moved on to another session, whose attempt is its own.
     let mut later = BTreeMap::from([(id("worker"), SessionId::new("s2"))]);
-    assert_eq!(settle(&mut later, attempt("s1"), refused()), None);
+    return_attempt(&mut later, &id("worker"), &SessionId::new("s1"));
     assert_eq!(later.get(&id("worker")), Some(&SessionId::new("s2")));
 }
 
@@ -542,17 +490,6 @@ fn the_note_says_why_in_the_seats_own_numbers() {
     assert_eq!(
         why(HandoverReason::CacheExpiring, 12.0, &cached, idle),
         "idle 48 min; nothing it waits for comes before its cache expires at 60 min"
-    );
-    let note = outcome_note(
-        &id("worker"),
-        "why",
-        std::path::Path::new("/m.md"),
-        Address::Owner,
-        &Ok(done()),
-    );
-    assert_eq!(
-        note.body,
-        "automatic handover of p/worker done (why): it saved to /m.md (m12) and has a new session."
     );
 }
 
@@ -605,7 +542,9 @@ fn a_row_that_has_moved_on_is_not_the_row_that_was_judged() {
 
 #[tokio::test]
 async fn a_seat_that_is_switched_on_is_handed_over_at_the_line_with_one_note() {
-    let mut auto = Auto::new(ON).await;
+    let rig = Rig::new().await;
+    rig.register_chief().await;
+    let mut auto = Auto::with_rig(rig, ON).await;
     // Below the line nothing is asked.
     auto.rig.share("s1", 599).await;
     auto.rig.turn("s1").await;
@@ -615,6 +554,8 @@ async fn a_seat_that_is_switched_on_is_handed_over_at_the_line_with_one_note() {
     // No command was given: the daemon asks the worker to save, and sends
     // no note at the line first.
     let request = auto.save_requested("worker", &[]).await;
+    let (release, gate) = oneshot::channel();
+    *auto.rig.recorder.clear_gate.lock().unwrap() = Some(gate);
     auto.rig.deliver(request, "s1", "%1").await;
     std::fs::write(auto.rig.memory("worker"), "state").unwrap();
     auto.rig.report("s1", LifecycleEvent::Idle).await;
@@ -624,16 +565,21 @@ async fn a_seat_that_is_switched_on_is_handed_over_at_the_line_with_one_note() {
             .unwrap(),
         Some(id("worker"))
     );
-    let memory = auto.rig.memory("worker");
+    // The outcome belongs to the current manager, not to the one used
+    // at admission. A clear reply without a start-line id is not success.
+    auto.file(
+        "worker",
+        &format!("+++\nharness = 'pi'\n{ON}\nmanager = 'org/chief'\n+++\nWork"),
+    );
+    release.send(()).unwrap();
     assert_eq!(
         auto.message(&[DELIVERY.as_slice(), &["agent.saved"]].concat())
             .await,
         (
-            "p/lead".to_owned(),
+            "org/chief".to_owned(),
             format!(
-                "automatic handover of p/worker done (context 63%, line 60%): it saved to {} \
-                 ({request}) and has a new session.",
-                memory.display()
+                "automatic handover of p/worker (context 63%, line 60%) did not complete: \
+                 saved ({request}); clear confirmed; resume not confirmed: the start line could not be identified."
             )
         )
     );

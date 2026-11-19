@@ -48,6 +48,7 @@ params!(SubmitParams { pub task_id: TaskId, #[serde(default = "result")] pub wha
 params!(AttachParams { pub task_id: TaskId, pub file: TaskFile, });
 params!(ReviewParams { pub task_id: TaskId, pub review_task: TaskId, });
 params!(VerdictParams { pub task_id: TaskId, pub verdict: TaskVerdict, pub review_task: Option<TaskId>, pub note: Option<String>, });
+params!(CarryBackParams { pub task_id: TaskId, pub fix_task: TaskId, pub review_task: TaskId, pub note: String, });
 params!(GetParams { pub task_id: TaskId, });
 params!(ListParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,6 +87,7 @@ fn org_error(error: OrgServiceError) -> MethodError {
                 error_code::INVALID_PARAMS
             }
             TaskRefusal::NotAllowed { .. }
+            | TaskRefusal::CannotCarryBack { .. }
             | TaskRefusal::NotReviewOf { .. }
             | TaskRefusal::OwnReview { .. }
             | TaskRefusal::Measure { .. } => error_code::REFUSED,
@@ -333,6 +335,26 @@ pub(crate) fn register_task_methods_with_reporting(
             review_task: p.review_task,
             note: p.note,
             by
+        }
+    );
+    mutation!(
+        "task.carry_back",
+        CarryBackParams,
+        |p: &CarryBackParams| {
+            for id in [&p.task_id, &p.fix_task, &p.review_task] {
+                sequence(id)?;
+            }
+            if p.note.trim().is_empty() {
+                return Err(TaskError::InvalidParams("note must not be blank".into()));
+            }
+            size("note", &p.note, 4096)
+        },
+        |p: CarryBackParams, by| TaskCommand::CarryBack {
+            task_id: p.task_id,
+            fix_task: p.fix_task,
+            review_task: p.review_task,
+            note: p.note,
+            by,
         }
     );
     let list = tasks.clone();

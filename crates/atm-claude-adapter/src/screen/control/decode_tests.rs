@@ -437,7 +437,7 @@ fn malformed_viewport_refuses_every_entry_point() {
                 "\x1b[",
                 "\x1b[2",
                 "\x1b[999m",
-                "\x1b[4m",
+                "\x1b[5m",
                 "\x1b[9m",
                 "\x1b[1A",
                 "\x1b]8;;https://example.invalid",

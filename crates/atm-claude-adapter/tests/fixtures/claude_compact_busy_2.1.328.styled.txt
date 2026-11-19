@@ -1,0 +1,27 @@
+Captured: Claude Code 2.1.328, 2026-11-19, sealed local canned Messages API, tmux 3.8.
+[38;5;231m[49m●[39m Fixture reply 1.           
+
+[38;5;246m✻[39m [38;5;246mWorked for 0s · done 7:39 AM[39m                            
+
+[38;5;246m[48;5;237m❯ [38;5;231m/compact[39m                                                                                                          
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;147m[49m✻[39m [38;5;153mC[38;5;147mompacting conversation… [38;5;246m(0s)[39m                           
+[38;5;246m  ⎿  Tip: Start small, ask Claude for a plan, and check its edits[39m                                                   
+                                                                                                [38;5;246m◐ medium · /effort[39m  
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m                           
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246mfixture status[39m             
+  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents[39m                                            

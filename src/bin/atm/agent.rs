@@ -22,11 +22,15 @@ pub enum AgentListFormat {
     Table,
     Json,
 }
+
+const BARE_NAME_HELP: &str =
+    "Bare seat name. The project comes from --project-root or the current directory.";
+
 #[derive(Debug, Subcommand)]
 pub enum AgentAction {
     /// Start a named agent from its role in a new tmux pane
     Up {
-        #[arg(value_parser = parse_name)]
+        #[arg(value_parser = parse_name, help = BARE_NAME_HELP)]
         name: String,
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -35,7 +39,7 @@ pub enum AgentAction {
     },
     /// Register an existing pane as a named agent without restarting its program
     Adopt {
-        #[arg(value_parser = parse_name)]
+        #[arg(value_parser = parse_name, help = BARE_NAME_HELP)]
         name: String,
         #[arg(value_parser = parse_pane)]
         pane: String,
@@ -102,7 +106,7 @@ fn parse_name(name: &str) -> Result<String, String> {
         .parse()
         .and_then(|project| AgentId::new(project, name))
         .map(|agent| agent.name)
-        .map_err(|error| error.to_string())
+        .map_err(|error| format!("{error}; use the bare seat name; the project comes from --project-root or the current directory"))
 }
 
 fn parse_pane(pane: &str) -> Result<String, String> {

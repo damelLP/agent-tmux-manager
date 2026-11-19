@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -82,6 +83,47 @@ class ProcessState(unittest.TestCase):
         finally:
             child.wait(timeout=30)
         self.assertFalse(process_running(child.pid))
+
+
+class FlightContracts(unittest.TestCase):
+    def test_bound_starting_is_not_in_flight(self):
+        snapshot = dict(agents=[
+            dict(agent_id='project/bound', state='starting', session_id='fixture-session'),
+            dict(agent_id='project/missing', state='starting'),
+            dict(agent_id='project/null', state='starting', session_id=None),
+            dict(agent_id='project/empty', state='starting', session_id=''),
+            dict(agent_id='project/malformed', state='starting', session_id=True),
+            dict(agent_id='project/clear', state='clearing', session_id='fixture-clear-session'),
+        ], messages={'project/bound': [dict(message_id='m7', delivery=dict(phase='delivering'))]})
+        self.assertEqual(atm_rollout.in_flight(snapshot), [
+            'agent project/missing is starting',
+            'agent project/null is starting',
+            'agent project/empty is starting',
+            'agent project/malformed is starting',
+            'agent project/clear is clearing',
+            'message m7 to project/bound is being delivered',
+        ])
+        self.assertEqual(atm_rollout.in_flight(dict(agents=None, messages={})), [])
+
+    def test_quiet_snapshot_names_bound_starting_as_revalidation(self):
+        snapshot = dict(sessions=[], messages={}, commands=[], sidebars=[], status_line=None,
+                        agents=[dict(agent_id='project/seat', state='starting', pane='%1',
+                                     session_id='fixture-session', activity=None, harness='pi',
+                                     model=None, cost_usd=None, reason=None)])
+        rollout = SimpleNamespace(args=SimpleNamespace(wait=0), snapshot=lambda: snapshot,
+                                  lingering=lambda commands: commands, panes=lambda: {'%1'})
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(patch.object(atm_rollout.time, 'monotonic', return_value=0))
+            stack.enter_context(patch.object(atm_rollout.time, 'sleep', side_effect=AssertionError('must not wait')))
+            try:
+                taken = atm_rollout.Rollout.quiet_snapshot(rollout)
+            except atm_rollout.Refused as error:
+                self.fail(f'bound revalidation should not refuse rollout: {error}')
+        self.assertEqual(taken, snapshot)
+        self.assertIn('Agent project/seat: starting, pane %1 (bound session; revalidation pending)',
+                      out.getvalue())
 
 
 class Rig(unittest.TestCase):

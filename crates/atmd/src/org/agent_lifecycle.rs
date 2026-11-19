@@ -23,32 +23,37 @@
 
 use super::agent_flow::{
     adopt_baseline, clear_noop, clear_refusal, cleared_session, decide_clear, decide_start,
-    input_refusal, launch_enter_allowed, launch_line, launch_line_is_staged, launch_paste_allowed,
-    placement, safe_editor, safe_to_paste, shell_baseline, shell_refusal, start_view,
-    started_session, submit_allowed, submit_step, ClearProgress, KeyAction, ProcFacts, Ready,
-    StartProgress, StartView, Step,
+    input_blocker, input_refusal, launch_enter_allowed, launch_line, launch_line_is_staged,
+    launch_paste_allowed, placement, safe_editor, safe_to_paste, shell_baseline, shell_refusal,
+    start_view, started_session, submit_allowed, submit_step, ClearProgress, InputBlocker,
+    KeyAction, ProcFacts, Ready, StartProgress, StartView, Step,
 };
 use super::agent_launch::{launch_command, LaunchCommand};
 use super::agent_project::PreparedAgent;
 use super::agent_screen::{agent_screen, AgentScreen, PaneBaseline};
+use super::agent_unreadable::{foreground_session, ForegroundSession, ScreenSample};
 use super::agents::{
     harness, matches_agent, AdoptResult, AgentError, AgentRuntime, ClearResult, DownResult,
     UpResult,
 };
+use super::start_line::StartLineDisposition;
 use crate::control::reservation::{
     ExpectedTag, PaneCapture, PaneId, PaneKey, Reservation, ReservationError,
 };
 use crate::control::{service::ServiceError, SpawnContext};
-use crate::registry::PaneSession;
+use crate::registry::{PaneSession, SessionEvent};
 use crate::server::methods::CallContext;
 use atm_core::harness_control::{ClearProof, ControlDialog, ControlScreen, SessionArrival};
-use atm_core::{Harness, SessionId, SessionView};
-use atm_org::{AgentId, AgentStatus, OrgCommand};
+use atm_core::{Harness, SessionId, SessionStatus, SessionView};
+use atm_org::{Agent, AgentId, AgentStatus, OrgCommand};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
-use tokio::time::timeout;
+use tokio::{
+    sync::broadcast,
+    time::{timeout, timeout_at, Instant},
+};
 
 /// Set once a flow has changed a pane, so its cleanup knows that the
 /// organisation log must account for it.
@@ -227,7 +232,10 @@ const REGISTRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 impl AgentRuntime {
     /// The sessions on a pane, checked: a registry that can't answer is an
     /// error, never "no sessions".
-    async fn pane_sessions(&self, pane: &PaneId) -> Result<Vec<PaneSession>, AgentError> {
+    pub(super) async fn pane_sessions(
+        &self,
+        pane: &PaneId,
+    ) -> Result<Vec<PaneSession>, AgentError> {
         timeout(REGISTRY_BUDGET, self.registry.pane_sessions(pane.as_str()))
             .await
             .map_err(|_| AgentError::Timeout)?
@@ -252,7 +260,7 @@ impl AgentRuntime {
         pane: &PaneId,
         effect: &Effect,
     ) -> Result<AdoptResult, AgentError> {
-        let state = self.org.snapshot().await?;
+        let (state, cursor) = self.org.snapshot_at().await?;
         let tag = id.to_string();
         let on_pane = |agent: &&atm_org::Agent| {
             agent.status != AgentStatus::Down && agent.pane.as_deref() == Some(pane.as_str())
@@ -350,23 +358,36 @@ impl AgentRuntime {
                 .map(|definition| definition.harness)
         });
         // A pending row counts as a live harness process; a child or excluded row does not.
-        let live = |harness: Harness| {
-            rows.iter().any(|row| {
+        let roots = |harness: Harness| {
+            let excluded = excluded.as_ref();
+            rows.iter().filter(move |row| {
                 row.view.parent_session_id.is_none()
-                    && excluded.as_ref() != Some(&row.view.id)
+                    && excluded != Some(&row.view.id)
                     && row.view.harness == harness.short_tag()
             })
         };
         let seen = match harness.and_then(|harness| agent_screen(harness).zip(Some(harness))) {
-            Some((screen, harness)) if live(harness) => {
-                self.adopt_screen(r, pane, screen, found.local_agent_tag.as_deref())
-                    .await?
+            Some((screen, harness)) if roots(harness).next().is_some() => {
+                self.adopt_screen(
+                    r,
+                    pane,
+                    screen,
+                    found.local_agent_tag.as_deref(),
+                    existing.and_then(|agent| agent.session_id.as_ref()),
+                    roots(harness),
+                )
+                .await?
             }
             _ => None,
         };
-        let (baseline, safe) = match seen {
-            Some((baseline, safe)) => (Some(baseline), safe),
-            None => (None, false),
+        let (baseline, safe, diagnosis) = match seen {
+            Some(seen) => (seen.baseline, seen.safe, seen.diagnosis),
+            None => (None, false, None),
+        };
+        let record_screen = |cursor| {
+            if let Some((at, read, foreground)) = diagnosis {
+                self.screens.record(id, read, at, cursor, foreground);
+            }
         };
         if !tagged {
             effect.store(true, Ordering::SeqCst);
@@ -378,6 +399,7 @@ impl AgentRuntime {
             if let Some(baseline) = baseline {
                 self.record_baseline(id.clone(), pane.as_str(), baseline);
             }
+            record_screen(cursor);
             return Ok(AdoptResult {
                 agent_id: id.clone(),
                 state: recorded.status,
@@ -393,7 +415,7 @@ impl AgentRuntime {
             .filter(|agent| agent.pane.is_some() && !bound)
             .map(|agent| agent.status)
             .filter(|status| matches!(status, AgentStatus::Ready | AgentStatus::Starting));
-        if kept.is_none() {
+        let cursor = if kept.is_none() {
             self.org
                 .execute(
                     OrgCommand::Adopt {
@@ -403,13 +425,18 @@ impl AgentRuntime {
                     },
                     chrono::Utc::now(),
                 )
-                .await?;
-        }
+                .await?
+                .last()
+                .map_or(cursor, |event| event.seq)
+        } else {
+            cursor
+        };
         // Only now is the agent recorded on this pane: a baseline is never
         // kept for a pane the organisation does not give the agent.
         if let Some(baseline) = baseline {
             self.record_baseline(id.clone(), pane.as_str(), baseline);
         }
+        record_screen(cursor);
         if safe && !bound && kept != Some(AgentStatus::Ready) {
             // A harness that announces its session with the first prompt.
             self.org
@@ -437,13 +464,15 @@ impl AgentRuntime {
     /// pinned. The process facts are read between two captures. Nothing is
     /// recorded here: the adopt records the baseline once the pane is the
     /// agent's.
-    async fn adopt_screen(
+    async fn adopt_screen<'a>(
         &self,
         r: &Reservation,
         pane: &PaneId,
         screen: &'static AgentScreen,
         tag: Option<&str>,
-    ) -> Result<Option<(PaneBaseline, bool)>, AgentError> {
+        binding: Option<&SessionId>,
+        rows: impl Iterator<Item = &'a PaneSession>,
+    ) -> Result<Option<AdoptScreen>, AgentError> {
         let format = screen.capture_format();
         let first = r.capture(pane, format).await?.inspection;
         let Some((root, command)) = first.pane_root_pid().zip(first.foreground_command) else {
@@ -455,11 +484,24 @@ impl AgentRuntime {
         let second = r.capture(pane, format).await?;
         Ok(
             pin(screen, (root, &command), &facts, &second).map(|(baseline, control)| {
+                let read =
+                    ScreenSample::read(screen, &baseline, &second, pane, tag, binding, &control);
                 let safe = safe_editor(&control)
                     && !second.inspection.dead
                     && !second.inspection.in_mode
                     && second.inspection.local_agent_tag.as_deref() == tag;
-                (baseline, safe)
+                AdoptScreen {
+                    baseline: (control.dialog != ControlDialog::Unknown).then_some(baseline),
+                    safe,
+                    diagnosis: read.and_then(|sample| {
+                        let foreground = if sample.unreadable {
+                            Some(foreground_session(rows, &facts, binding)?)
+                        } else {
+                            None
+                        };
+                        Some((Instant::now(), sample, foreground))
+                    }),
+                }
             }),
         )
     }
@@ -503,13 +545,19 @@ pub(super) fn other_harness<'a>(
         .filter(|_| !harnesses.contains(&wanted))
 }
 
-/// The adopt rule: what a pane that already runs something is pinned to, and
-/// the adapter's read of its screen. `seen` is the root process and foreground
+struct AdoptScreen {
+    baseline: Option<PaneBaseline>,
+    safe: bool,
+    diagnosis: Option<(Instant, ScreenSample, Option<ForegroundSession>)>,
+}
+
+/// The adopt rule's candidate pin and the adapter's read of its screen.
+/// Only a recognized control screen may install the candidate. `seen` is the root process and foreground
 /// command of a look at the pane taken before `facts` were read, and `capture`
 /// was taken after: the reads are not atomic, so the facts count only when
-/// both looks show the same root process and command. `None` pins nothing: the
-/// looks differ, the process shape places no harness, the command is the
-/// shell's own, or the adapter does not recognise the screen.
+/// both looks show the same root process and command. `None` means the
+/// looks differ, the process shape places no harness, or the command is the
+/// shell's own.
 pub(super) fn pin(
     screen: &AgentScreen,
     seen: (u32, &str),
@@ -523,9 +571,6 @@ pub(super) fn pin(
     }
     let baseline = adopt_baseline(facts, root, command)?;
     let (command, control) = screen.start_candidate(capture, &baseline)?;
-    if control.dialog == ControlDialog::Unknown {
-        return None;
-    }
     Some((baseline.with_harness(command)?, control))
 }
 
@@ -645,6 +690,153 @@ fn input_error(
     Ok(())
 }
 
+/// Identity of the editor whose session saved. A handover must not follow a
+/// later pane or a newer binding when it takes the clear reservation.
+#[derive(Debug, Clone)]
+pub(super) struct SavedSeat {
+    pub agent: AgentId,
+    pub pane: PaneId,
+    pub session: SessionId,
+}
+
+impl SavedSeat {
+    pub(super) fn matches(&self, agent: &Agent) -> bool {
+        agent.status == AgentStatus::Ready
+            && agent.id == self.agent
+            && agent.pane.as_deref() == Some(self.pane.as_str())
+            && agent.session_id.as_ref() == Some(&self.session)
+    }
+
+    pub(super) fn changed(&self) -> AgentError {
+        AgentError::Refused(format!(
+            "agent {} no longer has its saved session {} on {}; nothing was sent",
+            self.agent, self.session, self.pane
+        ))
+    }
+
+    pub(super) fn refusal(&self, reason: &str) -> AgentError {
+        clear_refused(&self.agent, &self.pane, reason)
+    }
+
+    pub(super) fn row_wake(&self, event: &SessionEvent) -> Result<bool, AgentError> {
+        match event {
+            SessionEvent::Removed { session_id, .. } if *session_id == self.session => {
+                Err(self.changed())
+            }
+            SessionEvent::Updated { session } if session.id == self.session => {
+                if session.tmux_pane.as_deref() == Some(self.pane.as_str()) {
+                    Ok(true)
+                } else {
+                    Err(self.changed())
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn candidate(&self, row: &SessionView, harness: Harness) -> bool {
+        row.tmux_pane.as_deref() == Some(self.pane.as_str())
+            && row.parent_session_id.is_none()
+            && !row.id.is_pending()
+            && row.harness == harness.short_tag()
+    }
+
+    fn pinned_row<'a>(
+        &self,
+        rows: &'a [PaneSession],
+        harness: Harness,
+    ) -> Result<&'a SessionView, AgentError> {
+        let mut candidates = rows
+            .iter()
+            .map(|row| &row.view)
+            .filter(|row| self.candidate(row, harness));
+        match (candidates.next(), candidates.next()) {
+            (Some(row), None) if row.id == self.session => Ok(row),
+            _ => Err(self.changed()),
+        }
+    }
+}
+
+/// Keep registry evidence through both reserved input guards. The control
+/// actor already checks the pane and its agent tag on the fresh capture;
+/// this nonblocking check covers session changes since the registry reads.
+struct SavedClearFence {
+    target: SavedSeat,
+    // None latches an invalidation so a guard refusal cannot become a retry.
+    rows: Mutex<Option<broadcast::Receiver<SessionEvent>>>,
+}
+
+impl SavedClearFence {
+    fn permits(&self, harness: Harness) -> bool {
+        let Ok(mut slot) = self.rows.try_lock() else {
+            return false;
+        };
+        let valid = slot.as_mut().is_some_and(|rows| {
+            for _ in 0..=rows.len() {
+                match rows.try_recv() {
+                    Ok(event) => {
+                        if self.target.row_wake(&event).is_err()
+                            || matches!(event, SessionEvent::Updated { session }
+                                if session.id != self.target.session && self.target.candidate(&session, harness))
+                        {
+                            return false;
+                        }
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => return true,
+                    Err(_) => return false, // lost evidence cannot authorize input
+                }
+            }
+            rows.is_empty()
+        });
+        if !valid {
+            *slot = None;
+        }
+        valid
+    }
+
+    fn invalidated(&self) -> bool {
+        self.rows.try_lock().map_or(true, |slot| slot.is_none())
+    }
+}
+
+/// These two early results mean no Clear was committed and no input attempted.
+/// Once the flow commits to the clear, only an error or Cleared can leave it.
+#[derive(Debug)]
+pub(super) enum ClearAttempt {
+    Blocked(&'static str),
+    Expired,
+    Cleared(ClearOutcome),
+}
+
+#[derive(Debug)]
+pub(super) struct ClearOutcome {
+    pub result: ClearResult,
+    /// This operation's committed binding (or unbound editor) fence.
+    pub ready_seq: Option<u64>,
+    pub start_line: StartLineDisposition,
+}
+
+struct ClearSetup {
+    pane: PaneId,
+    harness: Harness,
+    screen: &'static AgentScreen,
+    baseline: PaneBaseline,
+    before: Vec<SessionId>,
+    bind: Option<SessionId>,
+}
+
+enum ClearPreflight {
+    Blocked(&'static str),
+    Noop,
+    Ready(ClearSetup),
+}
+
+fn clear_refused(id: &AgentId, pane: &PaneId, reason: &str) -> AgentError {
+    AgentError::Refused(format!(
+        "agent {id} was not cleared: {reason}; nothing was sent to {pane}"
+    ))
+}
+
 impl AgentRuntime {
     /// Clear an agent's conversation with its harness's own command, and
     /// report the agent Ready again only on the proof the harness's policy
@@ -667,11 +859,82 @@ impl AgentRuntime {
         id: &AgentId,
         reserved: Option<&PaneId>,
         waiting: &Waiting,
-    ) -> Result<ClearResult, AgentError> {
+        saved: Option<&SavedSeat>,
+        retry_before: Option<Instant>,
+    ) -> Result<ClearAttempt, AgentError> {
+        // Subscribe before the preflight reads the rows. Retrying a read-only
+        // preflight must not leave any live operation with input authority.
+        let mut events = self.registry.subscribe();
+        let fence = saved.map(|target| {
+            Arc::new(SavedClearFence {
+                target: target.clone(),
+                rows: Mutex::new(Some(events.resubscribe())),
+            })
+        });
+        let preflight = self.clear_preflight(r, id, reserved, saved);
+        let plan = match retry_before {
+            Some(at) => match timeout_at(at, preflight).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(ClearAttempt::Expired),
+            },
+            None => preflight.await?,
+        };
+        let plan = match plan {
+            ClearPreflight::Ready(plan) => plan,
+            ClearPreflight::Blocked(reason) => return Ok(ClearAttempt::Blocked(reason)),
+            ClearPreflight::Noop => {
+                return Ok(ClearAttempt::Cleared(ClearOutcome {
+                    result: ClearResult {
+                        agent_id: id.clone(),
+                        session_id: None,
+                    },
+                    ready_seq: None,
+                    start_line: StartLineDisposition::Unidentified,
+                }))
+            }
+        };
+        if let Some(session_id) = plan.bind.clone() {
+            self.org
+                .execute(
+                    OrgCommand::SessionBound {
+                        agent_id: id.clone(),
+                        session_id,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await?;
+        }
+        if retry_before.is_some_and(|at| Instant::now() >= at) {
+            return Ok(ClearAttempt::Expired);
+        }
+        waiting_for(waiting, "the clear command was not typed");
+        self.org
+            .execute(
+                OrgCommand::Clear {
+                    agent_id: id.clone(),
+                },
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        self.finish_clear(r, id, waiting, plan, fence, &mut events)
+            .await
+    }
+
+    async fn clear_preflight(
+        &self,
+        r: &Reservation,
+        id: &AgentId,
+        reserved: Option<&PaneId>,
+        saved: Option<&SavedSeat>,
+    ) -> Result<ClearPreflight, AgentError> {
         let state = self.org.snapshot().await?;
         let agent = state
             .agent(id)
             .ok_or_else(|| AgentError::NotFound(format!("agent {id} was not found")))?;
+        if let Some(saved) = saved.filter(|saved| !saved.matches(agent)) {
+            return Err(saved.changed());
+        }
         if agent.status != AgentStatus::Ready {
             return Err(AgentError::Refused(format!(
                 "agent {id} is {}; only a ready agent can be cleared",
@@ -685,9 +948,6 @@ impl AgentRuntime {
             )));
         }
         let pane = pane.ok_or_else(|| AgentError::Refused(format!("agent {id} has no pane")))?;
-        // Subscribed before the rows are read: a session that arrives from
-        // here on is an event, and the rows below are what was there before.
-        let mut events = self.registry.subscribe();
         let rows: Vec<SessionView> = self
             .pane_sessions(&pane)
             .await?
@@ -717,62 +977,107 @@ impl AgentRuntime {
             )));
         }
         // No session the pane or the agent has now can be the clear's result.
-        let mut before: Vec<SessionId> = rows
+        let before: Vec<SessionId> = rows
             .iter()
             .map(|row| row.id.clone())
             .chain(agent.session_id.clone())
             .chain(agent.excluded_session_id.clone())
             .collect();
-        let refused = |reason: &str| {
-            AgentError::Refused(format!(
-                "agent {id} was not cleared: {reason}; nothing was sent to {pane}"
-            ))
-        };
         let capture = r.capture(&pane, format).await?;
-        if let Some(reason) = input_refusal(screen, &capture, &baseline, &tag) {
-            return Err(refused(reason));
+        let mut registry_idle = true;
+        if let Some(saved) = saved {
+            // Capture is paced. Recheck the binding and registry under the
+            // reservation *after* that await, not just when it was requested.
+            let rows = self.pane_sessions(&pane).await?;
+            let latest = self.org.snapshot().await?;
+            if latest.agent(id).is_none_or(|agent| !saved.matches(agent)) {
+                return Err(saved.changed());
+            }
+            registry_idle = saved.pinned_row(&rows, harness)?.status == SessionStatus::Idle;
+        }
+        let refused = |block: InputBlocker| match block {
+            InputBlocker::Temporary(reason) if saved.is_some() => {
+                Ok(ClearPreflight::Blocked(reason))
+            }
+            _ => Err(clear_refused(id, &pane, block.reason())),
+        };
+        if let Some(block) = input_blocker(screen, &capture, &baseline, &tag) {
+            return refused(block);
         }
         let control = screen.control(&capture, &baseline);
         if clear_noop(policy, agent.session_id.is_some(), own.len(), &control) {
-            return Ok(ClearResult {
-                agent_id: id.clone(),
-                session_id: None,
-            });
+            return Ok(ClearPreflight::Noop);
         }
         if let Some(reason) = clear_refusal(policy, &control) {
-            return Err(refused(reason));
+            return refused(if safe_editor(&control) {
+                InputBlocker::Terminal(reason)
+            } else {
+                InputBlocker::Temporary(reason)
+            });
         }
-        if let Some(row) = own.first().filter(|_| agent.session_id.is_none()) {
-            // The one session on the pane is the conversation being cleared:
-            // bound, the Clear excludes it and it is never taken for a new one.
-            self.org
-                .execute(
-                    OrgCommand::SessionBound {
-                        agent_id: id.clone(),
-                        session_id: row.id.clone(),
-                    },
-                    chrono::Utc::now(),
-                )
-                .await?;
+        if !registry_idle {
+            return Ok(ClearPreflight::Blocked("the session is not idle"));
         }
-        waiting_for(waiting, "the clear command was not typed");
-        self.org
-            .execute(
-                OrgCommand::Clear {
-                    agent_id: id.clone(),
-                },
-                chrono::Utc::now(),
-            )
-            .await?;
+        // An unbound standalone clear excludes the sole earlier session too.
+        let bind = own
+            .first()
+            .filter(|_| agent.session_id.is_none())
+            .map(|row| row.id.clone());
+        Ok(ClearPreflight::Ready(ClearSetup {
+            pane,
+            harness,
+            screen,
+            baseline,
+            before,
+            bind,
+        }))
+    }
 
+    async fn finish_clear(
+        &self,
+        r: &Reservation,
+        id: &AgentId,
+        waiting: &Waiting,
+        setup: ClearSetup,
+        fence: Option<Arc<SavedClearFence>>,
+        events: &mut broadcast::Receiver<SessionEvent>,
+    ) -> Result<ClearAttempt, AgentError> {
+        let ClearSetup {
+            pane,
+            harness,
+            screen,
+            baseline,
+            mut before,
+            ..
+        } = setup;
+        let (policy, format, tag) = (screen.policy(), screen.capture_format(), id.to_string());
         let command = policy.clear_command;
+        if let Some(fence) = &fence {
+            // Clear moves the old binding to the exclusion under our reservation.
+            let target = &fence.target;
+            let state = self.org.snapshot().await?;
+            if state.agent(&target.agent).is_none_or(|agent| {
+                agent.status != AgentStatus::Clearing
+                    || agent.pane.as_deref() != Some(target.pane.as_str())
+                    || agent.excluded_session_id.as_ref() != Some(&target.session)
+            }) {
+                return Err(target.changed());
+            }
+            target.pinned_row(&self.pane_sessions(&pane).await?, harness)?;
+        }
         loop {
-            let (baseline, tag) = (baseline.clone(), tag.clone());
-            let guard = move |capture: &_| safe_to_paste(screen, capture, &baseline, &tag);
-            match r
+            let (baseline, tag, check) = (baseline.clone(), tag.clone(), fence.clone());
+            let guard = move |capture: &_| {
+                let safe = safe_to_paste(screen, capture, &baseline, &tag);
+                check.is_none_or(|fence| fence.permits(harness)) && safe
+            };
+            let pasted = r
                 .paste_guarded(&pane, id.clone(), command.to_owned(), format, guard)
-                .await
-            {
+                .await;
+            if let Some(fence) = fence.as_ref().filter(|fence| fence.invalidated()) {
+                return Err(fence.target.changed());
+            }
+            match pasted {
                 Ok(()) => break,
                 Err(error) => input_error(
                     waiting,
@@ -783,23 +1088,38 @@ impl AgentRuntime {
             }
         }
         waiting_for(waiting, "the clear command did not appear in the editor");
+        waiting_for(waiting, "the clear command did not appear in the editor");
+        let not_submitted = || {
+            stopped(
+                waiting,
+                id,
+                "clear",
+                "the clear command was typed and not submitted".into(),
+            )
+        };
         loop {
             let capture = r.capture(&pane, format).await?;
+            if fence.as_ref().is_some_and(|fence| !fence.permits(harness)) {
+                return Err(not_submitted());
+            }
             match submit_step(screen, &capture, &baseline, &tag, command) {
                 Step::Key { key, .. } => {
-                    let (baseline, tag) = (baseline.clone(), tag.clone());
+                    let (baseline, tag, check) = (baseline.clone(), tag.clone(), fence.clone());
                     let guard = move |capture: &_| {
-                        submit_allowed(screen, capture, &baseline, &tag, command)
+                        let safe = submit_allowed(screen, capture, &baseline, &tag, command);
+                        check.is_none_or(|fence| fence.permits(harness)) && safe
                     };
                     // A session that is on the pane before the Enter is not
                     // its result (somebody cleared by hand meanwhile). Read
                     // before the key, not after: the real one can beat that.
-                    before.extend(
-                        self.pane_sessions(&pane)
-                            .await?
-                            .into_iter()
-                            .map(|row| row.view.id),
-                    );
+                    let rows = self.pane_sessions(&pane).await?;
+                    if let Some(fence) = &fence {
+                        fence
+                            .target
+                            .pinned_row(&rows, harness)
+                            .map_err(|_| not_submitted())?;
+                    }
+                    before.extend(rows.into_iter().map(|row| row.view.id));
                     // Said before the key: a deadline while the key is out
                     // must not report the step before it.
                     waiting_for(
@@ -808,7 +1128,11 @@ impl AgentRuntime {
                     );
                     #[cfg(test)]
                     self.progress("clear_submitting", Some(id.clone()));
-                    match r.keys_guarded(&pane, id.clone(), key, format, guard).await {
+                    let entered = r.keys_guarded(&pane, id.clone(), key, format, guard).await;
+                    if fence.as_ref().is_some_and(|fence| fence.invalidated()) {
+                        return Err(not_submitted());
+                    }
+                    match entered {
                         Ok(()) => break,
                         Err(error) => input_error(
                             waiting,
@@ -868,12 +1192,20 @@ impl AgentRuntime {
                             agent_id: id.clone(),
                         },
                     };
-                    self.org.execute(command, chrono::Utc::now()).await?;
-                    self.queue_start_line(id, session_id.as_ref()).await;
-                    return Ok(ClearResult {
-                        agent_id: id.clone(),
-                        session_id,
-                    });
+                    // History must see the start line before it can let an
+                    // older job act on this Ready, even across replay.
+                    let start_line = self
+                        .queue_start_line(id, session_id.as_ref(), fence.is_some())
+                        .await;
+                    let ready = self.org.execute(command, chrono::Utc::now()).await?;
+                    return Ok(ClearAttempt::Cleared(ClearOutcome {
+                        result: ClearResult {
+                            agent_id: id.clone(),
+                            session_id,
+                        },
+                        ready_seq: ready.first().map(|event| event.seq),
+                        start_line,
+                    }));
                 }
                 Step::Key { key, expect, .. } => {
                     let (baseline, tag) = (baseline.clone(), tag.clone());
@@ -906,7 +1238,17 @@ impl AgentRuntime {
         &self,
         id: &AgentId,
         waiting: &Waiting,
+        saved_handover: bool,
     ) -> Result<(), AgentError> {
+        // A saved handover is already bound. With a readable, unset marker,
+        // its preflight never submitted Clear and has no writes to settle.
+        if saved_handover
+            && waiting
+                .lock()
+                .is_ok_and(|progress| progress.reason.is_none())
+        {
+            return Ok(());
+        }
         self.settle(id, waiting, AgentStatus::Clearing, "clear")
             .await
     }
@@ -1446,7 +1788,7 @@ impl AgentRuntime {
                         },
                     };
                     self.org.execute(command, chrono::Utc::now()).await?;
-                    self.queue_start_line(&id, session_id.as_ref()).await;
+                    self.queue_start_line(&id, session_id.as_ref(), false).await;
                     return Ok(UpResult {
                         agent_id: id,
                         pane: pane.to_string(),

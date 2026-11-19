@@ -261,6 +261,8 @@ pub enum HistoryUpdate {
 
 #[derive(Debug, Clone)]
 struct RecipientHistory {
+    // A committed clear's start note; survives revalidation, not replacement.
+    start_first: Option<MessageId>,
     observation: Option<RecipientObservation>,
     status_since: Option<DateTime<Utc>>,
     last_event_at: Option<DateTime<Utc>>,
@@ -273,6 +275,7 @@ struct RecipientHistory {
 impl Default for RecipientHistory {
     fn default() -> Self {
         Self {
+            start_first: None,
             observation: None,
             status_since: None,
             last_event_at: None,
@@ -421,6 +424,7 @@ struct Queue {
     /// is not the message asking.
     in_flight: [Option<MessageId>; 2],
     head: Option<MessageId>,
+    start_first: Option<MessageId>,
 }
 
 impl Queue {
@@ -441,6 +445,11 @@ impl Queue {
     /// a follower's readiness budget and stale-blocker bound start when it
     /// becomes the head, not while it waits its turn.
     fn blocked_by(&self, id: MessageId) -> Option<MessageId> {
+        // A reserved attempt cannot straddle clear. An older retry may
+        // still have a historical attempt, but cannot veto the start note.
+        if let Some(start) = self.start_first {
+            return (start != id).then_some(start);
+        }
         self.other_in_flight(id).or(self
             .head
             .filter(|head| *head < id && !self.in_flight.contains(&Some(id))))
@@ -578,6 +587,21 @@ impl MessageHistory {
         Ok(())
     }
 
+    fn start_first(&self, recipient: &AgentId) -> Option<MessageId> {
+        let start = self.recipients.get(recipient)?.start_first?;
+        self.open.get(recipient)?.contains(&start).then_some(start)
+    }
+
+    fn open_ordered(&self, recipient: &AgentId) -> Result<Vec<MessageId>, MessageError> {
+        self.replayed()?;
+        let start = self.start_first(recipient);
+        let fifo = self.open.get(recipient).into_iter().flatten().copied();
+        Ok(start
+            .into_iter()
+            .chain(fifo.filter(|id| Some(*id) != start))
+            .collect())
+    }
+
     fn queue(&self, recipient: &AgentId) -> Queue {
         let Some(open) = self.open.get(recipient) else {
             return Queue::default();
@@ -590,6 +614,7 @@ impl MessageHistory {
         Queue {
             in_flight: [in_flight.next(), in_flight.next()],
             head: open.first().copied(),
+            start_first: self.start_first(recipient),
         }
     }
 
@@ -890,6 +915,22 @@ impl MessageHistory {
             named.and_then(|id| Some((id, agent_facts(self.state.agent(id)?))))
         {
             let history = self.recipients.entry(id.clone()).or_default();
+            match event {
+                OrgEvent::AgentClearRequested { .. } => {
+                    // queue_start_line reuses an already open line.
+                    history.start_first =
+                        self.open.get(id).into_iter().flatten().copied().find(|id| {
+                            self.state
+                                .message(id)
+                                .is_some_and(|m| super::start_line::is_start_line(&m.content))
+                        });
+                }
+                OrgEvent::AgentUpRequested { .. }
+                | OrgEvent::AgentAdopted { .. }
+                | OrgEvent::AgentPaneCreated { .. }
+                | OrgEvent::AgentDown { .. } => history.start_first = None,
+                _ => {}
+            }
             track_agent_not_ready(
                 &mut history.not_ready_since,
                 before.as_ref().map(|old| old.0),
@@ -941,21 +982,40 @@ impl MessageHistory {
         let Address::Agent(recipient) = &message.content.to else {
             return Ok(());
         };
+        let before = self.start_first(recipient);
         let open = self.open.entry(recipient.clone()).or_default();
-        let previous_head = open.first().copied();
-        if matches!(
+        let previous_head = before.or_else(|| open.first().copied());
+        let is_open = matches!(
             message.status,
             DeliveryStatus::Queued | DeliveryStatus::Delivering
-        ) {
+        );
+        if is_open {
             open.insert(id);
         } else {
             open.remove(&id);
         }
-        if seq > self.startup_high_water && open.first().copied() != previous_head {
+        if let Some(history) = self.recipients.get_mut(recipient) {
+            if !is_open && history.start_first == Some(id) {
+                history.start_first = None;
+            } else if is_open
+                && history.start_first.is_none()
+                && matches!(event, OrgEvent::MessageSent(content) if super::start_line::is_start_line(content))
+                && self
+                    .state
+                    .agent(recipient)
+                    .is_some_and(|agent| agent.status == AgentStatus::Clearing)
+            {
+                history.start_first = Some(id);
+            }
+        }
+        let head = self
+            .start_first(recipient)
+            .or_else(|| self.open.get(recipient)?.first().copied());
+        if seq > self.startup_high_water && head != previous_head {
             // A live promotion starts a fresh readiness budget even if nobody
             // consumed the replayed follower's wait. During replay the head
             // keeps its recovery-time budget instead.
-            if let Some(track) = open.first().and_then(|head| self.messages.get_mut(head)) {
+            if let Some(track) = head.and_then(|head| self.messages.get_mut(&head)) {
                 track.hold_since = None;
             }
         }
@@ -1459,6 +1519,13 @@ impl MessageHistoryHandle {
         match self.inner.as_ref() {
             HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
             HistoryBackend::Live { state, .. } => history_state(state)?.snapshot(id, now),
+        }
+    }
+
+    pub(super) fn open_ordered(&self, recipient: &AgentId) -> Result<Vec<MessageId>, MessageError> {
+        match self.inner.as_ref() {
+            HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
+            HistoryBackend::Live { state, .. } => history_state(state)?.open_ordered(recipient),
         }
     }
 

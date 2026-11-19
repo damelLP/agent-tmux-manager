@@ -617,6 +617,78 @@ fn restart_queued_and_delivering_hold() {
     rig.test.rig.close();
 }
 
+/// Ack is durable even for a reference the pane never received. A follower's
+/// real receipt fences the restarted scheduler; journal silence alone would not.
+#[test]
+fn recipient_ack_cancel_survives_daemon_restart() {
+    let mut rig = MessageRig::start(Confirmation::Generous);
+    let lead = rig.ready_agent("lead", StandInMode::Claude);
+    rig.hold_turn(&lead.pane);
+    let mut watch = rig.watch();
+    let id = rig.send(None, &lead.id, "read directly while busy");
+    let follower = rig.send(None, &lead.id, "still needs delivery");
+    let unread = rig.inbox_entry(Some(&lead.pane), None, &id);
+    assert_eq!(unread["status"], "queued");
+    assert_eq!(unread["read_at"], Value::Null);
+    assert_eq!(
+        rig.atm_json(Some(&lead.pane), &["msg", "ack", &id, "--format", "json"]),
+        json!({"count":1}),
+    );
+    let reason = "recipient acknowledged; automatic delivery cancelled";
+    let final_failure = watch.wait("cancelled delivery", about("msg.delivery_failed", &id));
+    assert_eq!(
+        final_failure["body"],
+        json!({"message_id":id, "reason":reason, "final":true})
+    );
+    let read = watch.wait("read after cancellation", |e| {
+        e["kind"] == "msg.read" && e["body"]["message_ids"] == json!([id])
+    });
+    assert!(seq(&final_failure) < seq(&read));
+    assert!(attempts(&mut watch, &rig, &id).is_empty());
+    let settled = rig.inbox_entry(Some(&lead.pane), None, &id);
+    let first_read = settled["read_at"].as_str().expect("first read").to_owned();
+    let end = rig.test.cursor();
+    drop(watch);
+
+    rig.test.rig.restart_daemon();
+    let mut watch = Watch::open(&rig, end);
+    let cursor = rig.test.rig.event_cursor(&lead.pane);
+    rig.finish_turn(&lead.pane);
+    watch.wait(
+        "uncancelled follower's receipt",
+        about("msg.delivered", &follower),
+    );
+    assert_eq!(
+        rig.accepted_since(&lead.pane, cursor),
+        [reference(&follower)]
+    );
+    assert!(attempts(&mut watch, &rig, &id).is_empty());
+    let current = rig.inbox_entry(Some(&lead.pane), None, &id);
+    let history = rig.atm_json(None, &["msg", "history"]);
+    let sender_row = history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["message_id"] == id)
+        .unwrap();
+    for row in [&current, sender_row] {
+        assert_eq!(row["status"], "failed");
+        assert_eq!(row["read_at"], first_read);
+        assert_eq!(
+            row["delivery"],
+            json!({
+                "phase":"failed", "reason":reason, "attempt":0, "pane":null,
+                "session_id":null, "confirmation":null, "retry_at":null, "blocked_by":null,
+            })
+        );
+    }
+    assert_eq!(
+        rig.atm_json(Some(&lead.pane), &["msg", "ack", &id, "--format", "json"]),
+        json!({"count":0})
+    );
+    rig.test.rig.close();
+}
+
 /// A message that was never attempted is not held by a restart: the new
 /// daemon attempts it as its first attempt once the recipient is free.
 #[test]

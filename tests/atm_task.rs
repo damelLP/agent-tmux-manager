@@ -36,6 +36,127 @@ async fn all_nine_task_commands_have_help() {
     assert!(!dir.path().join("fallback").exists());
 }
 
+// Break caught: the CLI drops evidence, uses a legacy mutation, or treats queueing as delivery.
+#[tokio::test]
+async fn carry_back_cli_forwards_explicit_evidence() {
+    let args = [
+        "task",
+        "carry-back",
+        "t21",
+        "--from-fix",
+        "t35",
+        "--review-task",
+        "t42",
+        "--note",
+        "covers the fix",
+    ];
+    let params =
+        json!({"task_id":"t21","fix_task":"t35","review_task":"t42","note":"covers the fix"});
+    let reply = json!({"result":{"task_id":"t21","changed":true,"notification":{"status":"queued","message_id":"m53"}}});
+    for format in ["text", "json"] {
+        let argv = [&args[..], &["--format", format]].concat();
+        let out = support::exchange(
+            &argv,
+            "task.carry_back",
+            params.clone(),
+            reply.clone(),
+            Some("%7"),
+            true,
+            false,
+        )
+        .await;
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stderr.is_empty());
+        if format == "text" {
+            assert_eq!(
+                out.stdout,
+                b"t21 changed\nnotification: queued m53 (not delivery confirmation)\n"
+            );
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                reply["result"]
+            );
+        }
+    }
+    let old = support::exchange(
+        &args,
+        "task.carry_back",
+        params,
+        Value::Null,
+        Some("%7"),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(old.status.code(), Some(1), "{old:?}");
+    assert!(old.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&old.stderr).contains("the daemon is too old; restart atmd"));
+}
+
+// Break caught: missing proof flags or malformed IDs reach the transport instead of syntax rejection.
+#[tokio::test]
+async fn carry_back_cli_requires_proof_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = support::command(dir.path(), &["task", "carry-back", "--help"], None)
+        .output()
+        .await
+        .unwrap();
+    assert!(help.status.success(), "{help:?}");
+    let text = String::from_utf8(help.stdout).unwrap();
+    for flag in ["--from-fix", "--review-task", "--note"] {
+        assert!(text.contains(flag));
+    }
+    for args in [
+        &[
+            "task",
+            "carry-back",
+            "t21",
+            "--from-fix",
+            "t35",
+            "--review-task",
+            "t42",
+        ][..],
+        &[
+            "task",
+            "carry-back",
+            "t21",
+            "--from-fix",
+            "t35",
+            "--note",
+            "reason",
+        ],
+        &[
+            "task",
+            "carry-back",
+            "t21",
+            "--review-task",
+            "t42",
+            "--note",
+            "reason",
+        ],
+        &[
+            "task",
+            "carry-back",
+            "t21",
+            "--from-fix",
+            "t035",
+            "--review-task",
+            "t42",
+            "--note",
+            "reason",
+        ],
+    ] {
+        let out = support::command(dir.path(), args, None)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        assert!(out.stdout.is_empty());
+    }
+    assert!(!dir.path().join("fallback").exists());
+}
+
 // Break caught: CLI fixtures drift from real method results or lose refusal messages.
 // Captured: atmd b3f75b26, 2026-11-15, private DaemonServer with committed synthetic seed state;
 // no real harness payloads or model turns. Seed clock is 2026-01-15T12:00:00Z.

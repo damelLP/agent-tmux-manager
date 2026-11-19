@@ -112,10 +112,16 @@ def at_prompt(shell):
     return len(fields) > 5 and fields[2] == fields[5]  # its process group is the terminal's
 
 
+def starting_with_session(agent):
+    """A bound starting row is revalidated after a restart, not interrupted."""
+    session_id = agent.get('session_id')
+    return agent['state'] == 'starting' and isinstance(session_id, str) and bool(session_id)
+
+
 def in_flight(snapshot):
     """What a restart would break: it leaves such an agent stuck and such a message held."""
     busy = [f"agent {agent['agent_id']} is {agent['state']}" for agent in snapshot['agents'] or []
-            if agent['state'] in ('starting', 'clearing')]
+            if agent['state'] in ('starting', 'clearing') and not starting_with_session(agent)]
     busy += [f"message {message['message_id']} to {agent} is being delivered"
              for agent, messages in snapshot['messages'].items() for message in messages
              if message['delivery']['phase'] == 'delivering']
@@ -510,7 +516,8 @@ class Rollout:
                 f"{row.get('id_short')} {row.get('tmux_pane') or '-'}" for row in working) if working else ''))
         panes = self.panes()
         for agent in snapshot['agents'] or []:
-            say(f"Agent {agent['agent_id']}: {agent['state']}, pane {agent.get('pane') or '-'}")
+            revalidation = ' (bound session; revalidation pending)' if starting_with_session(agent) else ''
+            say(f"Agent {agent['agent_id']}: {agent['state']}, pane {agent.get('pane') or '-'}{revalidation}")
             if panes is not None and agent.get('pane') and agent['pane'] not in panes:
                 say(f"Warning: agent {agent['agent_id']}'s pane {agent['pane']} is gone; the restart will "
                     'record it down')

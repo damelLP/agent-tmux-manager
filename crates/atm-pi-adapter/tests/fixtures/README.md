@@ -446,3 +446,15 @@ composers and fails the dedicated negatives. Bold titles do not excuse a draft,
 running turn, dialog, malformed notice or unexplained extra rule. Removing the
 bold-title path makes the real built-in-theme regressions fail. No new model
 turn was needed for this fix.
+
+
+## Styled Markdown link (pi 1.5.2)
+
+Captured: pi 1.5.2, 2026-11-18, sealed tmux 3.8 capture-pane -p -e -N after offline resume of a synthetic conversation; cwd sanitized.
+`screen_styled_s2-markdown-link_128x42_1.5.2.txt` is the full 128×42 viewport.
+The seed contains one Markdown link to `example.test`; no model was called.
+Pi emits SGR 4/24 around the label; tmux captures SGR 4 and then resets with
+SGR 0. Only the cwd value was replaced. Each row ends with one storage-only
+`|`, which the test removes to retain literal trailing grid spaces.
+Synthetic: dropping only underline leaves the same idle editor; conceal,
+malformed SGR and damaged rules still refuse the observation.

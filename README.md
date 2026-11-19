@@ -5,7 +5,7 @@
 
 A live dashboard and a daemon-backed control plane for coding agents in tmux.
 
-**0.5.1 opens the dashboard on Work, with vim-style tabs and reporting threads, and fixes chat copy, logging and its workspace sidebar.** ATM also includes owner decision answers and spoken-answer relays, message history, return digests, and evaluation reports. It is not a complete unattended workflow: see [known limits and not yet](#known-limits-and-not-yet).
+**0.5.2 polishes the Work view, recognises more Claude Code screens, and prompts new sessions to resume after a saved handover.** ATM also includes owner decision answers and spoken-answer relays, message history, return digests, and evaluation reports. It is not a complete unattended workflow: see [known limits and not yet](#known-limits-and-not-yet).
 
 ## What it does
 
@@ -269,7 +269,7 @@ For `clear`, `handover`, `respawn`, `down`, `msg send --to` and `inbox --for`, a
 
 ### Handing an agent over
 
-`atm agent handover <agent>` does in one command what a clear by hand needs three steps for. `atmd` sends the agent one message that asks it to write what its next session needs to `.atm/memory/<name>.md` in the project's main checkout. It waits until that turn has ended and the file has changed, and then clears the agent as `atm agent clear` does. The new session finds the file through `atm me`.
+`atm agent handover <agent>` does in one command what a clear by hand needs three steps for. `atmd` sends the agent one message that asks it to write what its next session needs to `.atm/memory/<name>.md` in the project's main checkout. It waits until that turn has ended and the file has changed, and then clears the agent as `atm agent clear` does. Instead of the plain start line, the replacement is prompted: `Run atm me; read its memory file; resume open work or report and stop.`
 
 ```bash
 atm agent handover worker                      # waits up to 10 minutes for the save, then clears
@@ -280,10 +280,11 @@ atm agent handover worker --format json        # {"agent_id":…,"message_id":"m
 - **Nothing is cleared unless the agent saved.** `atmd` notes the memory file's size and modification time when the command starts, just before it queues the request. Saved means that, once the save turn has ended, the file is there and either differs from that or is new. A change made before the request reaches the agent counts too, for example by an agent that writes its file and asks for its own handover in the same turn. The content is not read. If the save turn ends and the file is as it was, or it has been removed, the command fails with `<agent> ended its save turn and <file> did not change; nothing was cleared`.
 - **The request is an ordinary message** from `system`, typed as `[mN] Read: atm inbox --id mN` under the usual delivery rules: an idle agent, an empty editor, no dialog, and not the pane you are focused on. If it is not delivered within the timeout the command fails and says so. The request stays queued, the next `atm agent handover` of that agent reuses it, and `atm msg give-up mN` cancels it.
 - **If the save turn does not end in time** the command fails with `<agent>'s save turn did not end in <n> s`, and adds `it waits at a dialog in %N` when the agent is waiting for an answer, for example a permission to write the file.
-- **If the clear is refused after the save** (you are focused on the pane, a draft is in the editor, a new turn has started) the command fails with `<agent> saved its state (mN); ` followed by the clear's own reason. Run `atm agent clear <agent>` when the pane is free.
-- **An agent may hand itself over.** From its own pane the command answers `started` at once, because the request can only arrive after the agent's current turn has ended. The agent then ends its turn, is asked to save, and is cleared. If that handover fails, the agent's manager (you, when its role names none) gets one note with the reason. The same note is sent when another caller's command is gone before the handover fails, for example a command that was killed while it waited: the handover carries on, and its failure goes to the agent's manager instead. From an agent's shell, whose tools may stop a long command, run a handover in the background.
+- **A saved handover waits for a safe editor.** If the first clear preflight sends nothing because the pane is busy, focused, at a dialog or has a draft, `atmd` can check again for up to 20 seconds on the same pane and session. `atm agent list` shows why it is waiting. It never asks for a second save, deletes a draft or repeats a clear that may have sent input. A changed session or lost pane stops it. On failure the command identifies the save and the refusal; inspect `atm agent list` before trying again.
+- **Cleared is not the same as resumed.** The command still answers `cleared` when the clear itself is confirmed. For the outcome note, `atmd` waits up to another 30 seconds for both the new session's binding and a receipt for its exact start line. A success names the save message, old and new session IDs and delivered resume message. If the start line is disabled, held, or unconfirmed, the note says the clear succeeded but resume was not confirmed. It does not resend a prompt or send a second note if the receipt comes late. A receipt proves prompt acceptance, not that the agent read its memory.
+- **Who hears the outcome.** After a save, the current role's manager gets one outcome note, falling back to the recorded manager at `agent up`, then to the owner. An explicit `manager = "owner"` wins. Before a save, a waiting command gets its error as an answer; an unclaimed failure goes in a note. From its own pane the command answers `started` at once so the agent can finish its turn, and the daemon carries on. From an agent's shell, whose tools may stop a long command, run a handover in the background.
 - **Only a `ready` agent with a known session** can be handed over, and one handover per agent runs at a time. Anyone may ask, as for messages.
-- **A restart of `atmd` during a handover** loses it: the request is still delivered and the agent saves, but nothing is cleared. Run the command again.
+- **A restart of `atmd` during a handover** loses its in-flight work and its outcome note. The saved request or a clear already started may still have taken effect. Inspect the agent and its inbox before rerunning the command.
 
 **A note at the context line.** When a named agent's turn ends and its context is at 60% or more, `atmd` sends one note to the agent's manager (to you for an agent whose role names none, and for an adopted agent): `agent <id> is at <n>% of its context (line 60%). Hand it over: atm agent handover <id>`. It is sent once per session and nothing is cleared. After a restart of `atmd` a session that was already noted can be noted once more. The line is 60% for every harness and model: a chosen number, not a measured one, until measurements give better ones.
 
@@ -296,14 +297,13 @@ cache_minutes = 60            # optional, required for "idle": how long you assu
 idle_minutes  = 48            # optional: default four fifths of cache_minutes, and always below it
 ```
 
-- **`"context"`:** when a turn of the seat ends at or above its line, `atmd` runs the handover above itself: the same save request, the same wait for the memory file, the same clear. The seat's manager gets one note when it is over, `automatic handover of <id> done (context 63%, line 60%): it saved to <file> (mN) and has a new session.` or `automatic handover of <id> (…) did not complete: <reason>. Nothing more is tried in this session. By hand: atm agent handover <id>`, in place of the note at the line. `context_line` also moves that note for a seat that is off.
+- **`"context"`:** when a turn of the seat ends at or above its line, `atmd` runs the same save, clear and resume check. The manager gets one outcome note in place of the note at the line, for example `automatic handover of p/worker (context 63%, line 60%) complete: saved (m12); cleared and bound old -> new; resume prompt m15 delivered.` If the clear retry window expires, the note includes the last refusal. `context_line` also moves the line note for a seat that is off.
 - **`"idle"`:** when the seat has been idle for `idle_minutes` and nothing it waits for will come before `cache_minutes` are over, it is asked to save while its cache is still warm, and the handover gives up when they are over. `atmd` has no cache life of its own, because none has been measured: without `cache_minutes` there is no idle rule. What a seat waits for is read from tasks and decisions only: a task it holds or has given to another agent, or a pending decision it asked for (your answer counts as coming in time). A seat that works by messages alone waits for nothing as far as `atmd` can see, so use `"idle"` only where tasks carry the work.
 - **The file is read at every turn end,** in the project's main checkout, as `atm me` reads it. An edit takes effect at the seat's next turn end with no restart and no respawn, and removing `auto_handover` stops it. A missing or invalid role file is off.
 - **It never does more than the command would.** Nothing is typed while a turn runs, over a draft, at a dialog or into the pane you are focused on: the request waits there as any message does, and after ten minutes the manager is told. Nothing is cleared unless the agent saved. A session that shows background work is left alone, and so is one that has done nothing but start.
 - **One try per session.** Whatever becomes of it, `atmd` asks no second time in that session; the next session has a try of its own. If the start-line turn already ends at or above its line, the note says that this session will not be handed over automatically: neither the context nor the idle rule runs in it, even after later work. A handover that could not start (the agent is not ready, another handover of it runs) sends nothing and does not count.
 - **A session whose cache has run out is not cleared.** With `"idle"` on, a seat idle for longer than `cache_minutes` is left as it is, and gets the note at its line. Clear it with a command.
 - **Limits.** All of it is in memory: after a restart of `atmd` nothing is done until a turn ends, and a handover the restart cut off is lost with its note. A request that was never delivered when the handover gave up stays queued, as for the command: once what held it is gone it is typed, the agent saves, and nothing clears the session. For an idle seat that late turn runs on a cold cache; `atm msg give-up mN` cancels the request. An older `atmd` refuses a role file that has these keys (`agent up` fails and `atm me` reports an invalid role), so remove them before going back to one.
-  - Admission does not re-check the session the watcher judged: a clear/rebind in that tiny window can target the new session (reasoned, unverified).
   - After a daemon restart, a session with a recorded start line has its first turn end counted as "not worked"; at the line this excludes it from automatic handover for that session.
   - Even with all automatic rules off, every registry session's turn end copies the full organisation state; a Ready seat also reads its role file, and its line note waits for background work to end.
 
@@ -591,6 +591,14 @@ atm task attach t41 evidence.log --kind evidence --note 'Verification output'
 
 These are examples of separate paths, not commands to execute unconditionally in order: a task must be submitted to start review or receive its first verdict, and an accepted result is final. An accepted **plan** resumes work instead of finishing the task. A verdict with a submitted review task also accepts that review task. Reviewed measures require such a review for result acceptance unless the owner accepts; owner-judgement results require the owner.
 
+If a task is `changes_requested` and its assigned seat is `Down`, the assignee's strict reporting-line manager or the organisation owner can accept it from a reviewed fix:
+
+```sh
+atm task carry-back t41 --from-fix t56 --review-task t60 --note 'The fix covers the remaining case'
+```
+
+The distinct, same-project fix must still be accepted, with that review used to accept its **result**, and the review must still be accepted. A parent link is neither required nor sufficient. The caller records why the fix covers the original. This does not reassign the original, change the fix or review, or waive an owner-only measure or outstanding decision redo. The original records the actual caller and evidence in its verdict. Its creator gets a Note (System routes to Owner; no self-note), not a request to resume work. Inspect the task after an uncertain reply; repeating the operation once it is accepted is refused without another write.
+
 ### Task commands and data
 
 Every subcommand accepts `--format text|json` (default text); the option also works before the subcommand, e.g. `atm task --format json get t41`. JSON preserves the complete original daemon result, including additive fields and newer enum strings. Text escapes terminal controls; `get` shows every task field, including the measure, budget, decision reference, files, timestamps and cost record when present. Newer enum values read as `unknown` in summaries rather than making reads fail; full raw get fields and JSON remain visible. This daemon refuses unknown enum inputs.
@@ -604,6 +612,7 @@ Every subcommand accepts `--format text|json` (default text); the option also wo
 | `attach <id> <path>` | Required `--kind <file-kind>`; `--note <text>` |
 | `review <id> <review-task-id>` | Starts an existing review of the submitted task |
 | `verdict <id> <accepted\|changes_requested>` | `--review-task <id>`, `--note <text>` |
+| `carry-back <id>` | Required `--from-fix <id>`, `--review-task <id>`, `--note <text>` |
 | `list` | `--project <id>`, `--agent <project/name>`, `--creator <owner\|system\|project/name>`, `--state <state>`, `--kind <kind>`, `--parent <id>`, `--after <id>`, `--open`, `--limit <1..1000>` (default 100) |
 | `get <id>` | Complete task, not just its list summary |
 
@@ -1079,6 +1088,18 @@ The owner-run source-checkout tool `scripts/atm-supervise` records stable/previo
 One automatic rollback is conditional on **unhealthy two-way probation**, both diagnostic logs retained, unchanged verified slots/pairs and rollout's own quiet checks. Unhealthy ONE-WAY probation, uncertain final health, refused recovery or missing evidence remains **NEEDS YOU**; there is no automatic retry, resume or slot reconciliation. Pair rollback still does not rewind organisation state, and candidate credential sharing remains routing isolation, not a sandbox. See the [supervisor procedure](scripts/atm-promotion.md#supervisor) and [known limits/manual recovery](scripts/atm-promotion.md#known-limits-and-the-manual-way-out); inspect retained evidence before intervention.
 
 ## Changelog
+
+### 0.5.2
+
+- **Work view:** compact footers show help first and only show extra hints that fit. Teammates stay with their reporting thread through unseated panes, mixed windows still show known work headlines, and captions omit empty fields.
+- **Claude Code background shells:** ATM recognises the auto-mode footers in 2.1.327 and 2.1.328, so they no longer hold up delivery on otherwise ready screens.
+- **Claude Code idle screens:** settled manual `/compact` and Stop-hook warning screens read as idle when the prior turn is visibly complete.
+- **Screen, rollout and CLI fixes:** ATM reads pi screens with underlined links and Claude Code's `Restart to update` notice. Rollout allows bound seats pending revalidation. Help for `atm agent up` and `atm agent adopt` explains bare seat names.
+- **Handover:** after saving, ATM can retry a clear refused because the editor wasn't ready and tells the seat's manager whether the handover completed.
+- **Start and resume:** after a clear, the start line takes priority over ordinary queued messages. The new start line for a saved handover asks the replacement session to read its memory and resume open work, or report and stop.
+- **Queued messages:** acknowledging a still-queued message with `atm msg ack` cancels its automatic delivery, including after a restart. It doesn't undo input already sent.
+- **Unreadable screens:** if a seat's screen stays unreadable during delivery or revalidation, ATM sends one diagnostic note to its manager (or the owner if no manager is available) instead of silently waiting.
+- **Reviewed fixes:** `atm task carry-back` applies the result of an accepted, independently reviewed fix to the original task without reassigning it.
 
 ### 0.5.1
 

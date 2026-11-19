@@ -733,7 +733,7 @@ fn above_completion_requires_exact_frame() {
         ("conceal", format!("{text}\x1b[8m")),
         (
             "unsupported status style",
-            text.replace(status, "  \x1b[4munderlined\x1b[24m"),
+            text.replace(status, "  \x1b[5mblinking\x1b[25m"),
         ),
     ] {
         assert_ne!(changed, text, "{why}");

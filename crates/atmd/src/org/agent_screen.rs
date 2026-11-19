@@ -13,7 +13,7 @@ use crate::control::reservation::{CaptureFormat, PaneCapture};
 use atm_core::harness_control::{
     ControlPolicy, ControlScreen, HookListEntry, ScreenInput, ScreenTextFormat,
 };
-use atm_core::{Harness, ScreenCursor, ScreenFacts};
+use atm_core::{Harness, ScreenCursor, ScreenFacts, SessionDomain, StatusLineData};
 
 /// What was recorded about a pane's processes when it was created or adopted.
 ///
@@ -115,6 +115,8 @@ pub struct AgentScreen {
     staged: fn(ScreenInput<'_>, &str) -> Option<bool>,
     control: fn(ScreenInput<'_>, Option<ScreenCursor>) -> ControlScreen,
     hooks_valid: fn(&[HookListEntry]) -> bool,
+    pub(crate) version: fn(&SessionDomain) -> Option<&str>,
+    pub(crate) remember_version: fn(&mut SessionDomain, &StatusLineData),
 }
 
 impl std::fmt::Debug for AgentScreen {
@@ -134,6 +136,8 @@ static SCREENS: [AgentScreen; 3] = [
         staged: atm_claude_adapter::screen::staged_draft_matches,
         control: atm_claude_adapter::screen::observe_control_screen,
         hooks_valid: no_hook_list,
+        version: atm_claude_adapter::status_line::session_version,
+        remember_version: atm_claude_adapter::status_line::remember_session_version,
     },
     AgentScreen {
         harness: Harness::Pi,
@@ -141,6 +145,8 @@ static SCREENS: [AgentScreen; 3] = [
         staged: atm_pi_adapter::screen::staged_draft_matches,
         control: atm_pi_adapter::screen::observe_control_screen,
         hooks_valid: no_hook_list,
+        version: |_| None,
+        remember_version: |_, _| {},
     },
     AgentScreen {
         harness: Harness::Codex,
@@ -148,6 +154,8 @@ static SCREENS: [AgentScreen; 3] = [
         staged: atm_codex_adapter::screen::staged_draft_matches,
         control: atm_codex_adapter::screen::observe_control_screen,
         hooks_valid: atm_codex_adapter::screen::validate_hook_list,
+        version: |_| None,
+        remember_version: |_, _| {},
     },
 ];
 
@@ -158,6 +166,10 @@ pub fn agent_screen(harness: Harness) -> Option<&'static AgentScreen> {
 }
 
 impl AgentScreen {
+    pub(super) fn harness(&self) -> Harness {
+        self.harness
+    }
+
     /// The capture format this harness's adapter reads.
     #[must_use]
     pub fn capture_format(&self) -> CaptureFormat {

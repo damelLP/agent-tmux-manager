@@ -3,6 +3,7 @@
 use crate::*;
 use atm_core::SessionId;
 use chrono::{DateTime, Utc};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +447,8 @@ impl OrgState {
             OrgCommand::ReadMessages { who, message_ids } => {
                 self.validate_address(who)?;
                 let mut unread = false;
+                let mut cancelled = BTreeSet::new();
+                let mut events = Vec::new();
                 for id in message_ids {
                     let message = self.require_message(id)?;
                     if &message.content.to != who {
@@ -454,12 +457,26 @@ impl OrgState {
                             who: who.clone(),
                         });
                     }
-                    if message.status != DeliveryStatus::Delivered {
-                        return Err(delivery_refusal(message, "read"));
+                    if !terminal(message) && cancelled.insert(*id) {
+                        let reason = if message.last_attempt.is_some() {
+                            "recipient acknowledged; automatic delivery cancelled; a prior attempt may still finish or have left a draft"
+                        } else {
+                            "recipient acknowledged; automatic delivery cancelled"
+                        };
+                        events.push(OrgEvent::MessageDeliveryFailed {
+                            message_id: *id,
+                            reason: reason.into(),
+                            final_failure: true,
+                        });
                     }
                     unread |= message.read_at.is_none();
                 }
-                unread
+                // Return only after the whole batch has passed ownership checks.
+                // A truncated log can leave cancelled mail unread, not read mail open.
+                if unread {
+                    events.push(event);
+                }
+                return Ok(events);
             }
             OrgCommand::Task(command) => return self.decide_task(command, event),
             OrgCommand::ObserveTaskUsage(input) => return self.decide_usage(input),

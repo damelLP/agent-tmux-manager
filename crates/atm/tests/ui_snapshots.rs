@@ -742,6 +742,31 @@ fn compact_footer_default() {
     insta::assert_debug_snapshot!(buf);
 }
 
+#[test]
+fn compact_footer_hints_at_sidebar_widths() {
+    let buffers = [
+        (20, false, "? help  gt/gT tabs"),
+        (20, true, "? help [pick]"),
+        (24, false, "? help  gt/gT tabs"),
+        (24, true, "? help [pick]"),
+        (40, false, "? help  gt/gT tabs  w alias"),
+        (40, true, "? help [pick]  gt/gT tabs  w alias"),
+    ]
+    .map(|(width, pick_mode, want)| {
+        let mut app = App::new();
+        app.pick_mode = pick_mode;
+        let buf = render_buffer(width, 1, |frame, area| {
+            render_compact_footer(frame, area, &app);
+        });
+        assert_eq!(
+            buffer_text(&buf),
+            format!("{want:<width$}", width = usize::from(width))
+        );
+        buf
+    });
+    insta::assert_debug_snapshot!(buffers);
+}
+
 // ---- Filter (`/` search) ---------------------------------------------------
 
 /// Lead (Opus) with a Sonnet teammate, plus an unrelated Opus session,
@@ -967,6 +992,179 @@ fn work_windows_with_marks() {
     );
     insta::assert_debug_snapshot!(buf);
 }
+// Render pure synthetic Work snapshots through the normal reducer, not by forcing tree rows.
+fn work_caption_app(
+    grouping: WorkGrouping,
+    windows: WorkWindows,
+    org: WorkOrg,
+    sessions: Vec<SessionView>,
+) -> App {
+    let mut app = App::new();
+    app.state = AppState::Connected;
+    app.work_grouping = grouping;
+    app.update_sessions(sessions);
+    let effects = app.reduce_work(
+        WorkInput::Capabilities {
+            methods: vec!["session.windows".into(), "org.tree".into()],
+            watch: false,
+        },
+        Duration::ZERO,
+    );
+    work_load(&mut app, effects, windows, org);
+    app.expand_all();
+    app.selected_index = 0;
+    app
+}
+
+#[test]
+fn work_window_headlines_with_unattributed_panes() {
+    let windows = serde_json::from_value(serde_json::json!({"state":"ok","windows":[
+        {"id":"@1","name":"one","links":[{"session":"work","index":1}],"panes":["%1","%2","%3"]},
+        {"id":"@2","name":"mix","links":[{"session":"work","index":2}],"panes":["%6","%5","%4"]},
+        {"id":"@3","name":"plain","links":[{"session":"work","index":3}],"panes":["%7"]}
+    ]}))
+    .unwrap();
+    let org = serde_json::from_value(serde_json::json!({"projects":[{
+        "seats":[
+            {"agent_id":"alpha/lead","pane":"%1","manager":"owner","tasks":["t1"]},
+            {"agent_id":"alpha/one","pane":"%2","manager":"alpha/lead","tasks":[]},
+            {"agent_id":"alpha/two","pane":"%4","manager":"alpha/lead","tasks":[]},
+            {"agent_id":"beta/lead","pane":"%5","manager":"owner","tasks":[]},
+            {"agent_id":"beta/one","pane":null,"manager":"beta/lead","tasks":[]}
+        ],"tasks":[{"task_id":"t1","title":"Alpha task"}]
+    }],"needs_owner":{"items":[]}}))
+    .unwrap();
+    let sessions = (1..=7)
+        .map(|i| SessionView {
+            id: format!("session-{i}").into(),
+            id_short: format!("s{i}"),
+            tmux_pane: Some(format!("%{i}")),
+            project_root: Some("/fixtures/repo".into()),
+            worktree_branch: Some("main".into()),
+            started_at: format!("2026-01-01T00:00:0{i}Z"),
+            status: SessionStatus::Idle,
+            harness: "pi".into(),
+            ..Default::default()
+        })
+        .collect();
+    let buf = work_buffer(
+        &work_caption_app(WorkGrouping::Windows, windows, org, sessions),
+        false,
+    );
+    let text = buffer_text(&buf);
+    for want in [
+        "▼ Alpha task 1 open · alpha/lead · 1 one",
+        "▼ Work threads · alpha/lead, beta/lead · 2 mix",
+        "▼ 3 plain",
+    ] {
+        assert!(
+            text.lines().any(|line| line.contains(want)),
+            "missing {want}:\n{text}"
+        );
+    }
+    insta::assert_debug_snapshot!(buf);
+}
+
+// Break caught: optional Work metadata leaves empty separators at real sidebar widths.
+#[test]
+fn work_sparse_detail_at_sidebar_widths() {
+    let windows = WorkWindows {
+        state: "ok".into(),
+        windows: vec![],
+    };
+    let org = serde_json::from_value(serde_json::json!({"projects":[{
+        "seats":[
+            {"agent_id":"lead","pane":"%5","manager":"owner","tasks":[]},
+            {"agent_id":"reporter","pane":null,"manager":"lead","tasks":[]},
+            {"agent_id":"repo/solo","pane":"%6","manager":"owner","tasks":[]},
+            {"agent_id":"repo/helper","pane":null,"manager":"repo/solo","tasks":[]}
+        ],"tasks":[]
+    }],"needs_owner":{"items":[]}}))
+    .unwrap();
+    let session = |id: &str, pane: Option<&str>, started| SessionView {
+        id: id.into(),
+        id_short: id.into(),
+        tmux_pane: pane.map(Into::into),
+        started_at: format!("2026-01-01T00:00:0{started}Z"),
+        status: SessionStatus::Idle,
+        harness: "pi".into(),
+        ..Default::default()
+    };
+    let r = SessionView {
+        project_root: Some("/fixtures/repo".into()),
+        ..session("r", None, 3)
+    };
+    let b = SessionView {
+        worktree_branch: Some("dev".into()),
+        ..session("b", None, 1)
+    };
+    let app = work_caption_app(
+        WorkGrouping::Threads,
+        windows,
+        org,
+        vec![
+            session("l", Some("%5"), 4),
+            session("s", Some("%6"), 5),
+            r,
+            session("n", None, 2),
+            b,
+        ],
+    );
+    let buffers = [
+        (
+            20,
+            [
+                "│>▼ lead           │",
+                "│ ▼ solo · repo    │",
+                "│   - r [pi] 0% ...│",
+                "│   - n [pi] 0%    │",
+                "│   - b [pi] 0% ...│",
+            ],
+        ),
+        (
+            24,
+            [
+                "│>▼ lead               │",
+                "│ ▼ solo · repo        │",
+                "│   - r [pi] 0% · repo │",
+                "│   - n [pi] 0%        │",
+                "│   - b [pi] 0% · dev  │",
+            ],
+        ),
+        (
+            40,
+            [
+                "│>▼ lead                               │",
+                "│ ▼ solo · repo                        │",
+                "│   - r [pi] 0% · repo                 │",
+                "│   - n [pi] 0%                        │",
+                "│   - b [pi] 0% · dev                  │",
+            ],
+        ),
+    ]
+    .map(|(width, want)| {
+        let render = |compact| {
+            render_buffer(width, 12, |frame, area| {
+                if compact {
+                    render_compact_session_list(frame, area, &app);
+                } else {
+                    render_session_list(frame, area, &app);
+                }
+            })
+        };
+        let check = |buf: &Buffer| {
+            let text = buffer_text(buf);
+            let rows = [1, 3, 6, 7, 8].map(|i| text.lines().nth(i).unwrap());
+            assert_eq!(rows, want, "{width} columns:\n{text}");
+        };
+        let compact = render(true);
+        check(&compact);
+        check(&render(false));
+        compact
+    });
+    insta::assert_debug_snapshot!(buffers);
+}
+
 #[test]
 fn work_folded_window_counts() {
     let mut app = work_app();
@@ -1519,6 +1717,29 @@ fn tabs_work_default_compact_40() {
 #[test]
 fn work_threads_cross_repo_full() {
     let buf = work_buffer(&thread_snapshot_app(false), false);
+    insta::assert_debug_snapshot!(buf);
+}
+
+// Break caught: a non-seat teammate renders in a separate fallback window, not its thread.
+#[test]
+fn work_thread_keeps_paned_teammate() {
+    let mut app = thread_snapshot_app(false);
+    let mut child = app.sessions[&SessionId::new("child001")].clone();
+    child.tmux_pane = Some("%9".into());
+    app.update_sessions(vec![child]);
+    let org = app.work.org().unwrap().clone();
+    let effects = app.reduce_work(WorkInput::Refresh, Duration::ZERO);
+    work_load(&mut app, effects, work_windows(true), org);
+    app.expand_all();
+
+    let buf = work_buffer(&app, false);
+    let text = buffer_text(&buf);
+    assert_eq!(text.matches("child001").count(), 1, "{text}");
+    assert!(
+        text.find("child001").unwrap() < text.find("3 support").unwrap(),
+        "{text}"
+    );
+    assert!(!text.contains("4 review"), "{text}");
     insta::assert_debug_snapshot!(buf);
 }
 #[test]

@@ -146,11 +146,7 @@ fn file_error(path: &Path, error: impl std::fmt::Display) -> AgentError {
     AgentError::Internal(format!("{}: {error}", path.display()))
 }
 
-pub(super) fn read_files(
-    role_file: &Path,
-    memory_file: &Path,
-    name: &str,
-) -> Result<(Option<RoleSpec>, bool), AgentError> {
+pub(super) fn read_role_file(role_file: &Path, name: &str) -> Result<Option<RoleSpec>, AgentError> {
     let nonregular = || {
         AgentError::Refused(format!(
             "{}: role is not a regular file",
@@ -195,6 +191,15 @@ pub(super) fn read_files(
             Some(atm_org::parse_role(name, text).map_err(|_| invalid())?)
         }
     };
+    Ok(role)
+}
+
+pub(super) fn read_files(
+    role_file: &Path,
+    memory_file: &Path,
+    name: &str,
+) -> Result<(Option<RoleSpec>, bool), AgentError> {
+    let role = read_role_file(role_file, name)?;
     let exists = match fs::metadata(memory_file) {
         Ok(metadata) if metadata.is_file() => true,
         Ok(_) => {

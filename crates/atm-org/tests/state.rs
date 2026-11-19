@@ -595,6 +595,195 @@ fn notice_validation_is_atomic() {
     assert_eq!(note.delivered_at, Some(note.sent_at));
 }
 
+// Break caught: a named delivery notice can escape its reason, source or
+// audience restrictions, or a rejected event advances state/replay counters.
+#[test]
+fn named_notice_validation_is_narrow() {
+    let mut state = started();
+    let worker_id: AgentId = "p/worker".parse().unwrap();
+    let worker = Address::Agent(worker_id.clone());
+    apply(
+        &mut state,
+        3,
+        OrgEvent::AgentAdopted {
+            agent_id: worker_id,
+            pane: "%1".into(),
+            session_id: None,
+        },
+    );
+    apply(
+        &mut state,
+        4,
+        OrgEvent::MessageSent(content(worker.clone())),
+    );
+    apply(
+        &mut state,
+        5,
+        OrgEvent::MessageSent(content(Address::Owner)),
+    );
+    let valid = MessageContent {
+        from: Address::System,
+        kind: MessageKind::Note,
+        delivery_notice: Some(DeliveryNotice {
+            source_message_id: MessageId::new(4),
+            reason: "blocked.readiness_timeout".into(),
+        }),
+        ..content(Address::Agent(id()))
+    };
+    let mut bad = vec![
+        (
+            "owner sender",
+            MessageContent {
+                from: Address::Owner,
+                ..valid.clone()
+            },
+        ),
+        (
+            "agent sender",
+            MessageContent {
+                from: worker.clone(),
+                ..valid.clone()
+            },
+        ),
+        (
+            "not a note",
+            MessageContent {
+                kind: MessageKind::Report,
+                ..valid.clone()
+            },
+        ),
+        (
+            "unregistered target",
+            MessageContent {
+                to: Address::Agent("p/absent".parse().unwrap()),
+                ..valid.clone()
+            },
+        ),
+        (
+            "source seat",
+            MessageContent {
+                to: worker,
+                ..valid.clone()
+            },
+        ),
+        (
+            "system target",
+            MessageContent {
+                to: Address::System,
+                ..valid.clone()
+            },
+        ),
+    ];
+    for (name, source) in [("owner source", 5), ("absent source", 999)] {
+        bad.push((
+            name,
+            MessageContent {
+                delivery_notice: Some(DeliveryNotice {
+                    source_message_id: MessageId::new(source),
+                    reason: "unobserved".into(),
+                }),
+                ..valid.clone()
+            },
+        ));
+    }
+    for reason in [
+        "",
+        "focus",
+        "running_turn",
+        "failed.pane_gone",
+        "future_reason",
+        "blocked.",
+        "hold.",
+        "unobserved.extra",
+        "evidence_unavailable.extra",
+    ] {
+        bad.push((
+            reason,
+            MessageContent {
+                delivery_notice: Some(DeliveryNotice {
+                    source_message_id: MessageId::new(4),
+                    reason: reason.into(),
+                }),
+                ..valid.clone()
+            },
+        ));
+    }
+    let before = state.clone();
+    let mut stats = ReplayStats::default();
+    for (name, note) in bad {
+        let event = OrgEvent::MessageSent(note);
+        assert!(
+            stats
+                .apply_parts(&mut state, 6, time(), event.kind(), &event.to_body())
+                .is_err(),
+            "accepted {name:?}"
+        );
+        assert_eq!(state, before, "mutated on {name:?}");
+        assert_eq!(stats, ReplayStats::default(), "counted {name:?}");
+    }
+}
+
+// Break caught: routing a notice about another keyed notice can recursively
+// notify managers. The legacy Owner destination must remain usable.
+#[test]
+fn named_notice_about_another_delivery_notice_refuses_but_owner_fallback_works() {
+    let mut state = started();
+    let worker: AgentId = "p/worker".parse().unwrap();
+    let other: AgentId = "p/other".parse().unwrap();
+    for (seq, agent_id, pane) in [(3, worker.clone(), "%1"), (4, other.clone(), "%2")] {
+        apply(
+            &mut state,
+            seq,
+            OrgEvent::AgentAdopted {
+                agent_id,
+                pane: pane.into(),
+                session_id: None,
+            },
+        );
+    }
+    apply(
+        &mut state,
+        5,
+        OrgEvent::MessageSent(content(Address::Agent(worker))),
+    );
+    let note = MessageContent {
+        from: Address::System,
+        kind: MessageKind::Note,
+        delivery_notice: Some(DeliveryNotice {
+            source_message_id: MessageId::new(5),
+            reason: "unobserved".into(),
+        }),
+        ..content(Address::Agent(id()))
+    };
+    apply(&mut state, 6, OrgEvent::MessageSent(note.clone()));
+    let nested = MessageContent {
+        to: Address::Agent(other),
+        delivery_notice: Some(DeliveryNotice {
+            source_message_id: MessageId::new(6),
+            reason: "blocked.agent_unavailable".into(),
+        }),
+        ..note
+    };
+    let before = state.clone();
+    let mut stats = ReplayStats::default();
+    let event = OrgEvent::MessageSent(nested.clone());
+    assert!(matches!(
+        stats.apply_parts(&mut state, 7, time(), event.kind(), &event.to_body()),
+        Err(OrgError::Apply(ApplyError::InvalidDeliveryNotice(_)))
+    ));
+    assert_eq!(state, before);
+    assert_eq!(stats, ReplayStats::default());
+    let fallback = MessageContent {
+        to: Address::Owner,
+        ..nested
+    };
+    apply(&mut state, 7, OrgEvent::MessageSent(fallback));
+    assert_eq!(
+        state.inbox(&Address::Owner)[0].status,
+        DeliveryStatus::Delivered
+    );
+}
+
 #[test]
 fn duplicate_committed_notice_key_is_atomic() {
     let mut state = OrgState::default();

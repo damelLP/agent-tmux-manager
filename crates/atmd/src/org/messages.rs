@@ -38,10 +38,12 @@
 //! | Blocked | B settles/releases; A2 retains logical recipient ownership and deduplicates notices |
 //! | Complete | No input/event; A2 retains eligible late-receipt evidence |
 //! | Owner retry/give-up | A2 recipient slot, await active B settlement; no Observe reservation |
+//! | Recipient ack | Organisation writer closes scheduling before marking read; B still accounts for its active attempt |
 //!
 //! A2 holds the admission permit through B's cleanup, not through long readiness
 //! waits. Its recipient slot also serializes resolution and post-release receipt
-//! writes: B and A2 must never independently settle the same active attempt.
+//! writes. Ack cannot recall a committed attempt; its cleanup and scoped receipt
+//! still belong to B, and a failed message may still receive a real receipt.
 //! Retry retains the ID and attempt budget; give-up may later be superseded by
 //! a receipt. OwnerFocused notices stay in the inbox, without external notify.
 //! B builds the exact one-line inbox reference for every message (for a start
@@ -219,6 +221,26 @@ impl MessageRuntime {
             cancel,
             admissions: Arc::new(Semaphore::new(MESSAGE_ADMISSION_LIMIT)),
         }
+    }
+
+    /// A stale open snapshot must not re-register an ID behind its final fold.
+    /// A later final fold forgets the registration itself. Neither check grants input.
+    pub(super) fn register_for_delivery(
+        &self,
+        message: &Message,
+        now: DateTime<Utc>,
+    ) -> Result<bool, MessageError> {
+        let open = |status| matches!(status, DeliveryStatus::Queued | DeliveryStatus::Delivering);
+        if !open(message.status) {
+            return Ok(false);
+        }
+        self.evidence
+            .register(message.id, delivery_line(message.id, &message.content))?;
+        let still_open = open(self.history.snapshot(message.id, now)?.message.status);
+        if !still_open {
+            self.evidence.forget_unscoped(message.id);
+        }
+        Ok(still_open)
     }
 }
 
@@ -533,10 +555,9 @@ impl Service {
         Ok(())
     }
 
-    /// The recipient's queued and delivering messages, in FIFO order.
+    /// The recipient's open messages in the input policy's order.
     pub(super) fn open(&self, recipient: &AgentId) -> Result<Vec<MessageId>, MessageError> {
-        let view = self.view()?;
-        Ok((view.open.get(recipient).into_iter().flatten().copied()).collect())
+        self.rt.history.open_ordered(recipient)
     }
 
     /// Every recipient with a message that can still be scheduled.
@@ -1086,9 +1107,8 @@ impl MessageHandle {
             .await
     }
 
-    /// Acknowledge a fully validated batch of delivered messages in the caller's inbox.
-    /// The count is the number of messages this call marked read, taken at the
-    /// ordered fold of its committed event; already-read IDs add nothing.
+    /// Acknowledge a validated batch in the caller's inbox, cancelling open delivery.
+    /// The count is taken at the ordered read fold; already-read IDs add nothing.
     pub async fn ack(&self, p: AckParams, caller: CallContext) -> Result<AckResult, MessageError> {
         let service = self.live()?;
         service
@@ -1102,7 +1122,7 @@ impl MessageHandle {
                     .await?;
                 let view = service.view()?;
                 let mut count = 0;
-                for envelope in &committed {
+                for envelope in committed.iter().filter(|event| event.kind == "msg.read") {
                     count += view.reads.get(&envelope.seq).ok_or_else(|| {
                         MessageError::Internal("acknowledgement fold was not retained".into())
                     })?;

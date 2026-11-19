@@ -144,6 +144,27 @@ impl RegistryActor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_processes(mut self, pids: &[u32]) -> Self {
+        struct Processes(Vec<u32>);
+        impl ProcessInfo for Processes {
+            fn start_time(&self, pid: u32) -> Option<u64> {
+                self.0.contains(&pid).then_some(1)
+            }
+            fn alive(&self, pid: u32, start_time: u64) -> bool {
+                self.start_time(pid) == Some(start_time)
+            }
+            fn cwd(&self, _pid: u32) -> Option<std::path::PathBuf> {
+                None
+            }
+            fn parent(&self, _pid: u32, _harness: atm_core::Harness) -> Option<SessionId> {
+                None
+            }
+        }
+        self.process_info = Arc::new(Processes(pids.to_vec()));
+        self
+    }
+
     /// Runs the actor event loop.
     ///
     /// Processes commands and finished git lookups until the command channel
@@ -294,6 +315,9 @@ impl RegistryActor {
                 view: SessionView::from_domain_at(session, self.clock.utc_now()),
                 pid: infra.pid,
                 start: infra.start.clone(),
+                harness_version: crate::org::agents::agent_screen(session.harness)
+                    .and_then(|screen| (screen.version)(session))
+                    .map(str::to_owned),
             })
             .collect()
     }

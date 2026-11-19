@@ -14,6 +14,15 @@
 //! determines Running. Synthetic completed/fresh-history twins with the busy
 //! footer fail closed rather than supplying idle/fresh readiness. Manual busy
 //! mode has no capture and remains unsupported.
+//!
+//! Captured: claude 2.1.327, 2026-11-18, live capture-pane -p -e -N (lead), sanitized.
+//! The auto-mode shell pill ends in `↓ to manage`; busy frames include
+//! `esc to interrupt` immediately before that hint. Both forms use the same
+//! two-space margin and still require transcript evidence for turn state.
+//!
+//! Captured: Claude Code 2.1.328, 2026-11-19, sealed local canned Messages API, tmux 3.8.
+//! The shell pill adds `← for agents` immediately before `↓ to manage` and
+//! after `esc to interrupt` when busy. The rest of the row is unchanged.
 use super::*;
 use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
@@ -47,21 +56,65 @@ pub(super) fn background_shell_footer(footer: &str) -> bool {
     }) {
         return false;
     }
-    let shell_count = |value: &str| {
-        value == "1 shell"
-            || value.strip_suffix(" shells").is_some_and(|count| {
-                !count.is_empty()
-                    && !count.starts_with('0')
-                    && count != "1"
-                    && count.bytes().all(|c| c.is_ascii_digit())
-            })
-    };
     match (parts.next(), parts.next(), parts.next()) {
         (Some(count), None, None)
         | (Some(count), Some("← for agents"), None)
         | (Some("← for agents"), Some(count), None) => shell_count(count),
         _ => false,
     }
+}
+
+fn shell_count(value: &str) -> bool {
+    value == "1 shell"
+        || value.strip_suffix(" shells").is_some_and(|count| {
+            !count.is_empty()
+                && !count.starts_with('0')
+                && count != "1"
+                && count.bytes().all(|c| c.is_ascii_digit())
+        })
+}
+
+const MANAGE_HINT: &str = " · ↓ to manage";
+
+fn managed_shell_footer(row: &str) -> Option<&str> {
+    let footer = row.trim_end_matches(' ').strip_prefix("  ")?;
+    let pill = footer
+        .strip_prefix("⏵⏵ auto mode on · ")?
+        .strip_suffix(MANAGE_HINT)?;
+    let pill = pill.strip_suffix(" · ← for agents").unwrap_or(pill);
+    let count = pill.strip_suffix(" · esc to interrupt").unwrap_or(pill);
+    shell_count(count).then_some(footer)
+}
+
+fn legacy_footer(row: &str) -> &str {
+    let row = row.trim();
+    if let Some((left, right)) = row.split_once("  ") {
+        let right = right.trim_start();
+        // A misaligned pill continuation is not a separate right-aligned notice.
+        if !right.starts_with(['·', '↓'])
+            && !right.starts_with("esc to interrupt")
+            && !right.contains(MANAGE_HINT)
+        {
+            return left;
+        }
+    }
+    row
+}
+
+pub(super) fn editor_footer(row: &str) -> Option<&str> {
+    managed_shell_footer(row).or_else(|| {
+        let footer = legacy_footer(row);
+        ((footer.starts_with("⏵⏵ ") && MODE_FOOTERS.contains(&footer))
+            || background_shell_footer(footer))
+        .then_some(footer)
+    })
+}
+
+fn control_footer(row: &str) -> Option<&str> {
+    managed_shell_footer(row).or_else(|| {
+        let footer = legacy_footer(row);
+        mode_footer(footer).then_some(footer)
+    })
 }
 
 pub const CONTROL_POLICY: ControlPolicy = ControlPolicy::new(
@@ -134,24 +187,19 @@ pub fn observe_control_screen(
     } else {
         (footer, before_footer)
     };
-    let footer = footer
-        .trim()
-        .split_once("  ")
-        .map_or(footer.trim(), |(left, _)| left);
-    if !mode_footer(footer) {
+    let Some(footer) = control_footer(footer) else {
         return result;
-    }
+    };
     // Without a complete header, only already-recognized ordinary facts apply.
     if let Some((start, end)) = header {
         if let Some((facts, _)) = editor_facts(&lines, styled, Some(end), before_footer, footer) {
             result.facts = facts;
         }
         if lines.get(..start).unwrap_or_default().iter().any(|line| {
-            let trimmed = line.trim();
             line.starts_with("❯ ")
                 || line.starts_with("❯\u{a0}")
                 || line.starts_with("● ")
-                || mode_footer(trimmed.split_once("  ").map_or(trimmed, |(left, _)| left))
+                || control_footer(line).is_some()
         }) {
             result.facts.fresh_editor = FreshEditorEvidence::Unknown;
         }
@@ -258,10 +306,9 @@ fn parse_completion_draft(screen: &StyledScreen) -> Option<CompletionDraft<'_>> 
     let (menu, above_editor) = if !above.is_empty() {
         (above, true)
     } else if ordinary.is_some()
-        || below.last().is_some_and(|footer| {
-            let footer = footer.trim();
-            mode_footer(footer.split_once("  ").map_or(footer, |(left, _)| left))
-        })
+        || below
+            .last()
+            .is_some_and(|footer| control_footer(footer).is_some())
     {
         // A recognized mode footer owns its opaque status slot, including in
         // manual mode. The ordinary/control readers still validate the frame.

@@ -1,0 +1,60 @@
+---
+source: crates/atm/tests/ui_snapshots.rs
+expression: buffers
+---
+[
+    Buffer {
+        area: Rect { x: 0, y: 0, width: 20, height: 1 },
+        content: [
+            "? help  gt/gT tabs  ",
+        ],
+        styles: [
+            x: 0, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: NONE,
+        ]
+    },
+    Buffer {
+        area: Rect { x: 0, y: 0, width: 20, height: 1 },
+        content: [
+            "? help [pick]       ",
+        ],
+        styles: [
+            x: 0, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: NONE,
+        ]
+    },
+    Buffer {
+        area: Rect { x: 0, y: 0, width: 24, height: 1 },
+        content: [
+            "? help  gt/gT tabs      ",
+        ],
+        styles: [
+            x: 0, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: NONE,
+        ]
+    },
+    Buffer {
+        area: Rect { x: 0, y: 0, width: 24, height: 1 },
+        content: [
+            "? help [pick]           ",
+        ],
+        styles: [
+            x: 0, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: NONE,
+        ]
+    },
+    Buffer {
+        area: Rect { x: 0, y: 0, width: 40, height: 1 },
+        content: [
+            "? help  gt/gT tabs  w alias             ",
+        ],
+        styles: [
+            x: 0, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: NONE,
+        ]
+    },
+    Buffer {
+        area: Rect { x: 0, y: 0, width: 40, height: 1 },
+        content: [
+            "? help [pick]  gt/gT tabs  w alias      ",
+        ],
+        styles: [
+            x: 0, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: NONE,
+        ]
+    },
+]

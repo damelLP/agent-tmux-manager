@@ -1,5 +1,8 @@
 use atm_core::harness_control::{ClearProof, ControlDialog, SessionArrival};
-use atm_core::{styled_screen::StyledScreen, FreshEditorEvidence, ScreenInput, TurnState};
+use atm_core::{
+    styled_screen::StyledScreen, DialogState, FreshEditorEvidence, InputState, ScreenInput,
+    TurnState,
+};
 use atm_pi_adapter::screen::{self, observe_control_screen, CONTROL_POLICY};
 macro_rules! capture {
     ($name:literal) => {
@@ -78,6 +81,37 @@ fn fresh_and_conversation_have_independent_editor_facts() {
         observe(&old).facts.fresh_editor,
         FreshEditorEvidence::Unknown
     );
+}
+
+#[test]
+fn captured_markdown_link_does_not_hide_the_idle_editor() {
+    let fixture = include_str!("fixtures/screen_styled_s2-markdown-link_128x42_1.5.2.txt");
+    let (provenance, rows) = fixture.split_once('\n').unwrap();
+    assert!(provenance.starts_with("Captured: pi 1.5.2,"));
+    let mut capture = String::new();
+    for row in rows.lines() {
+        capture.push_str(row.strip_suffix('|').expect("fixture row sentinel"));
+        capture.push('\n');
+    }
+    assert_eq!(capture.lines().count(), 42);
+    assert_eq!(capture.matches("\x1b[4m").count(), 1);
+
+    let result = observe(&capture);
+    assert_eq!(result.facts.input, InputState::Empty);
+    assert_eq!(result.facts.turn, TurnState::NotRunning);
+    assert_eq!(result.facts.dialog, DialogState::None);
+    assert_eq!(result.dialog, ControlDialog::None);
+    assert_eq!(result.facts.fresh_editor, FreshEditorEvidence::Unknown);
+
+    // Synthetic: remove only underline, or damage the capture without touching the link.
+    assert_eq!(result, observe(&capture.replace("\x1b[4m", "")));
+    for damaged in [
+        capture.replace("\x1b[4m", "\x1b[8m"),
+        capture.replace("\x1b[4m", "\x1b[4:m"),
+        capture.replace('─', "x"),
+    ] {
+        assert_eq!(observe(&damaged), Default::default());
+    }
 }
 
 #[test]

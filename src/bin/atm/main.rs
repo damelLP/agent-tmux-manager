@@ -159,6 +159,42 @@ mod agent_contract_tests {
     }
 
     #[test]
+    fn up_and_adopt_explain_bare_seat_names() {
+        for (action, extra) in [("up", &[][..]), ("adopt", &["%7"][..])] {
+            let mut args = vec!["atm", "agent", action, "project/lead"];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["--project-root", "fixture"]);
+            let error = Args::try_parse_from(&args).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+            let text = error.to_string();
+            assert!(text.contains("invalid agent name"), "{text}");
+            assert!(
+                text.contains("use the bare seat name; the project comes from --project-root or the current directory"),
+                "{text}"
+            );
+            args[3] = "lead";
+            assert!(Args::try_parse_from(args).is_ok(), "{action}");
+        }
+        assert!(Args::try_parse_from(["atm", "agent", "clear", "project/lead"]).is_ok());
+    }
+
+    #[test]
+    fn up_and_adopt_show_bare_seat_names_in_help() {
+        for action in ["up", "adopt"] {
+            let help = Args::try_parse_from(["atm", "agent", action, "--help"]).unwrap_err();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+            let text = help.to_string();
+            let arguments = text.split_once("Arguments:").unwrap().1;
+            let name_help = arguments.split("\n\n").next().unwrap();
+            let normalized = name_help.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(normalized.contains(
+                "<NAME> Bare seat name. The project comes from --project-root or the current directory."
+            ), "{action}: {text}");
+        }
+    }
+
+    #[test]
     fn agent_panes_are_validated_by_clap() {
         for (pane, valid) in [
             ("%0", true),

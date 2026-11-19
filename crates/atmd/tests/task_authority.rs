@@ -710,6 +710,184 @@ async fn private_socket_enforces_reporting_lines_for_three_and_five_projects() {
         .unwrap();
 }
 
+async fn carry_back_case(rig: &Rig, creator: &str) -> Value {
+    let measure = json!({"kind":"reviewed","rubric":"Independent proof"});
+    let original = rig.assigned(creator, "alpha/worker", measure.clone()).await;
+    rig.ok("alpha/worker", "task.submit", json!({"task_id":original}))
+        .await;
+    rig.ok(
+        creator,
+        "task.verdict",
+        json!({"task_id":original,"verdict":"changes_requested"}),
+    )
+    .await;
+    let fix = rig.assigned("alpha/other", "alpha/lead", measure).await;
+    let review = rig
+        .ok(
+            "alpha/other",
+            "task.create",
+            json!({
+                "title":"Review fix", "kind":"review", "judges":fix, "measure":{"kind":"owner"},
+            }),
+        )
+        .await["task_id"]
+        .clone();
+    rig.ok(
+        "alpha/other",
+        "task.assign",
+        json!({"task_id":review,"agent_id":"alpha/reviewer"}),
+    )
+    .await;
+    rig.ok("alpha/lead", "task.submit", json!({"task_id":fix}))
+        .await;
+    rig.ok("alpha/reviewer", "task.submit", json!({"task_id":review}))
+        .await;
+    rig.ok(
+        "alpha/other",
+        "task.verdict",
+        json!({"task_id":fix,"review_task":review,"verdict":"accepted"}),
+    )
+    .await;
+    json!({"task_id":original,"fix_task":fix,"review_task":review,"note":"  Covers the outstanding changes.  "})
+}
+
+// Break caught: carry-back grants creator/peer authority, fails to settle the original,
+// writes a second source verdict, or omits the creator's note.
+#[tokio::test]
+async fn carry_back_down_holder_uses_the_original_reporting_line() {
+    use atmd::eventlog::{read_from, Stream};
+    let rig = Rig::new(3).await;
+    let params = carry_back_case(&rig, "alpha/other").await;
+    let method = "task.carry_back";
+    let id: TaskId = serde_json::from_value(params["task_id"].clone()).unwrap();
+    let fix: TaskId = serde_json::from_value(params["fix_task"].clone()).unwrap();
+    let review: TaskId = serde_json::from_value(params["review_task"].clone()).unwrap();
+    let error = rig
+        .call("gamma/chief", method, params.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.0.code, "refused");
+    assert_eq!(
+        error.0.message,
+        format!("cannot carry back task {id}: it has no down assignee")
+    );
+    rig.org
+        .execute(
+            OrgCommand::Down {
+                agent_id: "alpha/worker".parse().unwrap(),
+                reason: "fixture".into(),
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    for who in ["alpha/other", "beta/lead"] {
+        assert_eq!(
+            rig.refused(who, method, params.clone()).await,
+            format!("{who} may not carry back task {id}")
+        );
+    }
+    rig.manager("alpha/worker", "not-a-seat");
+    assert!(rig
+        .refused("gamma/chief", method, params.clone())
+        .await
+        .contains("unknown manager alpha/not-a-seat"));
+    rig.manager("alpha/worker", "lead");
+    let before = rig.state().await;
+    let cursor = rig.org.status().unwrap();
+    let reply = rig.ok("gamma/chief", method, params.clone()).await;
+    assert_eq!(reply["changed"], true);
+    assert_eq!(reply["notification"]["status"], "queued");
+    let rows: Vec<_> = read_from(&rig.dir.path().join("state"), Stream::Events, cursor)
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        ["task.verdict", "task.cost_recorded", "msg.sent"]
+    );
+    let note = format!("Accepted via fix {fix} (review {review}); Covers the outstanding changes.");
+    assert_eq!(
+        rows[0].body,
+        json!({"task_id":id,"by":"gamma/chief","verdict":"accepted","review_task":null,"note":note})
+    );
+    let state = rig.state().await;
+    let task = state.task(&id).unwrap();
+    assert_eq!(task.state, atm_org::TaskState::Accepted);
+    assert_eq!(task.agent_id.as_ref().unwrap().to_string(), "alpha/worker");
+    assert_eq!(task.reason.as_deref(), Some(note.as_str()));
+    assert_eq!(state.task(&fix), before.task(&fix));
+    assert_eq!(state.task(&review), before.task(&review));
+    assert_eq!(
+        rows[2].body,
+        json!({
+            "from":"gamma/chief", "to":"alpha/other", "kind":"note", "task":id, "attachments":[],
+            "body":format!("Task {id} accepted via fix {fix} (review {review}).\nInspect the recorded reason: atm task get {id}\nRe-check current state before acting; this note does not request a resume."),
+        })
+    );
+    let end = rig.org.status().unwrap();
+    let error = rig.call("gamma/chief", method, params).await.unwrap_err();
+    assert_eq!(error.0.code, "conflict");
+    assert_eq!(
+        error.0.message,
+        format!("cannot carry back task {id} while Accepted")
+    );
+    assert_eq!(rig.org.status().unwrap(), end);
+}
+
+// Break caught: the creator shortcut loses a real manager grant or a malformed request writes.
+#[tokio::test]
+async fn carry_back_checks_params_and_resolves_a_creator_manager() {
+    let rig = Rig::new(3).await;
+    let params = carry_back_case(&rig, "alpha/lead").await;
+    let method = "task.carry_back";
+    rig.org
+        .execute(
+            OrgCommand::Down {
+                agent_id: "alpha/worker".parse().unwrap(),
+                reason: "fixture".into(),
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let start = rig.org.status().unwrap();
+    for (field, invalid) in [
+        ("by", json!("owner")),
+        ("fix_task", json!("t01")),
+        ("review_task", json!("wrong")),
+        ("note", json!(" \t")),
+        ("note", json!("é".repeat(2049))),
+        ("note", Value::Null),
+    ] {
+        let mut input = params.clone();
+        input[field] = invalid;
+        assert_eq!(
+            rig.call("alpha/lead", method, input)
+                .await
+                .unwrap_err()
+                .0
+                .code,
+            "invalid_params",
+            "{field}"
+        );
+        assert_eq!(rig.org.status().unwrap(), start);
+    }
+    let mut missing = params.clone();
+    missing.as_object_mut().unwrap().remove("note");
+    assert_eq!(
+        rig.call("alpha/lead", method, missing)
+            .await
+            .unwrap_err()
+            .0
+            .code,
+        "invalid_params"
+    );
+    let reply = rig.ok("alpha/lead", method, params).await;
+    assert_eq!(reply["changed"], true);
+    assert_eq!(reply["notification"], Value::Null, "no creator self-note");
+    assert_eq!(rig.org.status().unwrap(), start + 2);
+}
+
 // Break caught: being a manager bypasses own-agent and result-measure restrictions.
 #[tokio::test]
 async fn managers_cannot_work_for_agents_or_bypass_measures() {

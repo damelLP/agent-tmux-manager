@@ -8,6 +8,21 @@ use atm_core::{DialogState, FreshEditorEvidence, InputState, ScreenFacts, Screen
 const COMBINED: &str = include_str!("fixtures/screen_styled_clear-update-installed_2.1.325.txt");
 const STANDALONE: &str = include_str!("fixtures/screen_styled_update-installed_2.1.325.txt");
 const UPDATE: &str = "✔ Update installed · /restart to apply";
+const RESTART_TO_UPDATE: &str = "✔ Update installed · Restart to update";
+
+fn restart_to_update_capture() -> String {
+    let capture = include_str!("fixtures/screen_styled_restart-to-update_2.1.325.txt");
+    let mut frame = String::new();
+    for row in body(capture).lines() {
+        let Some(row) = row.strip_suffix('|') else {
+            panic!("fixture row sentinel");
+        };
+        frame.push_str(row);
+        frame.push('\n');
+    }
+    assert_eq!(frame.lines().count(), 7);
+    frame
+}
 
 fn body(capture: &str) -> &str {
     capture.split_once('\n').map_or(capture, |(_, body)| body)
@@ -68,6 +83,54 @@ fn combined_update_notice_preserves_completed_turn_with_known_footer() {
 #[test]
 fn standalone_update_notice_preserves_completed_turn_with_known_footer() {
     idle(&footer(STANDALONE));
+}
+
+#[test]
+fn captured_restart_to_update_notice_preserves_completed_turn() {
+    let text = restart_to_update_capture();
+    assert!(text.contains(RESTART_TO_UPDATE));
+    idle(&text);
+}
+
+#[test]
+fn restart_to_update_notice_does_not_make_a_typed_draft_empty() {
+    let text = restart_to_update_capture();
+    assert_eq!(text.matches("\x1b[2m").count(), 1);
+    // Synthetic: remove only faint from the editor glyphs to model a typed draft.
+    let text = text.replace("\x1b[2m", "");
+    let input = ScreenInput::Styled(&text);
+    let control = observe_control_screen(input, None);
+    assert_eq!(control.facts.input, InputState::Draft);
+    assert_eq!(control.facts.turn, TurnState::NotRunning);
+    assert_eq!(control.dialog, ControlDialog::None);
+    assert_eq!(control.facts.fresh_editor, FreshEditorEvidence::Unknown);
+    assert_eq!(
+        staged_draft_matches(input, "I, can see if our page loads"),
+        Some(true)
+    );
+    assert_eq!(staged_draft_matches(input, "/clear"), Some(false));
+}
+
+#[test]
+fn restart_to_update_notice_rejects_wrong_spelling_and_alignment() {
+    let text = restart_to_update_capture();
+    let row = text
+        .lines()
+        .find(|row| row.contains(RESTART_TO_UPDATE))
+        .unwrap();
+    // Synthetic: two equal-width wrong spellings, a one-cell left shift, and a
+    // row inserted before the border. No variant changes the footer or editor.
+    for changed in [
+        text.replace(RESTART_TO_UPDATE, "✔ Update installed · Restart to udpate"),
+        text.replace(RESTART_TO_UPDATE, "✔ Update installed · Restart to resume"),
+        text.replace(row, row.strip_prefix(' ').unwrap()),
+        text.replace(row, &format!("{row}\n")),
+    ] {
+        assert_ne!(changed, text);
+        let control = observe_control_screen(ScreenInput::Styled(&changed), None);
+        assert_eq!(control.facts.turn, TurnState::Unknown);
+        assert_eq!(control.dialog, ControlDialog::Unknown);
+    }
 }
 
 #[test]

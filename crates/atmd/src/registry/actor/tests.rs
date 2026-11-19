@@ -1830,6 +1830,28 @@ fn new_discovery_publishes_registered_then_updated() {
 }
 
 #[test]
+fn unreadable_screen_version_learns_from_existing_session_status_line() {
+    let (_, mut actor, _) = create_actor();
+    let mut session = create_test_session("version-known");
+    session.harness = atm_core::Harness::ClaudeCode;
+    register_session_in(&mut actor, session);
+    for version in [Some("2.1.327"), None, Some("2.1.327\nprivate text")] {
+        send_status_line(
+            &mut actor,
+            serde_json::json!({
+                "session_id": "version-known", "version": version
+            }),
+        );
+        let pid = actor
+            .session_id_to_pid
+            .get(&SessionId::new("version-known"))
+            .unwrap();
+        let (session, _) = actor.sessions_by_pid.get(pid).unwrap();
+        assert_eq!(session.claude_code_version.as_deref(), Some("2.1.327"));
+    }
+}
+
+#[test]
 fn status_line_by_session_id_updates_and_publishes() {
     let (_, mut actor, mut event_rx) = create_actor();
     let dir = tempfile::tempdir().unwrap();

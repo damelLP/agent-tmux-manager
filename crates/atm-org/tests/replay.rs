@@ -12,6 +12,94 @@ use serde_json::{json, Value};
 use std::{cell::RefCell, collections::BTreeMap};
 use support::*;
 
+// This fixture is also runnable against the rollback reader, without the new
+// command policy. Both the full write and an interrupted prefix must be terminal.
+#[test]
+fn ack_cancel_legacy_facts_replay() {
+    for attempted in [false, true] {
+        let mut state = OrgState::default();
+        let mut stats = ReplayStats::default();
+        let id = MessageId::new(3);
+        let mut records = vec![
+            ("project.registered", json!({"project_id":"p", "root":"/p"})),
+            (
+                "agent.adopted",
+                json!({"agent_id":"p/worker", "pane":"%1", "session_id":"s1"}),
+            ),
+            (
+                "msg.sent",
+                json!({"from":"owner", "to":"p/worker", "kind":"brief", "body":"read directly", "attachments":[], "task":null}),
+            ),
+        ];
+        if attempted {
+            records.push((
+                "msg.delivery_attempted",
+                json!({"message_id":"m3", "attempt":1, "pane":"%1"}),
+            ));
+        }
+        let reason = if attempted {
+            "recipient acknowledged; automatic delivery cancelled; a prior attempt may still finish or have left a draft"
+        } else {
+            "recipient acknowledged; automatic delivery cancelled"
+        };
+        records.push((
+            "msg.delivery_failed",
+            json!({"message_id":"m3", "reason":reason, "final":true}),
+        ));
+        let pre_read = u64::try_from(records.len()).unwrap();
+        for (seq, (kind, body)) in (1..).zip(records) {
+            if kind == "msg.delivery_failed" && !attempted {
+                let mut bare = state.clone();
+                let mut stats = stats.clone();
+                stats
+                    .apply_parts(
+                        &mut bare,
+                        seq,
+                        time(),
+                        "msg.read",
+                        &json!({"message_ids":["m3"]}),
+                    )
+                    .unwrap();
+                assert_eq!(bare.message(&id).unwrap().read_at, Some(time()));
+                assert_eq!(bare.message(&id).unwrap().status, DeliveryStatus::Queued);
+            }
+            stats
+                .apply_parts(&mut state, seq, time(), kind, &body)
+                .unwrap();
+        }
+        assert_eq!(state.message(&id).unwrap().status, DeliveryStatus::Failed);
+        assert!(state.message(&id).unwrap().read_at.is_none());
+        assert!(state
+            .decide(
+                &OrgCommand::DeliveryAttempted {
+                    message_id: id,
+                    attempt: 2,
+                    pane: "%1".into()
+                },
+                time()
+            )
+            .unwrap()
+            .is_empty());
+        stats
+            .apply_parts(
+                &mut state,
+                pre_read + 1,
+                time(),
+                "msg.read",
+                &json!({"message_ids":["m3"]}),
+            )
+            .unwrap();
+        let row = state.message(&id).unwrap();
+        assert_eq!(row.status, DeliveryStatus::Failed);
+        assert_eq!(row.failure.as_deref(), Some(reason));
+        assert_eq!(row.read_at, Some(time()));
+        assert_eq!(row.last_attempt.is_some(), attempted);
+        assert!(row.receipt.is_none());
+        assert_eq!(stats.applied, pre_read + 1);
+        assert_eq!(stats.skipped_unknown, 0);
+    }
+}
+
 #[test]
 fn unknown_kind_is_skipped_and_counted_without_touching_state() {
     let mut state = OrgState::default();
@@ -1306,6 +1394,128 @@ fn legacy_unkeyed_notice_does_not_claim_key() {
     assert_eq!(state.inbox(&Address::Owner).len(), 3);
     assert!(state.decide(&command, time()).unwrap().is_empty());
     assert_eq!(stats.applied, 3);
+}
+
+fn manager_notice_replay_prefix() -> (OrgState, ReplayStats) {
+    let mut state = OrgState::default();
+    let mut stats = ReplayStats::default();
+    for (seq, kind, body) in [
+        (
+            1,
+            "project.registered",
+            json!({"project_id":"p", "root":"/p"}),
+        ),
+        (
+            2,
+            "agent.adopted",
+            json!({"agent_id":"p/worker", "pane":"%1", "session_id":null}),
+        ),
+        (
+            3,
+            "agent.adopted",
+            json!({"agent_id":"p/lead", "pane":"%2", "session_id":null}),
+        ),
+        (
+            4,
+            "agent.adopted",
+            json!({"agent_id":"p/other", "pane":"%3", "session_id":null}),
+        ),
+        (
+            5,
+            "agent.down",
+            json!({"agent_id":"p/lead", "reason":"fixture stopped"}),
+        ),
+        (
+            6,
+            "msg.sent",
+            json!({"from":"owner", "to":"p/worker", "kind":"brief", "body":"Work",
+            "attachments":[], "task":null}),
+        ),
+    ] {
+        stats
+            .apply_parts(&mut state, seq, time(), kind, &body)
+            .unwrap();
+    }
+    (state, stats)
+}
+
+// Break caught: the rollback reader rejects a routed keyed note, marks it
+// delivered without a receipt, or scopes the lifetime key to an audience.
+#[test]
+fn manager_delivery_notice_replays_and_keeps_lifetime_key() {
+    let seed = manager_notice_replay_prefix();
+    for reason in [
+        "blocked.readiness_timeout",
+        "blocked.agent_not_ready_timeout",
+        "hold.enter_not_sent",
+        "evidence_unavailable",
+        "unobserved",
+    ] {
+        let (mut state, mut stats) = seed.clone();
+        let mut body = delivery_notice_body("m6", reason);
+        body["to"] = json!("p/lead");
+        stats
+            .apply_parts(&mut state, 7, time(), "msg.sent", &body)
+            .unwrap_or_else(|error| {
+                panic!("{reason} must replay for a registered Down manager: {error}")
+            });
+        assert_eq!(stats.applied, 7);
+        let note = state.message(&MessageId::new(7)).unwrap();
+        assert_eq!(state.inbox(&Address::Agent(id())), [note]);
+        assert!(state.inbox(&Address::Owner).is_empty());
+        assert_eq!(note.status, DeliveryStatus::Queued);
+        assert_eq!(note.delivered_at, None);
+        assert_eq!(note.read_at, None);
+        assert_eq!(
+            state.message(&MessageId::new(6)).unwrap().status,
+            DeliveryStatus::Queued
+        );
+        assert!(state.has_delivery_notice(&DeliveryNotice {
+            source_message_id: MessageId::new(6),
+            reason: reason.into(),
+        }));
+
+        let before = (state.clone(), stats.clone());
+        for to in [Address::Owner, Address::Agent("p/other".parse().unwrap())] {
+            let repeated = MessageContent {
+                to,
+                body: "Changed copy or audience after lost reply".into(),
+                ..note.content.clone()
+            };
+            assert!(state
+                .decide(&OrgCommand::SendMessage(repeated), time())
+                .unwrap()
+                .is_empty());
+        }
+        body["to"] = json!("p/other");
+        assert!(matches!(
+            stats.apply_parts(&mut state, 8, time(), "msg.sent", &body),
+            Err(OrgError::Apply(ApplyError::DuplicateDeliveryNotice(_)))
+        ));
+        assert_eq!((state, stats), before);
+    }
+}
+
+// Break caught: after enabling manager routing, reissuing a notice duplicates
+// a key that the old writer already used for an owner-only note.
+#[test]
+fn manager_delivery_notice_is_deduped_by_legacy_owner_note() {
+    let (mut state, mut stats) = manager_notice_replay_prefix();
+    let mut body = delivery_notice_body("m6", "blocked.readiness_timeout");
+    stats
+        .apply_parts(&mut state, 7, time(), "msg.sent", &body)
+        .unwrap();
+    body["to"] = json!("p/lead");
+    let OrgEvent::MessageSent(note) = OrgEvent::from_parts("msg.sent", &body).unwrap().unwrap()
+    else {
+        panic!("expected a message");
+    };
+    assert!(state
+        .decide(&OrgCommand::SendMessage(note), time())
+        .unwrap()
+        .is_empty());
+    assert_eq!(state.inbox(&Address::Owner).len(), 1);
+    assert!(state.inbox(&Address::Agent(id())).is_empty());
 }
 
 #[test]

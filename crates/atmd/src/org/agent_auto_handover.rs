@@ -32,22 +32,21 @@
 //!
 //! # An automatic handover
 //!
-//! - At most one is started per session. Whatever becomes of it, the daemon
-//!   tries no more in that session. A session whose start-line turn ends at
+//! - At most one save is asked for per session. The shared saved job retries
+//!   a recoverable clear preflight without asking to save again. A session whose start-line turn ends at
 //!   or above its line is noted and excluded from both automatic rules for
 //!   the whole session, so a large starting context cannot cause a loop.
 //! - Preflight refusal queues no request, sends no note and returns the
 //!   attempt; queue/audit failure after admission may leave a request and
 //!   produces one failure note, keeping the attempt.
-//! - Once admitted it ends in exactly one note from `system` to the agent's
-//!   manager (the owner for an agent whose role names none): done, or why
-//!   not. That note replaces the note at the context line.
+//! - Once admitted it reports through the same retained task as the command:
+//!   one outcome note to the current manager, with the replacement binding
+//!   and actual start-line receipt for a success. It replaces the line note.
 //! - The save may take ten minutes at the context line, and until the cache
 //!   expires for an idle seat.
 //!
 //! # Limits
 //!
-//! - Admission does not re-check the session the watcher judged: a clear/rebind in that tiny window can target the new session (reasoned, unverified).
 //! - After a daemon restart, a session with a recorded start line has its first turn end counted as "not worked"; at the line this excludes it from automatic handover for that session.
 //! - Everything here is in memory. After a restart of `atmd` no turn end is
 //!   on record, so nothing is done until a turn ends; a handover the restart
@@ -68,7 +67,7 @@
 
 use super::{
     agent_context::{detached_read, paths, read_files},
-    agent_handover::{context_note, Admitted, Deadline, HandoverParams, HandoverResult, Handovers},
+    agent_handover::{context_note, Deadline, HandoverParams, Handovers, NoteOrigin},
     start_line::is_start_line,
 };
 use crate::{
@@ -79,12 +78,11 @@ use atm_core::{SessionId, SessionStatus, SessionView};
 use atm_org::{
     auto_handover::{auto_step, handover_settings, AutoInput, AutoStep, HandoverSettings},
     idle::HandoverReason,
-    Address, Agent, AgentId, AgentStatus, MessageContent, MessageKind, OrgCommand, OrgState,
+    Address, Agent, AgentId, AgentStatus, OrgCommand, OrgState,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -148,60 +146,15 @@ pub(super) fn why(
     }
 }
 
-/// The one note that ends an automatic handover of `agent`.
-pub(super) fn outcome_note(
-    agent: &AgentId,
-    why: &str,
-    memory: &Path,
-    manager: Address,
-    result: &Result<HandoverResult, MethodError>,
-) -> MessageContent {
-    let body = match result {
-        Ok(done) => format!(
-            "automatic handover of {agent} done ({why}): it saved to {} ({}) and has a new session.",
-            memory.display(),
-            done.message_id
-        ),
-        Err(error) => format!(
-            "automatic handover of {agent} ({why}) did not complete: {}. Nothing more is tried \
-             in this session. By hand: atm agent handover {agent}",
-            error.0.message
-        ),
-    };
-    MessageContent {
-        delivery_notice: None,
-        from: Address::System,
-        to: manager,
-        kind: MessageKind::Note,
-        body,
-        attachments: Vec::new(),
-        task: None,
-    }
-}
-
-/// What follows an automatic handover's end: its one note, to the agent's
-/// manager. Only a preflight refusal queues no request and gets no note,
-/// returning its session's attempt; admission write failures keep the attempt.
-pub(super) fn settle(
+// Only preflight refusal returns the attempt. After admission the shared
+// handover job keeps it, even when a write, clear or confirmation fails.
+pub(super) fn return_attempt(
     attempted: &mut BTreeMap<AgentId, SessionId>,
-    attempt: Attempt,
-    outcome: Outcome,
-) -> Option<MessageContent> {
-    match outcome {
-        Ok((manager, result)) => Some(outcome_note(
-            &attempt.agent,
-            &attempt.why,
-            &attempt.memory,
-            manager,
-            &result,
-        )),
-        Err(error) => {
-            tracing::debug!(agent = %attempt.agent, %error, "Automatic handover not admitted");
-            if attempted.get(&attempt.agent) == Some(&attempt.session) {
-                attempted.remove(&attempt.agent);
-            }
-            None
-        }
+    agent: &AgentId,
+    session: &SessionId,
+) {
+    if attempted.get(agent) == Some(session) {
+        attempted.remove(agent);
     }
 }
 
@@ -233,13 +186,8 @@ pub(super) fn still_shows(view: &SessionView, share: f64, background: bool) -> b
 pub(super) struct Attempt {
     pub agent: AgentId,
     pub session: SessionId,
-    pub why: String,
-    pub memory: PathBuf,
+    pub origin: NoteOrigin,
 }
-
-/// How an automatic handover ended. `Err`: preflight refusal, no request
-/// queued. `Ok`: the manager and outcome, including admission write failures.
-pub(super) type Outcome = Result<(Address, Result<HandoverResult, MethodError>), MethodError>;
 
 struct Watch {
     handovers: Handovers,
@@ -251,7 +199,7 @@ struct Watch {
     noted: BTreeMap<AgentId, SessionId>,
     /// The session each agent last tried or excluded for starting at its line.
     attempted: BTreeMap<AgentId, SessionId>,
-    ended: mpsc::Sender<(Attempt, Outcome)>,
+    refused: mpsc::Sender<(AgentId, SessionId)>,
 }
 
 /// Starts the watcher for the agents `handovers` serves. Runs until `cancel`
@@ -261,7 +209,7 @@ pub fn spawn_handover_watch(handovers: Handovers, cancel: CancellationToken) {
 }
 
 pub(super) fn spawn_watch(handovers: Handovers, timer: Arc<dyn Timer>, cancel: CancellationToken) {
-    let (ended, mut endings) = mpsc::channel(64);
+    let (refused, mut refusals) = mpsc::channel(64);
     let mut watch = Watch {
         rows: handovers.registry.subscribe(),
         handovers,
@@ -270,7 +218,7 @@ pub(super) fn spawn_watch(handovers: Handovers, timer: Arc<dyn Timer>, cancel: C
         seen: HashMap::new(),
         noted: BTreeMap::new(),
         attempted: BTreeMap::new(),
-        ended,
+        refused,
     };
     tokio::spawn(async move {
         loop {
@@ -294,7 +242,7 @@ pub(super) fn spawn_watch(handovers: Handovers, timer: Arc<dyn Timer>, cancel: C
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
                 () = woken => watch.wake(),
-                Some((attempt, outcome)) = endings.recv() => watch.ended(attempt, outcome).await,
+                Some((agent, session)) = refusals.recv() => return_attempt(&mut watch.attempted, &agent, &session),
             }
         }
     });
@@ -449,13 +397,6 @@ impl Watch {
                 if !latest.is_some_and(|row| still_shows(&row, seen.share, seen.background)) {
                     return;
                 }
-                let memory = match paths(&state, agent) {
-                    Ok((_, memory)) => memory,
-                    Err(error) => {
-                        tracing::warn!(agent = %agent.id, %error, "No automatic handover: no memory file path");
-                        return;
-                    }
-                };
                 let give_up_at = give_up_at
                     .or_else(|| now.checked_add_signed(TimeDelta::from_std(SAVE_TIMEOUT).ok()?))
                     .unwrap_or(now);
@@ -468,18 +409,23 @@ impl Watch {
                 let attempt = Attempt {
                     agent: agent.id.clone(),
                     session: session.clone(),
-                    why: why(reason, seen.share, &settings, idle),
-                    memory,
+                    origin: NoteOrigin::Automatic {
+                        why: why(reason, seen.share, &settings, idle),
+                        idle_share: (reason != HandoverReason::ContextLine
+                            && settings.limits.cache.is_some()
+                            && seen.share.is_finite()
+                            && seen.share > 0.)
+                            .then_some(seen.share),
+                    },
                 };
                 self.run(attempt, left.unwrap_or_default(), self.timer.at(give_up_at));
             }
         }
     }
 
-    /// Runs one handover as a task of its own; how it ended comes back on
-    /// the watcher's channel.
+    /// Run the shared job. Only preflight refusal is returned to policy.
     fn run(&self, attempt: Attempt, save: Duration, deadline: Deadline) {
-        let (handovers, ended) = (self.handovers.clone(), self.ended.clone());
+        let (handovers, refused) = (self.handovers.clone(), self.refused.clone());
         tokio::spawn(async move {
             let p = HandoverParams {
                 agent: attempt.agent.clone(),
@@ -489,27 +435,17 @@ impl Watch {
                 client_id: CallerId("atmd".into()),
                 from_pane: None,
             };
-            let outcome = match handovers.admit(p, caller, deadline).await {
-                Err(refused) => Err(refused),
-                Ok(Admitted { job, manager, .. }) => {
-                    Ok((manager, async { job.await?.run().await }.await))
+            handovers.until_stopped(async {
+                match handovers.admit(p, caller, deadline, Some(&attempt.session)).await {
+                    Ok(admitted) => {
+                        handovers.finish_admitted(&attempt.agent, admitted, attempt.origin, None).await;
+                    }
+                    Err(error) => {
+                        tracing::debug!(agent = %attempt.agent, %error, "Automatic handover not admitted");
+                        let _ = refused.send((attempt.agent, attempt.session)).await;
+                    }
                 }
-            };
-            // A closed channel is the watcher's end: nobody is left to tell.
-            let _ = ended.send((attempt, outcome)).await;
+            }).await;
         });
-    }
-
-    /// An automatic handover has ended.
-    async fn ended(&mut self, attempt: Attempt, outcome: Outcome) {
-        let agent = attempt.agent.clone();
-        let Some(note) = settle(&mut self.attempted, attempt, outcome) else {
-            return;
-        };
-        let org = &self.handovers.org;
-        let sent = org.execute(OrgCommand::SendMessage(note), self.timer.now());
-        if let Err(error) = sent.await {
-            tracing::warn!(%agent, %error, "Automatic handover's note was not recorded");
-        }
     }
 }

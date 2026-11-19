@@ -1,4 +1,5 @@
-//! Fresh reporting-line facts for admission, never replay or note routing.
+//! Current reporting-line reads. Admission and outcome routing differ: only
+//! outcome routing may fall back to the manager recorded at up.
 //!
 //! One retained detached-reader slot is shared by all clones. A hung read holds
 //! that slot until it clears; manager authority fails closed in the meantime.
@@ -6,7 +7,7 @@
 //! admission, not atomically across roles; later edits do not revoke admitted work.
 
 use super::{
-    agent_context::{detached_read, manager_address, paths},
+    agent_context::{detached_read, manager_address, paths, read_role_file},
     agents::AgentError,
     intent::{file_error, read_policy_with_error},
     tasks::TaskError,
@@ -148,6 +149,36 @@ fn read_edges(
         reason: None,
         edges,
     })
+}
+
+/// An outcome goes to the explicit current manager, the recorded fallback,
+/// or the owner. This does not grant manager authority or require a Ready seat.
+pub(super) async fn outcome_manager(
+    state: &OrgState,
+    id: &AgentId,
+    fallback: Address,
+    files: Arc<Semaphore>,
+) -> Address {
+    let fresh = async {
+        let (role_file, _) = paths(state, state.agent(id)?).ok()?;
+        let reading = role_file.clone();
+        let name = id.name.clone();
+        let role = detached_read(files, &reading, move || read_role_file(&role_file, &name))
+            .await
+            .ok()??;
+        role.config.manager.as_ref()?; // omission asks for fallback; explicit owner wins
+        manager_address(id, Some(&role))
+    }
+    .await;
+    fresh
+        .into_iter()
+        .chain(std::iter::once(fallback))
+        .find(|address| match address {
+            Address::Owner => true,
+            Address::Agent(manager) => state.agent(manager).is_some(),
+            Address::System => false,
+        })
+        .unwrap_or(Address::Owner)
 }
 
 fn role_manager(state: &OrgState, node: &AgentId) -> Result<Address, AgentError> {

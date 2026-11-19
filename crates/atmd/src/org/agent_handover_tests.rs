@@ -7,6 +7,7 @@
 
 use super::agent_auto_handover::spawn_handover_watch;
 use super::agent_handover::*;
+use super::agent_lifecycle::{ClearAttempt, ClearOutcome, SavedSeat};
 use super::agents::{AgentError, ClearResult};
 use super::OrgHandle;
 use crate::eventlog::Envelope;
@@ -30,6 +31,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// A hang guard only; nothing below depends on how long a step takes.
@@ -38,6 +40,11 @@ const GUARD: Duration = Duration::from_secs(30);
 struct Recorder {
     called: mpsc::UnboundedSender<AgentId>,
     refuse: Mutex<Option<String>>,
+    blocked: Mutex<Option<&'static str>>,
+    clear_gate: Mutex<Option<oneshot::Receiver<()>>>,
+    completion: Arc<Mutex<Option<ClearOutcome>>>,
+    waits: Mutex<Vec<Option<String>>>,
+    parked: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Clearer for Recorder {
@@ -46,19 +53,42 @@ impl Clearer for Recorder {
     }
     fn clear(
         &self,
-        agent: AgentId,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ClearResult, AgentError>> + Send>> {
-        let _ = self.called.send(agent.clone());
+        target: SavedSeat,
+        _retry_before: Option<Instant>,
+        _finish_by: Instant,
+    ) -> Answer<ClearAttempt> {
         let refuse = self.refuse.lock().unwrap().clone();
+        let blocked = *self.blocked.lock().unwrap();
+        let gate = self.clear_gate.lock().unwrap().take();
+        let completion = self.completion.clone();
+        let _ = self.called.send(target.agent.clone());
         Box::pin(async move {
-            match refuse {
-                Some(reason) => Err(AgentError::Refused(reason)),
-                None => Ok(ClearResult {
-                    agent_id: agent,
-                    session_id: Some(SessionId::new("after-clear")),
-                }),
+            if let Some(gate) = gate {
+                gate.await.unwrap();
+            }
+            match (refuse, blocked) {
+                (Some(reason), _) => Err(AgentError::Refused(reason)),
+                (_, Some(reason)) => Ok(ClearAttempt::Blocked(reason)),
+                _ => Ok(ClearAttempt::Cleared(
+                    completion.lock().unwrap().take().unwrap_or(ClearOutcome {
+                        result: ClearResult {
+                            agent_id: target.agent,
+                            session_id: Some(SessionId::new("after-clear")),
+                        },
+                        ready_seq: None,
+                        start_line: super::start_line::StartLineDisposition::Unidentified,
+                    }),
+                )),
             }
         })
+    }
+    fn clear_wait(&self, _target: &SavedSeat, reason: Option<String>) {
+        if reason.is_some() {
+            if let Some(parked) = self.parked.lock().unwrap().take() {
+                let _ = parked.send(());
+            }
+        }
+        self.waits.lock().unwrap().push(reason);
     }
 }
 
@@ -88,6 +118,7 @@ struct Rig {
     org: OrgHandle,
     registry: RegistryHandle,
     cancel: CancellationToken,
+    service_stop: CancellationToken,
     recorder: Arc<Recorder>,
     cleared: mpsc::UnboundedReceiver<AgentId>,
     service: Handovers,
@@ -105,18 +136,32 @@ impl Rig {
     /// `lead` (no manager, `%0`, `lead-1`) and `worker` (manager `lead`,
     /// `%1`, `s1`).
     async fn new() -> Self {
+        Self::with_registry(crate::registry::spawn_registry()).await
+    }
+
+    async fn with_registry(registry: RegistryHandle) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir_all(root.join(".atm/memory")).unwrap();
         let cancel = CancellationToken::new();
         let org = OrgHandle::open(dir.path().join("state"), cancel.clone()).await;
-        let registry = crate::registry::spawn_registry();
         let (called, cleared) = mpsc::unbounded_channel();
         let recorder = Arc::new(Recorder {
             called,
             refuse: Mutex::new(None),
+            blocked: Mutex::new(None),
+            clear_gate: Mutex::new(None),
+            completion: Arc::default(),
+            waits: Mutex::new(Vec::new()),
+            parked: Mutex::new(None),
         });
-        let service = Handovers::new(org.clone(), registry.clone(), recorder.clone());
+        let service_stop = cancel.child_token();
+        let service = Handovers::new(
+            org.clone(),
+            registry.clone(),
+            recorder.clone(),
+            service_stop.clone(),
+        );
         let committed = org.committed.subscribe();
         let mut rig = Self {
             _dir: dir,
@@ -124,6 +169,7 @@ impl Rig {
             org,
             registry,
             cancel,
+            service_stop,
             recorder,
             cleared,
             service,
@@ -151,6 +197,20 @@ impl Rig {
 
     async fn run(&self, command: OrgCommand) -> Vec<Envelope> {
         self.org.execute(command, Utc::now()).await.unwrap()
+    }
+
+    async fn register_chief(&self) {
+        self.run(OrgCommand::RegisterProject {
+            project_id: "org".parse().unwrap(),
+            root: self._dir.path().join("org").to_str().unwrap().into(),
+            move_root: false,
+        })
+        .await;
+        self.run(OrgCommand::Up {
+            agent_id: "org/chief".parse().unwrap(),
+            role: atm_org::parse_role("chief", "+++\nharness='pi'\n+++\nChief").unwrap(),
+        })
+        .await;
     }
 
     /// A started agent on `pane`; ready and idle in `session` when one is given.
@@ -284,6 +344,25 @@ impl Rig {
     async fn state(&self) -> OrgState {
         self.org.snapshot().await.unwrap()
     }
+
+    /// Finish the save and hold the first clear's result so the test can put
+    /// events in the retry's inbox before the refusal opens the wait.
+    async fn hold_first_clear(&mut self) -> (oneshot::Sender<()>, Call, MessageId) {
+        let (release, gate) = oneshot::channel();
+        *self.recorder.clear_gate.lock().unwrap() = Some(gate);
+        let (_deadline, call) = self.start("worker", owner());
+        let save = self.requested().await;
+        self.deliver(save, "s1", "%1").await;
+        std::fs::write(self.memory("worker"), "state").unwrap();
+        self.report("s1", LifecycleEvent::Idle).await;
+        assert_eq!(
+            tokio::time::timeout(GUARD, self.cleared.recv())
+                .await
+                .unwrap(),
+            Some(id("worker"))
+        );
+        (release, call, save)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -306,7 +385,8 @@ impl Drop for AdmissionGate {
 }
 
 impl Rig {
-    fn gate(&mut self, boundary: AdmissionWrite) -> AdmissionGate {
+    fn gate(&mut self, boundary: impl Into<Option<AdmissionWrite>>) -> AdmissionGate {
+        let boundary = boundary.into();
         let real = self.org.clone();
         let (requests, mut receive) = mpsc::channel(64);
         self.service.org = OrgHandle {
@@ -319,10 +399,10 @@ impl Rig {
             while let Some(request) = receive.recv().await {
                 let matches = match &request {
                     super::Request::Execute { command, .. } => match (boundary, command.as_ref()) {
-                        (AdmissionWrite::Queue, OrgCommand::SendMessage(content)) => {
+                        (Some(AdmissionWrite::Queue), OrgCommand::SendMessage(content)) => {
                             content.body.starts_with("Handover:")
                         }
-                        (AdmissionWrite::Audit, OrgCommand::SaveRequested { .. }) => true,
+                        (Some(AdmissionWrite::Audit), OrgCommand::SaveRequested { .. }) => true,
                         _ => false,
                     },
                     _ => false,
@@ -721,7 +801,7 @@ async fn a_delivery_read_before_the_save_turns_status_does_not_end_the_save() {
         timeout_ms: 600_000,
     };
     let due = Box::pin(std::future::ready(()));
-    let admitted = rig.service.admit(p, owner(), due).await.ok().unwrap();
+    let admitted = rig.service.admit(p, owner(), due, None).await.ok().unwrap();
     let job = admitted.job.await.unwrap();
     let request = rig.requested().await;
     std::fs::write(rig.memory("worker"), "written before the request arrived").unwrap();
@@ -729,7 +809,13 @@ async fn a_delivery_read_before_the_save_turns_status_does_not_end_the_save() {
     // committed. The job has not run yet and has read neither.
     rig.deliver(request, "s1", "%1").await;
 
-    let (code, message) = refusal(answer(tokio::spawn(job.run())).await);
+    let (code, message) = refusal(
+        answer(tokio::spawn(async move {
+            let mut job = job;
+            job.run().await
+        }))
+        .await,
+    );
     assert_eq!(code, error_code::TIMEOUT);
     assert_eq!(
         message,
@@ -759,10 +845,9 @@ async fn an_agent_that_asks_for_its_own_handover_is_answered_at_once() {
     rig.next("agent.saved").await;
     let cleared = tokio::time::timeout(GUARD, rig.cleared.recv()).await;
     assert_eq!(cleared.unwrap(), Some(id("worker")));
-    assert!(
-        !rig.kinds().contains(&"msg.sent".to_string()),
-        "a handover that worked sends no note"
-    );
+    let note = rig.next("msg.sent").await;
+    assert_eq!(note.body["to"], "p/lead");
+    assert_eq!(note.body["body"], format!("handover of p/worker did not complete: saved ({request}); clear confirmed; resume not confirmed: the start line could not be identified."));
 }
 
 #[tokio::test]
@@ -845,7 +930,7 @@ async fn a_failure_after_the_callers_call_has_ended_is_told_to_the_manager() {
 }
 
 #[tokio::test]
-async fn a_handover_that_works_after_its_caller_left_sends_no_note() {
+async fn a_clear_after_its_caller_left_reports_unconfirmed_resume() {
     let mut rig = Rig::new().await;
     let (_deadline, call) = rig.start("worker", from_pane("%0"));
     let request = rig.requested().await;
@@ -854,13 +939,15 @@ async fn a_handover_that_works_after_its_caller_left_sends_no_note() {
     rig.deliver(request, "s1", "%1").await;
     std::fs::write(rig.memory("worker"), "state").unwrap();
     rig.report("s1", LifecycleEvent::Idle).await;
-    // The handover carries on to the clear, and nobody is sent anything.
     let cleared = tokio::time::timeout(GUARD, rig.cleared.recv()).await;
     assert_eq!(cleared.unwrap(), Some(id("worker")));
-    assert_eq!(
-        rig.kinds(),
-        ["msg.delivery_attempted", "msg.delivered", "agent.saved"]
-    );
+    let note = rig.next("msg.sent").await;
+    assert_eq!(note.body["to"], "p/lead");
+    assert!(note.body["body"]
+        .as_str()
+        .unwrap()
+        .contains("clear confirmed; resume not confirmed"));
+    assert!(rig.kinds().is_empty());
 }
 
 #[tokio::test]
@@ -946,10 +1033,474 @@ async fn a_refused_clear_after_the_save_says_that_the_state_is_saved() {
         message,
         format!("p/worker saved its state ({request}); {reason}")
     );
+    let note = rig.next("msg.sent").await;
+    assert_eq!(
+        note.body["body"],
+        format!("handover of p/worker did not complete: saved ({request}); {reason}.")
+    );
+    assert_eq!(note.body["to"], "p/lead");
+}
+
+// Break caught: reporting success from clear/queue alone, accepting another
+// message's receipt, or freezing the manager before the resume is confirmed.
+#[tokio::test]
+async fn handover_requires_exact_replayed_resume_receipt_and_current_manager() {
+    use crate::org::start_line::{start_line, StartLineDisposition};
+    let mut rig = Rig::new().await;
+    rig.register_chief().await;
+    rig.kinds();
+    let (release, gate) = oneshot::channel();
+    *rig.recorder.clear_gate.lock().unwrap() = Some(gate);
+    rig.share("s1", 510).await;
+    let (_deadline, call) = rig.start("worker", owner());
+    let save = rig.requested().await;
+    rig.deliver(save, "s1", "%1").await;
+    std::fs::write(rig.memory("worker"), "state").unwrap();
+    rig.report("s1", LifecycleEvent::Idle).await;
+    assert_eq!(
+        tokio::time::timeout(GUARD, rig.cleared.recv())
+            .await
+            .unwrap(),
+        Some(id("worker"))
+    );
+    let saved = rig.next("agent.saved").await;
+    let clear = rig
+        .run(OrgCommand::Clear {
+            agent_id: id("worker"),
+        })
+        .await[0]
+        .seq;
+    // Use an actual Ready commit and a pending *existing* canonical start line.
+    let resume = MessageId::new(
+        rig.run(OrgCommand::SendMessage(start_line(&id("worker"))))
+            .await[0]
+            .seq,
+    );
+    let ready = rig
+        .run(OrgCommand::SessionBound {
+            agent_id: id("worker"),
+            session_id: "s2".into(),
+        })
+        .await[0]
+        .seq;
+    *rig.recorder.completion.lock().unwrap() = Some(ClearOutcome {
+        result: ClearResult {
+            agent_id: id("worker"),
+            session_id: Some("s2".into()),
+        },
+        ready_seq: Some(ready),
+        start_line: StartLineDisposition::Track(resume),
+    });
+    release.send(()).unwrap();
+    let done = answer(call).await.unwrap();
+    assert_eq!(done.state, HandoverState::Cleared);
+    assert_eq!(done.session_id, Some("s2".into()));
+    // Drain the existing start-line send before looking for the outcome.
+    assert_eq!(rig.next("msg.sent").await.seq, resume.seq());
+    let roles = rig.root.join(".atm/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    std::fs::write(
+        roles.join("worker.md"),
+        "+++\nharness='pi'\nmanager='org/chief'\n+++\nWork",
+    )
+    .unwrap();
+    let receipt = rig
+        .run(OrgCommand::Delivered {
+            message_id: resume,
+            session_id: "s2".into(),
+            confirmation: "prompt_submit_exact_reference".into(),
+        })
+        .await;
+    let note = rig.next("msg.sent").await;
+    assert!(
+        saved.seq < clear && clear < ready && ready < receipt[0].seq && receipt[0].seq < note.seq
+    );
+    assert_eq!(note.body["from"], "system");
+    assert_eq!(note.body["to"], "org/chief");
+    assert_eq!(note.body["body"], format!("handover of p/worker (context 51%) complete: saved ({save}); cleared and bound s1 -> s2; resume prompt {resume} delivered."));
+    assert_eq!(rig.state().await.messages().count(), 3);
+}
+
+#[test]
+fn handover_resume_evidence_rejects_wrong_id_session_and_lifecycle() {
+    use serde_json::json;
+    let (seat, old, resume) = (id("worker"), SessionId::new("s1"), MessageId::new(8));
+    let event = |kind: &str, body| Envelope {
+        seq: 10,
+        ts: Utc::now(),
+        kind: kind.into(),
+        body,
+    };
+    let bind = event(
+        "agent.session_bound",
+        json!({"agent_id":"p/worker", "session_id":"s2"}),
+    );
+    let receipt = |id: &str, session: &str| {
+        event(
+            "msg.delivered",
+            json!({"message_id":id, "session_id":session, "confirmation":"prompt_submit_exact_reference"}),
+        )
+    };
+    let delivered = receipt("m8", "s2");
+    for [first, second] in [[&bind, &delivered], [&delivered, &bind]] {
+        let mut facts = ResumeFacts::default();
+        assert_eq!(facts.apply(first, &seat, &old, resume), Ok(None));
+        assert_eq!(
+            facts.apply(second, &seat, &old, resume),
+            Ok(Some("s2".into()))
+        );
+    }
+    let mut facts = ResumeFacts {
+        bound: Some("s2".into()),
+        receipt: None,
+    };
+    assert_eq!(
+        facts.apply(&receipt("m7", "s2"), &seat, &old, resume),
+        Ok(None)
+    );
+    for session in ["s1", "s3", "pending-42"] {
+        assert_eq!(
+            facts.apply(&receipt("m8", session), &seat, &old, resume),
+            Err("start line m8 was not confirmed in the replacement session".into())
+        );
+    }
+    let down = event("agent.down", json!({"agent_id":"p/worker"}));
+    assert_eq!(
+        facts.apply(&down, &seat, &old, resume),
+        Err("the agent left the cleared lifecycle".into())
+    );
+    let failed = event(
+        "msg.delivery_failed",
+        json!({"message_id":"m8", "reason":"owner gave up", "final_failure":true}),
+    );
+    assert_eq!(
+        facts.apply(&failed, &seat, &old, resume),
+        Err("start line m8 failed: owner gave up".into())
+    );
+}
+
+// Break caught: a registry update is ignored; the 250 ms backoff must not be
+// able to satisfy this test, even if the scheduler auto-advances paused time.
+#[tokio::test]
+async fn handover_clear_retries_after_a_same_session_update() {
+    let mut rig = Rig::new().await;
+    let (parked, wait_entered) = oneshot::channel();
+    *rig.recorder.parked.lock().unwrap() = Some(parked);
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (release, call, request) = rig.hold_first_clear().await;
     assert_eq!(
         rig.kinds(),
         ["msg.delivery_attempted", "msg.delivered", "agent.saved"]
     );
+    *rig.recorder.blocked.lock().unwrap() = None;
+    tokio::time::pause(); // no more filesystem work until after the retry
+    let before = Instant::now();
+    release.send(()).unwrap();
+    tokio::time::timeout(GUARD, wait_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    rig.share("s1", 510).await;
+    assert_eq!(
+        tokio::time::timeout(GUARD, rig.cleared.recv())
+            .await
+            .unwrap(),
+        Some(id("worker"))
+    );
+    assert_eq!(
+        Instant::now() - before,
+        Duration::ZERO,
+        "the timer, not the registry event, woke the retry"
+    );
+    tokio::time::resume();
+    let result = answer(call).await.unwrap();
+    assert_eq!(result.message_id, request);
+    assert_eq!(result.session_id, Some(SessionId::new("after-clear")));
+    assert!(rig.cleared.try_recv().is_err());
+    let note = rig.next("msg.sent").await;
+    assert_eq!(note.body["to"], "p/lead", "not a new save request");
+    assert!(rig.kinds().is_empty(), "did not queue another save");
+}
+
+// Break caught: a harmless Updated coalesces away the following Removed, so
+// the restored tuple hides that this seat disappeared while the job waited.
+#[tokio::test]
+async fn handover_clear_keeps_queued_removal_before_resume() {
+    let mut rig = Rig::new().await;
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (release, call, _) = rig.hold_first_clear().await;
+    tokio::time::pause();
+    rig.share("s1", 510).await;
+    rig.registry.remove("s1".into()).await.unwrap();
+    let mut row = SessionDomain::new("s1".into(), AgentType::GeneralPurpose, Model::Unknown);
+    row.harness = Harness::Pi;
+    row.tmux_pane = Some("%1".into());
+    rig.registry.register(row).await.unwrap();
+    rig.share("s1", 520).await;
+    *rig.recorder.blocked.lock().unwrap() = None;
+    release.send(()).unwrap();
+    let result = answer(call).await;
+    assert_eq!(refusal(result).0, error_code::REFUSED);
+    assert!(
+        rig.cleared.try_recv().is_err(),
+        "removal allowed another preflight"
+    );
+}
+
+// Break caught: skipping over a pane move after the first same-session wake.
+#[tokio::test]
+async fn handover_clear_keeps_queued_pane_move_before_return() {
+    use crate::registry::{RegistryActor, SessionEvent};
+    let (requests, receive) = mpsc::channel(64);
+    let (events, _) = broadcast::channel(64);
+    let actor = tokio::spawn(RegistryActor::new(receive, events.clone()).run());
+    let mut rig = Rig::with_registry(RegistryHandle::new(requests, events.clone())).await;
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (release, call, _) = rig.hold_first_clear().await;
+    tokio::time::pause();
+    rig.share("s1", 510).await;
+    // The snapshot matches again; only the notifications witness the move.
+    let mut row = rig.registry.get_session("s1".into()).await.unwrap();
+    for pane in ["%2", "%1"] {
+        row.tmux_pane = Some(pane.into());
+        events
+            .send(SessionEvent::Updated {
+                session: Box::new(row.clone()),
+            })
+            .unwrap();
+    }
+    *rig.recorder.blocked.lock().unwrap() = None;
+    release.send(()).unwrap();
+    let result = answer(call).await;
+    assert_eq!(refusal(result).0, error_code::REFUSED);
+    assert!(
+        rig.cleared.try_recv().is_err(),
+        "pane move allowed another preflight"
+    );
+    actor.abort();
+    let _ = actor.await;
+}
+
+// Break caught: a missed registry invalidation becomes permission to retry
+// against a now-matching tuple. A lagged receiver must fail closed.
+#[tokio::test]
+async fn handover_clear_does_not_retry_with_lagged_registry_evidence() {
+    let mut rig = Rig::new().await;
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (release, call, _) = rig.hold_first_clear().await;
+    tokio::time::pause();
+    let mut witness = rig.registry.subscribe();
+    for share in 0..4096 {
+        rig.share("s1", share % 1000).await;
+    }
+    assert!(matches!(
+        witness.try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(_))
+    ));
+    *rig.recorder.blocked.lock().unwrap() = None;
+    release.send(()).unwrap();
+    let result = answer(call).await;
+    assert_eq!(refusal(result).0, error_code::UNAVAILABLE);
+    assert!(
+        rig.cleared.try_recv().is_err(),
+        "registry lag allowed another preflight"
+    );
+}
+
+// Break caught: a parked wait-source error loses the last safe-editor refusal
+// in the RPC or the manager's terminal note.
+#[tokio::test]
+async fn handover_clear_reports_last_refusal_when_wait_source_lags() {
+    let mut rig = Rig::new().await;
+    *rig.recorder.blocked.lock().unwrap() = Some("the session is not idle");
+    let (release, call, save) = rig.hold_first_clear().await;
+    let saved = rig.next("agent.saved").await;
+    let mut witness = rig.org.committed.subscribe();
+    for _ in 0..2048 {
+        rig.org.committed.send(saved.clone()).unwrap();
+    }
+    assert!(matches!(
+        witness.try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(_))
+    ));
+    rig.committed = rig.org.committed.subscribe();
+    tokio::time::pause();
+    release.send(()).unwrap();
+    let (code, reply) = refusal(answer(call).await);
+    tokio::time::resume();
+    assert_eq!(code, error_code::UNAVAILABLE);
+    let reason = reply
+        .strip_prefix(&format!("p/worker saved its state ({save}); "))
+        .unwrap();
+    assert!(
+        reason.starts_with("could not wait for another screen observation ("),
+        "{reason}"
+    );
+    assert!(reason.ends_with("; last clear refusal: agent p/worker was not cleared: the session is not idle; nothing was sent to %1"), "{reason}");
+    let note = rig.next("msg.sent").await;
+    assert_eq!(
+        note.body["body"],
+        format!("handover of p/worker did not complete: saved ({save}); {reason}.")
+    );
+    assert_eq!(note.body["to"], "p/lead");
+    assert!(rig.cleared.try_recv().is_err());
+}
+
+// Break caught: resolver shutdown leaves the detached job waiting on
+// broadcast senders it owns; the timer wakes it for another preflight.
+#[tokio::test]
+async fn handover_clear_stops_parked_retry_on_agent_service_shutdown() {
+    let mut rig = Rig::new().await;
+    let fence = rig.gate(None);
+    spawn_handover_watch(rig.service.clone(), rig.service_stop.clone());
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (parked, wait_entered) = oneshot::channel();
+    *rig.recorder.parked.lock().unwrap() = Some(parked);
+    let (release, call, _) = rig.hold_first_clear().await;
+    tokio::time::pause();
+    release.send(()).unwrap();
+    tokio::time::timeout(GUARD, wait_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    *rig.recorder.blocked.lock().unwrap() = None;
+    let stopped_at = Instant::now();
+    rig.service_stop.cancel();
+    let result = answer(call).await;
+    assert_eq!(refusal(result).0, error_code::UNAVAILABLE);
+    fence.finish(&mut rig).await;
+    assert_eq!(
+        stopped_at,
+        Instant::now(),
+        "the parked job waited past shutdown"
+    );
+    assert!(
+        rig.cleared.try_recv().is_err(),
+        "service shutdown allowed another preflight"
+    );
+    assert_eq!(
+        rig.recorder.waits.lock().unwrap().last(),
+        Some(&None),
+        "parked overlay leaked"
+    );
+}
+
+// Break caught: after physical clear has been acknowledged to the command,
+// its retained job still owns the receipt watch past agent-service shutdown.
+#[tokio::test]
+async fn handover_clear_stops_confirmation_on_agent_service_shutdown() {
+    use super::start_line::{start_line, StartLineDisposition};
+    let mut rig = Rig::new().await;
+    let fence = rig.gate(None);
+    spawn_handover_watch(rig.service.clone(), rig.service_stop.clone());
+    let (release, call, _) = rig.hold_first_clear().await;
+    rig.run(OrgCommand::Clear {
+        agent_id: id("worker"),
+    })
+    .await;
+    rig.bind("worker", "s2", "%1").await;
+    let resume = MessageId::new(
+        rig.run(OrgCommand::SendMessage(start_line(&id("worker"))))
+            .await[0]
+            .seq,
+    );
+    *rig.recorder.completion.lock().unwrap() = Some(ClearOutcome {
+        result: ClearResult {
+            agent_id: id("worker"),
+            session_id: Some("s2".into()),
+        },
+        ready_seq: Some(resume.seq()),
+        start_line: StartLineDisposition::Track(resume),
+    });
+    tokio::time::pause();
+    let watchers = rig.org.committed.receiver_count();
+    release.send(()).unwrap();
+    assert_eq!(answer(call).await.unwrap().state, HandoverState::Cleared);
+    assert_eq!(
+        rig.org.committed.receiver_count(),
+        watchers + 1,
+        "waiting on live receipt evidence"
+    );
+    let stopped_at = Instant::now();
+    rig.service_stop.cancel();
+    // Fence on the retained job dropping its request sender. The org and
+    // registry actors deliberately remain available during this shutdown.
+    fence.finish(&mut rig).await;
+    assert_eq!(
+        stopped_at,
+        Instant::now(),
+        "confirmation survived shutdown until its deadline"
+    );
+    assert!(!rig
+        .state()
+        .await
+        .messages()
+        .any(|m| m.content.body.starts_with("handover of ")));
+}
+
+// Break caught: a draft removed without any new turn is never checked again;
+// or an event flood extends the first refusal's fixed deadline.
+#[tokio::test]
+async fn handover_clear_backoff_and_cutoff_need_no_new_turn() {
+    for expires in [false, true] {
+        let mut rig = Rig::new().await;
+        let (release, gate) = oneshot::channel();
+        *rig.recorder.clear_gate.lock().unwrap() = Some(gate);
+        *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+        let (_deadline, call) = rig.start("worker", owner());
+        let request = rig.requested().await;
+        rig.deliver(request, "s1", "%1").await;
+        std::fs::write(rig.memory("worker"), "state").unwrap();
+        rig.report("s1", LifecycleEvent::Idle).await;
+        assert_eq!(
+            tokio::time::timeout(GUARD, rig.cleared.recv())
+                .await
+                .unwrap(),
+            Some(id("worker"))
+        );
+        tokio::time::pause(); // all filesystem work is already done
+        let start = Instant::now();
+        release.send(()).unwrap();
+        // Return of the first refused preflight and the second attempt are
+        // in-memory fences; Tokio can advance only its virtual clock here.
+        assert_eq!(
+            tokio::time::timeout(GUARD, rig.cleared.recv())
+                .await
+                .unwrap(),
+            Some(id("worker"))
+        );
+        // Tokio's virtual timer rounds a deadline up to its next 1 ms tick.
+        assert!((250..=251).contains(&(Instant::now() - start).as_millis()));
+        if expires {
+            // The last refusal is distinct from the first; keep the window
+            // anchored even though new registry frames are continually ready.
+            *rig.recorder.blocked.lock().unwrap() = Some("the session is not idle");
+            for share in 510..525 {
+                rig.share("s1", share).await;
+            }
+            tokio::time::advance(Duration::from_secs(20)).await;
+            let (_code, message) = refusal(call.await.unwrap());
+            assert!(
+                message.contains("clear retry window expired; last clear refusal:"),
+                "{message}"
+            );
+            assert!(message.contains("the session is not idle"), "{message}");
+        } else {
+            // The real capture test covers how the screen refusal is made;
+            // this scripted clear service only substitutes the next frame.
+            *rig.recorder.blocked.lock().unwrap() = None;
+            let result = call.await.unwrap().unwrap();
+            assert_eq!(result.message_id, request);
+            assert_eq!(result.session_id, Some(SessionId::new("after-clear")));
+            assert!((750..=752).contains(&(Instant::now() - start).as_millis()));
+            assert_eq!(rig.cleared.try_recv().unwrap(), id("worker"));
+            assert!(rig.cleared.try_recv().is_err());
+        }
+        tokio::time::resume();
+        let waits = rig.recorder.waits.lock().unwrap();
+        assert_eq!(waits.first().unwrap().as_deref(), Some(format!("handover saved ({request}); waiting for a safe editor to clear: the editor is not empty and idle").as_str()));
+        assert_eq!(waits.last(), Some(&None));
+    }
 }
 
 #[tokio::test]
@@ -1167,6 +1718,7 @@ async fn admission_preflight_leaves_both_writes_to_the_retained_owner() {
             },
             owner(),
             Box::pin(std::future::pending()),
+            None,
         )
         .await
         .ok()
@@ -1210,11 +1762,12 @@ async fn admission_writes_survive_caller_loss_between_queue_and_audit() {
         );
         gate.finish(&mut rig).await;
         assert!(rig.cleared.try_recv().is_err(), "cleared more than once");
-        assert!(!rig
-            .state()
-            .await
-            .messages()
-            .any(|m| m.content.body.starts_with("handover of ")));
+        let note = rig.next("msg.sent").await;
+        assert_eq!(note.body["to"], "p/lead");
+        assert!(note.body["body"]
+            .as_str()
+            .unwrap()
+            .contains("clear confirmed; resume not confirmed"));
     }
 }
 

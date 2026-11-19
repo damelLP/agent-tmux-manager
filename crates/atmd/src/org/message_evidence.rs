@@ -234,6 +234,7 @@ impl MessageEvidence {
         let mut state = self.state()?;
         if expected_prompt != super::message_delivery::inbox_reference(id)
             && expected_prompt != super::start_line::start_reference(id)
+            && expected_prompt != super::start_line::resume_reference(id)
         {
             return Err(MessageError::Refused(
                 "message reference does not match its ID".into(),

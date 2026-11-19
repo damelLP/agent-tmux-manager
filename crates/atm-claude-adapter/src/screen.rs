@@ -285,16 +285,7 @@ fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts,
     } else {
         (footer, before_footer)
     };
-    // The left help chrome is fixed; a separately aligned notice decides no fact.
-    let footer = footer
-        .trim()
-        .split_once("  ")
-        .map_or(footer.trim(), |(left, _)| left);
-    if !((footer.starts_with("⏵⏵ ") && control::MODE_FOOTERS.contains(&footer))
-        || control::background_shell_footer(footer))
-    {
-        return None;
-    }
+    let footer = control::editor_footer(footer)?;
     editor_facts(lines, styled, header_end, before_footer, footer)
 }
 
@@ -399,8 +390,9 @@ fn editor_facts(
     };
     // Status follows the transcript, whether the input is inline or bottom-pinned.
     // Only recognized trailing chrome may be skipped, never arbitrary progress text.
-    let mut history: Vec<_> = lines
-        .get(header_end.unwrap_or(0)..history_end)?
+    let history_start = header_end.unwrap_or(0);
+    let history_rows = lines.get(history_start..history_end)?;
+    let mut history: Vec<_> = history_rows
         .iter()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
@@ -418,12 +410,16 @@ fn editor_facts(
     };
     let idle_history = match history.as_slice() {
         [] | ["❯ /clear"] => header_end.is_some(),
-        [.., line] => spinner_body(line)
-            .is_some_and(|body| body.contains(" for ") && body.contains(" · done ")),
+        [.., line] => completed_spinner(line),
     };
     let turn = if status.is_some_and(running_status) {
         TurnState::Running
-    } else if idle_history {
+    } else if idle_history
+        || completed_stop_warning(lines.get(history_start..top)?, lines.get(top)?)
+        || history
+            .last()
+            .is_some_and(|last| completed_manual_compaction(history_rows, last))
+    {
         TurnState::NotRunning
     } else {
         TurnState::Unknown
@@ -455,7 +451,10 @@ fn clear_context_notice(line: &str, columns: usize) -> bool {
         return false;
     }
     let text = line.trim_start_matches(' ');
-    if text == UPDATE_INSTALLED {
+    if matches!(
+        text,
+        UPDATE_INSTALLED | "✔ Update installed · Restart to update"
+    ) {
         return true;
     }
     let Some(count) = text
@@ -507,6 +506,81 @@ fn skip_startup_notice(history: &mut Vec<&str>) {
 fn spinner_body(line: &str) -> Option<&str> {
     let (frame, body) = line.split_once(' ')?;
     (frame.chars().count() == 1 && "·✢*✳✶✻✽".contains(frame)).then_some(body)
+}
+
+fn completed_spinner(line: &str) -> bool {
+    spinner_body(line).is_some_and(|body| body.contains(" for ") && body.contains(" · done "))
+}
+
+// Captured: Claude Code 2.1.325 and 2.1.328, 2026-11-19, sealed local canned
+// Messages API, tmux 3.8. Both tails need a prior column-zero done spinner;
+// the action or notice is not completion evidence and never proves freshness.
+fn finished_before(history: &[&str]) -> bool {
+    history
+        .iter()
+        .rev()
+        .find(|row| !row.trim().is_empty())
+        .is_some_and(|row| !row.contains('…') && completed_spinner(row))
+}
+
+fn completed_stop_warning(rows: &[&str], border: &str) -> bool {
+    let [before @ .., notice] = rows else {
+        return false;
+    };
+    notice.starts_with("  ")
+        && matches!(
+            notice.trim_start_matches(' '),
+            "Stop hook error occurred · ctrl+o to see"
+                | "stop hook reported a problem · ctrl+o to see"
+        )
+        && notice.chars().count().checked_add(2) == Some(border.chars().count())
+        && finished_before(before)
+}
+
+fn completed_manual_compaction(history: &[&str], last: &str) -> bool {
+    // Use the already determined last non-chrome row, but keep the raw row
+    // boundaries and indentation to verify the whole compact action.
+    let Some(rows) = history
+        .iter()
+        .rposition(|row| row.trim() == last)
+        .and_then(|end| history.get(..=end))
+    else {
+        return false;
+    };
+    let (before, command, marker) = match rows {
+        [before @ .., command, marker, pre, pre_end, post, post_end]
+            if completed_compact_hook(pre, pre_end, "     PreCompact [")
+                && completed_compact_hook(post, post_end, "     PostCompact [") =>
+        {
+            (before, command, marker)
+        }
+        [before @ .., command, marker] => (before, command, marker),
+        _ => return false,
+    };
+    *command == "❯ /compact"
+        && matches!(
+            *marker,
+            "  ⎿  Compacted (ctrl+o to see full summary)"
+                | "  ⎿ \u{a0}Compacted (ctrl+o to see full summary)"
+        )
+        && finished_before(before)
+}
+
+fn completed_compact_hook(first: &str, second: &str, prefix: &str) -> bool {
+    let (Some(command), Some(rest)) = (first.strip_prefix(prefix), second.strip_prefix("     "))
+    else {
+        return false;
+    };
+    // 2.1.325 wrapped after the command bracket; 2.1.328 inside the command.
+    let command_piece = |s: &str| !s.is_empty() && s.trim() == s && !s.contains(['[', ']']);
+    if let Some(command) = command.strip_suffix(']') {
+        command_piece(command) && rest == "completed successfully: {}"
+    } else {
+        command_piece(command)
+            && rest
+                .strip_suffix("] completed successfully: {}")
+                .is_some_and(command_piece)
+    }
 }
 
 fn running_status(line: &str) -> bool {

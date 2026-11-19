@@ -39,6 +39,7 @@ impl RegistryActor {
                     pid,
                     &mut self.git_lookups,
                     self.clock.as_ref(),
+                    harness,
                 );
 
                 debug!(
@@ -102,6 +103,7 @@ impl RegistryActor {
                 pid,
                 &mut self.git_lookups,
                 self.clock.as_ref(),
+                harness,
             );
 
             debug!(
@@ -145,7 +147,13 @@ fn apply_status_line(
     pid: u32,
     git_lookups: &mut GitLookups,
     clock: &dyn Clock,
+    harness: atm_core::Harness,
 ) {
+    if let Some(reader) =
+        crate::org::agents::agent_screen(harness).filter(|_| session.harness == harness)
+    {
+        (reader.remember_version)(session, data);
+    }
     let cwd_changed = session.update_from_status_line(data);
     // Discard only the legacy operation's timestamp, before publication.
     session.last_activity = clock.utc_now();

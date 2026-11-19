@@ -27,7 +27,9 @@ const UNREADABLE: &str = include_str!(
 async fn observe(rig: &Rig) -> Result<RecipientObservation, MessageError> {
     let state = guarded(rig.org.snapshot()).await.unwrap();
     let agent = state.agent(&worker()).cloned().unwrap();
-    guarded((Effects::production(&rig.rt).observe)(agent)).await
+    guarded((Effects::production(&rig.rt).observe)(agent))
+        .await
+        .map(|(seen, _)| seen)
 }
 
 /// What the agent service answers for the worker: Ready, bound to `s1`,
@@ -68,6 +70,433 @@ async fn each_call_reads_one_new_capture_and_keeps_nothing() {
     // Nothing was kept: with no frame to read there is no observation.
     assert!(observe(&rig).await.is_err());
     assert_eq!(rig.pastes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_delivery_rearms_after_a_readable_busy_screen() {
+    let mut rig = Rig::attempt().await;
+    let diag = "atm cannot read demo/worker's screen (%1) for 120 s; pi may have changed its screen (version unknown). Delivery, readiness checks, clear, and handover need a readable screen.";
+    for count in 1..=2 {
+        rig.script(&[pi(UNREADABLE)]);
+        assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+        let since = Instant::now();
+        rig.script(&[pi(UNREADABLE)]); // the deadline's read, not the scheduler's
+        tokio::time::advance(Duration::from_millis(119_999)).await;
+        assert_eq!(screen_notes(&rig).await.len(), count - 1);
+        assert!(Instant::now() < since + Duration::from_secs(120));
+        assert_eq!(rig.reads(), 3);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let e = rig.committed.recv().await.unwrap();
+                if e.kind == "msg.sent" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the diagnostic was not committed");
+        assert_eq!(screen_notes(&rig).await, vec![diag; count]);
+        rig.script(&[pi(UNREADABLE)]);
+        assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(screen_notes(&rig).await.len(), count);
+        assert_eq!(rig.reads(), 0);
+        rig.script(&[pi(RUNNING)]);
+        assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Running);
+        assert_eq!(screen_notes(&rig).await.len(), count, "no recovery note");
+    }
+    assert_eq!(rig.pastes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_scheduler_keeps_two_messages_queued_without_duplicate_notes() {
+    use crate::org::message_service_tests::{owner, page};
+    use atm_comms::message_types::DeliveryPhase;
+
+    let production: Arc<OnceLock<Effects>> = Arc::default();
+    let (observed, mut observations) = mpsc::unbounded_channel();
+    let effects = Effects {
+        deliver: Arc::new({
+            let production = production.clone();
+            move |rt, id, deadline| (production.get().unwrap().deliver)(rt, id, deadline)
+        }),
+        observe: Arc::new({
+            let production = production.clone();
+            move |agent| {
+                let read = (production.get().unwrap().observe)(agent);
+                let observed = observed.clone();
+                Box::pin(async move {
+                    let result = read.await;
+                    let _ = observed.send(result.is_ok());
+                    result
+                })
+            }
+        }),
+    };
+    let policy = DeliveryPolicy::new(DeliverySettings {
+        readiness_timeout: Duration::from_secs(3),
+        ..Default::default()
+    })
+    .unwrap();
+    let rig = Rig::start(Fold::Service, true, policy, Some(effects)).await;
+    assert!(production.set(Effects::production(&rig.rt)).is_ok());
+    // The diagnostic is already committed before the mail's hold
+    // deadline, so a blocked-readiness notice would repeat the same cause.
+    rig.script(&[pi(UNREADABLE), pi(UNREADABLE)]);
+    assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+    let mut events = rig.org.committed.subscribe();
+    let note = guarded(async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.kind == "msg.sent" {
+                break event;
+            }
+        }
+    })
+    .await;
+    rig.folded(note.seq).await;
+    rig.script(&vec![pi(UNREADABLE); 24]);
+    let first = MessageId::new(rig.commit(Rig::message(worker())).await);
+    let follower = MessageId::new(rig.commit(Rig::message(worker())).await);
+    assert_eq!(guarded(observations.recv()).await, Some(true));
+    let inbox = || async {
+        let mut params = page();
+        params.recipient = Some(Address::Agent(worker()));
+        rig.messages
+            .as_ref()
+            .unwrap()
+            .inbox(params, owner())
+            .await
+            .unwrap()
+    };
+    let snapshot = guarded(async {
+        loop {
+            let result = inbox().await;
+            if result
+                .messages
+                .iter()
+                .any(|m| m.message_id == first && m.delivery.phase == DeliveryPhase::Blocked)
+            {
+                break result;
+            }
+            assert!(observations.recv().await.is_some());
+        }
+    })
+    .await;
+    assert!(snapshot
+        .messages
+        .iter()
+        .all(|m| m.status == DeliveryStatus::Queued && m.delivery.attempt == 0));
+    assert_eq!(
+        snapshot
+            .messages
+            .iter()
+            .find(|m| m.message_id == follower)
+            .unwrap()
+            .delivery
+            .blocked_by,
+        Some(first)
+    );
+    // The next successful read proves the scheduler finished evaluating
+    // the blocked round before we inspect its committed notices.
+    assert_eq!(guarded(observations.recv()).await, Some(true));
+    assert_eq!(screen_notes(&rig).await, [
+        "atm cannot read demo/worker's screen (%1) for 3 s; pi may have changed its screen (version unknown). Delivery, readiness checks, clear, and handover need a readable screen."
+    ]);
+    assert_eq!(rig.pastes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_needs_a_successful_attributable_read() {
+    let rig = Rig::attempt().await;
+    let tracker = rig.rt.agents.screens().unwrap();
+    let agent = rig
+        .org
+        .snapshot()
+        .await
+        .unwrap()
+        .agent(&worker())
+        .unwrap()
+        .clone();
+    for frame in [
+        pi(RUNNING),
+        pi(DRAFT),
+        with(pi(UNREADABLE), |c| c.inspection.in_mode = true),
+        with(pi(UNREADABLE), |c| {
+            c.inspection.foreground_command = Some("zsh".into())
+        }),
+        with(pi(UNREADABLE), |c| {
+            c.inspection.local_agent_tag = Some("demo/other".into())
+        }),
+    ] {
+        rig.script(&[frame]);
+        let _ = observe(&rig).await;
+        assert!(!tracker.active(&agent));
+        assert_eq!(rig.reads(), 0);
+    }
+    assert!(observe(&rig).await.is_err());
+    assert!(!tracker.active(&agent));
+    rig.script(&[pi(UNREADABLE)]);
+    assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+    assert!(tracker.active(&agent));
+    assert_eq!(rig.pastes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_deadline_does_not_report_an_old_binding() {
+    let rig = Rig::attempt().await;
+    rig.script(&[pi(UNREADABLE)]);
+    assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+    rig.commit(OrgCommand::SessionBound {
+        agent_id: worker(),
+        session_id: SessionId::new("s2"),
+    })
+    .await;
+    rig.script(&[pi(UNREADABLE)]);
+    let mut events = rig.org.committed.subscribe();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    let diagnostic = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if events.recv().await.unwrap().kind == "msg.sent" {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        diagnostic.is_err(),
+        "a previous binding's clock produced a stale note"
+    );
+    assert_eq!(rig.reads(), 3, "the obsolete deadline must not capture");
+    assert_eq!(rig.pastes(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_transient_retry_ends_on_loss_rebind_or_readable_frame() {
+    #[derive(Clone, Copy, Debug)]
+    enum End {
+        PaneGone,
+        Readable,
+    }
+    for end in [End::PaneGone, End::Readable] {
+        let rig = Rig::attempt().await;
+        rig.script(&[pi(UNREADABLE)]);
+        assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+        let mut reads = rig.read_events.clone();
+        let before = reads.borrow().0;
+        assert_eq!(rig.reads(), 0);
+        tokio::time::advance(Duration::from_secs(120)).await;
+        // Empty script: the compound capture and the metadata fallback both fail.
+        let first_retry = before + 2;
+        guarded(reads.wait_for(|event| event.0 >= first_retry))
+            .await
+            .unwrap();
+        assert_eq!(reads.borrow().0, first_retry);
+        let failed_at = Instant::now();
+        assert!(screen_notes(&rig).await.is_empty());
+
+        let raw_calls = match end {
+            End::PaneGone => {
+                rig.tmux.script_inspect(&pane(), None).unwrap();
+                2 // failed compound followed by positive pane-gone metadata
+            }
+            End::Readable => {
+                rig.script(&[pi(DRAFT)]); // readable does not mean safe for input
+                1
+            }
+        };
+        let last = first_retry + raw_calls;
+        guarded(reads.wait_for(|event| event.0 >= last))
+            .await
+            .unwrap();
+        assert!(
+            Instant::now() >= failed_at + Duration::from_secs(5),
+            "{end:?}"
+        );
+        assert_eq!(rig.reads(), 0);
+        // Wait across several retry deadlines, ending on any unexpected read.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                reads.wait_for(|event| event.0 > last)
+            )
+            .await
+            .is_err(),
+            "retry outlived {end:?}"
+        );
+        let state = rig.org.snapshot().await.unwrap();
+        assert!(!rig
+            .rt
+            .agents
+            .screens()
+            .unwrap()
+            .active(state.agent(&worker()).unwrap()));
+        assert!(screen_notes(&rig).await.is_empty());
+        assert_eq!(rig.pastes(), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_real_observation_loss_still_tells_owner() {
+    for previous_note in [false, true] {
+        let production: Arc<OnceLock<Effects>> = Arc::default();
+        let effects = Effects {
+            deliver: Arc::new(|_, _, _| panic!("no usable observation authorizes input")),
+            observe: Arc::new({
+                let production = production.clone();
+                move |agent| (production.get().unwrap().observe)(agent)
+            }),
+        };
+        let policy = DeliveryPolicy::new(DeliverySettings {
+            readiness_timeout: Duration::from_secs(3),
+            ..Default::default()
+        })
+        .unwrap();
+        let rig = Rig::start(Fold::Service, true, policy, Some(effects)).await;
+        assert!(production.set(Effects::production(&rig.rt)).is_ok());
+        let mut events = rig.org.committed.subscribe();
+        rig.script(&[pi(UNREADABLE)]);
+        assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+        if previous_note {
+            rig.script(&[pi(UNREADABLE)]);
+            tokio::time::advance(Duration::from_secs(3)).await;
+            assert_eq!(guarded(events.recv()).await.unwrap().kind, "msg.sent");
+        }
+        // Both the capture and its metadata fallback now fail. That is a
+        // separate problem from a successful but unreadable viewport.
+        let source = MessageId::new(rig.commit(Rig::message(worker())).await);
+        let owner_notice = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let Some(OrgEvent::MessageSent(content)) =
+                    OrgEvent::from_parts(&event.kind, &event.body).unwrap()
+                {
+                    if content.delivery_notice.as_ref().is_some_and(|key| {
+                        key.source_message_id == source && key.reason == "unobserved"
+                    }) {
+                        break content;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("real observation loss must tell the owner even during an unreadable episode");
+        assert_eq!(owner_notice.to, Address::Owner);
+        assert_eq!(rig.snapshot(source).message.status, DeliveryStatus::Queued);
+        assert_eq!(rig.pastes(), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_failed_capture_cannot_retry_after_rebind() {
+    let rig = Rig::attempt().await;
+    rig.script(&[pi(UNREADABLE)]);
+    assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+    let mut reads = rig.read_events.clone();
+    let before = reads.borrow().0;
+    // The compound capture and the metadata fallback fail.
+    tokio::time::advance(Duration::from_secs(120)).await;
+    guarded(reads.wait_for(|event| event.0 >= before + 2))
+        .await
+        .unwrap();
+    rig.commit(OrgCommand::SessionBound {
+        agent_id: worker(),
+        session_id: SessionId::new("new-session"),
+    })
+    .await;
+    // No working frame or metadata is available to learn about the rebind.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            reads.wait_for(|event| event.0 > before + 2),
+        )
+        .await
+        .is_err(),
+        "retried a failed confirmation for an obsolete binding"
+    );
+    assert!(screen_notes(&rig).await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_screen_rebind_at_the_writer_does_not_change_delivery() {
+    let mut rig = Rig::start_with_harness(
+        0,
+        Fold::Service,
+        true,
+        DeliveryPolicy::default(),
+        None,
+        Harness::Pi,
+        true,
+    )
+    .await;
+    let mail = MessageId::new(rig.commit(Rig::message(worker())).await);
+    rig.script(&[pi(UNREADABLE)]);
+    assert_eq!(turn(&observe(&rig).await.unwrap()), TurnState::Unknown);
+    rig.script(&[pi(UNREADABLE)]);
+    let mut events = rig.org.committed.subscribe();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    let binding = guarded(async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.kind == "agent.session_bound" {
+                break event.seq;
+            }
+        }
+    })
+    .await;
+    let state = rig.org.snapshot().await.unwrap();
+    assert_eq!(
+        state.agent(&worker()).unwrap().session_id,
+        Some(SessionId::new("new-session"))
+    );
+    assert_eq!(state.message(&mail).unwrap().status, DeliveryStatus::Queued);
+    assert_eq!(rig.pastes(), 0);
+    // Replay the journal from before the race. The description may no longer
+    // be true when the event arrives, so replay must not depend on it.
+    let mut replayed = OrgState::default();
+    let mut stats = atm_org::ReplayStats::default();
+    while let Ok(event) = rig.committed.try_recv() {
+        stats
+            .apply_parts(&mut replayed, event.seq, event.ts, &event.kind, &event.body)
+            .unwrap();
+    }
+    assert_eq!(stats.skipped_unknown, 0);
+    assert_eq!(
+        replayed.agent(&worker()).unwrap().session_id,
+        Some(SessionId::new("new-session"))
+    );
+    assert_eq!(
+        replayed.message(&mail).unwrap().status,
+        DeliveryStatus::Queued
+    );
+    let mut late = replayed.messages().filter(|m| m.id.seq() > binding);
+    // Until a writer-side precondition exists the only allowed late effect
+    // is one ordinary, replayable informational Note. No other side effect.
+    if let Some(note) = late.next() {
+        assert_eq!(
+            (note.content.from.clone(), note.content.kind),
+            (Address::System, MessageKind::Note)
+        );
+        assert!(note.content.delivery_notice.is_none());
+        assert!(note
+            .content
+            .body
+            .starts_with("atm cannot read demo/worker's screen"));
+        assert!(late.next().is_none());
+    }
+}
+
+async fn screen_notes(rig: &Rig) -> Vec<String> {
+    rig.org
+        .snapshot()
+        .await
+        .unwrap()
+        .inbox(&Address::Owner)
+        .iter()
+        .filter(|msg| msg.content.from == Address::System && msg.content.kind == MessageKind::Note)
+        .map(|msg| msg.content.body.clone())
+        .collect()
 }
 
 #[tokio::test(start_paused = true)]
@@ -115,7 +544,11 @@ async fn only_a_ready_agent_passes_the_executors_gate() {
     let bound = recipient(&rig).await;
     let row = bound.session.clone();
     let frame = pi(RUNNING);
-    let see = |recipient: &Recipient| observed(&worker(), recipient, &frame);
+    let observe_as = |id: &AgentId, recipient: &Recipient| {
+        let facts = recipient.screen.facts(&frame, &recipient.baseline);
+        observed(id, recipient, &frame, facts)
+    };
+    let see = |recipient: &Recipient| observe_as(&worker(), recipient);
     let binding = Some(SessionId::new("s1"));
     for (recorded, eligible, attempted) in [
         (binding.clone(), row.clone(), true),
@@ -153,7 +586,7 @@ async fn only_a_ready_agent_passes_the_executors_gate() {
     for status in [AgentStatus::Ready, AgentStatus::Starting] {
         let mut recipient = bound.clone();
         recipient.status = status;
-        assert!(observed(&"demo/other".parse().unwrap(), &recipient, &frame).is_err());
+        assert!(observe_as(&"demo/other".parse().unwrap(), &recipient).is_err());
         recipient.baseline = PaneBaseline::unproven();
         assert!(see(&recipient).is_err());
     }

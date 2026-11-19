@@ -14,7 +14,8 @@ mod reconciliation {
         registry::{RegistryActor, RegistryHandle},
     };
     use atm_core::{AgentType, Harness, Model, SessionDomain, SessionId};
-    use atm_org::OrgCommand;
+    use atm_org::{delivery::DeliverySettings, OrgCommand};
+    use std::time::Duration;
     use tokio::sync::{broadcast, mpsc, watch};
     use tokio_util::sync::CancellationToken;
 
@@ -125,7 +126,8 @@ mod reconciliation {
             };
             let (send, receive) = mpsc::channel(100);
             let (events, _) = broadcast::channel(2048);
-            let actor = RegistryActor::new(receive, events.clone());
+            let actor =
+                RegistryActor::new(receive, events.clone()).with_test_processes(&[149, 150]);
             let token = cancel.clone();
             tokio::spawn(async move {
                 tokio::select! { _ = token.cancelled() => {}, _ = actor.run() => {} }
@@ -225,6 +227,18 @@ mod reconciliation {
             }
             self.registry.register(row).await.unwrap();
         }
+        async fn process_row(&self, id: &str, pid: u32, pane: &str, harness: Harness) {
+            self.registry
+                .register_discovered(
+                    SessionId::new(id),
+                    pid,
+                    std::path::PathBuf::from("/private/project"),
+                    Some(pane.into()),
+                    harness,
+                )
+                .await
+                .unwrap();
+        }
         fn inspection(pane: &str, tag: &str, dead: bool) -> PaneInspection {
             PaneInspection::new(
                 atm_tmux::PaneInfo {
@@ -283,6 +297,7 @@ mod reconciliation {
                     let env = self.spawn_env.clone();
                     std::sync::Arc::new(move |key| env.get(key).cloned())
                 },
+                DeliverySettings::default().readiness_timeout,
             )
         }
         /// The scripted procfs reader. Every test starts the service with it:
@@ -329,6 +344,226 @@ mod reconciliation {
     impl Drop for Rig {
         fn drop(&mut self) {
             self.cancel.cancel();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unreadable_screen_cold_row_does_not_prove_a_foreign_foreground() {
+        let rig = Rig::new().await;
+        rig.process_row("s1", 149, "%1", Harness::Pi).await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        // The registered session is still on the pane, but vim is now the
+        // foreground job of the pane's shell (the harness may be stopped).
+        let text = "ordinary text in vim\n";
+        rig.frame_of("%1", "p/lead", text, "vim");
+        let mut events = rig.org.committed.subscribe();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut inspection = Rig::inspection("%1", "p/lead", false)
+            .with_foreground_process(None, Some("vim".into()));
+        inspection.pane.height = 1;
+        rig.client
+            .script_capture(&PaneCapture::new(
+                text.into(),
+                inspection,
+                CaptureFormat::Ansi,
+            ))
+            .unwrap();
+        let notice = tokio::time::timeout(Duration::from_secs(140), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.kind == "msg.sent" {
+                    return event;
+                }
+            }
+        })
+        .await;
+        assert!(notice.is_err(), "a matching registry row for a background harness is not a foreground witness: {notice:?}");
+        assert_eq!(inputs(&rig), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unreadable_screen_restart_and_adopt_need_no_mail_or_hook() {
+        // A cold pin needs the real adapter read, not an empty baseline's Unknown.
+        // Synthetic SGR 9 (strikethrough) is supported by tmux, not StyledScreen.
+        const UNKNOWN: &str = "\x1b[9mprivate viewport sentinel\x1b[0m\n";
+        for restart in [true, false] {
+            let rig = Rig::new().await;
+            rig.process_row("s1", 150, "%1", Harness::Pi).await;
+            if restart {
+                rig.agent("lead", Some("%1"), Some("s1")).await;
+                rig.frame("%1", "p/lead", UNKNOWN);
+            }
+            let mut committed = rig.org.committed.subscribe();
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            if !restart {
+                rig.frame("%1", "p/lead", UNKNOWN);
+                let mut progress_events = agents.observation_events();
+                rig.command(OrgCommand::Adopt {
+                    agent_id: "p/lead".parse().unwrap(),
+                    pane: "%1".into(),
+                    session_id: Some(SessionId::new("s1")),
+                })
+                .await;
+                progress(&mut progress_events, "finished", Some("p/lead")).await;
+            }
+            let mut inspection = Rig::inspection("%1", "p/lead", false)
+                .with_foreground_process(None, Some("pi".into()));
+            inspection.pane.height = 1;
+            let capture = PaneCapture::new(UNKNOWN.into(), inspection, CaptureFormat::Ansi);
+            rig.client.script_capture(&capture).unwrap();
+            let pane = PaneId::parse("%1").unwrap();
+            let waiting_reads = rig.client.pending_reads(&pane).unwrap();
+            assert!(waiting_reads > 0);
+            tokio::time::advance(std::time::Duration::from_millis(119_999)).await;
+            assert!(notes(&rig).await.is_empty());
+            assert_eq!(rig.client.pending_reads(&pane).unwrap(), waiting_reads);
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                while committed.recv().await.unwrap().kind != "msg.sent" {}
+            })
+            .await
+            .expect("no diagnostic committed for the continuously unreadable seat");
+            assert_eq!(rig.client.pending_reads(&pane).unwrap(), 0);
+            assert_eq!(notes(&rig).await, [
+                "atm cannot read p/lead's screen (%1) for 120 s; pi may have changed its screen (version unknown). Delivery, readiness checks, clear, and handover need a readable screen."
+            ]);
+            assert_eq!(
+                agents.baseline_of(&"p/lead".parse().unwrap(), "%1"),
+                PaneBaseline::unproven()
+            );
+            assert_eq!(
+                rig.state("lead").await.status,
+                if restart {
+                    AgentStatus::Starting
+                } else {
+                    AgentStatus::Ready
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_screen_uses_current_manager_and_the_bound_rows_version() {
+        use atm_org::{Address, MessageKind};
+        const UNKNOWN: &str = "\x1b[9msynthetic private viewport text\x1b[0m\n";
+        for (edit, recipient) in [
+            ("manager='p/chief'\n", "p/chief"),
+            ("manager='owner'\n", "owner"),
+            ("", "p/lead"),
+            ("manager='p/not-registered'\n", "p/lead"),
+        ] {
+            tokio::time::pause();
+            let rig = Rig::new().await;
+            let dir = tempfile::tempdir().unwrap();
+            rig.command(OrgCommand::RegisterProject {
+                project_id: "p".parse().unwrap(),
+                root: dir.path().to_str().unwrap().into(),
+                move_root: true,
+            })
+            .await;
+            let roles = dir.path().join(".atm/roles");
+            std::fs::create_dir_all(&roles).unwrap();
+            let role = roles.join("worker.md");
+            let original = "+++\nharness='claude'\nmanager='p/lead'\n+++\n";
+            std::fs::write(&role, original).unwrap();
+            rig.agent("lead", None, None).await;
+            rig.agent("chief", None, None).await;
+            let id = "p/worker".parse::<AgentId>().unwrap();
+            for command in [
+                OrgCommand::Up {
+                    agent_id: id.clone(),
+                    role: atm_org::parse_role("worker", original).unwrap(),
+                },
+                OrgCommand::PaneCreated {
+                    agent_id: id.clone(),
+                    pane: "%7".into(),
+                },
+                OrgCommand::SessionBound {
+                    agent_id: id.clone(),
+                    session_id: SessionId::new("bound"),
+                },
+            ] {
+                rig.command(command).await;
+            }
+            for (session, pid, version) in [("bound", 150, "2.1.327"), ("other", 149, "9.9.9")] {
+                rig.process_row(session, pid, "%7", Harness::ClaudeCode)
+                    .await;
+                rig.registry
+                    .update_from_status_line(
+                        SessionId::new(session),
+                        Some(pid),
+                        atm_core::StatusLineData {
+                            session_id: session.into(),
+                            version: Some(version.into()),
+                            ..Default::default()
+                        },
+                        Harness::ClaudeCode,
+                    )
+                    .await
+                    .unwrap();
+            }
+            rig.frame_of("%7", "p/worker", UNKNOWN, "claude");
+            let mut committed = rig.org.committed.subscribe();
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            std::fs::write(&role, format!("+++\nharness='claude'\n{edit}+++\n")).unwrap();
+            let mut inspection = Rig::inspection("%7", "p/worker", false)
+                .with_foreground_process(None, Some("claude".into()));
+            inspection.pane.height = 1;
+            rig.client
+                .script_capture(&PaneCapture::new(
+                    UNKNOWN.into(),
+                    inspection,
+                    CaptureFormat::Ansi,
+                ))
+                .unwrap();
+            tokio::time::advance(Duration::from_millis(119_999)).await;
+            assert!(notes(&rig).await.is_empty());
+            // Keep paused auto-time from racing the real detached role read.
+            // The blocking task keeps the clock from auto-advancing; channel
+            // closure also releases it if the test fails.
+            let (release, hold) = tokio::sync::oneshot::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = hold.blocking_recv();
+            });
+            ready.await.unwrap();
+            tokio::time::advance(Duration::from_millis(2)).await;
+            with_wall_clock_hang_guard(async {
+                while committed.recv().await.unwrap().kind != "msg.sent" {}
+            })
+            .await;
+            release.send(()).unwrap();
+            task.await.unwrap();
+            tokio::time::resume();
+            let state = rig.org.snapshot().await.unwrap();
+            let mut messages = state.messages();
+            let content = &messages.next().unwrap().content;
+            assert!(
+                messages.next().is_none(),
+                "no second recipient or owner mirror"
+            );
+            assert_eq!(content.to, recipient.parse::<Address>().unwrap());
+            assert_eq!(content.from, Address::System);
+            assert_eq!(content.kind, MessageKind::Note);
+            assert!(
+                content.attachments.is_empty()
+                    && content.task.is_none()
+                    && content.delivery_notice.is_none()
+            );
+            let prefix = "atm cannot read p/worker's screen (%7) for ";
+            let (elapsed, _) = content
+                .body
+                .strip_prefix(prefix)
+                .unwrap()
+                .split_once(" s; ")
+                .unwrap();
+            assert!(elapsed.parse::<u64>().unwrap() >= 120);
+            assert_eq!(content.body, format!("{prefix}{elapsed} s; Claude Code 2.1.327 may have changed its screen. Delivery, readiness checks, clear, and handover need a readable screen."));
+            assert_eq!(inputs(&rig), 0);
         }
     }
 
@@ -574,6 +809,7 @@ mod reconciliation {
             rig.cancel.child_token(),
             rig.reader(),
             std::sync::Arc::new(|_| None),
+            DeliverySettings::default().readiness_timeout,
         );
         agents.reconciled().await.unwrap();
         assert!(matches!(
@@ -610,6 +846,7 @@ mod reconciliation {
             rig.cancel.child_token(),
             rig.reader(),
             std::sync::Arc::new(|_| None),
+            DeliverySettings::default().readiness_timeout,
         );
         agents.reconciled().await.unwrap();
         assert!(matches!(
@@ -1850,7 +2087,7 @@ mod reconciliation {
     async fn review_captures_have_minimum_interval_without_idle_polling() {
         let rig = Rig::new().await;
         rig.agent("lead", Some("%1"), Some("recorded")).await;
-        rig.row("recorded", "%1", false).await;
+        rig.process_row("recorded", 150, "%1", Harness::Pi).await;
         rig.frame("%1", "p/lead", "unknown\n");
         let (agents, _) = rig.start();
         agents.reconciled().await.unwrap();
@@ -1864,9 +2101,38 @@ mod reconciliation {
             progress(&mut events, "finished", Some("p/lead")).await;
         }
         let calls = rig.client.mock().calls().len();
-        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(calls, 9);
+        let mut inspection =
+            Rig::inspection("%1", "p/lead", false).with_foreground_process(None, Some("pi".into()));
+        inspection.pane.height = 1;
+        rig.client
+            .script_observe(&PaneCapture::new(
+                "unknown\n".into(),
+                inspection,
+                CaptureFormat::Ansi,
+            ))
+            .unwrap();
+        let mut committed = rig.org.committed.subscribe();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while committed.recv().await.unwrap().kind != "msg.sent" {}
+        })
+        .await
+        .expect("the deadline worker did not confirm the unreadable screen");
+        // The deadline worker consumes one successful compound capture, then
+        // leaves the reported episode dormant until a new observation.
+        let first_hour = rig.client.mock().calls();
+        assert_eq!(first_hour.len(), 10);
+        assert!(
+            matches!(&first_hour[calls..], [atm_tmux::mock::MockCall::RawCommand { subcommand, args }]
+            if subcommand == "list-panes" && args.iter().any(|arg| arg == "capture-pane"))
+        );
+        let mut events = rig.org.committed.subscribe();
+        tokio::time::advance(Duration::from_secs(3600)).await;
         agents.list(ListParams::default()).await.unwrap();
-        assert_eq!(rig.client.mock().calls().len(), calls);
+        assert!(events.try_recv().is_err());
+        assert_eq!(rig.client.mock().calls().len(), 10);
+        assert_eq!(notes(&rig).await.len(), 1);
     }
 
     #[tokio::test]
@@ -2174,6 +2440,7 @@ mod reconciliation {
                     cancel.clone(),
                     rig.reader(),
                     std::sync::Arc::new(|_| None),
+                    DeliverySettings::default().readiness_timeout,
                 );
                 agents.reconciled().await.unwrap();
                 let state = rig.org.snapshot().await.unwrap();
@@ -2208,6 +2475,7 @@ mod reconciliation {
                     cancel.clone(),
                     rig.reader(),
                     std::sync::Arc::new(|_| None),
+                    DeliverySettings::default().readiness_timeout,
                 );
                 agents.reconciled().await.unwrap();
                 assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
@@ -2533,6 +2801,7 @@ mod reconciliation {
             cancel.clone(),
             rig.reader(),
             std::sync::Arc::new(|_| None),
+            DeliverySettings::default().readiness_timeout,
         );
         agents.reconciled().await.unwrap();
         let (entered, entry) = tokio::sync::oneshot::channel();
@@ -2779,6 +3048,7 @@ mod reconciliation {
             cancel.clone(),
             rig.reader(),
             std::sync::Arc::new(|_| None),
+            DeliverySettings::default().readiness_timeout,
         );
         agents.reconciled().await.unwrap();
         cancel.cancel();
@@ -2971,6 +3241,7 @@ mod reconciliation {
                     cancel.clone(),
                     rig.reader(),
                     std::sync::Arc::new(|_| None),
+                    DeliverySettings::default().readiness_timeout,
                 );
                 agents.reconciled().await.unwrap();
                 assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
@@ -3001,6 +3272,7 @@ mod reconciliation {
                     cancel.clone(),
                     rig.reader(),
                     std::sync::Arc::new(|_| None),
+                    DeliverySettings::default().readiness_timeout,
                 );
                 agents.reconciled().await.unwrap();
                 assert_eq!(rig.state("lead").await.status, AgentStatus::Stuck);
@@ -3132,6 +3404,7 @@ mod reconciliation {
             rig.cancel.child_token(),
             rig.reader(),
             std::sync::Arc::new(|_| None),
+            DeliverySettings::default().readiness_timeout,
         );
         agents.reconciled().await.unwrap();
         assert!(matches!(
@@ -3280,6 +3553,15 @@ mod reconciliation {
                         crate::registry::RegistryCommand::GetAllSessions { respond_to } => {
                             let _ = respond_to.send(vec![view.clone()]);
                         }
+                        crate::registry::RegistryCommand::PaneSessions { pane, respond_to } => {
+                            assert_eq!(pane, "%1");
+                            let _ = respond_to.send(vec![crate::registry::PaneSession {
+                                view: view.clone(),
+                                pid: None,
+                                start: None,
+                                harness_version: None,
+                            }]);
+                        }
                         _ => panic!("unexpected registry operation"),
                     }
                 }
@@ -3292,6 +3574,7 @@ mod reconciliation {
                 rig.cancel.child_token(),
                 rig.reader(),
                 std::sync::Arc::new(|_| None),
+                DeliverySettings::default().readiness_timeout,
             );
             agents.reconciled().await.unwrap();
             let cursor = rig.org.status().unwrap();
@@ -5203,6 +5486,7 @@ mod reconciliation {
             rig.cancel.child_token(),
             reader,
             std::sync::Arc::new(|_| None),
+            DeliverySettings::default().readiness_timeout,
         );
         agents.reconciled().await.unwrap();
         assert_eq!(unread(&rig), 0);

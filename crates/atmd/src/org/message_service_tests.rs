@@ -1208,13 +1208,15 @@ async fn concurrent_ack_counts_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn queued_or_failed_ack_refuses_entire_batch() {
-    let rig = Rig::seeded().await;
+async fn ack_open_batch_is_recipient_only_and_counts_folded_reads() {
+    let mut rig = Rig::seeded().await;
     let delivered = rig
         .send(owner(), Address::Agent(worker()), "delivered")
         .await;
     rig.deliver(delivered, "%1", "s1").await;
-    let queued = rig.send(owner(), Address::Agent(worker()), "queued").await;
+    let queued = rig
+        .send(pane("%2"), Address::Agent(worker()), "queued")
+        .await;
     let failed = rig.send(owner(), Address::Agent(worker()), "failed").await;
     rig.run(OrgCommand::DeliveryFailed {
         message_id: failed,
@@ -1222,27 +1224,74 @@ async fn queued_or_failed_ack_refuses_entire_batch() {
         final_failure: true,
     })
     .await;
-    for undelivered in [queued, failed] {
+    let foreign = rig.send(owner(), Address::Agent(other()), "foreign").await;
+    let cursor = rig.org.status().unwrap();
+    for (caller, ids, want) in [
+        (owner(), vec![queued], "refused"),
+        (pane("%2"), vec![queued], "refused"),
+        (pane("%1"), vec![queued, foreign], "refused"),
+        (pane("%1"), vec![queued, MessageId::new(999)], "not_found"),
+    ] {
         let error = rig
             .messages
-            .ack(
-                AckParams {
-                    ids: vec![delivered, undelivered],
-                },
-                pane("%1"),
-            )
+            .ack(AckParams { ids }, caller)
             .await
             .unwrap_err();
-        assert_eq!(code(error), "conflict");
-        assert_eq!(rig.inbox(pane("%1"), page()).await.unread_count, 3);
+        if want == "refused" {
+            assert!(error.to_string().contains("is not addressed to"), "{error}");
+        }
+        assert_eq!(code(error), want);
+        assert_eq!(rig.org.status().unwrap(), cursor);
     }
-    let alone = rig.messages.ack(
-        AckParams {
-            ids: vec![delivered],
-        },
-        pane("%1"),
+    let only = InboxParams {
+        id: Some(queued),
+        ..page()
+    };
+    let peek = rig.inbox(pane("%1"), only.clone()).await;
+    assert_eq!(peek.unread_count, 3);
+    assert_eq!(peek.messages[0].status, DeliveryStatus::Queued);
+    assert!(peek.messages[0].read_at.is_none());
+    assert_eq!(rig.org.status().unwrap(), cursor);
+
+    let ids = vec![queued, delivered, failed];
+    let ack = |messages: MessageHandle, ids| async move {
+        messages.ack(AckParams { ids }, pane("%1")).await
+    };
+    rig.hold();
+    let mut first = spawn_polled(ack(rig.messages.clone(), ids.clone()));
+    tokio::select! {
+        _ = rig.entered() => {},
+        result = &mut first => panic!("ack returned instead of writing: {result:?}"),
+    }
+    let second = spawn_polled(ack(rig.messages.clone(), ids.clone()));
+    rig.release();
+    assert_eq!(guarded(first).await.unwrap().unwrap().count, 3);
+    assert_eq!(guarded(second).await.unwrap().unwrap().count, 0);
+    assert_eq!(rig.org.status().unwrap(), cursor + 2);
+    let inbox = rig.inbox(pane("%1"), page()).await;
+    assert_eq!(inbox.unread_count, 0);
+    let row = |id| inbox.messages.iter().find(|m| m.message_id == id).unwrap();
+    assert_eq!(row(queued).status, DeliveryStatus::Failed);
+    assert_eq!(
+        row(queued).delivery.reason.as_deref(),
+        Some("recipient acknowledged; automatic delivery cancelled")
     );
-    assert_eq!(alone.await.unwrap().count, 1);
+    assert_eq!(
+        row(failed).delivery.reason.as_deref(),
+        Some("owner gave up on delivery")
+    );
+    assert_eq!(
+        row(delivered)
+            .delivery
+            .session_id
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "s1"
+    );
+    assert!(row(queued).read_at.is_some());
+    assert_eq!(ack(rig.messages.clone(), ids).await.unwrap().count, 0);
+    assert_eq!(rig.org.status().unwrap(), cursor + 2);
 }
 
 #[tokio::test(start_paused = true)]

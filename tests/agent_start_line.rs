@@ -173,11 +173,11 @@ fn start_line_after_up_and_after_clear(mode: StandInMode) {
     let cleared = clear.join().unwrap().expect("agent.clear");
     let new = cleared["session_id"].as_str().expect("a new session");
     assert_ne!(new, session);
+    let sent = watch.wait("the clear's start line", start_line_for(&agent));
     let bound = watch.wait("the clear's binding", |e| {
         e["kind"] == "agent.session_bound" && e["body"]["session_id"] == new
     });
-    let sent = watch.wait("the clear's start line", start_line_for(&agent));
-    assert!(seq(&bound) < seq(&sent));
+    assert!(seq(&sent) < seq(&bound));
     let second = id_of(&sent);
     assert_ne!(second, first);
     rig.test
@@ -204,41 +204,156 @@ fn start_line_after_up_and_after_clear_claude() {
     start_line_after_up_and_after_clear(StandInMode::Claude);
 }
 
-/// Messages to one agent are typed oldest first: one sent while the clear is
-/// held is typed before the clear's start line, which follows when that
-/// message's turn ends.
+/// Queue the ordinary message in the old session's running turn. Hold its
+/// Stop until /clear has started: clear can read the idle frame, but delivery
+/// still sees the old Working row and cannot paste into the old session.
 #[test]
-fn a_message_sent_during_a_clear_is_typed_before_the_start_line() {
-    let mode = StandInMode::Pi;
+fn a_clear_start_line_precedes_an_ordinary_message_queued_before_clear() {
+    let mode = StandInMode::Claude;
     let mut rig = start_line_rig(mode);
     let mut watch = rig.watch();
-    let (agent, pane, _, _) = up_through_start_line(&rig, &mut watch, mode);
+    let (agent, pane, old, _) = up_through_start_line(&rig, &mut watch, mode);
 
+    rig.hold_turn(&pane);
+    let message = rig.send(None, &agent, "for the new session");
+    assert_eq!(
+        rig.inbox_entry(None, Some(&agent), &message)["status"],
+        "queued"
+    );
+    let held = rig
+        .test
+        .rig
+        .control(&pane, json!({"command": "hold_next_hook", "event": "Stop"}));
+    assert!(held["error"].is_null(), "{held}");
+    rig.finish_turn(&pane);
+    let row = rig
+        .test
+        .rig
+        .wait_for_row(&pane, |row| row.id.as_str() == old);
+    assert_eq!(row.status, atm_core::SessionStatus::Working);
     let cursor = rig.test.rig.event_cursor(&pane);
     let clear = hold_clear(&rig, &agent, &pane);
-    let message = rig.send(None, &agent, "for the new session");
+    let released = rig
+        .test
+        .rig
+        .control(&pane, json!({"command": "release_hook"}));
+    assert!(released["error"].is_null(), "{released}");
+    // Hold the first prompt's exact receipt so a message sent after Ready
+    // must still wait for the start line, regardless of observation timing.
+    let held = rig.test.rig.control(
+        &pane,
+        json!({"command": "hold_next_hook", "event": "UserPromptSubmit"}),
+    );
+    assert!(held["error"].is_null(), "{held}");
     rig.advance(&pane, 100, "idle");
-    clear.join().unwrap().expect("agent.clear");
-    let sent = watch.wait("the clear's start line", start_line_for(&agent));
-    let line_id = id_of(&sent);
-
-    rig.test
+    let cleared = clear.join().unwrap().expect("agent.clear");
+    let new = cleared["session_id"].as_str().expect("a new session");
+    assert_ne!(new, old);
+    let line_id = id_of(&watch.wait("the clear's start line", start_line_for(&agent)));
+    let first = rig
+        .test
         .rig
-        .wait_event(&pane, cursor, accepted(&reference(&message)));
-    watch.wait("the message's receipt", about("msg.delivered", &message));
-    // The start line waits for the message's turn.
-    assert_eq!(rig.accepted_since(&pane, cursor), [reference(&message)]);
-    rig.finish_turn(&pane);
-    rig.test
+        .wait_event(&pane, cursor, |e| e["kind"] == "accepted");
+    assert_eq!(
+        first["text"],
+        line(&line_id),
+        "first input to the new session: {first}"
+    );
+    let newer = rig.send(None, &agent, "after the clear returned Ready");
+    for id in [&message, &newer] {
+        let entry = rig.inbox_entry(None, Some(&agent), id);
+        assert_eq!(entry["status"], "queued", "{entry}");
+        assert_eq!(entry["delivery"]["blocked_by"], line_id, "{entry}");
+    }
+    assert_eq!(rig.accepted_since(&pane, cursor), [line(&line_id)]);
+    let released = rig
+        .test
         .rig
-        .wait_event(&pane, cursor, accepted(&line(&line_id)));
-    watch.wait("the start line's receipt", about("msg.delivered", &line_id));
+        .control(&pane, json!({"command": "release_hook"}));
+    assert!(released["error"].is_null(), "{released}");
+    let start_receipt = watch.wait("the start line's receipt", about("msg.delivered", &line_id));
+    assert_eq!(start_receipt["body"]["session_id"], new);
     rig.finish_turn(&pane);
+    let ordinary_receipt = watch.wait("the ordinary receipt", about("msg.delivered", &message));
+    assert_eq!(ordinary_receipt["body"]["session_id"], new);
+    assert!(seq(&start_receipt) < seq(&ordinary_receipt));
+    rig.finish_turn(&pane);
+    let newer_receipt = watch.wait("the newer receipt", about("msg.delivered", &newer));
+    assert_eq!(newer_receipt["body"]["session_id"], new);
+    assert!(seq(&ordinary_receipt) < seq(&newer_receipt));
     assert_eq!(
         rig.accepted_since(&pane, cursor),
-        [reference(&message), line(&line_id)]
+        [line(&line_id), reference(&message), reference(&newer)]
     );
     never_joined(&rig, &pane);
+    rig.test.rig.close();
+}
+
+/// Restart after a clear's Ready and before any attempt. As in the launch
+/// replay case, an idle stabilization window longer than the test's hang
+/// guard is never awaited; a held stand-in turn fences the actual restart.
+#[test]
+fn a_replayed_clear_start_line_still_precedes_older_messages() {
+    let mode = StandInMode::Claude;
+    let mut short = String::new();
+    let mut rig = start_line_rig_with(mode, |rig| {
+        short = set_stable_idle(rig, "{ secs = 600, nanos = 0 }");
+    });
+    // Adopt rather than launch so the long idle window never needs to let
+    // a first start line through.
+    let recipient = rig.ready_agent("lead", mode);
+    let (agent, pane) = (recipient.id, recipient.pane);
+    let mut watch = rig.watch();
+    let clear = hold_clear(&rig, &agent, &pane);
+    let older = rig.send(None, &agent, "still waiting after restart");
+    rig.advance(&pane, 100, "idle");
+    let result = clear.join().unwrap().expect("agent.clear");
+    let new = result["session_id"].as_str().unwrap();
+    let start = id_of(&watch.wait("the clear's start line", start_line_for(&agent)));
+    rig.hold_turn(&pane);
+    watch.catch_up(&rig);
+    for id in [&start, &older] {
+        assert!(watch.all(about("msg.delivery_attempted", id)).is_empty());
+    }
+    let end = rig.test.cursor();
+    drop(watch);
+
+    set_stable_idle(&rig, &short);
+    let cursor = rig.test.rig.event_cursor(&pane);
+    rig.test.rig.restart_daemon();
+    rig.assert_delivery_config_in_force();
+    let mut watch = Watch::open(&rig, end);
+    rig.finish_turn(&pane);
+    let first = rig
+        .test
+        .rig
+        .wait_event(&pane, cursor, |e| e["kind"] == "accepted");
+    assert_eq!(first["text"], line(&start));
+    let start_receipt = watch.wait(
+        "start delivered after replay",
+        about("msg.delivered", &start),
+    );
+    assert_eq!(start_receipt["body"]["session_id"], new);
+    assert_eq!(
+        start_receipt["body"]["confirmation"],
+        "prompt_submit_exact_reference"
+    );
+    rig.finish_turn(&pane);
+    let older_receipt = watch.wait(
+        "ordinary message delivered after replay",
+        about("msg.delivered", &older),
+    );
+    assert_eq!(older_receipt["body"]["session_id"], new);
+    assert_eq!(
+        older_receipt["body"]["confirmation"],
+        "prompt_submit_exact_reference"
+    );
+    assert_eq!(
+        rig.accepted_since(&pane, cursor),
+        [line(&start), reference(&older)]
+    );
+    watch.catch_up(&rig);
+    assert_eq!(watch.all(about("msg.delivery_attempted", &start)).len(), 1);
     rig.test.rig.close();
 }
 

@@ -22,6 +22,7 @@ use super::super::{
         is_focus_notice, AgentId, GiveUpResult, InboxEntry, InboxParams, ResolveParams,
         MESSAGE_ADMISSION_LIMIT,
     },
+    start_line::delivery_line,
 };
 use super::*;
 use crate::org::message_delivery::MESSAGE_RESOLUTION_BUDGET;
@@ -82,6 +83,7 @@ impl Screens {
                     .or_default() += 1;
                 pass(&screens.gate).await;
                 (screens.seen.lock().unwrap().get(&agent.id).cloned())
+                    .map(|seen| (seen, None))
                     .ok_or_else(|| MessageError::Unavailable("no observation scripted".into()))
             })
         })
@@ -177,7 +179,7 @@ async fn perform(rt: MessageRuntime, id: MessageId, act: Act) -> Result<(), Mess
         pane: PaneId::parse(&pane)?,
         harness: Harness::Pi,
         session_id: session.clone(),
-        excluded_sessions: HashSet::new(),
+        excluded_sessions: snapshot.recipient.excluded_session_id.into_iter().collect(),
     };
     rt.evidence.arm(scope.clone())?;
     rt.history.record(HistoryUpdate::Armed { scope }, now)?;
@@ -203,7 +205,7 @@ async fn perform(rt: MessageRuntime, id: MessageId, act: Act) -> Result<(), Mess
         Act::Deliver => {
             let session = session.unwrap();
             let prompt = LifecycleEvent::PromptSubmit {
-                prompt: Some(inbox_reference(id)),
+                prompt: Some(delivery_line(id, &snapshot.message.content)),
             };
             (rt.evidence).observe(&session, Some(&pane), Harness::Pi, &prompt)?;
             let receipt = rt.evidence.receipt(id)?.unwrap();
@@ -1194,6 +1196,88 @@ async fn follower_waits_behind_an_unattempted_head() {
         Some("another delivery is in flight on this pane")
     );
     assert_eq!(follower.blocked_by, Some(first));
+}
+
+#[tokio::test(start_paused = true)]
+async fn refusing_a_clear_start_line_keeps_guards_and_give_up_releases_fifo() {
+    for dialog in [false, true] {
+        let mut bench = Bench::blind().await;
+        bench.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| {
+                o.facts.turn = TurnState::Running;
+            }),
+        );
+        let older = bench.send(worker(), "older briefing").await;
+        bench
+            .rig
+            .run(OrgCommand::Clear { agent_id: worker() })
+            .await;
+        let start = MessageId::new(
+            bench
+                .rig
+                .run(OrgCommand::SendMessage(
+                    super::super::start_line::start_line(&worker()),
+                ))
+                .await,
+        );
+        bench.screens.set(
+            worker(),
+            with(ready("%1", "fresh"), |o| {
+                if dialog {
+                    o.facts.dialog = DialogState::Permission;
+                } else {
+                    o.facts.input = InputState::Draft;
+                }
+            }),
+        );
+        bench
+            .rig
+            .run(OrgCommand::SessionBound {
+                agent_id: worker(),
+                session_id: "fresh".into(),
+            })
+            .await;
+        let newer = bench.send(worker(), "newer briefing").await;
+        let notice = bench.event("blocked head notice", |e| {
+            matches!(e, OrgEvent::MessageSent(note) if note.to == Address::Owner && note.body.contains(" blocked: "))
+        }).await;
+        let OrgEvent::MessageSent(note) = notice else {
+            panic!("expected blocked notice")
+        };
+        assert!(
+            note.body.starts_with(&format!("{start} blocked: ")),
+            "{}",
+            note.body
+        );
+        assert!(
+            note.body
+                .contains(&format!("waiting behind it: {older}, {newer}.")),
+            "{}",
+            note.body
+        );
+        assert!(bench.entries().is_empty());
+        for id in [older, newer] {
+            let row = bench.entry(worker(), id).await;
+            assert_eq!(row.status, DeliveryStatus::Queued);
+            assert_eq!(row.delivery.blocked_by, Some(start));
+        }
+        assert_eq!(bench.give_up(start).await.unwrap(), DeliveryStatus::Failed);
+        assert_eq!(
+            bench.entry(worker(), newer).await.delivery.blocked_by,
+            Some(older)
+        );
+        assert!(bench.entries().is_empty()); // give-up does not clear a draft or dialog
+        bench.script(Act::Deliver);
+        bench.screens.set(worker(), ready("%1", "fresh"));
+        assert_eq!(bench.entered().await, older);
+        assert_eq!(bench.entered().await, newer);
+        bench
+            .event("ordinary follower delivered", |e| {
+                delivered(e) == Some(newer)
+            })
+            .await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -3523,6 +3607,186 @@ async fn legacy_unkeyed_note_allows_only_one_keyed_successor() {
         Some(key(id, "unobserved"))
     );
     rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ack_cancelled_queue_does_not_run_when_recipient_idles() {
+    use super::super::messages::AckParams;
+    let screens = Screens::default();
+    let idle = ready("%1", "s1");
+    screens.set(
+        worker(),
+        with(idle.clone(), |o| o.facts.turn = TurnState::Running),
+    );
+    let mut bench = Bench::with_screens(screens).await;
+    let head = bench.send(worker(), "already read").await;
+    let follower = bench.send(worker(), "waiting for delivery").await;
+    assert_eq!(
+        bench.entry(worker(), head).await.status,
+        DeliveryStatus::Queued
+    );
+    assert_eq!(
+        bench
+            .rig
+            .messages
+            .ack(AckParams { ids: vec![head] }, pane("%1"))
+            .await
+            .unwrap()
+            .count,
+        1
+    );
+    bench.script(Act::Deliver);
+    bench.screens.set(worker(), idle);
+    bench
+        .event("follower receipt", |e| delivered(e) == Some(follower))
+        .await;
+    assert_eq!(bench.entries(), [follower]);
+    let cancelled = bench.entry(worker(), head).await;
+    assert_eq!(cancelled.status, DeliveryStatus::Failed);
+    assert_eq!(cancelled.delivery.attempt, 0);
+    assert!(bench.rig.inbox(owner(), page()).await.messages.is_empty());
+    assert!(bench.rig.rt.evidence.snapshot(head).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ack_cancelled_while_waiting_for_admission_skips_executor() {
+    use super::super::messages::AckParams;
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    let rt = rig.job.service.rt.clone();
+    let snapshot = rt.history.snapshot(id, rt.clock.now().unwrap()).unwrap();
+    let admission = rt
+        .admissions
+        .clone()
+        .acquire_many_owned(MESSAGE_ADMISSION_LIMIT.try_into().unwrap())
+        .await
+        .unwrap();
+    let mut queued = rig.job.service.board.queued.subscribe();
+    let mut dispatch = Box::pin(rig.job.attempt(&snapshot, &mut queued, false));
+    poll_pending(dispatch.as_mut()).await;
+    assert_eq!(
+        rig.messages
+            .ack(AckParams { ids: vec![id] }, pane("%1"))
+            .await
+            .unwrap()
+            .count,
+        1
+    );
+    drop(admission);
+    assert!(matches!(guarded(dispatch).await.unwrap(), Next::Again));
+    assert!(rt.evidence.snapshot(id).is_err());
+}
+
+// An open snapshot retained before ack must not use up evidence capacity
+// when it gets as far as registration after the terminal fold forgot the ID.
+#[tokio::test(start_paused = true)]
+async fn ack_discards_registration_from_stale_open_snapshot() {
+    use super::super::messages::AckParams;
+    let rig = ManualJob::new().await;
+    let id = rig.send().await;
+    let rt = &rig.job.service.rt;
+    let now = rt.clock.now().unwrap();
+    let stale = rt.history.snapshot(id, now).unwrap().message;
+    assert_eq!(stale.status, DeliveryStatus::Queued);
+    assert_eq!(
+        rig.messages
+            .ack(AckParams { ids: vec![id] }, pane("%1"))
+            .await
+            .unwrap()
+            .count,
+        1
+    );
+    assert!(rt.evidence.snapshot(id).is_err());
+    assert!(!rt.register_for_delivery(&stale, now).unwrap());
+    assert!(rt.evidence.snapshot(id).is_err());
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ack_leaves_followers_blocked_by_the_staged_draft_not_the_old_id() {
+    use super::super::messages::AckParams;
+    let (mut rig, id, _) = ManualJob::recovery_original().await;
+    assert_eq!(
+        rig.messages
+            .ack(AckParams { ids: vec![id] }, pane("%1"))
+            .await
+            .unwrap()
+            .count,
+        1
+    );
+    // The stand-in observation still has a draft after the original hold is
+    // cancelled. ManualJob's executor panics on any dispatch.
+    let follower = rig.send().await;
+    rig.round(0).await;
+    let timeout = rig.job.service.rt.policy.settings().readiness_timeout;
+    tokio::time::advance(timeout).await;
+    rig.round(0).await;
+    let inbox = rig
+        .messages
+        .inbox(
+            InboxParams {
+                id: Some(follower),
+                ..page()
+            },
+            pane("%1"),
+        )
+        .await
+        .unwrap();
+    let entry = &inbox.messages[0];
+    assert_eq!(entry.status, DeliveryStatus::Queued);
+    assert_eq!(entry.delivery.phase, DeliveryPhase::Blocked);
+    assert_eq!(
+        entry.delivery.reason.as_deref(),
+        Some("input draft persisted past the delivery hold deadline")
+    );
+    assert_eq!(entry.delivery.blocked_by, None);
+    assert_eq!(entry.delivery.attempt, 0);
+    assert!(rig
+        .notes()
+        .await
+        .iter()
+        .any(|body| body.starts_with(&format!("{follower} blocked: input draft persisted"))));
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ack_read_append_failure_leaves_cancelled_prefix() {
+    use super::super::messages::AckParams;
+    let mut first = ManualJob::new().await;
+    let id = first.send().await;
+    while first.appends.try_recv().is_ok() {}
+    close(&first.gate);
+    let ack = |messages: super::super::messages::MessageHandle| async move {
+        messages.ack(AckParams { ids: vec![id] }, pane("%1")).await
+    };
+    let mut call = spawn_polled(ack(first.messages.clone()));
+    tokio::select! {
+        event = guarded(first.appends.recv()) => assert!(event.is_some()),
+        result = &mut call => panic!("ack did not write a cancellation: {result:?}"),
+    }
+    *first.fault.lock().unwrap() = Some(crate::eventlog::EventLogError::TimeoutBeforeHandover);
+    first.gate.add_permits(1);
+    assert!(matches!(
+        guarded(call).await.unwrap(),
+        Err(MessageError::Organisation(OrgServiceError::Timeout))
+    ));
+    let records = first.journal.lock().unwrap().clone();
+    assert_eq!(records.last().unwrap().kind, "msg.delivery_failed");
+    assert!(records.iter().all(|record| record.kind != "msg.read"));
+    first.stop().await;
+    let second = ManualJob::from_records(records).await;
+    let row = second.job.service.message(id).unwrap().unwrap();
+    assert_eq!(row.status, DeliveryStatus::Failed);
+    assert!(row.read_at.is_none());
+    assert!(second.job.service.open(&worker()).unwrap().is_empty());
+    let cursor = second.job.service.rt.org.status().unwrap();
+    assert_eq!(ack(second.messages.clone()).await.unwrap().count, 1);
+    {
+        let records = second.journal.lock().unwrap();
+        assert_eq!(records.last().unwrap().seq, cursor + 1);
+        assert_eq!(records.last().unwrap().kind, "msg.read");
+    }
+    second.stop().await;
 }
 
 #[tokio::test(start_paused = true)]

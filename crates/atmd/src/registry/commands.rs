@@ -29,6 +29,8 @@ pub struct PaneSession {
     /// The latest untagged `SessionStart` accepted for this row. `None` means
     /// the row has had none: a status line, discovery or another event made it.
     pub start: Option<AcceptedStart>,
+    /// Adapter-reported version, when known for this live session.
+    pub(crate) harness_version: Option<String>,
 }
 
 /// A `SessionStart` the registry applied to a row.

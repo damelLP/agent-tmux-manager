@@ -53,9 +53,40 @@ struct Seat {
 impl Seat {
     /// A ready agent `lead`, switched on, idle in a fresh session.
     fn start(mode: StandInMode) -> Self {
-        let test = AgentRig::start_with_config(mode, DELIVERY);
+        Self::start_with_lines(mode, false)
+    }
+
+    fn start_with_lines(mode: StandInMode, lines: bool) -> Self {
+        let mut test = AgentRig::start_with_config(mode, DELIVERY);
+        if lines {
+            test.rig.set_daemon_env("ATM_SPAWN_START_LINE", "on");
+            test.rig.restart_daemon();
+            assert_eq!(test.rpc("agent.list", json!({}), None), json!([]));
+        }
         let config = support::started_config(mode);
+        let mut watch = delivery_support::Watch::on(&test.rig, test.cursor());
         let started = Started::up_with(&test, "lead", &config, ON);
+        if lines {
+            watch.wait("the launch note's receipt", |e| {
+                e["kind"] == "msg.delivered"
+            });
+            test.rig
+                .wait_for_row(&started.pane, |r| r.status == SessionStatus::Working);
+            let now = test
+                .rig
+                .control(&started.pane, json!({"command":"barrier"}))["now_ms"]
+                .as_u64()
+                .unwrap();
+            let after = test.rig.event_cursor(&started.pane);
+            let reply = test.rig.control(
+                &started.pane,
+                json!({"command":"advance_to", "now_ms":now + config.work_ms}),
+            );
+            assert!(reply["error"].is_null(), "{reply}");
+            test.rig.wait_event(&started.pane, after, |e| {
+                e["kind"] == "rendered" && e["state"] == "idle"
+            });
+        }
         let row = test.rig.wait_for_row(&started.pane, |r| {
             !r.id.is_pending() && r.status == SessionStatus::Idle
         });
@@ -166,6 +197,11 @@ impl Seat {
     /// Let the save turn end, then let the stand-in finish the clear the
     /// daemon types. Returns the new session's id.
     fn end_turn_and_clear(&self) -> String {
+        self.hold_clear();
+        self.finish_clear()
+    }
+
+    fn hold_clear(&self) {
         let before_clear = self.test.rig.event_cursor(&self.pane);
         // Advance-then-wait is too late: completion can already trigger clear.
         self.test
@@ -173,6 +209,9 @@ impl Seat {
         self.test.rig.wait_event(&self.pane, before_clear, |e| {
             e["kind"] == "rendered" && e["state"] == "clearing"
         });
+    }
+
+    fn finish_clear(&self) -> String {
         self.advance(self.config.clear_gap_ms);
         let row = self.test.rig.wait_for_row(&self.pane, |r| {
             !r.id.is_pending() && r.id.as_str() != self.old && r.status == SessionStatus::Idle
@@ -216,10 +255,9 @@ fn handed_over_at_the_line(mode: StandInMode) {
     assert_eq!(
         note["body"]["body"],
         format!(
-            "automatic handover of {} done (context 63%, line 60%): it saved to {} ({message}) \
-             and has a new session.",
-            seat.id,
-            seat.memory().display()
+            "automatic handover of {} (context 63%, line 60%) did not complete: saved ({message}); \
+             clear confirmed; resume not confirmed: start lines are disabled.",
+            seat.id
         )
         .as_str()
     );
@@ -236,6 +274,135 @@ fn handed_over_at_the_line(mode: StandInMode) {
         .collect();
     assert_eq!(prompts.len(), 2, "{prompts:?}");
     seat.test.rig.close();
+}
+
+const RESUME_BODY: &str = "Run atm me; read its memory file; resume open work or report and stop.";
+
+fn automatic_handover_resume_before_older_message(mode: StandInMode) {
+    let mut seat = Seat::start_with_lines(mode, true);
+    seat.work_starts(63);
+    let after = seat.test.rig.event_cursor(&seat.pane);
+    seat.work_ends();
+    let save = seat.save_turn_started(after);
+    std::fs::create_dir_all(seat.memory().parent().unwrap()).unwrap();
+    std::fs::write(seat.memory(), "what the next session needs").unwrap();
+    seat.hold_clear();
+    // The explicit clear gap keeps the old message queued even if the
+    // scheduler sees the save turn end before handover's preflight.
+    let sent = seat.test.rpc(
+        "msg.send",
+        json!({"to": seat.id, "body": "ordinary briefing"}),
+        None,
+    );
+    let ordinary = sent["message_id"].as_str().unwrap();
+    let cursor = seat.test.rig.event_cursor(&seat.pane);
+    let new = seat.finish_clear();
+    assert_ne!(new, seat.old);
+    let watch = seat.watch.get_mut();
+    let clear = watch.wait("the clear request", |e| {
+        e["kind"] == "agent.clear_requested"
+    });
+    // Identify the note without its copy, so wrong copy fails an assertion.
+    let start = watch.wait("the resume note", |e| {
+        e["kind"] == "msg.sent" && e["body"]["from"] == "system" && e["body"]["to"] == seat.id
+    });
+    assert_eq!(start["body"]["body"], RESUME_BODY);
+    let start_id = format!("m{}", start["seq"]);
+    let ready = watch.wait("replacement ready", |e| {
+        e["kind"] == "agent.session_bound" && e["body"]["session_id"] == new
+    });
+    let attempt = watch.wait(
+        "resume attempt",
+        delivery_support::about("msg.delivery_attempted", &start_id),
+    );
+    let first = seat
+        .test
+        .rig
+        .wait_event(&seat.pane, cursor, |e| e["kind"] == "accepted");
+    assert_eq!(first["text"], format!("[{start_id}] {RESUME_BODY}"));
+    let resume = watch.wait(
+        "exact resume receipt",
+        delivery_support::about("msg.delivered", &start_id),
+    );
+    assert_eq!(resume["body"]["session_id"], new);
+    assert_eq!(
+        resume["body"]["confirmation"],
+        "prompt_submit_exact_reference"
+    );
+    let outcome = watch.wait("the success note to the manager", |e| {
+        e["kind"] == "msg.sent"
+            && e["body"]["to"] == "owner"
+            && e["body"]["body"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("automatic handover of "))
+    });
+    assert_eq!(outcome["body"]["body"], format!(
+        "automatic handover of {} (context 63%, line 60%) complete: saved ({save}); cleared and bound {} -> {new}; resume prompt {start_id} delivered.",
+        seat.id, seat.old,
+    ));
+    seat.work_ends();
+    let receipt = seat.watch.get_mut().wait(
+        "the ordinary receipt",
+        delivery_support::about("msg.delivered", ordinary),
+    );
+    assert_eq!(receipt["body"]["session_id"], new);
+    assert_eq!(
+        receipt["body"]["confirmation"],
+        "prompt_submit_exact_reference"
+    );
+    let events = seat.events();
+    let of_kind = |kind| events.iter().find(|event| event["kind"] == kind).unwrap();
+    let save_receipt = events
+        .iter()
+        .find(|e| delivery_support::about("msg.delivered", &save)(e))
+        .unwrap();
+    let ordinary_sent = events
+        .iter()
+        .find(|e| e["kind"] == "msg.sent" && format!("m{}", e["seq"]) == ordinary)
+        .unwrap();
+    let ordinary_attempt = events
+        .iter()
+        .find(|e| delivery_support::about("msg.delivery_attempted", ordinary)(e))
+        .unwrap();
+    let order = [
+        of_kind("agent.save_requested"),
+        save_receipt,
+        of_kind("agent.saved"),
+        &clear,
+        ordinary_sent,
+        &start,
+        &ready,
+        &attempt,
+        &resume,
+        &outcome,
+        ordinary_attempt,
+        &receipt,
+    ]
+    .map(|e| e["seq"].as_u64().unwrap());
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| {
+                e["kind"] == "msg.sent"
+                    && e["body"]["from"] == "system"
+                    && e["body"]["to"] == seat.id
+            })
+            .count(),
+        2,
+        "one save note and one resume note"
+    );
+    seat.test.rig.close();
+}
+
+#[test]
+fn automatic_handover_confirms_the_resume_before_an_older_queued_message_claude() {
+    automatic_handover_resume_before_older_message(StandInMode::Claude);
+}
+
+#[test]
+fn automatic_handover_confirms_the_resume_before_an_older_queued_message_pi() {
+    automatic_handover_resume_before_older_message(StandInMode::Pi);
 }
 
 #[test]

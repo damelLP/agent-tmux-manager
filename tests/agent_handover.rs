@@ -177,13 +177,14 @@ impl Handover {
 
     /// The handover's own records, in the order they were committed.
     fn assert_recorded(&self, expected: &[&str]) {
-        let kinds = self.kinds();
-        let found: Vec<&str> = kinds
+        let events = self.events();
+        let found: Vec<_> = events
             .iter()
-            .map(String::as_str)
+            .filter(|e| e["kind"] != "msg.sent" || e["body"]["to"] == self.id)
+            .filter_map(|e| e["kind"].as_str())
             .filter(|kind| expected.contains(kind))
             .collect();
-        assert_eq!(found, expected, "{kinds:?}");
+        assert_eq!(found, expected, "{events:?}");
     }
 }
 

@@ -110,6 +110,17 @@ pub enum TaskAction {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Accept a changes-requested task from a reviewed fix when its assignee is down
+    CarryBack {
+        #[arg(value_parser = parse_task)]
+        task_id: TaskId,
+        #[arg(long = "from-fix", value_parser = parse_task)]
+        fix_task: TaskId,
+        #[arg(long, value_parser = parse_task)]
+        review_task: TaskId,
+        #[arg(long)]
+        note: String,
+    },
     /// List a single page, optionally filtered; agent addresses must be full ids
     List {
         #[arg(long = "project")]
@@ -260,6 +271,20 @@ fn command(action: TaskAction) -> Result<(&'static str, Value)> {
             serde_json::to_value(VerdictParams {
                 task_id,
                 verdict,
+                review_task,
+                note,
+            })?,
+        ),
+        TaskAction::CarryBack {
+            task_id,
+            fix_task,
+            review_task,
+            note,
+        } => (
+            "task.carry_back",
+            serde_json::to_value(tasks::CarryBackParams {
+                task_id,
+                fix_task,
                 review_task,
                 note,
             })?,

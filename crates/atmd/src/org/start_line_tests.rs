@@ -13,6 +13,8 @@ use atm_org::{Address, AgentId, MessageContent, MessageId, MessageKind, OrgEvent
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
+const RESUME: &str = "Run atm me; read its memory file; resume open work or report and stop.";
+
 fn agent(name: &str) -> AgentId {
     format!("demo/{name}").parse().unwrap()
 }
@@ -85,6 +87,61 @@ fn only_canonical_or_historical_start_notes_get_the_current_start_text() {
     }
     let notice = focus_notice(id, &PaneId::parse("%7").unwrap());
     assert!(!is_start_line(&notice));
+}
+
+#[test]
+fn only_the_canonical_resume_note_gets_priority_copy_and_dedup() {
+    let id = MessageId::new(123456);
+    let seat = agent("lead");
+    let mut note = start_line(&seat);
+    note.body = RESUME.into();
+    let line = delivery_line(id, &note);
+    assert_eq!(line, format!("[m123456] {RESUME}"));
+    assert_eq!(line.len(), 80);
+    assert!(line.bytes().all(|b| (b' '..=b'~').contains(&b)));
+    assert!(is_start_line(&note));
+    let bound = SessionId::new("s1");
+    let queued = state(&[sent(note.clone())]);
+    assert!(!start_line_due(&queued, &seat, Some(&bound)));
+    assert!(start_line_due(&queued, &agent("other"), Some(&bound)));
+    assert!(!start_line_due(
+        &state(&[sent(note.clone()), attempted(4), delivered(4, "s1")]),
+        &seat,
+        Some(&bound),
+    ));
+    let mut notice = note.clone();
+    notice.delivery_notice = focus_notice(id, &PaneId::parse("%7").unwrap()).delivery_notice;
+    assert!(notice.delivery_notice.is_some());
+    for lookalike in [
+        notice,
+        MessageContent {
+            from: Address::Owner,
+            ..note.clone()
+        },
+        MessageContent {
+            to: Address::Owner,
+            ..note.clone()
+        },
+        MessageContent {
+            kind: MessageKind::Brief,
+            ..note.clone()
+        },
+        MessageContent {
+            task: Some("t7".parse().unwrap()),
+            ..note.clone()
+        },
+        MessageContent {
+            attachments: vec!["/project/brief.md".into()],
+            ..note.clone()
+        },
+        MessageContent {
+            body: format!("{RESUME} "),
+            ..note
+        },
+    ] {
+        assert!(!is_start_line(&lookalike));
+        assert_eq!(delivery_line(id, &lookalike), inbox_reference(id));
+    }
 }
 
 /// An organisation with `demo/lead` and `demo/other` adopted, and the events
@@ -259,6 +316,50 @@ fn evidence_expects_either_line_of_its_own_id_and_nothing_else() {
     ] {
         assert!(evidence().register(id, line.clone()).is_err(), "{line:?}");
     }
+}
+
+#[tokio::test]
+async fn only_the_exact_resume_text_confirms_its_attempt() {
+    let id = MessageId::new(123);
+    let evidence = evidence();
+    let reference = format!("[m123] {RESUME}");
+    for refused in [format!("[m124] {RESUME}"), format!("{reference} ")] {
+        assert!(evidence.register(id, refused).is_err());
+    }
+    evidence.register(id, reference.clone()).unwrap();
+    evidence
+        .arm(AttemptScope {
+            message_id: id,
+            attempt_seq: 124,
+            recipient: agent("lead"),
+            pane: PaneId::parse("%1").unwrap(),
+            harness: Harness::Pi,
+            session_id: Some(SessionId::new("s1")),
+            excluded_sessions: HashSet::new(),
+        })
+        .unwrap();
+    let prompt = |text| {
+        evidence
+            .observe(
+                &SessionId::new("s1"),
+                Some("%1"),
+                Harness::Pi,
+                &LifecycleEvent::PromptSubmit { prompt: Some(text) },
+            )
+            .unwrap();
+    };
+    for wrong in [
+        inbox_reference(id),
+        start_reference(id),
+        format!("{reference} "),
+    ] {
+        prompt(wrong);
+        assert_eq!(evidence.receipt(id).unwrap(), None);
+    }
+    prompt(reference);
+    let receipt = evidence.receipt(id).unwrap().unwrap();
+    assert_eq!(receipt.session_id.as_str(), "s1");
+    assert_eq!(receipt.confirmation, "prompt_submit_exact_reference");
 }
 
 #[tokio::test]

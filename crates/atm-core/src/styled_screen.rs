@@ -133,7 +133,8 @@ impl Style {
                     self.faint = false;
                 }
                 27 => self.inverse = false,
-                3 | 23 | 30..=37 | 39 | 40..=47 | 49 | 90..=97 | 100..=107 => {}
+                // Italic, underline and colors do not affect the retained attributes.
+                3 | 4 | 23 | 24 | 30..=37 | 39 | 40..=47 | 49 | 90..=97 | 100..=107 => {}
                 38 | 48 => {
                     let count = match values.next() {
                         Some(5) => 1,
@@ -171,6 +172,25 @@ mod tests {
             assert_eq!(s.faint_at(offset), Some(faint));
             assert_eq!(s.inverse_at(offset), Some(inverse));
         }
+    }
+
+    #[test]
+    fn underline_preserves_text_and_other_attributes() {
+        let screen = StyledScreen::parse("\x1b[1;2;7mA\x1b[4m界\x1b[24mZ\x1b[0m!\n")
+            .expect("underline toggles are presentation only");
+        assert_eq!(screen.text(), "A界Z!\n");
+        for offset in [0, 1, 4, 5] {
+            let expected = Some(offset != 5);
+            assert_eq!(screen.bold_at(offset), expected);
+            assert_eq!(screen.faint_at(offset), expected);
+            assert_eq!(screen.inverse_at(offset), expected);
+        }
+        for offset in [2, 3, 6] {
+            assert_eq!(screen.bold_at(offset), None);
+            assert_eq!(screen.faint_at(offset), None);
+            assert_eq!(screen.inverse_at(offset), None);
+        }
+        assert_eq!(StyledScreen::parse("A\x1b[4;24mB").unwrap().text(), "AB");
     }
 
     #[test]
@@ -213,7 +233,7 @@ mod tests {
             "\x1b[;2m",
             "\x1b[8m",
             "\x1b[28m",
-            "\x1b[4m",
+            "\x1b[4:2m",
             "\x1b[2J",
             "\x1b[1A",
             "\x1b[38;5m",

@@ -1,32 +1,36 @@
 //! The start line: after a start, respawn or clear of a named agent ends
 //! Ready, the daemon queues one note from `system` to the agent, and the
 //! message runtime types it as `[mN] New session: run the shell command atm me`,
-//! the note's text itself rather than an inbox reference. It goes through the runtime
-//! unchanged: its guards (an idle session, an empty editor, no dialog, not
+//! or, after a saved handover, as the resume instruction. Both type the note
+//! itself through the usual guards (an idle session, an empty editor, no dialog, not
 //! the owner's focused pane), its exact confirmation and its holds.
 //!
-//! Only the lifecycle flows queue it, after their own Ready write and inside
-//! the agent's reservation, so two checks for one agent never interleave.
-//! [`start_line_due`] allows at most one open start line per agent and none
+//! Only the lifecycle flows queue it, inside the agent's reservation, so
+//! two checks for one agent never interleave. Clear queues it after the
+//! Ready proof but before the Ready write, so it heads delivery in the
+//! replacement editor. Start and respawn still queue it after Ready.
+//! This allows at most one open start line per agent and none
 //! for a session that has already received one. Adopt, the restart check and
 //! the observer's binds queue nothing. `ATM_SPAWN_START_LINE=off` in the
 //! environment atmd was started in turns it off.
 //!
 //! Known limits:
-//! - A start or clear that ends Stuck queues no line, and neither does the
-//!   observer's later recovery of that agent to Ready.
-//! - Messages to one agent are typed oldest first: one queued before the line
-//!   is typed before it.
-//! - A crash between the Ready write and the line's write, or a failed write
-//!   (logged), loses the line. An open line held for the owner blocks a new
-//!   one until he retries or gives up, and giving up queues no replacement.
+//! - A start or clear without Ready proof queues no line, and neither does
+//!   the observer's later recovery of that agent to Ready. An interruption
+//!   after a clear queues its line can still leave the clear Stuck.
+//! - A clear's open start line precedes ordinary delivery until it is
+//!   delivered or finally failed. Start and respawn keep their usual order.
+//! - A crash before the line's write, or a failed write (logged), can lose
+//!   the line. An open line held for the owner blocks a new one until he
+//!   retries or gives up, and giving up queues no replacement.
 //! - Nobody acknowledges a start line: it stays unread in `atm inbox`. `atm me`
 //!   does not list it.
 //! - The Claude and pi matchers refuse wrapped staged drafts: no Enter or automatic
 //!   confirmation; a pasted line stays in the editor for inspection. For `m123`
 //!   the start text is 48 columns: synthetic edge-wrap checks fail below 50 pane
 //!   columns for Claude's two-column prompt and 48 for pi. Each extra ID digit
-//!   needs another column. Real-harness wrapping boundaries are unverified.
+//!   needs another column. The resume body is 70 columns before the ID and
+//!   prompt chrome; it can require a wider pane.
 //! - An agent that goes down or stuck before its line is delivered (a respawn
 //!   records it down for a moment, so it can too) leaves the line blocked: the
 //!   owner gets a "blocked: recipient agent is stuck or down" notice, and his
@@ -41,6 +45,7 @@ use atm_org::{
 
 /// The note's body, and the typed line after its `[mN]` token.
 const START_LINE: &str = "New session: run the shell command atm me";
+const RESUME_LINE: &str = "Run atm me; read its memory file; resume open work or report and stop.";
 
 /// The `ATM_SPAWN_*` variable that turns start lines off when it is `off`.
 const SWITCH: &str = "ATM_SPAWN_START_LINE";
@@ -59,19 +64,37 @@ pub fn start_line(agent: &AgentId) -> MessageContent {
     }
 }
 
-/// Only a complete current or historical start note, never a lookalike.
-/// Accept the old body when reading persisted messages; emit only START_LINE.
-/// Nobody but the daemon sends as `system`.
-#[must_use]
-pub fn is_start_line(content: &MessageContent) -> bool {
-    matches!(&content.to, Address::Agent(agent) if content == &start_line(agent)
-    || content == &MessageContent {
-        body: "New session: run atm me".into(),
-        ..start_line(agent)
-    })
+/// The copy to type for a complete canonical note, including historical
+/// plain notes. Nobody but the daemon sends as `system`.
+fn start_copy(content: &MessageContent) -> Option<&'static str> {
+    let MessageContent {
+        delivery_notice: None,
+        from: Address::System,
+        to: Address::Agent(_),
+        kind: MessageKind::Note,
+        body,
+        attachments,
+        task: None,
+    } = content
+    else {
+        return None;
+    };
+    if !attachments.is_empty() {
+        return None;
+    }
+    match body.as_str() {
+        START_LINE | "New session: run atm me" => Some(START_LINE),
+        RESUME_LINE => Some(RESUME_LINE),
+        _ => None,
+    }
 }
 
-/// The current line typed for start line `id`, including historical notes.
+#[must_use]
+pub fn is_start_line(content: &MessageContent) -> bool {
+    start_copy(content).is_some()
+}
+
+/// The current line typed for a plain start, including historical notes.
 #[must_use]
 pub fn start_reference(id: MessageId) -> String {
     format!("[{id}] {START_LINE}")
@@ -81,27 +104,30 @@ pub fn start_reference(id: MessageId) -> String {
 /// inbox reference of any other message.
 #[must_use]
 pub fn delivery_line(id: MessageId, content: &MessageContent) -> String {
-    if is_start_line(content) {
-        start_reference(id)
-    } else {
-        inbox_reference(id)
+    match start_copy(content) {
+        Some(RESUME_LINE) => resume_reference(id),
+        Some(_) => start_reference(id),
+        None => inbox_reference(id),
     }
+}
+
+pub(super) fn resume_reference(id: MessageId) -> String {
+    format!("[{id}] {RESUME_LINE}")
 }
 
 /// Whether `agent`, Ready on `session` after a start or clear, gets a start
 /// line: not while one to it is queued or delivering (that one serves the
 /// new session), and not if one was delivered to this same session.
-#[must_use]
-pub(super) fn start_line_due(
+fn existing_start_line(
     state: &OrgState,
     agent: &AgentId,
     session: Option<&SessionId>,
-) -> bool {
-    !state
+) -> Option<(MessageId, &'static str)> {
+    state
         .inbox(&Address::Agent(agent.clone()))
         .into_iter()
-        .filter(|message| is_start_line(&message.content))
-        .any(|message| match message.status {
+        .filter_map(|message| Some((message, start_copy(&message.content)?)))
+        .find(|(message, _)| match message.status {
             DeliveryStatus::Queued | DeliveryStatus::Delivering => true,
             DeliveryStatus::Delivered => {
                 session.is_some()
@@ -109,27 +135,63 @@ pub(super) fn start_line_due(
             }
             DeliveryStatus::Failed => false,
         })
+        .map(|(message, copy)| (message.id, copy))
+}
+
+#[cfg(test)]
+pub(super) fn start_line_due(
+    state: &OrgState,
+    agent: &AgentId,
+    session: Option<&SessionId>,
+) -> bool {
+    existing_start_line(state, agent, session).is_none()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum StartLineDisposition {
+    Track(MessageId),
+    Off,
+    Unidentified,
 }
 
 impl AgentRuntime {
-    /// Queue `id`'s start line, after its start, respawn or clear has
-    /// recorded Ready on `session` (`None`: an editor without a session).
-    /// Call it only under the agent's reservation. A failure is logged and
-    /// never fails the operation: the agent is Ready either way.
-    pub(super) async fn queue_start_line(&self, id: &AgentId, session: Option<&SessionId>) {
+    /// Queue `id`'s start line once its start, respawn or clear proved
+    /// Ready on `session` (`None`: an editor without a session). Call only
+    /// under the agent's reservation. The call logs a failure and returns
+    /// Unidentified without vetoing the caller's Ready.
+    pub(super) async fn queue_start_line(
+        &self,
+        id: &AgentId,
+        session: Option<&SessionId>,
+        resume: bool,
+    ) -> StartLineDisposition {
+        use StartLineDisposition::{Off, Track, Unidentified};
         if (self.spawn_env)(SWITCH).as_deref() == Some("off") {
-            return;
+            return Off;
         }
         let queued = async {
             let state = self.org.snapshot().await?;
-            if start_line_due(&state, id, session) {
-                let line = OrgCommand::SendMessage(start_line(id));
-                self.org.execute(line, chrono::Utc::now()).await?;
+            if let Some((reused, copy)) = existing_start_line(&state, id, session) {
+                // Keep one open slot; a carried plain note is not a resume.
+                return Ok((!resume || copy == RESUME_LINE).then_some(reused));
             }
-            Ok::<_, super::OrgServiceError>(())
+            let mut line = start_line(id);
+            if resume {
+                line.body = RESUME_LINE.into();
+            }
+            let sent = self
+                .org
+                .execute(OrgCommand::SendMessage(line), chrono::Utc::now())
+                .await?;
+            Ok::<_, super::OrgServiceError>(sent.first().map(|event| MessageId::new(event.seq)))
         };
-        if let Err(error) = queued.await {
-            tracing::warn!(agent = %id, %error, "Start line not queued; the agent is ready without it");
+        match queued.await {
+            Ok(Some(id)) => Track(id),
+            Ok(None) => Unidentified,
+            Err(error) => {
+                tracing::warn!(agent = %id, %error, "Start line could not be identified");
+                Unidentified
+            }
         }
     }
 }

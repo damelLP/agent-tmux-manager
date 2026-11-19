@@ -191,13 +191,23 @@ pub fn render_compact_footer(frame: &mut Frame, area: Rect, app: &App) {
         filter_indicator(app)
     } else if app.show_help {
         "? help".to_string()
-    } else if app.pick_mode {
-        "gt/gT tabs  w alias  ? help [pick]".to_string()
     } else {
-        "gt/gT tabs  w alias  ? help".to_string()
+        compact_footer_hints(area.width, app.pick_mode)
     };
     let paragraph = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
+}
+
+fn compact_footer_hints(width: u16, pick_mode: bool) -> String {
+    let mut hints = String::from(if pick_mode { "? help [pick]" } else { "? help" });
+    for suffix in ["  gt/gT tabs", "  w alias"] {
+        // The hints are ASCII, so bytes also measure terminal cells here.
+        if hints.len() + suffix.len() > usize::from(width) {
+            break;
+        }
+        hints.push_str(suffix);
+    }
+    hints
 }
 
 /// Returns `/query N/M` while a filter is active, else an empty string.
@@ -256,6 +266,80 @@ fn get_status_display(state: &AppState) -> (&'static str, Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn compact_footer_text(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| render_compact_footer(frame, frame.area(), app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    // Break caught: optional hints hide help/pick or leak partial key labels.
+    #[test]
+    fn compact_footer_keeps_complete_hints() {
+        for (width, pick_mode, want) in [
+            (17, false, "? help"),
+            (18, false, "? help  gt/gT tabs"),
+            (20, false, "? help  gt/gT tabs"),
+            (24, false, "? help  gt/gT tabs"),
+            (26, false, "? help  gt/gT tabs"),
+            (27, false, "? help  gt/gT tabs  w alias"),
+            (40, false, "? help  gt/gT tabs  w alias"),
+            (20, true, "? help [pick]"),
+            (24, true, "? help [pick]"),
+            (25, true, "? help [pick]  gt/gT tabs"),
+            (33, true, "? help [pick]  gt/gT tabs"),
+            (34, true, "? help [pick]  gt/gT tabs  w alias"),
+            (40, true, "? help [pick]  gt/gT tabs  w alias"),
+        ] {
+            let mut app = App::new();
+            app.pick_mode = pick_mode;
+            assert_eq!(
+                compact_footer_text(&app, width),
+                want,
+                "{width} columns, pick={pick_mode}"
+            );
+        }
+    }
+
+    // Break caught: the new width-aware hints displace a modal prompt or applied filter.
+    #[test]
+    fn compact_footer_keeps_modal_and_filter_precedence() {
+        let mut app = App::new();
+        app.show_help = true;
+        for pick_mode in [false, true] {
+            app.pick_mode = pick_mode;
+            assert_eq!(compact_footer_text(&app, 20), "? help");
+        }
+        app.show_help = false;
+        app.update_sessions(
+            [("a", "Sonnet"), ("b", "Opus"), ("c", "Opus")]
+                .into_iter()
+                .map(|(id, model)| atm_core::SessionView {
+                    id: id.into(),
+                    model: model.into(),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+        app.start_search();
+        for ch in "sonnet".chars() {
+            app.push_search_char(ch);
+        }
+        assert_eq!(compact_footer_text(&app, 20), "/sonnet▌");
+        app.confirm_search();
+        assert_eq!(compact_footer_text(&app, 20), "/sonnet 1/3");
+    }
 
     #[test]
     fn test_status_display_connected() {

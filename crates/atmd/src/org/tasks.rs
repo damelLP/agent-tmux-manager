@@ -14,6 +14,12 @@
 //! notice (or A's loss notice after A's new brief). A private post-state alone
 //! would not serialize fanout; ordered notification delivery needs its own design.
 //! Verdict answers retain current-state coalescing, not exact-at-verdict routing.
+//!
+//! Known limit (carry-back): if the original task is reopened after the worker's
+//! snapshot check but before enqueue, the creator can receive one outdated
+//! informational Note about that acceptance. The Note asks the creator to
+//! re-check current state and does not change the task.
+//!
 //! Delivery itself belongs exclusively to the existing confirmed-message runtime.
 
 use super::{
@@ -40,8 +46,8 @@ mod tests;
 
 pub(crate) use super::task_methods::register_task_methods_with_reporting;
 pub use super::task_methods::{
-    register_task_methods, AssignParams, AttachParams, CreateParams, GetParams, ListParams,
-    ReviewParams, SetStateParams, SubmitParams, VerdictParams,
+    register_task_methods, AssignParams, AttachParams, CarryBackParams, CreateParams, GetParams,
+    ListParams, ReviewParams, SetStateParams, SubmitParams, VerdictParams,
 };
 
 pub(super) const PAGE_BYTES: usize = 512 * 1024;
@@ -353,6 +359,31 @@ fn transition_notices(
     Ok(notes)
 }
 
+fn carry_back_notice(
+    verdict: &atm_org::TaskVerdictGiven,
+    fix: &TaskId,
+    review: &TaskId,
+    task: &Task,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<MessageContent> {
+    if task.state != TaskState::Accepted || task.changed_at != at || task.reason != verdict.note {
+        return None;
+    }
+    let to = match &task.creator {
+        Address::System => Address::Owner,
+        creator => creator.clone(),
+    };
+    (to != verdict.by).then(|| MessageContent {
+        delivery_notice: None,
+        from: verdict.by.clone(),
+        to,
+        kind: MessageKind::Note,
+        body: format!("Task {id} accepted via fix {fix} (review {review}).\nInspect the recorded reason: atm task get {id}\nRe-check current state before acting; this note does not request a resume.", id = task.id),
+        attachments: Vec::new(),
+        task: Some(task.id.clone()),
+    })
+}
+
 fn notifications(
     event: &OrgEvent,
     before: Option<&Task>,
@@ -395,6 +426,7 @@ pub(super) fn target(command: &TaskCommand) -> Option<TaskId> {
         | TaskCommand::Submit { task_id, .. }
         | TaskCommand::StartReview { task_id, .. }
         | TaskCommand::Verdict { task_id, .. }
+        | TaskCommand::CarryBack { task_id, .. }
         | TaskCommand::Attach { task_id, .. }
         | TaskCommand::Reminded { task_id, .. }
         | TaskCommand::Flagged { task_id, .. }
@@ -407,10 +439,12 @@ async fn qualify_manager(
     state: OrgState,
     files: &ReportingFiles,
 ) -> Result<(), TaskError> {
+    let carry_back = matches!(&*command, TaskCommand::CarryBack { .. });
     let (id, by) = match command {
         TaskCommand::Assign { task_id, by, .. }
         | TaskCommand::StartReview { task_id, by, .. }
         | TaskCommand::Verdict { task_id, by, .. }
+        | TaskCommand::CarryBack { task_id, by, .. }
         | TaskCommand::SetState {
             task_id,
             by,
@@ -423,7 +457,7 @@ async fn qualify_manager(
         return Ok(());
     };
     let task = task(&state, id)?;
-    if by.who == task.creator {
+    if !carry_back && by.who == task.creator {
         return Ok(());
     }
     let Some(assignee) = task.agent_id.clone().filter(|id| id != caller) else {
@@ -453,9 +487,14 @@ where
     });
     qualify_manager(&mut command, state, &files).await?;
     let id = target(&command);
-    let review = match &command {
-        TaskCommand::Verdict { review_task, .. } => review_task.clone(),
-        _ => None,
+    let (review, carry_back) = match &command {
+        TaskCommand::Verdict { review_task, .. } => (review_task.clone(), None),
+        TaskCommand::CarryBack {
+            fix_task,
+            review_task,
+            ..
+        } => (None, Some((fix_task.clone(), review_task.clone()))),
+        _ => (None, None),
     };
     let commit = org
         .execute_task(command, chrono::Utc::now())
@@ -502,6 +541,12 @@ where
                     TaskError::Internal("committed task event was not recognized".into())
                 })?;
             let state = org.snapshot().await?;
+            if let (Some((fix, review)), OrgEvent::TaskVerdict(verdict)) = (&carry_back, &event) {
+                let t = task(&state, &verdict.task_id)?;
+                return Ok(carry_back_notice(verdict, fix, review, t, envelope.ts)
+                    .into_iter()
+                    .collect());
+            }
             notifications(&event, commit.before.as_ref(), &state)
         }
         .await;
@@ -556,7 +601,7 @@ where
                 let kind = match envelope.kind.as_str() {
                     "task.assigned" => "brief",
                     "task.submitted" => "report",
-                    "task.verdict" => "answer",
+                    "task.verdict" if carry_back.is_none() => "answer",
                     _ => "note",
                 };
                 let mut error = error;

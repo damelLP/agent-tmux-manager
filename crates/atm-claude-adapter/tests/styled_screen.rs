@@ -163,11 +163,25 @@ fn custom_status_colored_and_truncated_rows_are_idle() {
 }
 
 #[test]
+fn custom_status_underline_does_not_change_observations() {
+    let plain = custom_status_plain(capture!("s1_status-color-160"));
+    let row = custom_status_row(&plain);
+    // Synthetic: give the captured one-row status slot underline, and no other attributes.
+    let baseline = plain.replace(row, "  status");
+    let decorated = plain.replace(row, "  \x1b[4mstatus\x1b[24m");
+    let control = |text| screen::observe_control_screen(ScreenInput::Styled(text), None);
+    let expected = control(&baseline);
+    assert_eq!(expected.facts.input, InputState::Empty);
+    assert_eq!(expected.facts.turn, TurnState::NotRunning);
+    assert_eq!(control(&decorated), expected);
+}
+
+#[test]
 fn custom_status_unsupported_decoration_stays_unknown() {
     let plain = custom_status_plain(capture!("s1_status-color-160"));
     let row = custom_status_row(&plain);
-    // Synthetic: the strict decoder does not support underline or strikethrough.
-    for decorated in ["  \x1b[4munderlined\x1b[24m", "  \x1b[9mstruck\x1b[29m"] {
+    // Synthetic: blink and strikethrough remain unsupported by the decoder.
+    for decorated in ["  \x1b[5mblinking\x1b[25m", "  \x1b[9mstruck\x1b[29m"] {
         let text = plain.replace(row, decorated);
         check(&text, ScreenFacts::default());
         assert_eq!(

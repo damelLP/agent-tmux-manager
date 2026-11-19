@@ -160,6 +160,195 @@ fn blocked(step: DeliveryStep, expected: FailureReason) {
     assert_eq!(step, DeliveryStep::Blocked { reason: expected });
 }
 
+fn bind_clear(f: &mut Fixture, ms: i64) {
+    f.apply(
+        OrgEvent::AgentSessionBound {
+            agent_id: agent(),
+            session_id: "fresh".into(),
+        },
+        ms,
+    );
+}
+
+fn clear_requested() -> OrgEvent {
+    OrgEvent::AgentClearRequested { agent_id: agent() }
+}
+
+fn clear_start_line() -> OrgEvent {
+    OrgEvent::MessageSent(super::start_line::start_line(&agent()))
+}
+
+#[test]
+fn clear_start_precedes_even_an_older_retry_and_a_newer_send() {
+    let mut f = Fixture::new(0);
+    f.attempt(1);
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: f.id,
+            reason: "staging refused".into(),
+            final_failure: false,
+        },
+        2,
+    );
+    f.apply(clear_requested(), 3);
+    f.apply(clear_start_line(), 4);
+    let start = MessageId::new(7);
+    assert_eq!(f.snapshot(4).blocked_by, Some(start));
+    assert_eq!(f.history.snapshot(start, at(4)).unwrap().blocked_by, None);
+    bind_clear(&mut f, 5);
+    f.apply(OrgEvent::MessageSent(content(agent())), 6);
+    let newer = MessageId::new(9);
+    assert_eq!(f.snapshot(6).blocked_by, Some(start));
+    assert_eq!(
+        f.history.snapshot(newer, at(6)).unwrap().blocked_by,
+        Some(start)
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: start,
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        7,
+    );
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: start,
+            reason: "retryable refusal".into(),
+            final_failure: false,
+        },
+        8,
+    );
+    assert_eq!(f.snapshot(8).blocked_by, Some(start));
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: start,
+            reason: "terminal refusal".into(),
+            final_failure: true,
+        },
+        9,
+    );
+    assert_eq!(f.snapshot(9).blocked_by, None);
+    assert_eq!(
+        f.history.snapshot(newer, at(9)).unwrap().blocked_by,
+        Some(f.id)
+    );
+}
+
+#[test]
+fn clear_priority_replays_only_open_start_rows() {
+    let start = MessageId::new(5);
+    // Crashes at each durable prefix: after Clear, after Sent but before
+    // Ready, after Ready, during an attempt, after either terminal outcome.
+    for (end, final_failure) in [
+        (4, false),
+        (5, false),
+        (6, false),
+        (7, false),
+        (8, false),
+        (8, true),
+    ] {
+        let mut f = Fixture::recovered(end, 20_000);
+        f.apply(clear_requested(), 1);
+        if end >= 5 {
+            f.apply(clear_start_line(), 2);
+        }
+        if end >= 6 {
+            bind_clear(&mut f, 3);
+        }
+        if end >= 7 {
+            f.apply(
+                OrgEvent::MessageDeliveryAttempted {
+                    message_id: start,
+                    attempt: 1,
+                    pane: "%1".into(),
+                },
+                4,
+            );
+        }
+        if end == 8 {
+            f.apply(
+                if final_failure {
+                    OrgEvent::MessageDeliveryFailed {
+                        message_id: start,
+                        reason: "owner gave up on delivery".into(),
+                        final_failure: true,
+                    }
+                } else {
+                    OrgEvent::MessageDelivered {
+                        message_id: start,
+                        session_id: "fresh".into(),
+                        confirmation: "prompt_submit_exact_reference".into(),
+                    }
+                },
+                5,
+            );
+        }
+        if end <= 5 {
+            f.apply(
+                OrgEvent::AgentStuck {
+                    agent_id: agent(),
+                    reason: "clear interrupted by daemon restart".into(),
+                },
+                20_000,
+            );
+            assert_eq!(
+                f.snapshot(20_000).live.agent_status,
+                atm_org::AgentStatus::Stuck
+            );
+            bind_clear(&mut f, 20_001);
+        }
+        assert_eq!(
+            f.snapshot(20_002).blocked_by,
+            (5..=7).contains(&end).then_some(start),
+            "prefix {end}"
+        );
+        if end == 7 {
+            let s = f.history.snapshot(start, at(20_002)).unwrap();
+            blocked(
+                next_delivery(&s.message, &s.live, at(20_002), &DeliveryPolicy::default()).unwrap(),
+                FailureReason::Restarted,
+            );
+        }
+    }
+}
+
+#[test]
+fn a_carried_start_line_gets_priority_only_during_its_clear_lifecycle() {
+    let mut f = Fixture::new(0);
+    f.apply(clear_start_line(), 1); // As after a launch's Ready.
+    let start = MessageId::new(4);
+    assert_eq!(f.snapshot(1).blocked_by, None);
+    assert_eq!(
+        f.history.snapshot(start, at(1)).unwrap().blocked_by,
+        Some(f.id)
+    );
+    f.apply(clear_requested(), 2);
+    bind_clear(&mut f, 3);
+    assert_eq!(f.snapshot(3).blocked_by, Some(start));
+    let mut lookalike = super::start_line::start_line(&agent());
+    lookalike.from = Address::Owner;
+    f.apply(OrgEvent::MessageSent(lookalike), 4);
+    let lookalike = MessageId::new(7);
+    assert_eq!(
+        f.history.snapshot(lookalike, at(4)).unwrap().blocked_by,
+        Some(start)
+    );
+    f.apply(
+        OrgEvent::AgentAdopted {
+            agent_id: agent(),
+            pane: "%1".into(),
+            session_id: Some("other".into()),
+        },
+        5,
+    );
+    assert_eq!(f.snapshot(5).blocked_by, None);
+    assert_eq!(
+        f.history.snapshot(start, at(5)).unwrap().blocked_by,
+        Some(f.id)
+    );
+}
+
 #[test]
 fn changing_blockers_keep_hold() {
     let mut f = Fixture::new(0);

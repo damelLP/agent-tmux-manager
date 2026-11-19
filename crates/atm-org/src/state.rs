@@ -128,6 +128,8 @@ pub struct OrgState {
     agents: BTreeMap<AgentId, Agent>,
     messages: BTreeMap<MessageId, Message>,
     pub(crate) tasks: BTreeMap<u64, Task>,
+    // Evidence for the current accepted result, rebuilt from the old verdict rows.
+    pub(crate) accepted_result_reviews: BTreeMap<TaskId, TaskId>,
     pub(crate) costs: crate::cost::CostLedger,
     pub(crate) reports: crate::report::ReportLedger,
     ever_assigned: BTreeSet<TaskId>,
@@ -312,13 +314,19 @@ impl OrgState {
                 self.validate_address(&content.from)?;
                 self.validate_address(&content.to)?;
                 if let Some(notice) = &content.delivery_notice {
-                    self.require_message(&notice.source_message_id)?;
+                    let source = self.require_message(&notice.source_message_id)?;
+                    let routed = notice.may_route_to_manager()
+                        && source.content.delivery_notice.is_none()
+                        && matches!(
+                            (&content.to, &source.content.to),
+                            (Address::Agent(manager), Address::Agent(recipient)) if manager != recipient
+                        );
                     if content.from != Address::System
-                        || content.to != Address::Owner
                         || content.kind != MessageKind::Note
+                        || (content.to != Address::Owner && !routed)
                     {
                         return Err(ApplyError::InvalidDeliveryNotice(
-                            "must be a system-to-owner note",
+                            "must be a system note to the owner or an eligible manager",
                         ));
                     }
                     if notice.reason.is_empty() {
@@ -442,6 +450,47 @@ impl OrgState {
         Ok(())
     }
 
+    pub(crate) fn invalidate_accepted_result_review(&mut self, id: &TaskId) {
+        self.accepted_result_reviews.remove(id);
+        if self.task(id).is_some_and(|t| t.kind == TaskKind::Review) {
+            self.accepted_result_reviews
+                .retain(|_, review| review != id);
+        }
+    }
+
+    fn track_accepted_result_review(&mut self, event: &OrgEvent) {
+        let id = match event {
+            OrgEvent::TaskVerdict(fact) => {
+                if fact.verdict == TaskVerdict::Accepted
+                    && self
+                        .task(&fact.task_id)
+                        .is_some_and(|t| t.submission == Some(TaskSubmission::Result))
+                {
+                    // The fix's verdict precedes the review's first acceptance.
+                    // Preserve citations of this result; folding clears its submission.
+                    if let Some(review) = &fact.review_task {
+                        self.accepted_result_reviews
+                            .insert(fact.task_id.clone(), review.clone());
+                    } else {
+                        self.accepted_result_reviews.remove(&fact.task_id);
+                    }
+                    return;
+                }
+                &fact.task_id
+            }
+            OrgEvent::TaskAssigned(fact) => &fact.task_id,
+            OrgEvent::TaskStateChanged(fact) => &fact.task_id,
+            OrgEvent::TaskSubmitted(fact) => &fact.task_id,
+            OrgEvent::TaskReviewStarted(fact) => {
+                // Starting a review does not replace the submission it examines.
+                self.accepted_result_reviews.remove(&fact.task_id);
+                return;
+            }
+            _ => return,
+        };
+        self.invalidate_accepted_result_review(id);
+    }
+
     /// Apply committed facts without enforcing today's transition policy.
     /// Any error leaves the aggregate unchanged.
     pub fn apply(
@@ -470,6 +519,7 @@ impl OrgState {
         self.track_return_event(seq, ts, event);
         self.track_cost_transition(event, ts);
         self.track_redo_transition(event);
+        self.track_accepted_result_review(event);
         match event {
             OrgEvent::ProjectRegistered { project_id, root } => {
                 self.projects.insert(

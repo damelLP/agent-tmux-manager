@@ -556,7 +556,19 @@ fn delivery_policy_and_read_ownership() {
         who: Address::Agent(id()),
         message_ids: vec![mid],
     };
-    assert!(state.decide(&read, time()).is_err());
+    assert_eq!(
+        state.decide(&read, time()).unwrap(),
+        vec![
+            OrgEvent::MessageDeliveryFailed {
+                message_id: mid,
+                reason: "recipient acknowledged; automatic delivery cancelled".into(),
+                final_failure: true,
+            },
+            OrgEvent::MessageRead {
+                message_ids: vec![mid]
+            },
+        ]
+    );
     let attempt = OrgCommand::DeliveryAttempted {
         message_id: mid,
         attempt: 1,
@@ -594,6 +606,117 @@ fn delivery_policy_and_read_ownership() {
         .is_err());
     assert_eq!(run(&mut state, read.clone(), &mut seq).len(), 1);
     assert!(run(&mut state, read, &mut seq).is_empty());
+}
+
+// A stale retry must not reopen a cancelled delivery, even before the read fold.
+#[test]
+fn read_messages_cancels_open_deliveries_before_read() {
+    let (mut state, mut seq) = setup();
+    run(&mut state, up(), &mut seq);
+    let [queued, retry, active, received, failed] = std::array::from_fn(|_| {
+        run(
+            &mut state,
+            OrgCommand::SendMessage(content(Address::Agent(id()))),
+            &mut seq,
+        );
+        MessageId::new(seq)
+    });
+    for message_id in [retry, active] {
+        run(
+            &mut state,
+            OrgCommand::DeliveryAttempted {
+                message_id,
+                attempt: 1,
+                pane: "%1".into(),
+            },
+            &mut seq,
+        );
+    }
+    for (message_id, final_failure) in [(retry, false), (failed, true)] {
+        run(
+            &mut state,
+            OrgCommand::DeliveryFailed {
+                message_id,
+                reason: "original problem".into(),
+                final_failure,
+            },
+            &mut seq,
+        );
+    }
+    let receipt = |message_id| OrgCommand::Delivered {
+        message_id,
+        session_id: "s1".into(),
+        confirmation: "prompt_submit_exact_reference".into(),
+    };
+    run(&mut state, receipt(received), &mut seq);
+    let message_ids = vec![queued, retry, active, queued, received, failed];
+    let read = OrgCommand::ReadMessages {
+        who: Address::Agent(id()),
+        message_ids: message_ids.clone(),
+    };
+    let cancel = |message_id, reason: &str| OrgEvent::MessageDeliveryFailed {
+        message_id,
+        reason: reason.into(),
+        final_failure: true,
+    };
+    let possible = "recipient acknowledged; automatic delivery cancelled; a prior attempt may still finish or have left a draft";
+    let expected = vec![
+        cancel(
+            queued,
+            "recipient acknowledged; automatic delivery cancelled",
+        ),
+        cancel(retry, possible),
+        cancel(active, possible),
+        OrgEvent::MessageRead { message_ids },
+    ];
+    assert_eq!(state.decide(&read, time()).unwrap(), expected);
+    for event in &expected {
+        seq += 1;
+        state.apply(seq, time(), event).unwrap();
+        if let OrgEvent::MessageDeliveryFailed { message_id, .. } = event {
+            let m = state.message(message_id).unwrap();
+            assert_eq!(m.status, DeliveryStatus::Failed);
+            assert!(m.read_at.is_none());
+            assert_noop(
+                &mut state,
+                OrgCommand::DeliveryAttempted {
+                    message_id: *message_id,
+                    attempt: 2,
+                    pane: "%1".into(),
+                },
+                &mut seq,
+            );
+            assert_noop(
+                &mut state,
+                OrgCommand::DeliveryFailed {
+                    message_id: *message_id,
+                    reason: "late retry".into(),
+                    final_failure: false,
+                },
+                &mut seq,
+            );
+        }
+    }
+    for (mid, attempt) in [(queued, None), (retry, Some(1)), (active, Some(1))] {
+        let row = state.message(&mid).unwrap();
+        assert_eq!(row.read_at, Some(time()));
+        assert_eq!(row.last_attempt.as_ref().map(|a| a.attempt), attempt);
+        assert!(row.receipt.is_none());
+    }
+    assert_eq!(
+        state.message(&failed).unwrap().failure.as_deref(),
+        Some("original problem")
+    );
+    assert_eq!(
+        state.message(&received).unwrap().status,
+        DeliveryStatus::Delivered
+    );
+    assert_noop(&mut state, read, &mut seq);
+    run(&mut state, receipt(active), &mut seq);
+    let late = state.message(&active).unwrap();
+    assert_eq!(late.status, DeliveryStatus::Delivered);
+    assert_eq!(late.read_at, Some(time()));
+    assert!(late.receipt.is_some());
 }
 
 fn notice(source_message_id: MessageId, reason: &str) -> MessageContent {

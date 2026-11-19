@@ -1860,6 +1860,124 @@ async fn verdict_enqueue_failure_preserves_committed_state() {
     }
 }
 
+// Break caught: a creator Note failure hides the committed verdict, labels it an answer,
+// or retries the write on a terminal task.
+#[tokio::test]
+async fn carry_back_note_enqueue_is_not_the_commit() {
+    // The real organisation actor loads the frozen prefix from a private journal.
+    use crate::eventlog::{EventLog, Stream};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let log = EventLog::open(&path, Stream::Events).unwrap();
+    let mut state = OrgState::default();
+    let mut stats = atm_org::ReplayStats::default();
+    for line in include_str!("../../../atm-org/tests/fixtures/task_carry_back_rollback.jsonl")
+        .lines()
+        .take(19)
+    {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let ts = row["ts"].as_str().unwrap().parse().unwrap();
+        let kind = row["kind"].as_str().unwrap();
+        let seq = log.append(ts, kind, row["body"].clone()).await.unwrap();
+        stats
+            .apply_parts(&mut state, seq, ts, kind, &row["body"])
+            .unwrap();
+    }
+    // Use the real actor and appender directly to avoid reopening a still-held log lock.
+    use tokio::sync::{broadcast, watch};
+    let (requests, receive) = mpsc::channel(8);
+    let (writer_health, health) = watch::channel(Ok(stats.applied));
+    let (publish, _) = broadcast::channel(8);
+    let org = OrgHandle {
+        requests,
+        health,
+        committed: publish.clone(),
+        reads: None,
+    };
+    let cancel = CancellationToken::new();
+    let actor = tokio::spawn(crate::org::actor::run(
+        state,
+        receive,
+        writer_health,
+        publish,
+        cancel.clone(),
+        move |row| {
+            let log = log.clone();
+            async move { log.append(row.ts, &row.kind, row.body).await }
+        },
+    ));
+    let make = |by| TaskCommand::CarryBack {
+        task_id: "t7".parse().unwrap(),
+        fix_task: "t12".parse().unwrap(),
+        review_task: "t15".parse().unwrap(),
+        note: "Covers the missing case.".into(),
+        by,
+    };
+    let result = execute_mutation(org.clone(), owner_caller(), make, |content| async move {
+        assert_eq!(content.kind, MessageKind::Note);
+        assert_eq!(content.to.to_string(), "p/creator");
+        Err(TaskError::Organisation(OrgServiceError::Unavailable(
+            "fixture append failed".into(),
+        )))
+    })
+    .await
+    .unwrap();
+    let Some(Notification::Unconfirmed { error }) = result.notification else {
+        panic!("missing enqueue diagnostic");
+    };
+    assert!(result.changed);
+    assert!(error
+        .message
+        .contains("task t7 committed; automatic note enqueue was not confirmed"));
+    let state = org.snapshot().await.unwrap();
+    assert_eq!(
+        state.task(&"t7".parse().unwrap()).unwrap().state,
+        TaskState::Accepted
+    );
+    assert_eq!(state.messages().count(), 0);
+    let end = org.status().unwrap();
+    assert!(
+        execute_mutation(org.clone(), owner_caller(), make, |_| async {
+            panic!("unexpected second send")
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(org.status().unwrap(), end);
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+// Break caught: a changed task gets a stale note, or System creator mail is unroutable.
+#[test]
+fn carry_back_note_tracks_the_committed_close_without_waking_the_holder() {
+    let original = "t3".parse().unwrap();
+    let fix = "t6".parse().unwrap();
+    let review = "t9".parse().unwrap();
+    let state = verdict_snapshot(TaskState::Accepted, true);
+    let mut task = state.task(&original).unwrap().clone();
+    task.creator = Address::System;
+    let at = task.changed_at;
+    let mut fact = verdict_fact(TaskVerdict::Accepted);
+    fact.by = "p/lead".parse().unwrap();
+    fact.note = Some("Accepted via fix t6 (review t9); reason".into());
+    task.reason.clone_from(&fact.note);
+    let note = carry_back_notice(&fact, &fix, &review, &task, at).unwrap();
+    assert_eq!(note.to, Address::Owner);
+    assert_eq!(note.from, fact.by);
+    assert_eq!(note.kind, MessageKind::Note);
+    assert_eq!(note.task, Some(original));
+    assert!(note.attachments.is_empty());
+    task.state = TaskState::Open;
+    assert!(carry_back_notice(&fact, &fix, &review, &task, at).is_none());
+    task.state = TaskState::Accepted;
+    task.reason = Some("New verdict".into());
+    assert!(carry_back_notice(&fact, &fix, &review, &task, at).is_none());
+    task.reason.clone_from(&fact.note);
+    task.changed_at += chrono::TimeDelta::seconds(1);
+    assert!(carry_back_notice(&fact, &fix, &review, &task, at).is_none());
+}
+
 // Break caught: dropping/timing out a verdict waiter drops its retained enqueue or permit.
 #[tokio::test]
 async fn verdict_worker_retains_enqueue_after_waiter_loss() {

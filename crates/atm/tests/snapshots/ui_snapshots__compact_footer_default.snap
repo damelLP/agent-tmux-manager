@@ -5,7 +5,7 @@ expression: buf
 Buffer {
     area: Rect { x: 0, y: 0, width: 30, height: 1 },
     content: [
-        "gt/gT tabs  w alias  ? help   ",
+        "? help  gt/gT tabs  w alias   ",
     ],
     styles: [
         x: 0, y: 0, fg: DarkGray, bg: Reset, underline: Reset, modifier: NONE,

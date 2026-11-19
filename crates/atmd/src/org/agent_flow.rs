@@ -604,6 +604,22 @@ pub(super) fn adopt_baseline(
     }
 }
 
+/// A no-effect input refusal. Only a known transient obstruction is retried
+/// during a handover's preflight; loss of identity or unknown focus is not.
+#[derive(Clone, Copy)]
+pub(super) enum InputBlocker {
+    Temporary(&'static str),
+    Terminal(&'static str),
+}
+
+impl InputBlocker {
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::Temporary(reason) | Self::Terminal(reason) => reason,
+        }
+    }
+}
+
 /// Why a capture does not allow input to the agent's harness, whatever its
 /// screen shows; `None` allows. Every paste and key of a flow requires this of
 /// the control actor's own capture: the agent's tag, a live pane out of copy
@@ -616,20 +632,32 @@ pub(super) fn input_refusal(
     baseline: &PaneBaseline,
     tag: &str,
 ) -> Option<&'static str> {
+    input_blocker(screen, capture, baseline, tag).map(InputBlocker::reason)
+}
+
+pub(super) fn input_blocker(
+    screen: &AgentScreen,
+    capture: &PaneCapture,
+    baseline: &PaneBaseline,
+    tag: &str,
+) -> Option<InputBlocker> {
+    use InputBlocker::{Temporary, Terminal};
     let pane = &capture.inspection;
     if pane.local_agent_tag.as_deref() != Some(tag) {
-        Some("the pane no longer carries the agent's tag")
+        Some(Terminal("the pane no longer carries the agent's tag"))
     } else if pane.dead {
-        Some("the program in the pane has exited")
+        Some(Terminal("the program in the pane has exited"))
     } else if pane.in_mode {
-        Some("the pane is in copy mode")
+        Some(Temporary("the pane is in copy mode"))
     } else if screen.foreground(capture, baseline) != Some(Foreground::Harness) {
-        Some("the harness is not known to be the pane's foreground program")
+        Some(Terminal(
+            "the harness is not known to be the pane's foreground program",
+        ))
     } else {
         match capture.focused {
             Some(false) => None,
-            Some(true) => Some("the pane is focused"),
-            None => Some("whether the pane is focused could not be read"),
+            Some(true) => Some(Temporary("the pane is focused")),
+            None => Some(Terminal("whether the pane is focused could not be read")),
         }
     }
 }

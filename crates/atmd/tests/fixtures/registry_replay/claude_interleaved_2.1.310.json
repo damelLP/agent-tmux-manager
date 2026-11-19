@@ -261,6 +261,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -380,6 +381,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -506,6 +508,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -627,6 +630,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -751,6 +755,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -878,6 +883,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -1004,6 +1010,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -1136,6 +1143,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -1265,6 +1273,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -1390,6 +1399,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -1518,6 +1528,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -1641,6 +1652,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -1765,6 +1777,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -1892,6 +1905,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2018,6 +2032,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2150,6 +2165,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2279,6 +2295,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2404,6 +2421,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2532,6 +2550,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2655,6 +2674,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2780,6 +2800,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -2978,6 +2999,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "child_session_ids": [
                 "adb195c092d3a06a4"
               ],
@@ -3203,6 +3225,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "child_session_ids": [
                 "adb195c092d3a06a4"
               ],
@@ -3420,6 +3443,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "child_session_ids": [
                 "adb195c092d3a06a4"
               ],
@@ -3629,6 +3653,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "child_session_ids": [
                 "adb195c092d3a06a4"
               ],
@@ -3851,6 +3876,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "child_session_ids": [
                 "adb195c092d3a06a4"
               ],
@@ -3980,6 +4006,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4107,6 +4134,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4228,6 +4256,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4356,6 +4385,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4478,6 +4508,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4597,6 +4628,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4729,6 +4761,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4856,6 +4889,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -4979,6 +5013,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 300,
                 "cache_read_tokens": 4000,
@@ -5107,6 +5142,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,
@@ -5589,6 +5625,7 @@
           "900001": {
             "domain": {
               "agent_type": "general_purpose",
+              "claude_code_version": "2.1.310",
               "context": {
                 "cache_creation_tokens": 0,
                 "cache_read_tokens": 0,

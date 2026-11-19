@@ -401,6 +401,7 @@ fn agent_error(error: AgentError) -> MessageError {
 pub(super) fn observation(
     recipient: &Recipient,
     capture: &PaneCapture,
+    facts: Option<ScreenFacts>,
 ) -> Result<RecipientObservation, MessageError> {
     if recipient.baseline.harness_command().is_none() {
         return Err(MessageError::Refused(format!(
@@ -415,7 +416,7 @@ pub(super) fn observation(
         status: row.status,
         last_event_at: None,
     });
-    let facts = recipient.screen.facts(capture, &recipient.baseline);
+    let facts = facts.unwrap_or_else(|| recipient.screen.facts(capture, &recipient.baseline));
     recipient_observation(capture, session, facts)
 }
 
@@ -558,7 +559,7 @@ impl Attempt {
         };
         let seen = match r.capture(pane, format).await {
             Ok(capture) => tagged(capture).and_then(|capture| {
-                let observation = observation(&recipient, &capture)?;
+                let observation = observation(&recipient, &capture, None)?;
                 Ok((capture, session_gate(&recipient)?, observation))
             }),
             Err(error) => Err(error.into()),
@@ -1109,8 +1110,9 @@ pub async fn deliver(
     if rt.cancel.is_cancelled() {
         return Err(shutting_down());
     }
-    let snapshot = rt.history.snapshot(id, rt.clock.now()?)?;
-    let recovery = rt.history.recovery_candidate(id, rt.clock.now()?)?;
+    let now = rt.clock.now()?;
+    let snapshot = rt.history.snapshot(id, now)?;
+    let recovery = rt.history.recovery_candidate(id, now)?;
     let recovering = recovery.is_some();
     let recipient = snapshot.recipient;
     let Some(pane) = recipient.pane.as_deref() else {
@@ -1120,8 +1122,9 @@ pub async fn deliver(
         )));
     };
     let pane = PaneId::parse(pane)?;
-    rt.evidence
-        .register(id, delivery_line(id, &snapshot.message.content))?;
+    if !rt.register_for_delivery(&snapshot.message, now)? {
+        return Ok(());
+    }
     let request = ReservationRequest::new(
         recipient.id,
         Some(pane.clone()),

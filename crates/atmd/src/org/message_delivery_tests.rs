@@ -385,6 +385,143 @@ async fn recovery_veto_after_final_capture_entry_sends_no_key() {
     }
 }
 
+async fn acknowledge(rig: &Rig, id: MessageId) {
+    use crate::org::{message_service_tests::pane as caller, messages::AckParams};
+    let ack = rig
+        .messages
+        .as_ref()
+        .unwrap()
+        .ack(AckParams { ids: vec![id] }, caller("%1"))
+        .await;
+    assert_eq!(ack.unwrap().count, 1);
+}
+
+// A reservation and a stale PasteNow do not grant input after the writer's veto.
+#[tokio::test(start_paused = true)]
+async fn ack_pre_attempt_capture_sends_no_input() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE)]);
+    let mut held = rig.capture_barrier.arm(0);
+    let mut task = rig.spawn_deliver(id);
+    recovery_capture_entered(&mut held, &mut task).await;
+    acknowledge(&rig, id).await;
+    drop(held);
+    let _ = guarded(task).await.unwrap();
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Failed);
+    assert!(snapshot.last_attempt_seq.is_none());
+    assert_eq!((rig.pastes(), rig.keys()), (0, 0));
+    assert!(rig.rt.evidence.snapshot(id).is_err());
+}
+
+// Losing an already pasted draft would drop the original attempt's accounting.
+#[tokio::test(start_paused = true)]
+async fn ack_during_paste_return_preserves_original_accounting() {
+    for submit in [true, false] {
+        let settings = DeliverySettings {
+            guard_poll_interval: Duration::from_secs(3),
+            ..DeliverySettings::default()
+        };
+        let mut rig = Rig::start(
+            Fold::Service,
+            true,
+            DeliveryPolicy::new(settings).unwrap(),
+            None,
+        )
+        .await;
+        let id = rig.ready_message().await;
+        let staged = staged(id);
+        let look = if submit {
+            staged.clone()
+        } else {
+            with(staged.clone(), |capture| capture.focused = Some(true))
+        };
+        rig.script(&[pi(IDLE), pi(IDLE), look, staged]);
+        rig.tmux_gate.hold_next(Effect::PasteText).unwrap();
+        let task = rig.spawn_deliver(id);
+        guarded(rig.tmux_gate.entered()).await;
+        let seq = rig.snapshot(id).last_attempt_seq.unwrap();
+        acknowledge(&rig, id).await;
+        assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Failed);
+        rig.tmux_gate.release();
+        if submit {
+            rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+            guarded(rig.tmux_gate.entered()).await;
+            rig.prompt("s1", inbox_reference(id));
+            rig.tmux_gate.release();
+        }
+        guarded(task).await.unwrap().unwrap();
+        let snapshot = rig.snapshot(id);
+        assert!(snapshot.message.read_at.is_some());
+        assert_eq!((rig.pastes(), rig.keys()), (1, usize::from(submit)));
+        assert_eq!(snapshot.message.last_attempt.as_ref().unwrap().attempt, 1);
+        if submit {
+            assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+            assert_eq!(
+                snapshot.message.receipt.unwrap().confirmation,
+                "prompt_submit_exact_reference"
+            );
+        } else {
+            assert_eq!(snapshot.last_attempt_seq, Some(seq));
+            assert_eq!(snapshot.hold, Some(ExecutorHold::EnterNotSent));
+            assert_eq!(snapshot.message.failure.as_deref(), Some("recipient acknowledged; automatic delivery cancelled; a prior attempt may still finish or have left a draft"));
+            assert_no_recovery(&rig, id);
+        }
+    }
+}
+
+// Never replace a real receipt or repeat a key already consumed by tmux.
+#[tokio::test(start_paused = true)]
+async fn ack_during_enter_return_keeps_late_receipt() {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    rig.tmux_gate.hold_next(Effect::SendKeys).unwrap();
+    let task = rig.spawn_deliver(id);
+    guarded(rig.tmux_gate.entered()).await;
+    acknowledge(&rig, id).await;
+    let cancelled = rig.snapshot(id).message;
+    assert_eq!(cancelled.status, DeliveryStatus::Failed);
+    assert!(cancelled.receipt.is_none());
+    rig.prompt("s1", inbox_reference(id));
+    rig.tmux_gate.release();
+    guarded(task).await.unwrap().unwrap();
+    let delivered = rig.snapshot(id).message;
+    assert_eq!(delivered.status, DeliveryStatus::Delivered);
+    assert_eq!(delivered.last_attempt, cancelled.last_attempt);
+    assert_eq!(delivered.read_at, cancelled.read_at);
+    assert_eq!((rig.pastes(), rig.keys()), (1, 1));
+    assert!(rig.rt.evidence.snapshot(id).is_err());
+}
+
+// Terminal fold invalidates even a claim queued at its final capture.
+#[tokio::test(start_paused = true)]
+async fn ack_revokes_pending_and_claimed_recovery() {
+    for claimed in [false, true] {
+        let (rig, id, seq) = recovery_enter_not_sent_original().await;
+        if claimed {
+            rig.script(&[staged(id), staged(id)]);
+            let mut held = rig.capture_barrier.arm(1);
+            let mut task = rig.spawn_deliver(id);
+            recovery_capture_entered(&mut held, &mut task).await;
+            acknowledge(&rig, id).await;
+            drop(held);
+            let _ = guarded(task).await.unwrap();
+        } else {
+            acknowledge(&rig, id).await;
+            let _ = rig.deliver(id).await;
+        }
+        let snapshot = rig.snapshot(id);
+        assert_eq!(snapshot.message.status, DeliveryStatus::Failed);
+        assert_eq!(snapshot.last_attempt_seq, Some(seq));
+        assert_eq!(snapshot.hold, Some(ExecutorHold::EnterNotSent));
+        assert_eq!((rig.pastes(), rig.keys()), (1, 0));
+        assert_no_recovery(&rig, id);
+        recovery_registry_empty(&rig);
+    }
+}
+
 // Break caught: a no-Enter refusal changes the hold and its lifetime notice key.
 #[tokio::test(start_paused = true)]
 async fn recovery_refusal_preserves_original_enter_not_sent() {
@@ -1395,7 +1532,7 @@ impl Rig {
         policy: DeliveryPolicy,
         scheduler: Option<Effects>,
     ) -> Self {
-        Self::start_with_harness(base, fold, agent, policy, scheduler, Harness::Pi).await
+        Self::start_with_harness(base, fold, agent, policy, scheduler, Harness::Pi, false).await
     }
 
     /// The Codex variant starts Ready after a clear: no binding or registry
@@ -1407,6 +1544,7 @@ impl Rig {
         policy: DeliveryPolicy,
         scheduler: Option<Effects>,
         harness: Harness,
+        rebind_before_diagnostic: bool,
     ) -> Self {
         let gate = Arc::new(Semaphore::new(1));
         let (enter, entered) = mpsc::unbounded_channel();
@@ -1434,6 +1572,43 @@ impl Rig {
                 }
             },
         ));
+        // Opt-in FIFO seam for the race probe only. Other rigs talk to the
+        // writer directly, including tests about its queue being full.
+        let requests = if rebind_before_diagnostic {
+            let (routed, mut proxy) = mpsc::channel::<Request>(64);
+            tokio::spawn(async move {
+                let mut rebind = true;
+                while let Some(request) = proxy.recv().await {
+                    if rebind
+                        && matches!(&request, Request::Execute { command, .. }
+                        if matches!(command.as_ref(), OrgCommand::SendMessage(content)
+                            if content.body.starts_with("atm cannot read ")))
+                    {
+                        rebind = false;
+                        let (reply, done) = oneshot::channel();
+                        requests
+                            .send(Request::Execute {
+                                command: Box::new(OrgCommand::SessionBound {
+                                    agent_id: worker(),
+                                    session_id: SessionId::new("new-session"),
+                                }),
+                                now: utc(),
+                                caller_pane: None,
+                                reply,
+                            })
+                            .await
+                            .unwrap();
+                        done.await.unwrap().unwrap();
+                    }
+                    if requests.send(request).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            routed
+        } else {
+            requests
+        };
         let org = OrgHandle {
             requests,
             health: status,
@@ -1539,6 +1714,7 @@ impl Rig {
                     })
                 }),
                 Arc::new(|_| None),
+                policy.settings().readiness_timeout,
             );
             guarded(agents.reconciled()).await.unwrap();
             assert_eq!(tmux.pending_reads(&pane()).unwrap(), 0);
@@ -2106,6 +2282,7 @@ async fn ready_unbound_codex() -> (Rig, MessageId) {
         DeliveryPolicy::default(),
         None,
         Harness::Codex,
+        false,
     )
     .await;
     let recipient = rig.rt.agents.recipient(&worker()).await.unwrap();
@@ -2113,7 +2290,7 @@ async fn ready_unbound_codex() -> (Rig, MessageId) {
     assert_eq!(recipient.harness, Harness::Codex);
     assert!(recipient.session_id.is_none() && recipient.session.is_none());
     assert_eq!(recipient.excluded, Some(SessionId::new("old")));
-    let observation = observation(&recipient, &codex_frame(CODEX_EMPTY)).unwrap();
+    let observation = observation(&recipient, &codex_frame(CODEX_EMPTY), None).unwrap();
     let id = rig.queue_observed_message(observation).await;
     assert_eq!(id, MessageId::new(123_456));
     tokio::time::advance(Duration::from_secs(10)).await;
@@ -3143,7 +3320,7 @@ async fn final_no_effect_attempt_is_not_left_to_policy_without_history_record() 
 async fn final_no_effect_attempt_ends_failed_with_one_owner_notice() {
     let effects = Effects {
         deliver: Arc::new(|rt, id, deadline| Box::pin(deliver(rt, id, deadline))),
-        observe: Arc::new(|_| Box::pin(async { Ok(idle_observation()) })),
+        observe: Arc::new(|_| Box::pin(async { Ok((idle_observation(), None)) })),
     };
     let mut rig = Rig::start(Fold::Service, true, one_attempt(), Some(effects)).await;
     while rig.committed.try_recv().is_ok() {}
@@ -3187,7 +3364,7 @@ async fn final_no_effect_attempt_ends_failed_with_one_owner_notice() {
 async fn final_no_effect_attempt_with_a_work_error_ends_failed() {
     let effects = Effects {
         deliver: Arc::new(|rt, id, deadline| Box::pin(deliver(rt, id, deadline))),
-        observe: Arc::new(|_| Box::pin(async { Ok(idle_observation()) })),
+        observe: Arc::new(|_| Box::pin(async { Ok((idle_observation(), None)) })),
     };
     let mut rig = Rig::start(Fold::Service, true, one_attempt(), Some(effects)).await;
     while rig.committed.try_recv().is_ok() {}
@@ -3628,7 +3805,7 @@ async fn unbound_codex_with_an_eligible_row_is_refused_before_commit() {
     // returning a policy wait for a newly observed source.
     let observed = HistoryUpdate::Observed {
         recipient: worker(),
-        observation: observation(&recipient, &codex_frame(CODEX_EMPTY)).unwrap(),
+        observation: observation(&recipient, &codex_frame(CODEX_EMPTY), None).unwrap(),
     };
     rig.rt.history.record(observed, rig.now()).unwrap();
     tokio::time::advance(rig.rt.policy.settings().stable_idle).await;
@@ -5232,15 +5409,21 @@ async fn a_start_line_is_typed_and_confirmed_as_its_own_text() {
 #[test]
 fn wrapped_start_lines_do_not_authorize_enter() {
     use crate::org::agent_screen_tests::capture as shot_of;
-    let reference = crate::org::start_line::start_reference(MessageId::new(123));
-    assert_eq!(reference.len(), 48);
-    for (harness, command, columns, wrapped) in [
-        (Harness::ClaudeCode, "claude", 50_u16, false),
-        (Harness::ClaudeCode, "claude", 49, true),
-        (Harness::ClaudeCode, "claude", 40, true),
-        (Harness::Pi, "pi", 48, false),
-        (Harness::Pi, "pi", 47, true),
-        (Harness::Pi, "pi", 40, true),
+    let start = crate::org::start_line::start_reference(MessageId::new(123));
+    assert_eq!(start.len(), 48);
+    let resume = "[m123456] Run atm me; read its memory file; resume open work or report and stop.";
+    assert_eq!(resume.len(), 80);
+    for (reference, harness, command, columns, wrapped) in [
+        (start.as_str(), Harness::ClaudeCode, "claude", 50_u16, false),
+        (start.as_str(), Harness::ClaudeCode, "claude", 49, true),
+        (start.as_str(), Harness::ClaudeCode, "claude", 40, true),
+        (start.as_str(), Harness::Pi, "pi", 48, false),
+        (start.as_str(), Harness::Pi, "pi", 47, true),
+        (start.as_str(), Harness::Pi, "pi", 40, true),
+        (resume, Harness::ClaudeCode, "claude", 82, false),
+        (resume, Harness::ClaudeCode, "claude", 81, true),
+        (resume, Harness::Pi, "pi", 80, false),
+        (resume, Harness::Pi, "pi", 79, true),
     ] {
         let prefix = if harness == Harness::ClaudeCode {
             "❯\u{a0}"
@@ -5269,8 +5452,8 @@ fn wrapped_start_lines_do_not_authorize_enter() {
         let baseline = PaneBaseline::adopted(100)
             .with_harness(command.into())
             .unwrap();
-        let facts = guard_facts(GuardedInput::Enter, &capture, screen, &baseline, &reference);
-        let case = format!("{command}, {columns} columns, wrapped: {wrapped}");
+        let facts = guard_facts(GuardedInput::Enter, &capture, screen, &baseline, reference);
+        let case = format!("{command}, {columns} columns, wrapped: {wrapped}, {reference:?}");
         assert_eq!(facts.screen.input, InputState::Draft, "{case}");
         assert_eq!(facts.screen.turn, TurnState::NotRunning, "{case}");
         assert_eq!(facts.control_dialog, ControlDialog::None, "{case}");

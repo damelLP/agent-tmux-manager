@@ -620,5 +620,15 @@ Both source views lack the mode footer and remain Unknown. `update_notice.rs`
 and atmd's adoption regression explicitly mark their appended, already-captured
 auto-mode footer as Synthetic; this isolates the notice grammar without treating
 a cropped viewport as safe. All altered counts, margins, statuses and drafts are
-Synthetic too. Only the exact two notice shapes at the existing two-cell right
-margin are skipped; they supply no turn, input or fresh-editor evidence.
+Synthetic too. Notice chrome supplies no turn, input or fresh-editor evidence.
+
+Captured: claude 2.1.325, 2026-11-18, live capture-pane -p -e -N (lead), sanitized.
+`screen_styled_restart-to-update_2.1.325.txt` preserves the last seven rows:
+the completed-turn status, `✔ Update installed · Restart to update` at the
+existing two-cell right margin, the editor, the custom status and the shell
+count footer. Earlier history was omitted. The editor and custom status values
+are fictional, preserving spaces, alignment and SGR. The first line is
+provenance and the final `|` on each row is a storage sentinel, not pane text.
+Synthetic: removing only faint from the editor yields a typed draft; moving or
+mutating just the notice does not establish an idle editor. The new spelling
+is recognized only on a standalone aligned notice row.

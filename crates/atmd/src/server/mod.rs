@@ -162,11 +162,20 @@ impl DaemonServer {
         let agents_cancel = CancellationToken::new();
         let agents_task = if services.agents.is_none() && services.org.status().is_ok() {
             services.control.clone().map(|control| {
-                let (agents, task) = crate::org::agents::spawn_agents(
+                let readiness = services
+                    .delivery_policy
+                    .as_ref()
+                    .and_then(|policy| policy.as_ref().ok())
+                    .map_or_else(
+                        || atm_org::delivery::DeliverySettings::default().readiness_timeout,
+                        |policy| policy.settings().readiness_timeout,
+                    );
+                let (agents, task) = crate::org::agents::spawn_agents_configured(
                     services.org.clone(),
                     self.registry.clone(),
                     control,
                     agents_cancel.clone(),
+                    readiness,
                 );
                 // One handover service for the method and the watcher: the
                 // note at the context line and the handovers the daemon runs

@@ -1,10 +1,10 @@
 // `agent.clear` over the real control actor and a scripted tmux client.
 //
 // Included after `agent_lifecycle_tests.rs`, into the same module: no module
-// docs, and that file's helpers are in scope. Every test runs on a paused
-// clock with in-memory I/O only, and synchronises on committed events, the
-// flow's own progress events and the order of scripted reads. Every "nothing
-// was sent" test names its refusal and has a twin that does send.
+// docs, and that file's helpers are in scope. Clear timing uses a paused
+// clock with in-memory I/O; the saved-handover cases pause after the save's
+// file work. Tests synchronise on committed events, progress events and
+// the order of scripted reads.
 //
 // Screens are the adapters' real captures (each adapter's fixture README
 // records its `Captured:` line) unless marked synthetic.
@@ -303,6 +303,591 @@ const ANNOUNCING: [(Harness, &str, &str, &str, &str); 2] = [
     (Harness::Pi, "/new", PI_CONVERSATION, PI_STAGED, PI_PADDED),
 ];
 
+// Break caught: classifying a recoverable screen error after committing
+// Clear, or following a changed target to a perfectly safe replacement.
+#[tokio::test(start_paused = true)]
+async fn handover_clear_rechecks_identity_and_blocks_without_input() {
+    use crate::org::agent_lifecycle::{ClearAttempt, SavedSeat};
+    use tokio::time::Instant;
+    let c = Clearing::new(Harness::ClaudeCode, Old::Lingering).await;
+    let mut committed = c.rig.org.committed.subscribe();
+    let target = SavedSeat { agent: lead(), pane: pane("%1"), session: "old".into() };
+    for text in [CLAUDE_DRAFT, CLAUDE_RUNNING, CLAUDE_MODAL] {
+        c.frame(text);
+        let result = c.agents.clear_handover(target.clone(), None, Instant::now() + std::time::Duration::from_secs(120)).await;
+        assert!(matches!(result, Ok(ClearAttempt::Blocked("the editor is not empty and idle"))), "{result:?}");
+        let row = c.agent().await;
+        assert_eq!(row.status, AgentStatus::Ready);
+        assert_eq!(row.session_id, Some("old".into()));
+        assert!(committed_kinds(&mut committed).is_empty());
+        assert!(c.sent().is_empty());
+    }
+    // An expired read-only preflight cannot admit Clear.
+    let result = c.agents.clear_handover(target.clone(), Some(Instant::now()), Instant::now() + std::time::Duration::from_secs(120)).await;
+    assert!(matches!(result, Ok(ClearAttempt::Expired)), "{result:?}");
+    assert!(committed_kinds(&mut committed).is_empty());
+    // The reservation cannot clear a rebind even with the same pane ID.
+    c.rig.command(OrgCommand::SessionBound { agent_id: lead(), session_id: "replacement".into() }).await;
+    let result = c.agents.clear_handover(target, None, Instant::now() + std::time::Duration::from_secs(120)).await;
+    assert!(matches!(result, Err(AgentError::Refused(reason)) if reason.contains("no longer has its saved session old")));
+    assert_eq!(committed_kinds(&mut committed), ["agent.session_bound"]);
+    assert!(c.sent().is_empty());
+}
+
+// Break caught: the Clear write lets a retry lose the identity that passed
+// preflight; a fresh editor alone cannot authorize pasting into a new session.
+#[tokio::test(start_paused = true)]
+async fn handover_clear_does_not_paste_into_replacement() {
+    use crate::org::agent_lifecycle::{ClearAttempt, SavedSeat};
+    use tokio::time::Instant;
+    for replace in [true, false] {
+        let (gate, mut entered) = mpsc::channel(1);
+        let rig = Rig::gated(Some(("agent.clear_requested", gate))).await;
+        let mut c = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+        let target = SavedSeat { agent: lead(), pane: pane("%1"), session: "old".into() };
+        let finish_by = Instant::now() + std::time::Duration::from_secs(120);
+        c.frame(CLAUDE_DRAFT);
+        assert!(matches!(c.agents.clear_handover(target.clone(), None, finish_by).await, Ok(ClearAttempt::Blocked(_))));
+        c.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+        c.frame(CLAUDE_CLEARED);
+        c.follow_up();
+        c.follow_up();
+        let agents = c.agents.clone();
+        let mut call = tokio::spawn(async move {
+            agents.clear_handover(target, Some(Instant::now() + std::time::Duration::from_secs(20)), finish_by).await
+        });
+        let release = entered.recv().await.unwrap();
+        assert!(c.sent().is_empty());
+        if replace {
+            c.session_start("replacement", Some("resume")).await;
+            assert!(c.rig.registry.get_session("old".into()).await.is_none());
+        }
+        release.send(()).unwrap();
+        let result = tokio::select! {
+            result = &mut call => result.unwrap(),
+            () = c.awaiting_session() => {
+                c.session_start("after-daemon-clear", Some("clear")).await;
+                call.await.unwrap()
+            }
+        };
+        if replace {
+            assert!(c.sent().is_empty(), "replacement received input: {:?}", c.sent());
+            assert!(result.is_err(), "{result:?}");
+        } else {
+            assert_eq!(c.sent(), ["paste %1 /clear", "keys %1 Enter"]);
+            assert!(matches!(result, Ok(ClearAttempt::Cleared(clear)) if clear.result.session_id == Some("after-daemon-clear".into())));
+        }
+    }
+}
+
+// Break caught: a retry pasted safely, but a replacement starts after the
+// row read for Enter. A staged-looking frame must not authorize submission.
+#[tokio::test(start_paused = true)]
+async fn handover_clear_does_not_submit_in_replacement() {
+    use crate::org::agent_lifecycle::SavedSeat;
+    use std::time::Duration;
+    use tokio::time::Instant;
+    let mut c = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+    c.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+    c.frame(CLAUDE_CLEARED);
+    c.follow_up();
+    c.follow_up();
+    let agents = c.agents.clone();
+    let mut call = tokio::spawn(async move {
+        let target = SavedSeat { agent: lead(), pane: pane("%1"), session: "old".into() };
+        agents.clear_handover(target, Some(Instant::now() + Duration::from_secs(20)), Instant::now() + Duration::from_secs(120)).await
+    });
+    progress(&mut c.events, "clear_submitting", Some("p/lead")).await;
+    assert_eq!(c.sent(), ["paste %1 /clear"]);
+    // The actor paces its capture after the staged frame. The registry
+    // round trip is in-memory, so it finishes before virtual time advances.
+    c.session_start("replacement", Some("resume")).await;
+    assert!(c.rig.registry.get_session("old".into()).await.is_none());
+    let result = tokio::select! {
+        result = &mut call => result.unwrap(),
+        () = c.awaiting_session() => {
+            c.session_start("after-daemon-clear", Some("clear")).await;
+            call.await.unwrap()
+        }
+    };
+    assert_eq!(c.sent(), ["paste %1 /clear"], "replacement received Enter");
+    assert!(result.is_err(), "{result:?}");
+}
+
+mod actor_closure {
+    use super::*;
+    use crate::control::reservation::Quarantine;
+    use crate::eventlog::{Envelope, EventLogError};
+    use crate::org::agent_handover::{Answer, Clearer, HandoverParams, Handovers, NoteOrigin};
+    use crate::org::agent_lifecycle::{ClearAttempt, SavedSeat};
+    use crate::org::{actor, OrgHandle};
+    use atm_org::MessageId;
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+
+    const GUARD: Duration = Duration::from_secs(30);
+    const REGISTRY_STOPPED: &str =
+        "agent service unavailable: session registry: response channel closed";
+    const WRITER_STOPPED: &str = "organisation service unavailable: organisation actor stopped";
+
+    struct Actor {
+        cancel: CancellationToken,
+        task: JoinHandle<()>,
+    }
+
+    impl Actor {
+        async fn stop(self) {
+            self.cancel.cancel();
+            self.task.await.unwrap();
+        }
+    }
+
+    // The actual request actors, with separate stop tokens. The writer's
+    // append sink and tmux are in-memory so shutdown and retry can be fenced
+    // on paused time without depending on a filesystem or a tmux process.
+    async fn rig(root: &Path, lose_append: Option<&'static str>) -> (Rig, Actor, Actor) {
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.child_token();
+        let (requests, receive) = mpsc::channel(64);
+        let (health, status) = watch::channel(Ok(0));
+        let (committed, _) = broadcast::channel(1024);
+        let mut seq = 0;
+        let writer = tokio::spawn(actor::run(
+            Default::default(),
+            receive,
+            health,
+            committed.clone(),
+            writer_cancel.clone(),
+            move |event: Envelope| {
+                seq += 1;
+                std::future::ready(if lose_append == Some(event.kind.as_str()) {
+                    Err(EventLogError::TimeoutAfterHandover)
+                } else {
+                    Ok(seq)
+                })
+            },
+        ));
+        let org = OrgHandle {
+            requests,
+            health: status,
+            committed,
+            reads: None,
+        };
+        let registry_cancel = cancel.child_token();
+        let (send, receive) = mpsc::channel(100);
+        let (events, _) = broadcast::channel(2048);
+        let registry_actor = RegistryActor::new(receive, events.clone());
+        let registry_task = tokio::spawn({
+            let stop = registry_cancel.clone();
+            async move {
+                tokio::select! { biased; () = stop.cancelled() => {}, () = registry_actor.run() => {} }
+            }
+        });
+        let registry = RegistryHandle::new(send, events.clone());
+        let client = ScriptedTmuxClient::new();
+        let (control, _) = spawn_control_with_org(
+            Box::new(client.clone()),
+            registry.clone(),
+            org.clone(),
+            cancel.clone(),
+        );
+        let rig = Rig {
+            org,
+            registry,
+            events,
+            client,
+            control,
+            cancel,
+            proc: Arc::new(Mutex::new(Some(job_in_front()))),
+            proc_after_enter: Default::default(),
+            proc_script: Default::default(),
+            spawn_env: Default::default(),
+        };
+        rig.command(OrgCommand::RegisterProject {
+            project_id: "p".parse().unwrap(),
+            root: root.to_str().unwrap().into(),
+            move_root: false,
+        })
+        .await;
+        (
+            rig,
+            Actor {
+                cancel: writer_cancel,
+                task: writer,
+            },
+            Actor {
+                cancel: registry_cancel,
+                task: registry_task,
+            },
+        )
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Step {
+        Clear { retry: bool, blocked: bool },
+        Parked,
+    }
+
+    struct ObserveClear {
+        agents: AgentHandle,
+        steps: mpsc::UnboundedSender<Step>,
+        first: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl Clearer for ObserveClear {
+        fn available(&self) -> Answer<()> {
+            self.agents.available()
+        }
+
+        fn clear(
+            &self,
+            target: SavedSeat,
+            retry_before: Option<Instant>,
+            finish_by: Instant,
+        ) -> Answer<ClearAttempt> {
+            let work = Clearer::clear(&self.agents, target, retry_before, finish_by);
+            let steps = self.steps.clone();
+            let first = self.first.lock().unwrap().take();
+            Box::pin(async move {
+                let result = work.await;
+                steps
+                    .send(Step::Clear {
+                        retry: retry_before.is_some(),
+                        blocked: matches!(
+                            result,
+                            Ok(ClearAttempt::Blocked("the editor is not empty and idle"))
+                        ),
+                    })
+                    .unwrap();
+                if let Some(first) = first {
+                    first.await.unwrap();
+                }
+                result
+            })
+        }
+
+        fn clear_wait(&self, target: &SavedSeat, reason: Option<String>) {
+            let parked = reason.is_some();
+            self.agents.clear_wait(target, reason);
+            if parked {
+                self.steps.send(Step::Parked).unwrap();
+            }
+        }
+    }
+
+    async fn next_step(rx: &mut mpsc::UnboundedReceiver<Step>) -> Step {
+        tokio::time::timeout(GUARD, rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn quarantines(c: &Clearing) -> Vec<Quarantine> {
+        c.rig
+            .control
+            .quarantines(Instant::now() + GUARD)
+            .await
+            .unwrap()
+    }
+
+    fn clear_quarantine() -> Vec<Quarantine> {
+        vec![Quarantine {
+            agent: lead(),
+            pane: Some(pane("%1")),
+            kind: ReservationKind::Clear,
+        }]
+    }
+
+    #[derive(Clone, Copy)]
+    enum Stop {
+        Registry,
+        Writer,
+        Both,
+    }
+
+    // Break caught: a read-only retry that genuinely reached reservation
+    // cleanup quarantines a pane because the org writer is unavailable.
+    async fn parked_retry(stop: Stop) {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = dir.path().join(".atm/memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        let (rig, writer, registry) = rig(dir.path(), None).await;
+        let c = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+        let mut committed = c.rig.org.committed.subscribe();
+        c.frame(CLAUDE_DRAFT);
+        let (steps, mut observations) = mpsc::unbounded_channel();
+        let (release, first) = oneshot::channel();
+        let agent_stop = c.agents.stop_token();
+        let service = Handovers::new(
+            c.rig.org.clone(),
+            c.rig.registry.clone(),
+            Arc::new(ObserveClear {
+                agents: c.agents.clone(),
+                steps,
+                first: Mutex::new(Some(first)),
+            }),
+            agent_stop.clone(),
+        );
+        let (reply, answer) = oneshot::channel();
+        let call = tokio::spawn(async move {
+            let admitted = service
+                .admit(
+                    HandoverParams {
+                        agent: lead(),
+                        timeout_ms: 600_000,
+                    },
+                    CallContext {
+                        client_id: CallerId("owner".into()),
+                        from_pane: None,
+                    },
+                    Box::pin(std::future::pending()),
+                    None,
+                )
+                .await
+                .unwrap();
+            service
+                .until_stopped(service.finish_admitted(
+                    &lead(),
+                    admitted,
+                    NoteOrigin::Command,
+                    Some(reply),
+                ))
+                .await
+                .unwrap();
+        });
+        let save: MessageId = tokio::time::timeout(GUARD, async {
+            loop {
+                let event = committed.recv().await.unwrap();
+                if event.kind == "agent.save_requested" {
+                    break serde_json::from_value(event.body["message_id"].clone()).unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        c.rig
+            .command(OrgCommand::DeliveryAttempted {
+                message_id: save,
+                attempt: 1,
+                pane: "%1".into(),
+            })
+            .await;
+        c.rig
+            .registry
+            .apply_lifecycle_event(
+                "old".into(),
+                LifecycleEvent::WorkingStart,
+                Harness::ClaudeCode,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        c.rig
+            .command(OrgCommand::Delivered {
+                message_id: save,
+                session_id: "old".into(),
+                confirmation: "prompt".into(),
+            })
+            .await;
+        std::fs::write(memory.join("lead.md"), "saved state").unwrap();
+        c.rig
+            .registry
+            .apply_lifecycle_event(
+                "old".into(),
+                LifecycleEvent::Idle,
+                Harness::ClaudeCode,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next_step(&mut observations).await,
+            Step::Clear {
+                retry: false,
+                blocked: true
+            }
+        );
+        tokio::time::pause(); // no filesystem work between here and the retry
+        let parked_at = Instant::now();
+        release.send(()).unwrap();
+        assert_eq!(next_step(&mut observations).await, Step::Parked);
+        let writer = if matches!(stop, Stop::Writer | Stop::Both) {
+            writer.stop().await;
+            None
+        } else {
+            Some(writer)
+        };
+        let registry = if matches!(stop, Stop::Registry | Stop::Both) {
+            registry.stop().await;
+            None
+        } else {
+            Some(registry)
+        };
+        assert_eq!(
+            Instant::now(),
+            parked_at,
+            "actors stopped before backoff elapsed"
+        );
+        assert_eq!(
+            next_step(&mut observations).await,
+            Step::Clear {
+                retry: true,
+                blocked: false
+            }
+        );
+        assert!(
+            Instant::now() > parked_at,
+            "retry woke from backoff, not a row change"
+        );
+        tokio::time::resume(); // the registry-only outcome reads the role file
+        let error = tokio::time::timeout(GUARD, answer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .0;
+        let reason = if writer.is_some() {
+            REGISTRY_STOPPED
+        } else {
+            WRITER_STOPPED
+        };
+        assert_eq!(error.code, "unavailable");
+        assert_eq!(
+            error.message,
+            format!("p/lead saved its state ({save}); {reason}")
+        );
+        tokio::time::timeout(GUARD, call).await.unwrap().unwrap();
+        assert!(
+            observations.try_recv().is_err(),
+            "only one retry after a save"
+        );
+        assert!(!agent_stop.is_cancelled());
+        assert!(
+            c.sent().is_empty(),
+            "the saved handover sent input: {:?}",
+            c.sent()
+        );
+        assert_eq!(c.unread(), 0, "the first clear consumed the draft");
+        let kinds = committed_kinds(&mut committed);
+        if writer.is_some() {
+            let state = c.rig.org.snapshot().await.unwrap();
+            let notes: Vec<_> = state
+                .messages()
+                .filter(|message| message.id != save)
+                .collect();
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].content.to, atm_org::Address::Owner);
+            assert_eq!(
+                notes[0].content.body,
+                format!("handover of p/lead did not complete: saved ({save}); {reason}.")
+            );
+            assert_eq!(
+                kinds,
+                [
+                    "msg.delivery_attempted",
+                    "msg.delivered",
+                    "agent.saved",
+                    "msg.sent"
+                ]
+            );
+        } else {
+            assert_eq!(
+                kinds,
+                ["msg.delivery_attempted", "msg.delivered", "agent.saved"]
+            );
+        }
+        let quarantines = quarantines(&c).await;
+        if matches!(stop, Stop::Writer) {
+            let interrupt = c.rig.control.interrupt("%1".into()).await;
+            assert!(
+                quarantines.is_empty()
+                    && matches!(&interrupt, Ok(pane) if pane == "%1")
+                    && c.sent() == ["keys %1 C-c"],
+                "quarantines: {quarantines:?}; owner interrupt: {interrupt:?}; sent: {:?}",
+                c.sent()
+            );
+        } else {
+            assert!(quarantines.is_empty(), "quarantines: {quarantines:?}");
+        }
+        for actor in [writer, registry].into_iter().flatten() {
+            actor.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn handover_clear_does_not_quarantine_on_parked_registry_stop() {
+        parked_retry(Stop::Registry).await;
+    }
+
+    #[tokio::test]
+    async fn handover_clear_does_not_quarantine_on_parked_writer_stop() {
+        parked_retry(Stop::Writer).await;
+    }
+
+    #[tokio::test]
+    async fn handover_clear_does_not_quarantine_on_parked_registry_and_writer_stop() {
+        parked_retry(Stop::Both).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn standalone_clear_quarantines_on_unknown_pre_clear_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rig, writer, registry) = rig(dir.path(), Some("agent.session_bound")).await;
+        rig.row_of("old", "%1", false, Harness::ClaudeCode).await;
+        let c = Clearing::on(rig, Harness::ClaudeCode, Old::Unbound).await;
+        c.frame(CLAUDE_CONVERSATION);
+        let error = c.clear().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("append timed out after hand-over; outcome unknown"),
+            "{error:?}"
+        );
+        assert_eq!(quarantines(&c).await, clear_quarantine());
+        assert!(c.sent().is_empty());
+        writer.stop().await;
+        registry.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handover_clear_quarantines_on_unknown_clear_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rig, writer, registry) = rig(dir.path(), Some("agent.clear_requested")).await;
+        let c = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+        c.frame(CLAUDE_CONVERSATION);
+        let error = c
+            .agents
+            .clear_handover(
+                SavedSeat {
+                    agent: lead(),
+                    pane: pane("%1"),
+                    session: "old".into(),
+                },
+                Some(Instant::now() + Duration::from_secs(20)),
+                Instant::now() + GUARD,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("append timed out after hand-over; outcome unknown"),
+            "{error:?}"
+        );
+        assert_eq!(quarantines(&c).await, clear_quarantine());
+        assert!(c.sent().is_empty());
+        writer.stop().await;
+        registry.stop().await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn clear_types_submits_and_binds_the_new_session() {
     // Also missing_end_with_valid_start_succeeds (with a lingering old row no
@@ -335,10 +920,10 @@ async fn clear_types_submits_and_binds_the_new_session() {
             let agent = clearing.agent().await;
             assert_eq!(agent.status, AgentStatus::Ready);
             assert_eq!(agent.session_id, Some(SessionId::new("new")));
-            // The new session's binding, then its start line.
+            // Make the start line visible before the new session is Ready.
             assert_eq!(
                 committed_kinds(&mut committed),
-                ["agent.clear_requested", "agent.session_bound", "msg.sent"]
+                ["agent.clear_requested", "msg.sent", "agent.session_bound"]
             );
             // One paste, one Enter, nothing else, ever.
             assert_eq!(clearing.sent().len(), 2, "{harness:?} {old:?}");
@@ -1307,8 +1892,8 @@ async fn duplicate_clear_conflicts_while_first_waits_for_delivery() {
         [
             "agent.session_bound",
             "agent.clear_requested",
-            "agent.session_bound",
-            "msg.sent"
+            "msg.sent",
+            "agent.session_bound"
         ]
     );
     assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
@@ -1339,7 +1924,7 @@ async fn clear_never_binds_a_pending_row_before_clearing() {
     );
     assert_eq!(
         committed_kinds(&mut committed),
-        ["agent.clear_requested", "agent.session_bound", "msg.sent"]
+        ["agent.clear_requested", "msg.sent", "agent.session_bound"]
     );
     assert_eq!(clearing.sent(), ["paste %1 /clear", "keys %1 Enter"]);
 }
@@ -1366,7 +1951,7 @@ async fn codex_clear_goes_from_conversation_to_fresh_editor() {
     assert_eq!(clearing.unread(), 9, "polls 002 through 004 were not needed");
     assert_eq!(
         committed_kinds(&mut committed),
-        ["agent.clear_requested", "agent.editor_ready", "msg.sent"]
+        ["agent.clear_requested", "msg.sent", "agent.editor_ready"]
     );
     let agent = clearing.agent().await;
     assert_eq!(agent.status, AgentStatus::Ready);
@@ -1727,7 +2312,7 @@ async fn missed_hook_conversation_not_noop() {
     assert_eq!(clearing.unread(), 0);
     assert_eq!(
         committed_kinds(&mut committed),
-        ["agent.clear_requested", "agent.editor_ready", "msg.sent"]
+        ["agent.clear_requested", "msg.sent", "agent.editor_ready"]
     );
     assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
 }
@@ -1773,6 +2358,38 @@ async fn clear_timeout_outside_its_range_is_refused_with_the_agent_unchanged() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn clear_does_not_publish_ready_while_its_start_line_append_is_held() {
+    let (gate, mut entered) = mpsc::channel(1);
+    let rig = Rig::gated(Some(("msg.sent", gate))).await;
+    let clearing = Clearing::on(rig, Harness::Codex, Old::Unbound).await;
+    let mut committed = clearing.rig.org.committed.subscribe();
+    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+    clearing.frame(CODEX_FRESH);
+    let call = clearing.start();
+    let release = tokio::time::timeout(std::time::Duration::from_secs(60), entered.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed_kinds(&mut committed), ["agent.clear_requested"]);
+    release.send(()).unwrap();
+    call.await.unwrap().unwrap();
+    assert_eq!(committed_kinds(&mut committed), ["msg.sent", "agent.editor_ready"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_clear_start_append_still_publishes_ready() {
+    let rig = Rig::gated_with_failure(None, Some("msg.sent")).await;
+    let clearing = Clearing::on(rig, Harness::Codex, Old::Unbound).await;
+    let mut committed = clearing.rig.org.committed.subscribe();
+    clearing.frames_through_enter(CODEX_CONVERSATION, CODEX_POPUP);
+    clearing.frame(CODEX_FRESH);
+    clearing.clear().await.unwrap();
+    assert_eq!(committed_kinds(&mut committed), ["agent.clear_requested", "agent.editor_ready"]);
+    assert_eq!(clearing.agent().await.status, AgentStatus::Ready);
+    assert_eq!(clearing.rig.org.snapshot().await.unwrap().messages().count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_clear_queues_one_start_line_and_a_second_clear_reuses_it() {
     // The clear's start line is the canonical note to the agent, queued. A
     // second clear while that line is still open queues no second one: the
@@ -1807,6 +2424,41 @@ async fn a_clear_queues_one_start_line_and_a_second_clear_reuses_it() {
         ["agent.clear_requested", "agent.editor_ready"]
     );
     assert_eq!(lines().await, once);
+}
+
+#[tokio::test(start_paused = true)]
+async fn handover_clear_does_not_claim_a_carried_plain_start_is_a_resume() {
+    use crate::org::agent_lifecycle::{ClearAttempt, SavedSeat};
+    use crate::org::start_line::{StartLineDisposition, start_line};
+    for copy in ["New session: run the shell command atm me", "New session: run atm me"] {
+        let mut c = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+        let mut note = start_line(&lead());
+        note.body = copy.into();
+        c.rig.command(OrgCommand::SendMessage(note.clone())).await;
+        let mut committed = c.rig.org.committed.subscribe();
+        c.frames_through_enter(CLAUDE_CONVERSATION, CLAUDE_STAGED);
+        c.frame(CLAUDE_CLEARED);
+        c.follow_up();
+        c.follow_up();
+        let agents = c.agents.clone();
+        let call = tokio::spawn(async move {
+            agents.clear_handover(
+                SavedSeat { agent: lead(), pane: pane("%1"), session: "old".into() },
+                None,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+            ).await
+        });
+        c.awaiting_session().await;
+        c.session_start("new", Some("clear")).await;
+        let result = call.await.unwrap().unwrap();
+        assert!(matches!(&result, ClearAttempt::Cleared(clear)
+            if clear.result.session_id == Some("new".into())
+                && matches!(clear.start_line, StartLineDisposition::Unidentified)), "{result:?}");
+        assert_eq!(committed_kinds(&mut committed), ["agent.clear_requested", "agent.session_bound"]);
+        let state = c.rig.org.snapshot().await.unwrap();
+        assert_eq!(state.messages().map(|m| (&m.content, m.status)).collect::<Vec<_>>(),
+            [(&note, atm_org::DeliveryStatus::Queued)]);
+    }
 }
 
 #[tokio::test(start_paused = true)]

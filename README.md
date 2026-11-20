@@ -223,6 +223,8 @@ atm decide d41 yes 'Approved'      # owner answer; --rule appends a standing rul
 atm away                           # you will not answer: agents go on under the away rules
 atm back                           # you are back: nothing more is decided for you
 atm status                         # one-line summary for tmux status bar
+atm usage                          # latest observed subscription usage
+atm usage --format json            # the same readings as a JSON array
 
 atm workspace create               # new session with ATM sidebar + agent + shell
 atm workspace attach               # inject sidebar into current session
@@ -524,6 +526,72 @@ A crossed limit sends the creator one ordinary system note **per task**, across 
 Only a proven parent session bound to a named agent can contribute. Exactly one open task must be assigned to that agent; otherwise measurements are unattributed. A first cumulative price establishes a baseline, not a charge for historical work; later positive high-water increases count once. Attribution follows observation order, so delayed reports can cross task boundaries. Counts reflect observations, not a complete billing history: lost/overflowed measurements and time spent on an older daemon cannot be recovered. Working/idle edges, tool calls and provider replies are not additional user turns.
 
 Missing cost/context is `null`, not reported zero. Codex reports no USD price; context requires explicit active tokens and window capacity, never a guessed model window or lifetime tokens. Peak percentages round up to whole percent and survive compaction. State time includes waiting and daemon downtime, stops at acceptance/cancellation, and sums subsecond visits before reporting whole seconds. Review starts (or direct verdicts naming a review) count rounds; automatic closure of a review does not create another round. Files/lines changed and files read are not measured here. No agent is stopped by accounting.
+
+## Subscription usage
+
+`atm usage` is an owner read, separate from [task usage](#task-usage) and
+context-window usage. It shows the daemon's most recent subscription reading
+from a bound Claude Code seat. It uses the existing Claude status line and does
+not need a hook reinstall, network query, or credentials. Run it outside a
+named agent pane. This follows ATM's local owner attribution convention, not
+an authentication boundary.
+
+No usage configuration is needed for one account per meter. All bound Claude
+seats with a proven current parent session feed the same local profile,
+`claude`. These are readings of one shared meter, not totals across seats or
+proof that their accounts match. With multiple accounts, put one alias per
+account in ATM's `config.toml` (`$XDG_CONFIG_HOME/atm/config.toml`, normally
+`~/.config/atm/config.toml`):
+
+```toml
+[[usage.sources]]
+agent = "project/builder"
+harness = "claude_code"
+meter = "claude"
+profile = "work"
+
+[[usage.sources]]
+agent = "project/reviewer"
+harness = "claude_code"
+meter = "claude"
+profile = "personal"
+```
+
+Use a full bound `project/name`. A profile is a local alias of 1–32 lowercase
+ASCII letters, digits, underscores or hyphens, starting with a letter or
+digit. Share it only for seats you know use the same subscription. Update the
+mapping when a seat changes accounts and restart `atmd`. Explicit sources
+replace the default for their meter only: unlisted seats for that meter are
+ignored. Invalid or duplicate source settings disable usage collection instead
+of falling back to a shared profile; other daemon features keep their own
+configuration. Currently only the `claude_code`/`claude` pair reports usage.
+
+`usage.list` takes `{}`. It returns an array sorted by `(profile, meter)`,
+also emitted by `atm usage --format json`. Each entry includes the local
+`profile`, `meter`, `source` harness, UTC `observed_at` (daemon receipt),
+`stale`, and `windows`. Windows are sorted by `(scope, duration_minutes)`:
+
+```json
+[
+  {
+    "profile": "claude",
+    "meter": "claude",
+    "source": "claude_code",
+    "observed_at": "2026-11-19T23:42:19Z",
+    "stale": false,
+    "windows": [{"scope": null, "duration_minutes": 10080, "used_percent": 52.0, "resets_at": "2026-11-22T21:00:00Z"}]
+  }
+]
+```
+
+`scope: null` means the whole meter; `resets_at: null` means the reset was
+not reported. Claude may report 5-hour or 7-day windows or both. A missing
+window was not reported in the latest valid sample, not 0% used. The daemon
+keeps the last nonempty valid sample in memory, and identical status redraws
+do not refresh its timestamp. A sample is stale after 60 minutes or when any
+reported window reaches its reset. `[]` means no sample received, including
+after a daemon restart until a new push. An old daemon that does not advertise
+`usage.list` returns a CLI error, not `[]`.
 
 ## Evaluation report
 

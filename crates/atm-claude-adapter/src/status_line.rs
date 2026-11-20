@@ -51,8 +51,35 @@
 //! another turn; added in ada96c5 on 2026-10-18. The other test payloads
 //! are hand-written (see `Synthetic:` there).
 
-use atm_core::{ContextUsage, LifecycleEvent, SessionDomain, StatusLineData, TokenCount};
+use atm_core::{
+    ContextUsage, LifecycleEvent, PlanUsageWindow, SessionDomain, StatusLineData, TokenCount,
+};
 use serde::Deserialize;
+use serde_json::Value;
+
+/// Stable meter label passed to the daemon alongside a normalized reading.
+pub const PLAN_METER: &str = "claude";
+
+/// Pull quota from the optional status-line fields independently of context.
+/// Missing/null resets are unknown; a malformed window does not affect its sibling.
+#[must_use]
+pub fn plan_usage_windows(status_line: &Value) -> Vec<PlanUsageWindow> {
+    let Some(limits) = status_line.get("rate_limits") else {
+        return Vec::new();
+    };
+    [("five_hour", 300), ("seven_day", 10_080)]
+        .into_iter()
+        .filter_map(|(name, minutes)| {
+            let window = limits.get(name)?;
+            let percent = window.get("used_percentage")?.as_f64()?;
+            let reset = match window.get("resets_at") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_i64()?),
+            };
+            PlanUsageWindow::from_epoch_seconds(minutes, percent, reset)
+        })
+        .collect()
+}
 
 /// A compact version token suitable for a user-facing diagnostic.
 fn version_token(value: &str) -> bool {
@@ -255,6 +282,79 @@ impl RawStatusLine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn captured_claude_week_only() {
+        // Captured: Claude Code 2.1.329, 2026-11-19, existing ATM StatusUpdate
+        // capture at 23:42:19 UTC, reduced to the rate_limits object.
+        let value = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude_status_line_quota_2.1.329.jsonl"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(plan_usage_windows(&value)).unwrap(),
+            serde_json::json!([{"scope":null,"duration_minutes":10080,"used_percent":52.0,"resets_at":"2026-11-22T21:00:00Z"}]),
+        );
+    }
+
+    #[test]
+    fn malformed_quota_preserves_context() {
+        // Synthetic: malformed short window beside a valid zero weekly window.
+        let line = serde_json::json!({
+            "session_id":"status-test",
+            "context_window":{"context_window_size":100000,"current_usage":{"input_tokens":7000}},
+            "rate_limits": {
+                "five_hour":{"used_percentage":44,"resets_at":"invalid"},
+                "seven_day":{"used_percentage":0}
+            }
+        });
+        let windows = plan_usage_windows(&line);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].duration_minutes, 10080);
+        assert_eq!(windows[0].used_percent, 0.0);
+        assert_eq!(windows[0].resets_at, None);
+        let raw: RawStatusLine = serde_json::from_value(line).unwrap();
+        assert_eq!(
+            raw.to_status_line_data().unwrap().current_input_tokens,
+            7000,
+        );
+    }
+
+    #[test]
+    fn absent_or_invalid_quota_is_empty_and_future_keys_are_ignored() {
+        // Synthetic: quota is optional, malformed, or outside the allowlist.
+        for line in [
+            serde_json::json!({}),
+            serde_json::json!({"rate_limits": "invalid"}),
+            serde_json::json!({"rate_limits": {
+                "five_hour":{"used_percentage":-1},
+                "seven_day":{"used_percentage":101},
+                "seven_day_other":{"used_percentage":17}
+            }}),
+            serde_json::json!({"rate_limits": {
+                "five_hour":{"used_percentage":"2"},
+                "seven_day":{"resets_at":1795381200}
+            }}),
+        ] {
+            assert!(plan_usage_windows(&line).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn both_reported_windows_are_in_duration_order() {
+        // Synthetic: both durations, including an explicitly unreported reset.
+        let line = serde_json::json!({"rate_limits": {
+            "seven_day":{"used_percentage":100,"resets_at":1795381200},
+            "five_hour":{"used_percentage":0.25,"resets_at":null}
+        }});
+        let windows = plan_usage_windows(&line);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].duration_minutes, 300);
+        assert_eq!(windows[0].used_percent, 0.25);
+        assert_eq!(windows[0].resets_at, None);
+        assert_eq!(windows[1].duration_minutes, 10080);
+        assert_eq!(windows[1].used_percent, 100.0);
+    }
+
     #[test]
     fn accounting_does_not_turn_missing_fields_into_reported_zero() {
         // Synthetic: partial status line versus genuine zero cost/current usage.

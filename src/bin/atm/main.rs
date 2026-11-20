@@ -326,6 +326,12 @@ enum Command {
     Org(org::OrgArgs),
     /// Evaluate task outcomes, time, owner step-ins, cost and change trends
     Report(report::ReportArgs),
+    /// Read the daemon's last observed subscription usage (owner only)
+    Usage {
+        /// Output format
+        #[arg(long, short = 'f', default_value = "text")]
+        format: UsageFormat,
+    },
     /// Create, assign, inspect and review durable tasks
     Task(task::TaskArgs),
     /// Record the owner's answer to a decision
@@ -535,6 +541,12 @@ enum ListFormat {
     Ids,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum UsageFormat {
+    Text,
+    Json,
+}
+
 // ============================================================================
 // Logging Setup
 // ============================================================================
@@ -592,6 +604,7 @@ async fn run() -> Result<()> {
         Some(Command::Me(args)) => return me::cmd_me(args).await,
         Some(Command::Org(args)) => return org::cmd_org(args).await,
         Some(Command::Report(args)) => return report::cmd_report(args).await,
+        Some(Command::Usage { format }) => return cli::cmd_usage(format).await,
         Some(Command::Task(args)) => return task::cmd_task(args).await,
         Some(Command::Decide(args)) => return decide::cmd_decide(args).await,
         Some(Command::Relay(args)) => return relay::cmd_relay(args).await,

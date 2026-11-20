@@ -40,6 +40,7 @@ pub mod eventlog;
 pub mod monitor;
 pub mod notify;
 pub mod org;
+pub mod plan_usage;
 pub mod project;
 pub mod registry;
 pub mod server;

@@ -607,6 +607,13 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     services.delivery_policy = Some(config.delivery);
     // An invalid section never leaves the reminder on with guessed settings.
     services.reminder = reminder_from(config.reminder);
+    services.plan_usage = match config.usage {
+        Ok(usage) => Some(usage),
+        Err(reason) => {
+            warn!(%reason, "Plan usage collection is off; no implicit profiles will be used");
+            None
+        }
+    };
     let server = DaemonServer::with_services(&socket_path, services, cancel_token);
 
     info!(socket = %socket_path.display(), "Starting server");
@@ -657,6 +664,7 @@ struct StartupConfig {
     delivery: Result<atm_org::delivery::DeliveryPolicy, String>,
     /// `None` when `[reminder]` turns the reminder off.
     reminder: Result<Option<atm_org::reminder::ReminderSettings>, String>,
+    usage: Result<atmd::plan_usage::PlanUsage, String>,
 }
 
 async fn read_startup_config(path: Option<PathBuf>) -> StartupConfig {
@@ -686,6 +694,8 @@ fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
                         "invalid config: malformed TOML or invalid [delivery] settings".into()
                     }),
                 reminder: atmd::org::task_reminder::parse_reminder_settings(&text),
+                usage: atmd::plan_usage::PlanUsage::parse_config(&text)
+                    .map_err(|error| error.to_string()),
             }
         }
         Err(error) => {
@@ -693,7 +703,8 @@ fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
             StartupConfig {
                 notify: Err(reason.clone()),
                 delivery: Err(reason.clone()),
-                reminder: Err(reason),
+                reminder: Err(reason.clone()),
+                usage: Err(reason),
             }
         }
     }

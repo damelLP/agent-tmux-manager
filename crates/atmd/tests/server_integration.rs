@@ -316,15 +316,18 @@ mod plan_usage_contract {
 
     #[tokio::test]
     async fn status_updates_from_two_bound_sources_share_one_sample_without_changing_context() {
+        // Captured: Claude Code 2.1.329, 2026-11-19, ATM status-line push (quota only).
+        // Synthetic: the local session, pane and context around the real quota fields.
+        let Some(lines) = captured_hook_payloads(
+            "atm-claude-adapter",
+            "claude_status_line_quota_2.1.329.jsonl",
+        ) else {
+            return;
+        };
+        let captured = lines.first().expect("captured quota line");
         let (server, registry) = rig().await;
         let mut client = server.connect().await;
         client.handshake(None).await;
-        // Captured: Claude Code 2.1.329, 2026-11-19, ATM status-line push (quota only).
-        // Synthetic: the local session, pane and context around the real quota fields.
-        let captured: Value = serde_json::from_str(include_str!(
-            "../../atm-claude-adapter/tests/fixtures/claude_status_line_quota_2.1.329.jsonl"
-        ))
-        .unwrap();
         send_applied(
             &mut client,
             1,

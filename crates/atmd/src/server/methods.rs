@@ -58,6 +58,8 @@ pub struct MethodServices {
     pub org: crate::org::OrgHandle,
     /// Nonblocking pre-translation capture; disabled for legacy library callers.
     pub raw: crate::org::RawHandle,
+    /// Live in-memory meter readings; off when [usage] configuration is invalid.
+    pub plan_usage: Option<crate::plan_usage::PlanUsage>,
 }
 
 impl MethodServices {
@@ -75,6 +77,7 @@ impl MethodServices {
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
             raw: crate::org::RawHandle::default(),
+            plan_usage: Some(crate::plan_usage::PlanUsage::default()),
         }
     }
 }
@@ -203,6 +206,11 @@ pub(crate) fn router_with_reporting(
         |error| error.to_string(),
     );
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
+    crate::org::plan_usage_query::register(
+        &mut router,
+        services.org.clone(),
+        services.plan_usage.clone(),
+    )?;
     crate::org::org_tree_methods::register_org_tree_method(
         &mut router,
         services.org.clone(),

@@ -365,6 +365,7 @@ impl DaemonServer {
         let cancel = self.cancel_token.child_token();
         let raw = services.raw.clone();
         let org = services.org.clone();
+        let plan_usage = services.plan_usage.clone();
         let (evidence, history) = services.message_tap.clone().unzip();
 
         connections.spawn(async move {
@@ -379,6 +380,7 @@ impl DaemonServer {
             )
             .with_raw(raw)
             .with_org(org)
+            .with_plan_usage(plan_usage)
             .with_message_evidence(evidence, history);
             let handler = match handler.with_disconnect_monitor() {
                 Ok(handler) => handler,

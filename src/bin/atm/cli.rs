@@ -6,17 +6,72 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use atm_core::SessionView;
+use atm_core::{PlanUsageSnapshot, SessionView};
 use atm_protocol::{ClientMessage, DaemonMessage};
 use atm_tmux::RealTmuxClient;
 use atm_tui::{daemon, role};
 use atmd::control::{resolve_pane_id, ReplyOutcome};
 
-use super::{output::stdout, spawn::non_empty_env, ListFormat};
+use super::{output::stdout, rpc, spawn::non_empty_env, ListFormat, UsageFormat};
 
 // ============================================================================
 // CLI Command Implementations
 // ============================================================================
+
+/// Read the cached subscription meter via the same capability check as other RPCs.
+pub(super) async fn cmd_usage(format: UsageFormat) -> Result<()> {
+    let value = match rpc::call("usage.list", serde_json::json!({}), Duration::from_secs(12)).await
+    {
+        Ok(value) => value,
+        Err(rpc::RpcError::TooOld) => {
+            bail!("plan usage is unsupported by this daemon; restart atmd with a current version")
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let samples: Vec<PlanUsageSnapshot> =
+        serde_json::from_value(value).context("invalid plan usage response")?;
+    stdout(|out| {
+        if matches!(format, UsageFormat::Json) {
+            writeln!(out, "{}", serde_json::to_string_pretty(&samples)?)?;
+        } else if samples.is_empty() {
+            writeln!(out, "Plan usage unavailable (no samples received).")?;
+        } else {
+            let utc = |at: chrono::DateTime<chrono::Utc>| {
+                at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            };
+            for sample in samples {
+                let freshness = if sample.stale { "stale" } else { "fresh" };
+                writeln!(
+                    out,
+                    "{} ({}) — observed {} [{freshness}]",
+                    sample.profile,
+                    sample.meter,
+                    utc(sample.observed_at)
+                )?;
+                for window in sample.windows {
+                    let minutes = window.duration_minutes;
+                    let duration = if minutes % 1440 == 0 {
+                        format!("{}d", minutes / 1440)
+                    } else if minutes % 60 == 0 {
+                        format!("{}h", minutes / 60)
+                    } else {
+                        format!("{minutes}m")
+                    };
+                    let reset = window
+                        .resets_at
+                        .map(utc)
+                        .unwrap_or_else(|| "unavailable".into());
+                    writeln!(
+                        out,
+                        "  {duration}: {}% used; reset {reset}",
+                        window.used_percent
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
 
 /// Fetches the current session list from the daemon via one-shot connection.
 async fn fetch_sessions() -> Result<(Vec<SessionView>, bool)> {

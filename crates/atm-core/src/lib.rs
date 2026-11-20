@@ -15,6 +15,7 @@ pub mod harness_control;
 pub mod harness_registry;
 pub mod lifecycle;
 pub mod model;
+pub mod plan_usage;
 pub mod session;
 pub mod styled_screen;
 pub mod tool;
@@ -39,6 +40,7 @@ pub use lifecycle::{
     NeedsInputReason, NotificationKind,
 };
 pub use model::{derive_display_name, Model};
+pub use plan_usage::{PlanProfileId, PlanUsageSnapshot, PlanUsageWindow};
 pub use session::{
     format_age, ActivityDetail, LinesChanged, SessionDomain, SessionDuration, SessionId,
     SessionStatus, SessionView, StatusLineData,

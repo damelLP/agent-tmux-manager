@@ -44,13 +44,20 @@ impl TestServer {
     /// Internal helper that spawns the server and returns both the test server and registry handle.
     async fn spawn_internal() -> (Self, atmd::registry::RegistryHandle) {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("test.sock");
-
         let registry = spawn_registry();
-        let registry_handle = registry.clone();
-        let cancel_token = CancellationToken::new();
+        let services = atmd::server::methods::MethodServices::new(registry.clone());
+        let server = Self::spawn_with_services(temp_dir, CancellationToken::new(), services).await;
+        (server, registry)
+    }
 
-        let server = DaemonServer::new(socket_path.clone(), registry, cancel_token.clone());
+    async fn spawn_with_services(
+        temp_dir: TempDir,
+        cancel_token: CancellationToken,
+        services: atmd::server::methods::MethodServices,
+    ) -> Self {
+        let socket_path = temp_dir.path().join("test.sock");
+        let server =
+            DaemonServer::with_services(socket_path.clone(), services, cancel_token.clone());
 
         let (ready, started) = tokio::sync::oneshot::channel();
         let run_task = tokio::spawn(async move {
@@ -76,14 +83,12 @@ impl TestServer {
             "Server socket did not appear within {SOCKET_WAIT_TIMEOUT:?}"
         );
 
-        let test_server = TestServer {
+        Self {
             socket_path,
             cancel_token,
             run_task,
             _temp_dir: temp_dir,
-        };
-
-        (test_server, registry_handle)
+        }
     }
 
     /// Spawns a new test server in the background.
@@ -176,6 +181,230 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> TestClient<R, W> {
         };
         self.send(msg).await;
         self.recv().await
+    }
+}
+
+mod plan_usage_contract {
+    use super::*;
+    use atm_org::OrgCommand;
+    use atm_protocol::{error_code, ResponsePayload};
+    use atmd::{org::OrgHandle, registry::RegistryHandle, server::methods::MethodServices};
+    use serde_json::{json, Value};
+
+    async fn rig() -> (TestServer, RegistryHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let org = OrgHandle::open(dir.path().join("org"), cancel.child_token()).await;
+        let now = chrono::Utc::now();
+        org.execute(
+            OrgCommand::RegisterProject {
+                project_id: "fixture".parse().unwrap(),
+                root: dir.path().to_str().unwrap().into(),
+                move_root: false,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        let registry = spawn_registry();
+        for (agent, pane, bound) in [
+            ("alpha", "%1", true),
+            ("bravo", "%2", true),
+            ("unbound", "%3", false),
+        ] {
+            let mut row = create_test_session(agent);
+            row.harness = Harness::ClaudeCode;
+            row.tmux_pane = Some(pane.into());
+            org.execute(
+                OrgCommand::Adopt {
+                    agent_id: format!("fixture/{agent}").parse().unwrap(),
+                    pane: pane.into(),
+                    session_id: bound.then(|| row.id.clone()),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+            registry.register(row).await.unwrap();
+        }
+        let mut services = MethodServices::new(registry.clone());
+        services.org = org;
+        services.state_dir = dir.path().join("state");
+        // The exact committed bindings are the fixture; don't run tmux reconciliation.
+        services.agents = Some(atmd::org::agents::AgentHandle::disabled("fixture"));
+        (
+            TestServer::spawn_with_services(dir, cancel, services).await,
+            registry,
+        )
+    }
+
+    async fn usage(client: &mut TestClient, pane: Option<&str>, params: Value) -> ResponsePayload {
+        client
+            .send(ClientMessage::request(
+                "usage".into(),
+                "usage.list".into(),
+                params,
+                pane.map(str::to_owned),
+            ))
+            .await;
+        match timeout(SOCKET_WAIT_TIMEOUT, client.recv()).await.unwrap() {
+            DaemonMessage::Response { id, payload } if id == "usage" => payload,
+            other => panic!("expected usage response, got {other:?}"),
+        }
+    }
+
+    async fn owner_usage(client: &mut TestClient) -> Value {
+        match usage(client, None, json!({})).await {
+            ResponsePayload::Result(value) => value,
+            other => panic!("owner usage query failed: {other:?}"),
+        }
+    }
+
+    fn status(session: &str, pane: &str, quota: Value, tokens: u32) -> ClientMessage {
+        ClientMessage::status_update(json!({
+            "session_id": session, "tmux_pane": pane, "rate_limits": quota,
+            "context_window": {"context_window_size":100000,"current_usage":{"input_tokens": tokens}}
+        }))
+    }
+
+    #[tokio::test]
+    async fn usage_list_capability_and_scope() {
+        let (server, _) = rig().await;
+        let mut client = server.connect().await;
+        client.send(ClientMessage::connect(None)).await;
+        match timeout(SOCKET_WAIT_TIMEOUT, client.recv()).await.unwrap() {
+            DaemonMessage::Connected { methods, .. } => assert!(
+                methods.iter().any(|m| m == "usage.list"),
+                "usage.list is not advertised"
+            ),
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        assert_eq!(owner_usage(&mut client).await, json!([]));
+        send_applied(
+            &mut client,
+            1,
+            status(
+                "alpha",
+                "%1",
+                json!({"five_hour":{"used_percentage":12}}),
+                1000,
+            ),
+        )
+        .await;
+        assert_eq!(
+            owner_usage(&mut client).await[0]["windows"][0]["used_percent"],
+            json!(12.0)
+        );
+        for (pane, params, code) in [
+            (Some("%1"), json!({}), error_code::REFUSED),
+            (Some("%2"), json!({}), error_code::REFUSED),
+            (Some("invalid"), json!({}), error_code::INVALID_PARAMS),
+            (
+                None,
+                json!({"profile":"claude"}),
+                error_code::INVALID_PARAMS,
+            ),
+        ] {
+            match usage(&mut client, pane, params).await {
+                ResponsePayload::Error(error) => assert_eq!(error.code, code),
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(owner_usage(&mut client).await.as_array().unwrap().len(), 1);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_updates_from_two_bound_sources_share_one_sample_without_changing_context() {
+        let (server, registry) = rig().await;
+        let mut client = server.connect().await;
+        client.handshake(None).await;
+        // Captured: Claude Code 2.1.329, 2026-11-19, ATM status-line push (quota only).
+        // Synthetic: the local session, pane and context around the real quota fields.
+        let captured: Value = serde_json::from_str(include_str!(
+            "../../atm-claude-adapter/tests/fixtures/claude_status_line_quota_2.1.329.jsonl"
+        ))
+        .unwrap();
+        send_applied(
+            &mut client,
+            1,
+            status("alpha", "%1", captured["rate_limits"].clone(), 1000),
+        )
+        .await;
+        let first = owner_usage(&mut client).await;
+        assert_eq!(
+            first[0]["windows"],
+            json!([{"scope":null,"duration_minutes":10080,"used_percent":52.0,"resets_at":"2026-11-22T21:00:00Z"}])
+        );
+
+        send_applied(
+            &mut client,
+            2,
+            status(
+                "alpha",
+                "%1",
+                json!({"seven_day":{"used_percentage":"malformed"}}),
+                7000,
+            ),
+        )
+        .await;
+        let row = registry.get_session(SessionId::new("alpha")).await.unwrap();
+        assert!((row.context_percentage - 7.0).abs() < 1e-9);
+        assert_eq!(
+            owner_usage(&mut client).await[0]["windows"],
+            first[0]["windows"],
+            "malformed quota erased the sample"
+        );
+
+        send_applied(
+            &mut client,
+            3,
+            status(
+                "unbound",
+                "%3",
+                json!({"five_hour":{"used_percentage":95}}),
+                1000,
+            ),
+        )
+        .await;
+        send_applied(
+            &mut client,
+            4,
+            status(
+                "alpha",
+                "%2",
+                json!({"five_hour":{"used_percentage":95}}),
+                1000,
+            ),
+        )
+        .await;
+        assert_eq!(
+            owner_usage(&mut client).await[0]["windows"],
+            first[0]["windows"],
+            "unproven source overwrote the sample"
+        );
+
+        send_applied(
+            &mut client,
+            5,
+            status(
+                "bravo",
+                "%2",
+                json!({"five_hour":{"used_percentage":0}}),
+                1000,
+            ),
+        )
+        .await;
+        let next = owner_usage(&mut client).await;
+        assert_eq!(next.as_array().unwrap().len(), 1);
+        assert_eq!(next[0]["profile"], "claude");
+        assert_eq!(next[0]["meter"], "claude");
+        assert_eq!(next[0]["source"], "claude_code");
+        assert_eq!(
+            next[0]["windows"],
+            json!([{"scope":null,"duration_minutes":300,"used_percent":0.0,"resets_at":null}])
+        );
+        server.shutdown().await;
     }
 }
 

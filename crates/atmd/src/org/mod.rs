@@ -67,6 +67,7 @@ pub mod message_types;
 pub mod messages;
 mod org_tree;
 pub(crate) mod org_tree_methods;
+pub(crate) mod plan_usage_query;
 mod raw;
 pub(crate) mod report;
 pub(crate) mod reporting_line;

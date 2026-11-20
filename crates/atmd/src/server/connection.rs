@@ -29,7 +29,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use atm_claude_adapter::{RawHookEvent, RawStatusLine};
+use atm_claude_adapter::{status_line, RawHookEvent, RawStatusLine};
 use atm_codex_adapter::RawCodexEvent;
 use atm_core::{SessionId, StatusLineData};
 use atm_pi_adapter::RawPiEvent;
@@ -172,6 +172,7 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     methods: Arc<MethodRouter>,
     raw: crate::org::RawHandle,
     org: crate::org::OrgHandle,
+    plan_usage: Option<crate::plan_usage::PlanUsage>,
     message_evidence: Option<crate::org::message_evidence::MessageEvidence>,
     message_history: Option<crate::org::message_history::MessageHistoryHandle>,
     watcher: Option<Forwarder>,
@@ -251,6 +252,7 @@ where
             methods,
             raw: crate::org::RawHandle::default(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
+            plan_usage: None,
             message_evidence: None,
             message_history: None,
             watcher: None,
@@ -264,6 +266,11 @@ where
 
     pub fn with_org(mut self, org: crate::org::OrgHandle) -> Self {
         self.org = org;
+        self
+    }
+
+    pub(crate) fn with_plan_usage(mut self, usage: Option<crate::plan_usage::PlanUsage>) -> Self {
+        self.plan_usage = usage;
         self
     }
 
@@ -823,30 +830,24 @@ where
                 "status line is not a JSON object".to_string(),
             ));
         }
+        let plan_sample = self.plan_usage.as_ref().and_then(|cache| {
+            let windows = status_line::plan_usage_windows(&data);
+            (!windows.is_empty()).then(|| (cache, chrono::Utc::now(), windows))
+        });
         let (pid, pane, status, usage) = parse_status_line_with_pane(data)?;
         let session_id = SessionId::new(status.session_id.clone());
+        let harness = atm_core::Harness::ClaudeCode;
         let mut proof = None;
 
         // Send to registry for processing
         let applied = self
             .registry
-            .update_from_status_line(
-                session_id.clone(),
-                pid,
-                status,
-                atm_core::Harness::ClaudeCode,
-            )
+            .update_from_status_line(session_id.clone(), pid, status, harness)
             .await;
         if applied.is_ok() {
             if let Some(usage) = usage {
-                self.observe_task_usage(
-                    &session_id,
-                    pane.as_deref(),
-                    atm_core::Harness::ClaudeCode,
-                    &usage,
-                    &mut proof,
-                )
-                .await;
+                self.observe_task_usage(&session_id, pane.as_deref(), harness, &usage, &mut proof)
+                    .await;
             }
         }
         // Activity only: it can neither bind nor confirm, so it needs no parent
@@ -859,7 +860,33 @@ where
                 .filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok());
             self.record_message_event(&session_id, pane, None, None, false);
         }
-        applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))
+        applied.map_err(|e| ConnectionError::RegistryError(e.to_string()))?;
+
+        let Some((cache, observed_at, windows)) = plan_sample else {
+            return Ok(());
+        };
+        let Some(pane) = pane
+            .as_deref()
+            .filter(|p| crate::control::reservation::PaneId::parse(*p).is_ok())
+        else {
+            return Ok(());
+        };
+        if self.org.status().is_ok()
+            && self
+                .message_parent_proven(&session_id, Some(pane), harness, &mut proof)
+                .await
+        {
+            if let Ok(state) = self.org.snapshot().await {
+                let source = crate::plan_usage::Source {
+                    session: &session_id,
+                    pane,
+                    harness,
+                    meter: status_line::PLAN_METER,
+                };
+                cache.observe(&state, source, observed_at, windows);
+            }
+        }
+        Ok(())
     }
 
     /// Evidence is installed and usable. A disabled one costs a hook nothing.

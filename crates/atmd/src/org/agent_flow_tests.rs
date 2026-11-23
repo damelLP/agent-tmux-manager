@@ -2427,6 +2427,7 @@ fn pane_row(id: &str, harness: Harness, start: Option<Option<&str>>) -> PaneSess
     PaneSession {
         view: atm_core::SessionView::from_domain(&row),
         pid: Some(4242),
+        process_start: None,
         harness_version: None,
         start: start.map(|source| AcceptedStart {
             source: source.map(Into::into),

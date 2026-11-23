@@ -12,7 +12,7 @@ mod stand_in;
 mod support;
 use serde_json::{json, Value};
 use stand_in::StandInMode;
-use support::{call_on, Confirmation, MessageRig, Recipient};
+use support::{about, call_on, Confirmation, MessageRig, Recipient};
 
 // Unlike ready_agent/shell_agent, launch acknowledges terminal frames by event.
 fn seat(rig: &mut MessageRig, name: &str) -> Recipient {
@@ -72,7 +72,14 @@ fn unbound_pane(rig: &MessageRig) -> String {
     ]))
 }
 fn ask(rig: &MessageRig, who: &Recipient, intent: bool) -> String {
-    rig.call("decision.request", json!({"kind":"plan","title":"Spoken choice","options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":intent}), Some(&who.pane)).unwrap()["decision_id"].as_str().unwrap().into()
+    let mut watch = rig.watch();
+    let id = rig.call("decision.request", json!({"kind":"plan","title":"Spoken choice","options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":intent}), Some(&who.pane)).unwrap()["decision_id"].as_str().unwrap().to_owned();
+    // U8: the bridge writes the question's row to the owner after the request
+    // returns; the no-append checks start once it is in.
+    watch.wait("the question's row to the owner", |e| {
+        e["kind"] == "msg.sent" && e["body"]["kind"] == "question" && e["body"]["from"] == who.id
+    });
+    id
 }
 fn resolve(id: &str, option: &str) -> Value {
     json!({"id":id,"option":option,"relay":true})
@@ -517,6 +524,191 @@ fn decide_relay_is_provisional_and_rejects_note_or_rule() {
     rig.test.rig.close();
 }
 
+// Break caught: confirm not being final, losing exact words/audit, or failing
+// to release the same held task while the owner is still away. Real binaries.
+#[test]
+fn relay_confirm_releases_the_cap() {
+    let mut rig = MessageRig::start(Confirmation::Generous);
+    let chief = seat(&mut rig, "chief");
+    let builder = seat(&mut rig, "builder");
+    assert_eq!(
+        rig.atm_json(None, &["relay", &chief.id, "--format", "json"])["agent"],
+        chief.id
+    );
+    let request = rig.atm_json(
+        Some(&builder.pane),
+        &[
+            "decisions",
+            "request",
+            "--kind",
+            "plan",
+            "--title",
+            "Spoken choice",
+            "--option",
+            "A",
+            "--option",
+            "B",
+            "--recommended",
+            "B",
+            "--may-be-undone",
+            "true",
+            "--changes-intent",
+            "true",
+            "--format",
+            "json",
+        ],
+    );
+    let id = request["decision_id"].as_str().unwrap();
+    let mut watch = rig.watch();
+    let cursor = rig.test.rig.event_cursor(&builder.pane);
+    let provisional = rig.atm_json(
+        Some(&chief.pane),
+        &["decide", id, "B", "--relay", "--format", "json"],
+    );
+    assert_eq!(provisional["decision"]["status"], "taken_provisionally");
+    told_relay(&rig, &mut watch, &builder, cursor, &format!("Decision {id} taken provisionally: B\nRelayed by {} as the owner's spoken answer; he has not confirmed it himself. Finish your task in progress on this option. Start nothing further on it: a task built on it names {id} in rests_on and waits until the owner has confirmed {id}.", chief.id));
+
+    let away = rig.atm_json(None, &["away", "--format", "json"]);
+    assert_eq!(away["stacking_caps"], json!({"project":1}));
+    let task = rig
+        .call(
+            "task.create",
+            json!({"title":"Linked follow-up","measure":{"kind":"owner"},"rests_on":id}),
+            None,
+        )
+        .unwrap();
+    let task = task["task_id"].as_str().unwrap();
+    let assign = || {
+        rig.call(
+            "task.assign",
+            json!({"task_id":task,"agent_id":builder.id}),
+            None,
+        )
+    };
+    let (code, reason) = assign().unwrap_err();
+    assert_eq!(code, "refused");
+    assert_eq!(reason, format!("task {task} rests on decision {id}, which was taken provisionally for the owner: it waits until he has seen {id} (stacking cap 1)"));
+    eprintln!("assign before: {code}: {reason}");
+
+    let cursor = rig.test.rig.event_cursor(&builder.pane);
+    let words = " \tB sounds good; it's right.\n  ";
+    let note =
+        "confirmed in his words, relayed by project/chief: ' \tB sounds good; it's right.\n  '";
+    let escaped_note =
+        "confirmed in his words, relayed by project/chief: ' \\tB sounds good; it's right.\\n  '";
+    // Flags work before the positional NOTE as well as after it.
+    let out = rig.atm(
+        Some(&chief.pane),
+        &["decide", id, "B", "--confirm", "--relay", words],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        out.stdout,
+        format!("{id} resolved: B by=owner\nNote: {escaped_note}\n").as_bytes()
+    );
+    eprintln!("atm decide:\n{}", String::from_utf8_lossy(&out.stdout));
+    told_relay(
+        &rig,
+        &mut watch,
+        &builder,
+        cursor,
+        &format!("Decision {id} resolved: B\nNote: {note}\nStanding rule: no"),
+    );
+    // U8: the relay and the confirm are two replies in the question's thread.
+    assert_eq!(
+        rig.decision_thread(id),
+        [
+            (builder.id.clone(), "asked".into(), vec!["owner".into()]),
+            ("system".into(), "taken".into(), vec![builder.id.clone()]),
+            ("system".into(), "resolved".into(), vec![builder.id.clone()]),
+        ]
+    );
+
+    let assigned = assign().unwrap();
+    assert_eq!(assigned["changed"], true);
+    let record = watch.wait("the formerly held assignment", |event| {
+        event["kind"] == "task.assigned" && event["body"]["task_id"] == task
+    });
+    eprintln!("assign after (still away): {record}");
+    let text = |args: &[&str]| {
+        let out = rig.atm(None, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(
+        text(&["decisions"]),
+        "No matching decisions.\n0 pending, 0 provisional\n"
+    );
+    let listed = text(&["decisions", "--status", "resolved"]);
+    assert_eq!(listed, format!("{id} resolved from=project/builder kind=plan class=changes_intent\n  title: Spoken choice\n  option: A\n  option: B (recommended)\n  answer: B by=owner rule=false\n  note: {escaped_note}\n0 pending, 0 provisional\n"));
+    eprintln!("atm decisions --status resolved:\n{listed}");
+    let again_away = text(&["away"]);
+    assert!(
+        again_away.starts_with("Already away since "),
+        "{again_away}"
+    );
+    eprintln!("atm away:\n{again_away}");
+    let report = text(&["report", "--project", "project"]);
+    assert!(
+        report.contains(
+            "decisions 0 taken for you, 0 agent decided, 1 relayed, 0 overruled, 0 tasks redone"
+        ),
+        "{report}"
+    );
+    eprintln!("atm report:\n{report}");
+    let digest = text(&["back"]);
+    for line in [
+        "Relayed spoken answers (1):".into(),
+        format!("{id} Spoken choice = B [resolved; by=owner; relayed by project/chief]"),
+        format!("  used: {task} [assigned; direct] Linked follow-up"),
+        format!("  Answer caller: {}", chief.pane.pane_id),
+        "Still waiting: none.".into(),
+    ] {
+        assert!(
+            digest.lines().any(|seen| seen == line),
+            "missing {line:?}: {digest}"
+        );
+    }
+    assert!(!digest.contains("  Answer: atm decide"), "{digest}");
+    eprintln!("atm back:\n{digest}");
+
+    let mut decisions = Vec::new();
+    for file in std::fs::read_dir(rig.test.rig.root().join("state/log/events")).unwrap() {
+        let path = file.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
+            continue;
+        }
+        let journal = std::fs::read_to_string(path).unwrap();
+        // A later delivery may be appending; only complete JSONL records count.
+        for line in journal
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_suffix('\n'))
+        {
+            let value: Value = serde_json::from_str(line).unwrap();
+            if value["body"]["decision_id"] == id
+                && value["kind"].as_str().unwrap().starts_with("decision.")
+            {
+                decisions.push((line.to_owned(), value));
+            }
+        }
+    }
+    assert_eq!(
+        decisions.len(),
+        2,
+        "one provisional + one resolved: {decisions:?}"
+    );
+    let (line, resolved) = decisions
+        .iter()
+        .find(|(_, row)| row["kind"] == "decision.resolved")
+        .unwrap();
+    assert_eq!(
+        resolved["body"],
+        json!({"decision_id":id,"option":"B","by":"owner","note":note,"standing_rule":false,"caller_pane":chief.pane.pane_id})
+    );
+    eprintln!("sealed journal: {line}");
+    rig.test.rig.close();
+}
+
 // Break caught: a self-relay becoming agent-decided, retry becoming confirmation,
 // or retry of an away-table take falsely acquiring relay provenance.
 #[test]
@@ -566,8 +758,11 @@ fn told_relay(
     let sent = watch.wait("the relay notice", |e| {
         e["kind"] == "msg.sent" && e["body"]["to"] == who.id
     });
+    // U8: the notice is a reply's wake row: today's message plus `post`.
+    let mut row = sent["body"].clone();
+    assert!(row.as_object_mut().unwrap().remove("post").is_some());
     assert_eq!(
-        sent["body"],
+        row,
         json!({"from":"system","to":who.id,"kind":"answer","body":body,"attachments":[],"task":null})
     );
     let id = format!("m{}", sent["seq"]);
@@ -646,5 +841,71 @@ fn relay_notice_is_enqueued_once_across_retry_and_restart() {
         &["decide", &detail, "no", "--relay", "--format", "json"],
     );
     told_relay(&rig, &mut watch, &chief, cursor, &format!("Decision {detail} taken provisionally: no\nRelayed by {} as the owner's spoken answer; he has not confirmed it himself. Carry on; he may still overrule it.", chief.id));
+    rig.test.rig.close();
+}
+
+// s3-giverelay. Break caught: the real CLI/daemon let a seat that is not the
+// designated relay give up, let a partial relay form reach the daemon, drop
+// the owner's words from the journal, or change his plain give-up. Real binaries.
+#[test]
+fn relay_gives_up_a_held_delivery_in_the_owners_words() {
+    let mut rig = MessageRig::start(Confirmation::Generous);
+    let chief = seat(&mut rig, "chief");
+    let builder = seat(&mut rig, "builder");
+    // A down recipient's messages stay queued until somebody gives up.
+    rig.call("agent.down", json!({"agent": builder.id}), None)
+        .unwrap();
+    let send = |body: &str| {
+        let sent = rig.call("msg.send", json!({"to": builder.id, "body": body}), None);
+        sent.unwrap()["message_id"].as_str().unwrap().to_owned()
+    };
+    let (stale, other) = (send("stale"), send("stale too"));
+    let queued = |id: &str| rig.inbox_entry(None, Some(&builder.id), id)["status"] == "queued";
+    let words = "Cancel them";
+    let relay_give_up = |id: &str| {
+        let args = ["wake", "give-up", "--relay", "--confirm", id, words];
+        rig.atm(Some(&chief.pane), &args)
+    };
+    // No relay designated, then another seat designated: the chief is refused.
+    let refusal = format!("{} may not confirm as relay for message {stale}", chief.id);
+    for designated in [None, Some(&builder)] {
+        if let Some(seat) = designated {
+            set(&rig, seat);
+        }
+        let out = relay_give_up(&stale);
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(&refusal),
+            "{out:?}"
+        );
+        assert!(queued(&stale));
+    }
+    set(&rig, &chief);
+    // A partial form never reaches the daemon.
+    let partial = rig.atm(
+        Some(&chief.pane),
+        &["wake", "give-up", "--relay", &stale, words],
+    );
+    assert_eq!(partial.status.code(), Some(2), "{partial:?}");
+    assert!(queued(&stale));
+    // The designated relay with his words: failed for good, words in the journal.
+    let mut watch = rig.watch();
+    let out = relay_give_up(&stale);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with(&format!("{stale} failed\n")));
+    let reason = format!(
+        "owner gave up on delivery; confirmed in his words, relayed by {}: '{words}'",
+        chief.id
+    );
+    let failed = watch.wait("the relayed give-up", about("msg.delivery_failed", &stale));
+    assert_eq!(failed["body"]["reason"], reason.as_str());
+    assert_eq!(failed["body"]["final"], true);
+    let entry = rig.inbox_entry(None, Some(&builder.id), &stale);
+    assert_eq!(entry["delivery"]["reason"], reason.as_str(), "{entry}");
+    // The owner's plain give-up is unchanged.
+    let owner = rig.atm_json(None, &["wake", "give-up", &other, "--format", "json"]);
+    assert_eq!(owner["status"], "failed");
+    let failed = watch.wait("the owner's give-up", about("msg.delivery_failed", &other));
+    assert_eq!(failed["body"]["reason"], "owner gave up on delivery");
     rig.test.rig.close();
 }

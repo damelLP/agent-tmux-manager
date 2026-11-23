@@ -13,9 +13,13 @@ Four skills installed for Claude Code, pi and Codex. Choose one protocol:
 checked model and harness/version, with unverified behavior stated explicitly
 in [`shared/references/atm-named-agents.md`](shared/references/atm-named-agents.md).
 Source/installation checks are not permission for unattended activation.
-Create durable owner choices with `atm decisions request`, and withdraw your own
-Pending requests with `atm decisions withdraw`. Decision lists remain
-requester-scoped, and only Owner can inspect another inbox. A2 digest/A3 drift
+Use `atm post --tag <seat>` in your project for a new brief or report. Read
+`[mN] Read: atm inbox --id mN` as before, reply in the thread with
+`atm post --reply` when the inbox offers it, and `atm ack mN` after handling
+Delivered. Create durable owner choices with `atm decisions request` and
+withdraw your own Pending requests with `atm decisions withdraw`. Decision
+lists remain requester-scoped; only Owner has full access to others' inboxes.
+A2 digest/A3 drift
 scheduling are not built.
 The skills do not create substitute clients or bypass those authority limits.
 
@@ -48,9 +52,11 @@ remains unimplemented; legacy skills use the profile script.
 
 ## Prerequisites
 
-- Named skills need the stage-1 commands `atm me`, `atm task`, `atm decisions`
-  and the named-agent message/lifecycle commands. Check command `--help` rather
-  than assuming the release number identifies those capabilities.
+- Named skills use `atm me`, `atm post`, `atm inbox`, `atm ack`, `atm task` and
+  `atm decisions`. The final `atm wake` recovery commands also need the updated
+  CLI. Check command `--help` rather than relying on the release number. Until
+  the switch is complete, old skills can read the same inbox line and use the
+  legacy message commands; old answers remain direct messages, not thread replies.
 - **Legacy loop: `atm` built after #119.** Its `atm send` pastes text and
   refuses unsafe sends. Check: `atm send --help` mentions "bracketed paste";
   `atm-coordinate` stops if it is missing.
@@ -128,8 +134,8 @@ symlinks and failure isolation. `tests/atm_named_skills.rs` checks metadata,
 reference/anchor layout, evidence slots and short entry examples, **not agent
 behavior**.
 
-[`evals/atm-skills/`](../../../../evals/atm-skills/) holds the legacy billed
-`claude -p` decision tests. **Do not run them without approval or reuse the old
+[`evals/atm-skills/`](../../../../evals/atm-skills/) has offline named-wake and
+strict-tag fixtures as well as legacy billed `claude -p` decision tests. **Do not run them without approval or reuse the old
 runner unchanged for the named skills**: it retains parts of personal setup.
 K3 must adapt the cases/client stand-ins and use a reviewed sealed launcher
 without personal connectors/skills, with every turn watched including startup.

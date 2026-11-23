@@ -1,9 +1,12 @@
 //! Bounded, read-only history over committed messages; no I/O or clock.
 //!
-//! Membership is fenced by send sequence, while delivery/read facts are current.
-//! Cursors bind normalized filters and attributed reader/scope, not authority:
-//! the daemon must admit the scope anew on every page. Attachments are never read.
-use crate::{Address, AgentId, Message, MessageId, OrgState, TaskId};
+//! Send sequence fences the candidate rows; delivery/read facts and presentation
+//! are current. Cursors bind normalized filters and attributed reader/scope, not
+//! authority: the daemon must admit the scope anew on every page.
+//! Attachments are never read.
+use crate::{
+    Address, AgentId, Message, MessageContent, MessageId, OrgState, PostPresentation, TaskId,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -120,7 +123,7 @@ fn validate_scope(p: &HistoryParams, scope: &HistoryScope) -> Result<(), History
     }
     Ok(())
 }
-fn matches(message: &Message, p: &HistoryParams, scope: &HistoryScope) -> bool {
+fn matches_scope(message: &Message, p: &HistoryParams, scope: &HistoryScope) -> bool {
     let c = &message.content;
     let addressed = match scope {
         HistoryScope::All => p
@@ -143,12 +146,23 @@ fn matches(message: &Message, p: &HistoryParams, scope: &HistoryScope) -> bool {
         }
     };
     addressed
-        && p.task
-            .as_ref()
-            .is_none_or(|task| c.task.as_ref() == Some(task))
         && p.since.is_none_or(|since| message.sent_at >= since)
         && p.until.is_none_or(|until| message.sent_at < until)
-        && p.text.as_ref().is_none_or(|text| c.body.contains(text))
+}
+
+fn matches_content(
+    p: &HistoryParams,
+    content: &MessageContent,
+    presentation: Option<&PostPresentation>,
+) -> bool {
+    p.task.as_ref().is_none_or(|task| {
+        !matches!(presentation, Some(PostPresentation::Removed))
+            && content.task.as_ref() == Some(task)
+    }) && p.text.as_ref().is_none_or(|text| {
+        presentation
+            .map_or(content.body.as_str(), PostPresentation::body)
+            .contains(text)
+    })
 }
 
 pub fn history<'a>(
@@ -158,6 +172,7 @@ pub fn history<'a>(
     seq: u64,
 ) -> Result<HistorySelection<'a>, HistoryError> {
     validate_scope(p, scope)?;
+    let filter_content = p.task.is_some() || p.text.is_some();
     let cursor = p
         .cursor
         .as_ref()
@@ -174,7 +189,14 @@ pub fn history<'a>(
             || c.last.seq() > c.fence
             || c.filters != Filters::from(p)
             || &c.scope != scope
-            || !position.is_some_and(|m| matches(m, p, scope))
+            || !position.is_some_and(|m| {
+                // An edited or removed anchor is only an offset. It need not
+                // still match, and checking its original text would expose it.
+                matches_scope(m, p, scope)
+                    && (!filter_content
+                        || state.wake_presentation(&m.content).is_some()
+                        || matches_content(p, &m.content, None))
+            })
         {
             return Err(HistoryError::InvalidParams(
                 "cursor does not match history query",
@@ -187,7 +209,11 @@ pub fn history<'a>(
     let capacity = usize::from(p.limit) + 1;
     let mut rows = VecDeque::with_capacity(capacity);
     for message in state.messages().filter(|m| {
-        m.id.seq() <= fence && cursor.as_ref().is_none_or(|c| m.id < c.last) && matches(m, p, scope)
+        m.id.seq() <= fence
+            && cursor.as_ref().is_none_or(|c| m.id < c.last)
+            && matches_scope(m, p, scope)
+            && (!filter_content
+                || matches_content(p, &m.content, state.wake_presentation(&m.content)))
     }) {
         if rows.len() == capacity {
             rows.pop_front();

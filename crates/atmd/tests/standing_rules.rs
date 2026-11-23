@@ -198,6 +198,12 @@ async fn only_accepted_owner_rule_commands_touch_the_rules_file() {
 async fn system_rule_request_without_a_project_is_refused_before_commit() {
     let rig = Rig::new().await;
     let request: DecisionRequest = serde_json::from_value(json!({"requester":"system","kind":"policy","title":"System question","context":"","files":[],"options":["yes","no"],"recommended":null,"may_be_undone":true,"changes_intent":false,"deadline":null})).unwrap();
+    // U8: the bridge posts its question, with a row to the owner; the state
+    // compared below starts once that row is written.
+    let mut rows = rig
+        .org
+        .watch(vec!["msg.sent".into()], rig.org.status().unwrap())
+        .unwrap();
     let events = rig
         .org
         .execute(
@@ -207,6 +213,12 @@ async fn system_rule_request_without_a_project_is_refused_before_commit() {
         .await
         .unwrap();
     let id = DecisionId::new(events.first().unwrap().seq);
+    let row = tokio::time::timeout(std::time::Duration::from_secs(60), rows.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.body["to"], "owner");
     let before = rig.org.snapshot().await.unwrap();
     assert_eq!(
         rig.resolve(id, None, true).await.unwrap_err().0.code,

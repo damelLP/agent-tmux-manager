@@ -1178,8 +1178,8 @@ fn script_readopt(adoption: &Adoption, text: &str, command: &str) {
 async fn readopt_keeps_a_binding_whose_row_is_only_a_discovery_row() {
     // Review 19, probe r02. A Ready agent bound to s1; its registry row is
     // only the discovery row, as every row is after a daemon restart until
-    // the harness's next event. Adopting it again on its idle pane must not
-    // drop the binding, and writes nothing.
+    // the harness's next event. A same-pane adopt must refuse without
+    // dropping the binding or changing the agent state.
     let mut adoption = Adoption::new().await;
     adoption.rig.row("s1", "%1", false).await;
     *adoption.rig.proc.lock().unwrap() = Some(job_in_front());
@@ -1201,35 +1201,33 @@ async fn readopt_keeps_a_binding_whose_row_is_only_a_discovery_row() {
         .row_of("pending-100", "%1", false, Harness::Pi)
         .await;
     progress(&mut adoption.events, "finished", Some("q/lead")).await;
-    let recorded = adoption.agent().await.unwrap();
-    assert_eq!(recorded.status, AgentStatus::Ready);
-    assert_eq!(recorded.session_id, Some(SessionId::new("s1")));
-
-    let mut committed = adoption.rig.org.committed.subscribe();
-    let before = adoption.rig.org.status().unwrap();
-    script_readopt(&adoption, PI_PADDED, "pi");
-    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
-    assert_eq!(adoption.rig.client.pending_reads(&pane("%1")).unwrap(), 0);
-    assert_eq!(committed_kinds(&mut committed), Vec::<String>::new());
-    assert_eq!(adoption.rig.org.status().unwrap(), before);
-    assert_eq!(adoption.agent().await.unwrap(), recorded);
-
-    // The same agent suspended with its binding (Starting, as a restart check
-    // leaves it on a busy screen): the adopt reports the editor and keeps s1.
-    adoption
-        .rig
-        .command(OrgCommand::Revalidate {
-            agent_id: adoptee(),
-        })
-        .await;
-    assert_eq!(adoption.agent().await.unwrap().status, AgentStatus::Starting);
-    committed_kinds(&mut committed);
-    script_readopt(&adoption, PI_PADDED, "pi");
-    assert_eq!(adoption.adopt().await.unwrap().state, AgentStatus::Ready);
-    assert_eq!(committed_kinds(&mut committed), ["agent.editor_ready"]);
-    let agent = adoption.agent().await.unwrap();
-    assert_eq!(agent.status, AgentStatus::Ready);
-    assert_eq!(agent.session_id, Some(SessionId::new("s1")));
+    let expected = "agent q/lead is already adopted in %1; its harness has not reported its session \
+                    since the restart, so nothing was changed. It reports at the seat's next turn; a Claude \
+                    seat also reports when its pane is resized.";
+    let pane = pane("%1");
+    let effects = mutations(&adoption.rig);
+    for status in [AgentStatus::Ready, AgentStatus::Starting] {
+        // Restart can also leave the agent Starting with its binding intact.
+        if status == AgentStatus::Starting {
+            adoption
+                .rig
+                .command(OrgCommand::Revalidate { agent_id: adoptee() })
+                .await;
+        }
+        let recorded = adoption.agent().await.unwrap();
+        assert_eq!(recorded.status, status);
+        assert_eq!(recorded.session_id, Some(SessionId::new("s1")));
+        let mut committed = adoption.rig.org.committed.subscribe();
+        let before = adoption.rig.org.status().unwrap();
+        adoption.rig.client.script_inspect(&pane, Some(&tagged)).unwrap();
+        let result = adoption.adopt().await;
+        assert!(matches!(&result, Err(AgentError::Refused(message)) if message == expected), "{result:?}");
+        assert_eq!(adoption.rig.client.pending_reads(&pane).unwrap(), 0);
+        assert!(committed_kinds(&mut committed).is_empty());
+        assert_eq!(adoption.rig.org.status().unwrap(), before);
+        assert_eq!(adoption.agent().await.unwrap(), recorded);
+        assert_eq!(mutations(&adoption.rig), effects);
+    }
 }
 
 #[tokio::test]
@@ -2131,6 +2129,7 @@ fn harness_row(id: &str, child: bool, harness: Harness) -> crate::registry::Pane
     crate::registry::PaneSession {
         view: atm_core::SessionView::from_domain(&row),
         pid: None,
+        process_start: None,
         start: None,
         harness_version: None,
     }

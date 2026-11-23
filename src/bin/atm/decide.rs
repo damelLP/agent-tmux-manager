@@ -20,8 +20,11 @@ pub struct DecideArgs {
     note: Option<String>,
     #[arg(long = "rule")]
     standing_rule: bool,
-    #[arg(long, conflicts_with_all = ["note", "standing_rule"])]
+    #[arg(long, conflicts_with = "standing_rule")]
     relay: bool,
+    /// Confirm the same provisional option as the designated relay; NOTE is the owner's verbatim words
+    #[arg(long, requires_all = ["relay", "note"], conflicts_with = "standing_rule")]
+    confirm: bool,
     #[arg(long, value_enum, default_value = "text")]
     format: MessageFormat,
 }
@@ -63,7 +66,7 @@ enum DecisionsAction {
         may_be_undone: bool,
         #[arg(long, action = clap::ArgAction::Set, required = true)]
         changes_intent: bool,
-        /// Future RFC3339 timestamp; the daemon checks time, with no expiry timer
+        /// Future RFC3339 timestamp; a decision still pending then expires
         #[arg(long, value_parser = parse_deadline)]
         deadline: Option<DateTime<Utc>>,
         /// Place after request; listing flags cannot be combined with a mutation
@@ -136,7 +139,11 @@ fn relay_text(id: DecisionId, option: &str, result: &MutationResult) -> Result<S
 }
 
 pub async fn cmd_decide(args: DecideArgs) -> Result<()> {
-    if args.relay {
+    if args.relay && !args.confirm && args.note.is_some() {
+        use clap::error::ErrorKind::ArgumentConflict;
+        clap::Error::raw(ArgumentConflict, "NOTE cannot be used with --relay alone").exit();
+    }
+    if args.relay && !args.confirm {
         let (result, raw): (MutationResult, _) = request(
             "decision.resolve",
             serde_json::json!({"id":args.id,"option":&args.option,"relay":true}),
@@ -152,7 +159,8 @@ pub async fn cmd_decide(args: DecideArgs) -> Result<()> {
             option: args.option,
             note: args.note,
             standing_rule: args.standing_rule,
-            relay: false,
+            relay: args.relay,
+            confirm: args.confirm,
         },
     )
     .await?;
@@ -205,6 +213,13 @@ pub async fn cmd_decide(args: DecideArgs) -> Result<()> {
         escaped(&answer.option, false),
         if result.changed { "" } else { " (unchanged)" }
     );
+    if args.confirm {
+        let note = answer.note.as_deref()
+            .filter(|_| decision.id == args.id && decision.status == DecisionStatus::Resolved)
+            .context("invalid relay confirmation result: expected the requested decision resolved with a note")?;
+        let note = escaped(note, false);
+        text.push_str(&format!(" by={}\nNote: {note}", answer.by));
+    }
     if decision.status == DecisionStatus::Overruled {
         if let Some(redo) = result
             .redo
@@ -486,11 +501,12 @@ mod tests {
         assert!(super::relay_text(id, "yes", &result).is_err());
     }
 
-    // Break caught: --relay accepts caller free text or the standing-rule path.
+    // Break caught: the standing-rule path or fabricated identity parses with relay.
+    // A note without --confirm is refused pre-RPC by cmd_decide (CLI-tested).
     #[test]
-    fn relay_arguments_exclude_note_and_rule() {
+    fn relay_arguments_exclude_rule_and_identity() {
         assert!(Args::try_parse_from(["atm", "decide", "d3", "no", "--relay"]).is_ok());
-        for extra in [vec!["note"], vec!["--rule"], vec!["--by", "owner"]] {
+        for extra in [vec!["--rule"], vec!["--by", "owner"]] {
             let mut args = vec!["atm", "decide", "d3", "no", "--relay"];
             args.extend(extra);
             assert_eq!(Args::try_parse_from(args).unwrap_err().exit_code(), 2);

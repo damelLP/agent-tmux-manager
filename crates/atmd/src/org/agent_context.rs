@@ -3,7 +3,9 @@
 
 use super::{agents::AgentError, message_inbox::caller_address, messages::MessageError, OrgHandle};
 use crate::server::methods::{parse_params, CallContext, MethodError, MethodRouter};
-use atm_org::{Address, Agent, AgentId, MessageId, MessageKind, OrgState, RoleSpec};
+use atm_org::{
+    Address, Agent, AgentId, MessageId, MessageKind, OrgState, PostPresentation, RoleSpec,
+};
 use atm_protocol::error_code;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -111,9 +113,9 @@ fn assemble_context(
             message_id: message.id,
             kind: message.content.kind,
             from: message.content.from.clone(),
-            first_line: message
-                .content
-                .body
+            first_line: state
+                .wake_presentation(&message.content)
+                .map_or(message.content.body.as_str(), PostPresentation::body)
                 .lines()
                 .next()
                 .unwrap_or_default()
@@ -122,9 +124,7 @@ fn assemble_context(
         .collect();
     Ok(AgentContext {
         agent_id: agent.id.clone(),
-        report_command: format!(
-            "atm msg send --to {manager} --kind report --body 'DONE: <result>'"
-        ),
+        report_command: format!("atm post --tag {manager} --kind report --body 'DONE: <result>'"),
         manager,
         role_file,
         instructions: role.map(|r| r.instructions),
@@ -319,6 +319,7 @@ mod tests {
                 body: "First\nSecond".into(),
                 attachments: vec![],
                 task: None,
+                post: None,
             }),
         ]
         .into_iter()
@@ -338,7 +339,7 @@ mod tests {
                 "role_file":"/project/.atm/roles/worker.md","instructions":"Fresh\n",
                 "unread_messages":[{"message_id":"m4","kind":"note","from":"system","first_line":"First"}],
                 "memory":{"path":"/project/.atm/memory/worker.md","exists":true},"open_tasks":[],
-                "report_command":"atm msg send --to project/lead --kind report --body 'DONE: <result>'"
+                "report_command":"atm post --tag project/lead --kind report --body 'DONE: <result>'"
             })
         );
         assert_eq!(state, before);
@@ -373,6 +374,7 @@ mod tests {
             body: "New session: run atm me later".into(),
             attachments: vec![],
             task: None,
+            post: None,
         };
         let mut state = OrgState::default();
         for (seq, event) in [
@@ -410,6 +412,77 @@ mod tests {
                 "New session: run atm me later".to_string()
             )]
         );
+    }
+
+    // Break caught: an unread wake's preview uses the journal's original copy.
+    #[test]
+    fn context_unread_wake_uses_edited_text_then_removed() {
+        use atm_org::{OrgEvent, PostEdited, PostRemoved};
+        use serde_json::json;
+        let now = "2026-01-15T12:00:00Z".parse().unwrap();
+        let agent: AgentId = "project/worker".parse().unwrap();
+        let mut state = OrgState::default();
+        for (i, (kind, body)) in [
+            (
+                "project.registered",
+                json!({"project_id":"project","root":"/project"}),
+            ),
+            (
+                "agent.adopted",
+                json!({"agent_id":agent,"pane":"%7","session_id":null}),
+            ),
+            (
+                "channel.posted",
+                json!({"channel":"project","author":"owner","kind":"note",
+                "body":"Old instructions\nSecond line","attachments":[],"mentions":[],
+                "wake":[agent],"route":false}),
+            ),
+            (
+                "msg.sent",
+                json!({"from":"owner","to":agent,"kind":"note","post":"m3",
+                "body":"Old instructions\nSecond line","attachments":[],"task":null}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = OrgEvent::from_parts(kind, &body).unwrap().unwrap();
+            state.apply(i as u64 + 1, now, &event).unwrap();
+        }
+        let preview = |state: &OrgState, expected: &str| {
+            let context =
+                assemble_context(state, state.agent(&agent).unwrap(), None, false).unwrap();
+            assert_eq!(
+                serde_json::to_value(context.unread_messages).unwrap(),
+                json!([
+                    {"message_id":"m4","kind":"note","from":"owner","first_line":expected}
+                ])
+            );
+        };
+        preview(&state, "Old instructions");
+        state
+            .apply(
+                5,
+                now,
+                &OrgEvent::ChannelPostEdited(PostEdited {
+                    post: MessageId::new(3),
+                    actor: Address::Owner,
+                    body: "New instructions\nNot the preview".into(),
+                }),
+            )
+            .unwrap();
+        preview(&state, "New instructions");
+        state
+            .apply(
+                6,
+                now,
+                &OrgEvent::ChannelPostRemoved(PostRemoved {
+                    post: MessageId::new(3),
+                    actor: Address::Owner,
+                }),
+            )
+            .unwrap();
+        preview(&state, "removed");
     }
 
     // Break caught: caller timeout drops the worker's permit and permits an

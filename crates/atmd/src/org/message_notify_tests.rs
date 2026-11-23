@@ -279,6 +279,7 @@ fn content() -> MessageContent {
         body: "private body".into(),
         attachments: vec![],
         task: None,
+        post: None,
     }
 }
 fn envelope(seq: u64, c: MessageContent) -> Envelope {
@@ -815,4 +816,114 @@ async fn committed_message_reaches_existing_runner_as_one_literal_argument() {
     );
     cancel.cancel();
     task.await.unwrap();
+}
+
+// The lead's note N6: a wake row to the owner whose post he has already been
+// shown in its channel pings nothing, whatever the delay. Break: such a row
+// counted open, or plain rows and later posts' rows no longer pinging.
+#[test]
+fn owner_wake_behind_his_marker_is_not_open() {
+    let fact =
+        |kind: &str, body: serde_json::Value| OrgEvent::from_parts(kind, &body).unwrap().unwrap();
+    let post = serde_json::json!({"channel":"alpha","author":"alpha/lead","session_id":null,
+        "kind":"note","body":"b","attachments":[],"task":null,"thread":null,
+        "mentions":["owner"],"wake":["owner"],"route":false});
+    let row = |post: Option<&str>| {
+        serde_json::json!({"from":"alpha/lead","to":"owner","kind":"note","body":"b",
+            "attachments":[],"task":null,"post":post})
+    };
+    let mut state = OrgState::default();
+    let at: DateTime<Utc> = "2026-01-01T12:00:00Z".parse().unwrap();
+    for (seq, event) in [
+        fact("project.registered", serde_json::json!({"project_id":"alpha","root":"/alpha"})),
+        fact("agent.adopted", serde_json::json!({"agent_id":"alpha/lead","pane":"%1","session_id":null})),
+        fact("channel.posted", post.clone()),
+        fact("channel.seen", serde_json::json!({"channel":"alpha","reader":"owner","through":"m3","session_id":null})),
+        fact("msg.sent", row(Some("m3"))),
+        fact("msg.sent", row(None)),
+        fact("channel.posted", post),
+        fact("msg.sent", row(Some("m7"))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state.apply(seq as u64 + 1, at, &event).unwrap();
+    }
+    assert!(
+        !still_open(&state, Subject::Message(MessageId::new(5))),
+        "behind his marker"
+    );
+    assert!(
+        still_open(&state, Subject::Message(MessageId::new(6))),
+        "a plain message"
+    );
+    assert!(
+        still_open(&state, Subject::Message(MessageId::new(8))),
+        "a post after his marker"
+    );
+}
+
+// U8 (design 12, the lead's Q4): a question's row to the owner is not pinged,
+// because its decision.requested is. Break caught: the question pinged twice,
+// the decision ping lost, or another decision step's row to him (a redo note
+// for a task the owner or system created) losing the ping it has today.
+#[test]
+fn question_row_to_the_owner_is_not_pinged_twice_and_a_redo_row_still_is() {
+    let fact =
+        |kind: &str, body: serde_json::Value| OrgEvent::from_parts(kind, &body).unwrap().unwrap();
+    let post = |author: &str, step: &str, thread: serde_json::Value| {
+        serde_json::json!({"channel":"alpha","author":author,"session_id":null,
+            "kind":"note","body":"b","attachments":[],"task":null,"thread":thread,
+            "mentions":["owner"],"wake":["owner"],"route":false,
+            "decision":{"decision_id":"d3","step":step}})
+    };
+    let row = |from: &str, post: &str| {
+        serde_json::json!({"from":from,"to":"owner","kind":"note","body":"b",
+            "attachments":[],"task":null,"post":post})
+    };
+    let mut state = OrgState::default();
+    let at: DateTime<Utc> = "2026-01-01T12:00:00Z".parse().unwrap();
+    for (seq, event) in [
+        fact(
+            "project.registered",
+            serde_json::json!({"project_id":"alpha","root":"/alpha"}),
+        ),
+        fact(
+            "agent.adopted",
+            serde_json::json!({"agent_id":"alpha/lead","pane":"%1","session_id":null}),
+        ),
+        fact(
+            "decision.requested",
+            serde_json::json!({"requester":"alpha/lead","kind":"plan",
+            "title":"t","context":"","files":[],"options":["a","b"],"recommended":"a",
+            "may_be_undone":true,"changes_intent":true,"deadline":null}),
+        ),
+        fact(
+            "channel.posted",
+            post("alpha/lead", "asked", serde_json::Value::Null),
+        ),
+        fact("msg.sent", row("alpha/lead", "m4")),
+        fact(
+            "channel.posted",
+            post("system", "redo:t9", serde_json::json!("m4")),
+        ),
+        fact("msg.sent", row("system", "m6")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state.apply(seq as u64 + 1, at, &event).unwrap();
+    }
+    assert!(
+        still_open(&state, Subject::Decision(DecisionId::new(3))),
+        "the decision ping stays"
+    );
+    assert!(
+        !still_open(&state, Subject::Message(MessageId::new(5))),
+        "the question's row"
+    );
+    assert!(
+        still_open(&state, Subject::Message(MessageId::new(7))),
+        "a redo note's row"
+    );
 }

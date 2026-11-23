@@ -7,6 +7,7 @@ enum DelayAt {
     Paste,
     Command,
     State,
+    Survey,
 }
 type Pause = (
     std::sync::Arc<tokio::sync::Notify>,
@@ -56,8 +57,9 @@ impl TmuxClient for DelayedClient {
     {
         Box::pin(async move {
             let result = self.mock.raw_command(command, args).await;
-            if matches!(self.at, DelayAt::State)
-                && args.contains(&crate::control::send::STATE_FORMAT)
+            if (matches!(self.at, DelayAt::State)
+                && args.contains(&crate::control::send::STATE_FORMAT))
+                || (matches!(self.at, DelayAt::Survey) && args.contains(&"capture-pane"))
             {
                 self.delay().await;
             }
@@ -131,6 +133,7 @@ async fn drop_caller_at(at: DelayAt) {
     );
     untagged(&mock, "%1");
     mock.set_next_raw_output("0 1");
+    mock_shell(&mock, "%1");
     let c = control.clone();
     let send = tokio::spawn(async move { c.send("%1".into(), "once".into()).await });
     entered.notified().await;
@@ -138,7 +141,7 @@ async fn drop_caller_at(at: DelayAt) {
     let _ = send.await;
     release.add_permits(1);
     control.flush_audits().await;
-    if matches!(at, DelayAt::State) {
+    if matches!(at, DelayAt::State | DelayAt::Survey) {
         assert!(input_calls(&mock).is_empty());
     } else {
         assert_eq!(
@@ -162,6 +165,12 @@ async fn drop_caller_at(at: DelayAt) {
 #[tokio::test]
 async fn dropped_send_caller_during_state_read_never_pastes() {
     tokio::time::timeout(Duration::from_secs(30), drop_caller_at(DelayAt::State))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn dropped_send_caller_during_survey_read_never_pastes() {
+    tokio::time::timeout(Duration::from_secs(30), drop_caller_at(DelayAt::Survey))
         .await
         .unwrap();
 }
@@ -202,6 +211,9 @@ async fn near_deadline(at: DelayAt) {
     tokio::time::advance(Duration::from_millis(29_999)).await;
     untagged(&mock, "%1");
     mock.set_next_raw_output("0 1");
+    if !matches!(at, DelayAt::Command) {
+        mock_shell(&mock, "%1");
+    }
     release.send(()).unwrap();
     job.await.unwrap().unwrap();
     let result = send.await.unwrap();
@@ -209,7 +221,7 @@ async fn near_deadline(at: DelayAt) {
     // the admitted input even after that caller timed out and dropped its wait.
     assert!(matches!(result, Err(ServiceError::Timeout)));
     control.flush_audits().await;
-    if matches!(at, DelayAt::State) {
+    if matches!(at, DelayAt::State | DelayAt::Survey) {
         assert!(input_calls(&mock).is_empty());
     } else {
         let first = if matches!(at, DelayAt::Command) {
@@ -249,4 +261,8 @@ async fn reservation_parked_spawn_near_deadline_still_submits() {
 #[tokio::test(start_paused = true)]
 async fn reservation_parked_state_read_past_deadline_never_pastes() {
     near_deadline(DelayAt::State).await;
+}
+#[tokio::test(start_paused = true)]
+async fn reservation_parked_survey_read_past_deadline_never_pastes() {
+    near_deadline(DelayAt::Survey).await;
 }

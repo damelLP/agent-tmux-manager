@@ -1,0 +1,61 @@
+Captured: claude 2.1.330, 2026-11-21, sealed rig (private user+net namespace, canned Messages API, no atmd), tmux 3.8 capture-pane -p -e; 82x60, no client attached; a fresh seat after a pasted reference and one Ctrl-U, on the first capture without the ctrl+y row (5.1 s after the key on 2.1.330 and 2.1.327, two rounds each); rig root path replaced.
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.330[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mSonnet 5.5 · API Usage Billing
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/srv/fixture-rig-root/proj[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────
+[39m❯ [7mT[0;2mry "write a test for <filepath>"[0m
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────
+
+[39m  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m

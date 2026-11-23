@@ -497,7 +497,7 @@ pub(super) struct ProcFacts {
     pub process_group: i32,
     /// The foreground process group of the root's terminal.
     pub foreground_group: i32,
-    /// The root's executable is one of the system's login shells.
+    /// The root's executable is recognized as a shell for pane detection.
     pub system_shell: bool,
     /// How many child processes the root has.
     pub children: usize,
@@ -509,8 +509,9 @@ pub(super) struct ProcFacts {
 impl ProcFacts {
     /// Build the facts from what was read: the content of `/proc/<pid>/stat`,
     /// of `/proc/<pid>/cmdline` and of `/proc/<pid>/task/<pid>/children`, the
-    /// canonical path of `/proc/<pid>/exe`, and the canonical paths listed in
-    /// `/etc/shells`. `None` when any of it does not parse.
+    /// canonical path of `/proc/<pid>/exe`, and the resolved shell paths.
+    /// `None` when procfs data does not parse. The reader handles an
+    /// unavailable shell list separately.
     #[must_use]
     pub(super) fn parse(
         stat: &str,

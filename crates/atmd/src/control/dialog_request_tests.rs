@@ -2,6 +2,7 @@
 //! scheduler. All races are held on channels, not on a delay.
 use super::pane_request_tests::*;
 use super::*;
+use crate::control::legacy_survey_test::mock_shell;
 use crate::control::{
     reservation::{testing::ScriptedTmuxClient, *},
     ReplyOutcome,
@@ -52,10 +53,72 @@ async fn barrier(control: &ControlHandle) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn legacy_reply_veto_uses_the_fresh_viewport_before_the_first_key() {
+    let frame = crate::control::legacy_survey_test::fixture();
+    // Synthetic: a staged full-width digit; no key was sent to make it.
+    let draft = frame.replacen("❯\u{a0} ", "❯\u{a0}１", 1);
+    assert_ne!(draft, frame);
+    let client = ScriptedTmuxClient::new();
+    let mock = client.mock();
+    let (control, actor, cancel) = start(Box::new(client.clone()));
+    for (view, option, yes, no, refused) in [
+        (draft.as_str(), None, false, false, true),
+        (&draft, None, true, false, true),
+        (&draft, Some(1), false, false, true),
+        (&frame, Some(2), false, false, true),
+        (&draft, None, false, true, false),
+        (&frame, None, true, false, false),
+        (&frame, Some(1), false, false, false),
+        ("prompt\n", Some(2), false, false, false),
+    ] {
+        mock.clear_calls();
+        script_admission(&client, if option.is_some() { 2 } else { 1 });
+        if !no {
+            script_viewport(&client, "%1", view);
+        }
+        let result = control.reply("%1".into(), option, yes, no).await;
+        let keys: Vec<_> = effects(&mock)
+            .into_iter()
+            .filter(|call| matches!(call, MockCall::SendKeys { .. }))
+            .collect();
+        if refused {
+            let err = crate::server::methods::control_error(result.unwrap_err()).0;
+            assert_eq!(err.code, "refused");
+            assert!(err.message.contains("feedback survey"));
+            assert!(keys.is_empty(), "{keys:?}");
+        } else {
+            result.unwrap();
+            let expected = match (no, option) {
+                (true, _) => vec![key("%1", "Escape")],
+                (_, Some(2)) => vec![key("%1", "Down"), key("%1", "Enter")],
+                _ => vec![key("%1", "Enter")],
+            };
+            assert_eq!(keys, expected);
+        }
+        assert_eq!(client.pending_reads(&pane()).unwrap(), 0);
+    }
+    cancel.cancel();
+    actor.await.unwrap();
+}
+
+fn script_viewport(client: &ScriptedTmuxClient, pane: &str, view: &str) {
+    let mut info = inspection();
+    info.pane.pane_id = pane.into();
+    info.pane.width = 217;
+    info.pane.height = view.lines().count().try_into().unwrap();
+    client
+        .script_capture(
+            &PaneCapture::new(view.into(), info, CaptureFormat::Ansi).with_focus(Some(false)),
+        )
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn held_reply_yields_to_reads_and_other_panes() {
     let client = ScriptedTmuxClient::new();
     let mock = client.mock();
     script_admission(&client, 2);
+    script_viewport(&client, "%1", "held screen\n");
     mock.set_pane_content("%1", vec!["held screen".into()]);
     let (control, actor, cancel) = start(Box::new(client));
     let (job, release) = hold(&control, ReservationKind::Delivery, |_| async { Ok(()) }).await;
@@ -160,6 +223,7 @@ async fn captures_and_numbered_replies_share_observation_pacing_and_take_fresh_t
         .with_focus(Some(false));
     client.script_observe(&frame).unwrap();
     script_admission(&client, 2);
+    script_viewport(&client, "%1", "fresh café\n");
     let (control, actor, cancel) = start(Box::new(client));
     control
         .observe(&pane(), CaptureFormat::Plain)
@@ -239,6 +303,7 @@ async fn a_paced_reply_that_becomes_held_parks_until_delivery_releases() {
     let mock = client.mock();
     // Initial admission, release from the hold, then the fresh pacing grant.
     script_admission(&client, 3);
+    script_viewport(&client, "%1", "dialog\n");
     let (control, actor, cancel) = start(Box::new(client));
     control.capture("%1".into(), None, false).await.unwrap();
     mock.clear_calls();
@@ -394,10 +459,46 @@ async fn caller_gone_during_server_or_capture_reads_types_and_audits_nothing() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_reply_abandoned_or_expired_during_the_survey_read_sends_no_keys() {
+    for abandoned in [false, true] {
+        let client = ScriptedTmuxClient::new();
+        let mock = client.mock();
+        script_admission(&client, 1);
+        script_viewport(&client, "%1", "no survey\n");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (control, actor, cancel) = start(Box::new(Paused {
+            inner: Box::new(client),
+            at: At::Survey,
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let c = control.clone();
+        let reply = tokio::spawn(async move { c.reply("%1".into(), None, true, false).await });
+        tokio::time::timeout(Duration::from_secs(60), entered.notified())
+            .await
+            .expect("never entered the veto read");
+        if abandoned {
+            reply.abort();
+            assert!(reply.await.unwrap_err().is_cancelled());
+        } else {
+            tokio::time::advance(ACTION_TIMEOUT).await;
+            assert!(matches!(reply.await.unwrap(), Err(ServiceError::Timeout)));
+        }
+        release.add_permits(1);
+        control.flush_audits().await;
+        assert!(effects(&mock).is_empty());
+        cancel.cancel();
+        actor.await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn caller_gone_after_first_navigation_still_finishes_and_audits() {
     let (_dir, org, org_cancel) = logged().await;
     let mock = MockTmuxClient::new();
+    mock_shell(&mock, "%1");
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let cancel = CancellationToken::new();
@@ -441,6 +542,7 @@ async fn a_huge_option_has_a_total_deadline_and_never_enters_after_it() {
     let client = ScriptedTmuxClient::new();
     let mock = client.mock();
     script_admission(&client, 2);
+    script_viewport(&client, "%1", "dialog\n");
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let (control, actor, cancel) = start(Box::new(Paused {
@@ -473,6 +575,7 @@ async fn ready_navigation_keys_recheck_the_deadline_without_yielding() {
     let client = ScriptedTmuxClient::new();
     let mock = client.mock();
     script_admission(&client, 2);
+    script_viewport(&client, "%1", "dialog\n");
     let (control, actor, cancel) = start(Box::new(Paused {
         inner: Box::new(client),
         at: At::AdvanceClock {
@@ -564,7 +667,12 @@ async fn failures_preserve_context_and_read_errors_are_not_audited() {
     let mock = MockTmuxClient::new();
     let cancel = CancellationToken::new();
     let (control, actor) = spawn_control(
-        Box::new(mock.clone()),
+        Box::new(Paused {
+            inner: Box::new(mock.clone()),
+            at: At::FailEnter,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }),
         crate::registry::spawn_registry(),
         org.clone(),
         cancel.clone(),
@@ -578,7 +686,7 @@ async fn failures_preserve_context_and_read_errors_are_not_audited() {
             .to_string(),
         "Failed to capture pane"
     );
-    mock.set_next_error(TmuxError::NotFound);
+    mock_shell(&mock, "%1");
     assert_eq!(
         control
             .reply("%1".into(), None, true, false)

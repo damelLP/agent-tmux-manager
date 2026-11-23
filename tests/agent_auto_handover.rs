@@ -57,13 +57,20 @@ impl Seat {
     }
 
     fn start_with_lines(mode: StandInMode, lines: bool) -> Self {
+        Self::start_at_width(mode, lines, None)
+    }
+
+    fn start_at_width(mode: StandInMode, lines: bool, columns: Option<u16>) -> Self {
         let mut test = AgentRig::start_with_config(mode, DELIVERY);
         if lines {
             test.rig.set_daemon_env("ATM_SPAWN_START_LINE", "on");
             test.rig.restart_daemon();
             assert_eq!(test.rpc("agent.list", json!({}), None), json!([]));
         }
-        let config = support::started_config(mode);
+        let mut config = support::started_config(mode);
+        if let Some(columns) = columns {
+            config.columns = columns;
+        }
         let mut watch = delivery_support::Watch::on(&test.rig, test.cursor());
         let started = Started::up_with(&test, "lead", &config, ON);
         if lines {
@@ -276,10 +283,21 @@ fn handed_over_at_the_line(mode: StandInMode) {
     seat.test.rig.close();
 }
 
+const PLAIN_BODY: &str = "New session: run the shell command atm me";
 const RESUME_BODY: &str = "Run atm me; read its memory file; resume open work or report and stop.";
 
-fn automatic_handover_resume_before_older_message(mode: StandInMode) {
-    let mut seat = Seat::start_with_lines(mode, true);
+fn automatic_handover_start_before_older_message(mode: StandInMode, narrow: Option<u16>) {
+    let mut seat = Seat::start_at_width(mode, true, narrow);
+    if let Some(width) = narrow {
+        let columns = support::checked(seat.test.rig.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            &seat.pane.pane_id,
+            "#{pane_width}",
+        ]));
+        assert_eq!(columns, width.to_string());
+    }
     seat.work_starts(63);
     let after = seat.test.rig.event_cursor(&seat.pane);
     seat.work_ends();
@@ -303,43 +321,83 @@ fn automatic_handover_resume_before_older_message(mode: StandInMode) {
         e["kind"] == "agent.clear_requested"
     });
     // Identify the note without its copy, so wrong copy fails an assertion.
-    let start = watch.wait("the resume note", |e| {
+    let start = watch.wait("the start note", |e| {
         e["kind"] == "msg.sent" && e["body"]["from"] == "system" && e["body"]["to"] == seat.id
     });
-    assert_eq!(start["body"]["body"], RESUME_BODY);
     let start_id = format!("m{}", start["seq"]);
     let ready = watch.wait("replacement ready", |e| {
         e["kind"] == "agent.session_bound" && e["body"]["session_id"] == new
     });
     let attempt = watch.wait(
-        "resume attempt",
+        "start attempt",
         delivery_support::about("msg.delivery_attempted", &start_id),
     );
+    let delivered = delivery_support::about("msg.delivered", &start_id);
+    let receipt = watch.wait("start receipt or wrapped draft hold", |e| {
+        let notice = &e["body"]["delivery_notice"];
+        delivered(e)
+            || (e["kind"] == "msg.sent"
+                && notice["source_message_id"] == start_id
+                && notice["reason"] == "hold.enter_not_sent")
+    });
+    if !delivered(&receipt) {
+        let rig = &seat.test.rig;
+        let draft = rig.wait_event(&seat.pane, cursor, |e| {
+            e["kind"] == "rendered" && e["draft"].as_str().is_some_and(|s| s.starts_with("[m"))
+        });
+        let accepted = rig
+            .journal(&seat.pane)
+            .into_iter()
+            .any(|e| e["kind"] == "accepted" && e["event_sequence"].as_u64().unwrap() > cursor);
+        let mut cmd = rig.command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
+        let inbox = support::checked(rig.run(cmd.args([
+            "inbox", "--id", ordinary, "--for", &seat.id, "--format", "json",
+        ])));
+        let follower = &serde_json::from_str::<Value>(&inbox).unwrap()["messages"][0];
+        assert_eq!(follower["status"], "queued", "{follower}");
+        assert_eq!(follower["delivery"]["blocked_by"], start_id, "{follower}");
+        assert!(!accepted, "held start unexpectedly accepted");
+        panic!("start line held instead of delivered at {narrow:?} columns; staged draft: {}; older {ordinary} blocked by {start_id}; hold: {}", draft["draft"], receipt["body"]["body"]);
+    }
+    let expected = if narrow.is_some() {
+        PLAIN_BODY
+    } else {
+        RESUME_BODY
+    };
+    assert_eq!(start["body"]["body"], expected);
     let first = seat
         .test
         .rig
         .wait_event(&seat.pane, cursor, |e| e["kind"] == "accepted");
-    assert_eq!(first["text"], format!("[{start_id}] {RESUME_BODY}"));
-    let resume = watch.wait(
-        "exact resume receipt",
-        delivery_support::about("msg.delivered", &start_id),
-    );
-    assert_eq!(resume["body"]["session_id"], new);
+    assert_eq!(first["text"], format!("[{start_id}] {expected}"));
+    assert_eq!(receipt["body"]["session_id"], new);
     assert_eq!(
-        resume["body"]["confirmation"],
+        receipt["body"]["confirmation"],
         "prompt_submit_exact_reference"
     );
-    let outcome = watch.wait("the success note to the manager", |e| {
+    let outcome_for_seat = |e: &Value| {
         e["kind"] == "msg.sent"
             && e["body"]["to"] == "owner"
             && e["body"]["body"]
                 .as_str()
                 .is_some_and(|s| s.starts_with("automatic handover of "))
-    });
-    assert_eq!(outcome["body"]["body"], format!(
-        "automatic handover of {} (context 63%, line 60%) complete: saved ({save}); cleared and bound {} -> {new}; resume prompt {start_id} delivered.",
-        seat.id, seat.old,
-    ));
+    };
+    // Fallback reports queueing and can commit on either side of the receipt.
+    let outcome = watch
+        .all(outcome_for_seat)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| watch.wait("the handover outcome to the manager", outcome_for_seat));
+    let prefix = format!("automatic handover of {} (context 63%, line 60%)", seat.id);
+    let expected_outcome = if narrow.is_some() {
+        format!("{prefix} did not complete: saved ({save}); clear confirmed; resume not confirmed: resume prompt not known to fit; plain start line {start_id} queued.")
+    } else {
+        assert!(receipt["seq"].as_u64() < outcome["seq"].as_u64());
+        format!("{prefix} complete: saved ({save}); cleared and bound {} -> {new}; resume prompt {start_id} delivered.", seat.old)
+    };
+    assert_eq!(outcome["body"]["body"], expected_outcome);
+    assert!(ready["seq"].as_u64() < outcome["seq"].as_u64());
+    let start_receipt = receipt;
     seat.work_ends();
     let receipt = seat.watch.get_mut().wait(
         "the ordinary receipt",
@@ -373,8 +431,7 @@ fn automatic_handover_resume_before_older_message(mode: StandInMode) {
         &start,
         &ready,
         &attempt,
-        &resume,
-        &outcome,
+        &start_receipt,
         ordinary_attempt,
         &receipt,
     ]
@@ -390,19 +447,25 @@ fn automatic_handover_resume_before_older_message(mode: StandInMode) {
             })
             .count(),
         2,
-        "one save note and one resume note"
+        "one save note and one start note"
     );
+    assert_eq!(events.iter().filter(|e| outcome_for_seat(e)).count(), 1);
     seat.test.rig.close();
 }
 
 #[test]
+fn automatic_handover_uses_plain_start_in_narrow_claude_pane() {
+    automatic_handover_start_before_older_message(StandInMode::Claude, Some(64));
+}
+
+#[test]
 fn automatic_handover_confirms_the_resume_before_an_older_queued_message_claude() {
-    automatic_handover_resume_before_older_message(StandInMode::Claude);
+    automatic_handover_start_before_older_message(StandInMode::Claude, None);
 }
 
 #[test]
 fn automatic_handover_confirms_the_resume_before_an_older_queued_message_pi() {
-    automatic_handover_resume_before_older_message(StandInMode::Pi);
+    automatic_handover_start_before_older_message(StandInMode::Pi, None);
 }
 
 #[test]

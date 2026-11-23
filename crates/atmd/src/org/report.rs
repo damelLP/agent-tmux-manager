@@ -1,7 +1,9 @@
 //! Read-only, ledger-backed reports over one committed organisation snapshot.
-use super::{message_inbox::caller_address, reporting_line, OrgHandle};
+use super::{
+    department_directory::DepartmentFiles, message_inbox::caller_address, reporting_line, OrgHandle,
+};
 use crate::server::methods::{parse_params, MethodError, MethodRouter};
-use atm_org::{Address, ReportError, ReportParams, ReportVisibility};
+use atm_org::{Address, DepartmentCostReport, ReportError, ReportParams, ReportVisibility};
 use atm_protocol::error_code;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -12,50 +14,67 @@ struct ResultEnvelope {
     seq: u64,
     #[serde(flatten)]
     report: atm_org::Report,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    departments: Vec<DepartmentCostReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 pub(crate) fn register(
     router: &mut MethodRouter,
     org: OrgHandle,
     files: reporting_line::ReportingFiles,
+    departments: DepartmentFiles,
     now: fn() -> DateTime<Utc>,
 ) -> Result<(), MethodError> {
     // Match decision.list, which uses the same retained reporting reader.
     router.register("org.report", Duration::from_secs(22), move |caller, params| {
         let org = org.clone();
         let files = files.clone();
+        let departments = departments.clone();
         async move {
             let params: ReportParams = parse_params(params)?;
             if let Some(id) = &params.after {
                 super::tasks::sequence(id)?;
             }
-            let (seq, state) = org.report_snapshot().await.map_err(super::agents::AgentError::Organisation)?;
-            let visible = match caller_address(&state, &caller)? {
-                Address::Agent(reader) => {
-                    let mut agents = BTreeSet::new();
-                    for agent in state.agents().filter(|agent| agent.id != reader) {
-                        match files.ancestors(state.clone(), agent.id.clone()).await {
-                            Ok(ancestors) if ancestors.contains(&reader) => { agents.insert(agent.id.clone()); }
-                            Ok(_) => (),
-                            Err(error) if error.0.code == error_code::REFUSED => {
-                                tracing::warn!(agent_id = %agent.id, %error, "Reporting line unavailable for report visibility");
+            let base = async {
+                let (seq, state) = org.report_snapshot().await.map_err(super::agents::AgentError::Organisation)?;
+                let visible = match caller_address(&state, &caller)? {
+                    Address::Agent(reader) => {
+                        let mut agents = BTreeSet::new();
+                        for agent in state.agents().filter(|agent| agent.id != reader) {
+                            match files.ancestors(state.clone(), agent.id.clone()).await {
+                                Ok(ancestors) if ancestors.contains(&reader) => { agents.insert(agent.id.clone()); }
+                                Ok(_) => (),
+                                Err(error) if error.0.code == error_code::REFUSED => {
+                                    tracing::warn!(agent_id = %agent.id, %error, "Reporting line unavailable for report visibility");
+                                }
+                                Err(error) => return Err(error),
                             }
-                            Err(error) => return Err(error),
                         }
+                        ReportVisibility::Reports { reader, agents }
                     }
-                    ReportVisibility::Reports { reader, agents }
-                }
-                _ => ReportVisibility::All,
-            };
-            let report = atm_org::report(&state, &params, &visible, now()).map_err(|error| {
-                let code = match &error {
-                    ReportError::InvalidParams(_) => error_code::INVALID_PARAMS,
-                    ReportError::NotFound(_) => error_code::NOT_FOUND,
-                    ReportError::Internal(_) => error_code::INTERNAL,
+                    _ => ReportVisibility::All,
                 };
-                MethodError::new(code, error.to_string())
-            })?;
-            let value = serde_json::to_value(ResultEnvelope { seq, report })
+                let report = atm_org::report(&state, &params, &visible, now()).map_err(|error| {
+                    let code = match &error {
+                        ReportError::InvalidParams(_) => error_code::INVALID_PARAMS,
+                        ReportError::NotFound(_) => error_code::NOT_FOUND,
+                        ReportError::Internal(_) => error_code::INTERNAL,
+                    };
+                    MethodError::new(code, error.to_string())
+                })?;
+                Ok((seq, report))
+            };
+            // Start the optional five-second lane before the base work, not
+            // after the potentially long sequence of reporting-line reads.
+            let (directory, (seq, report)) =
+                tokio::try_join!(biased; async { Ok(departments.read().await) }, base)?;
+            let departments = atm_org::department_costs(&report.projects, &directory.departments);
+            let warning = (!directory.problems.is_empty()).then(|| {
+                format!("department report may be incomplete: {}", directory.problems.join("; "))
+            });
+            let value = serde_json::to_value(ResultEnvelope { seq, report, departments, warning })
                 .map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))?;
             let bytes = serde_json::to_vec(&value)
                 .map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))?.len();

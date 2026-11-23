@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-seen-post-not-in-channel","method":"channel.seen","params":{"channel":"alpha","through":"m1"}},
+  "response": {"type":"response","id":"channel-seen-post-not-in-channel","error":{"code":"not_in_channel","message":"post m1 is not in channel alpha"}},
+  "ignore": []
+}

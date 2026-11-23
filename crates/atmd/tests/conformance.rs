@@ -19,6 +19,10 @@ use tokio::net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+#[allow(dead_code)]
+#[path = "../src/control/legacy_survey_test.rs"]
+mod survey_viewport;
+
 struct Server {
     socket: PathBuf,
     cancel: CancellationToken,
@@ -31,10 +35,20 @@ impl Server {
         Self::with_services(MethodServices::new(spawn_registry())).await
     }
 
-    async fn with_services(mut services: MethodServices) -> Self {
+    async fn with_services(services: MethodServices) -> Self {
+        Self::with_fixture_request(services, None).await
+    }
+
+    async fn with_fixture_request(mut services: MethodServices, request: Option<&Value>) -> Self {
         if services.control.is_none() {
             let mock = atm_tmux::MockTmuxClient::new();
-            mock.set_next_raw_output("0 1\n");
+            let method = request.and_then(|r| r["method"].as_str());
+            if method != Some("session.reply") {
+                mock.set_next_raw_output("0 1\n");
+            }
+            if matches!(method, Some("session.send" | "session.reply")) {
+                survey_viewport::mock_shell(&mock, "%7");
+            }
             mock.set_next_pane_id("%42");
             mock.set_pane_cwd("%7", "/from/pane");
             let (control, _) = atmd::control::service::spawn_control(
@@ -184,8 +198,25 @@ fn ignore_pointers_do_not_hide_structure_errors() {
     assert!(compare(json!({"extra":1}), json!({}), &[]).is_err());
 }
 
+async fn replay_fixture(server: &Server, request: Value) -> (Value, Value) {
+    let mut client = server.client().await;
+    let connected = client.connect().await;
+    client.send(request).await;
+    let response = client.recv().await;
+    client.require_next_pong().await;
+    (connected, response)
+}
+
+// The new names must be advertised and have the same wire contract as the old names.
 #[tokio::test]
 async fn replay_all_protocol_fixtures() {
+    let wake_pairs = [
+        ("msg.inbox", "wake.list"),
+        ("msg.ack", "wake.ack"),
+        ("msg.retry", "wake.retry"),
+        ("msg.give_up", "wake.give_up"),
+    ];
+    let mut covered = std::collections::BTreeSet::new();
     let mut paths = Vec::new();
     files(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/protocol"),
@@ -205,17 +236,38 @@ async fn replay_all_protocol_fixtures() {
                 "named-agent operations are not configured",
             ));
         }
-        let server = Server::with_services(services).await;
-        let mut client = server.client().await;
-        client.connect().await;
-        client.send(fixture.request).await;
-        let actual = client.recv().await;
-        let compared = compare(actual, fixture.response, &fixture.ignore);
-        client.require_next_pong().await;
+        let mut request = fixture.request;
+        let server = Server::with_fixture_request(services, Some(&request)).await;
+        let (connected, actual) = replay_fixture(&server, request.clone()).await;
+        let alias = if let Some(&(old, new)) =
+            wake_pairs.iter().find(|(old, _)| request["method"] == *old)
+        {
+            // These fixtures stop at validation or the disabled message service.
+            request["method"] = json!(new);
+            Some((old, new, replay_fixture(&server, request).await))
+        } else {
+            None
+        };
         server.stop().await;
         cancel.cancel();
+        let compared = compare(actual, fixture.response.clone(), &fixture.ignore);
         assert!(compared.is_ok(), "{}: {compared:?}", path.display());
+        if let Some((old, new, (alias_connected, reply))) = alias {
+            assert!(fixture.ignore.is_empty(), "{}: {new}", path.display());
+            assert_eq!(reply, fixture.response, "{}: {new}", path.display());
+            for hello in [connected, alias_connected] {
+                let methods = hello["methods"].as_array().unwrap();
+                for method in [old, new] {
+                    assert!(
+                        methods.iter().any(|name| name == method),
+                        "missing {method}"
+                    );
+                }
+            }
+            covered.insert(new);
+        }
     }
+    assert_eq!(covered.len(), wake_pairs.len(), "missing alias fixtures");
 }
 
 #[tokio::test]

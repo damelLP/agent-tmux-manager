@@ -1,6 +1,7 @@
 //! Method-owned schemas carried by the existing protocol 1.1 JSON envelope.
 
 use atm_core::{SessionId, SessionStatus};
+use atm_org::DecisionId;
 pub use atm_org::{AgentId, AgentStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -12,6 +13,9 @@ pub struct UpParams {
     pub name: String,
     /// Caller tmux socket path; absence retains legacy server selection.
     pub caller_server: Option<String>,
+    /// A direct owner hire approval for this seat, if supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hire: Option<DecisionId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +62,8 @@ pub struct UpResult {
     pub agent_id: AgentId,
     pub pane: String,
     pub state: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdoptResult {

@@ -864,7 +864,14 @@ mod real_daemon {
         assert_eq!(event.body["caller_pane"], "%99");
         assert_eq!(event.body["note"], "owner note");
         assert_eq!(event.body["standing_rule"], false);
-        let answer = guarded(answers.next()).await.unwrap().unwrap();
+        // The question's row to the owner (U8) is written by the bridge after
+        // the request returns, so it may come first: pass over it.
+        let answer = loop {
+            let row = guarded(answers.next()).await.unwrap().unwrap();
+            if row.body["kind"] != "question" {
+                break row;
+            }
+        };
         assert_eq!(answer.body["from"], "system");
         assert_eq!(answer.body["to"], "project/worker");
         assert_eq!(answer.body["kind"], "answer");
@@ -876,7 +883,14 @@ mod real_daemon {
         let decision = state.decision(&id).unwrap();
         assert_eq!(decision.status, DecisionStatus::Resolved);
         assert_eq!(decision.resolution.as_ref().unwrap().by, Address::Owner);
-        assert_eq!(state.messages().count(), 1);
+        // The answer; the question's row to the owner (U8) is not counted.
+        assert_eq!(
+            state
+                .messages()
+                .filter(|m| m.content.kind != atm_org::MessageKind::Question)
+                .count(),
+            1
+        );
         let text = rendered(controller.popup.as_mut().unwrap(), 100, 30);
         assert!(
             text.contains("recorded") && !text.contains("delivered"),
@@ -959,7 +973,17 @@ mod real_daemon {
                 .status,
             DecisionStatus::Pending
         );
-        assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 0);
+        // No answer; the question's row to the owner (U8) is not one.
+        assert_eq!(
+            rig.org
+                .snapshot()
+                .await
+                .unwrap()
+                .messages()
+                .filter(|m| m.content.kind != atm_org::MessageKind::Question)
+                .count(),
+            0
+        );
         controller.shutdown();
         rig.stop().await;
     }

@@ -141,3 +141,46 @@ fn role_preserves_body_and_defaults_and_registry_aliases() {
         .instructions
         .is_empty());
 }
+
+// U10 (design 9.3): `groups` names the role groups a seat answers to.
+#[test]
+fn role_groups_parse_and_default_to_empty() {
+    let role = parse_role(
+        "alpha",
+        "+++\nharness='pi'\ngroups=['builders', 'hard-1']\n+++\n",
+    )
+    .unwrap();
+    assert_eq!(role.config.groups, ["builders", "hard-1"]);
+    assert!(parse_role("alpha", ROLE).unwrap().config.groups.is_empty());
+}
+
+// Break: a group nobody could tag (`@Builders`, `@a/b`) accepted.
+#[test]
+fn role_group_names_follow_the_id_grammar() {
+    for bad in ["Builders", "a/b", "", "-x"] {
+        let text = format!("+++\nharness='pi'\ngroups=[{bad:?}]\n+++\n");
+        let error = parse_role("alpha", &text).unwrap_err().to_string();
+        assert!(error.contains("group"), "{bad:?}: {error}");
+    }
+}
+
+// Break: whitelisting `groups` opened the boundary to other keys.
+#[test]
+fn unknown_role_keys_are_still_refused_beside_groups() {
+    let error = parse_role("alpha", "+++\nharness='pi'\ngroups=['b']\ntyop=1\n+++")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("tyop"), "{error}");
+}
+
+// Break: every role snapshot in the log gains a key, so its bytes change.
+#[test]
+fn role_without_groups_serializes_as_before() {
+    let value = serde_json::to_value(parse_role("alpha", ROLE).unwrap()).unwrap();
+    assert!(value.get("groups").is_none(), "{value}");
+    let with = parse_role("alpha", "+++\nharness='pi'\ngroups=['b']\n+++\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(with).unwrap()["groups"],
+        serde_json::json!(["b"])
+    );
+}

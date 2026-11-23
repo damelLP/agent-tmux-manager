@@ -27,10 +27,12 @@
 //!   does not list it.
 //! - The Claude and pi matchers refuse wrapped staged drafts: no Enter or automatic
 //!   confirmation; a pasted line stays in the editor for inspection. For `m123`
-//!   the start text is 48 columns: synthetic edge-wrap checks fail below 50 pane
-//!   columns for Claude's two-column prompt and 48 for pi. Each extra ID digit
-//!   needs another column. The resume body is 70 columns before the ID and
-//!   prompt chrome; it can require a wider pane.
+//!   the plain line is 48 columns and the resume line 77. The latter is
+//!   `[m123] Run atm me; read its memory file; resume open work or report and stop.`
+//!   (70 columns before the ID). Each extra ID digit needs another column.
+//!   A saved clear queues the plain line instead if the pane width is unknown
+//!   or below the estimated resume reference length (including one spare ID
+//!   digit) plus three cells for editor chrome. A resize can still cause a hold.
 //! - An agent that goes down or stuck before its line is delivered (a respawn
 //!   records it down for a moment, so it can too) leaves the line blocked: the
 //!   owner gets a "blocked: recipient agent is stuck or down" notice, and his
@@ -47,6 +49,13 @@ use atm_org::{
 const START_LINE: &str = "New session: run the shell command atm me";
 const RESUME_LINE: &str = "Run atm me; read its memory file; resume open work or report and stop.";
 
+pub(super) fn resume_fits(columns: usize, next: MessageId) -> bool {
+    // The reference is ASCII. Reserve a digit for intervening journal writes
+    // and three cells for chrome: Claude/Codex have two-cell prompts, and
+    // pi 1.5.2's default editor reserves a cursor cell.
+    columns >= resume_reference(next).len() + 1 + 3
+}
+
 /// The `ATM_SPAWN_*` variable that turns start lines off when it is `off`.
 const SWITCH: &str = "ATM_SPAWN_START_LINE";
 
@@ -61,6 +70,7 @@ pub fn start_line(agent: &AgentId) -> MessageContent {
         body: START_LINE.into(),
         attachments: Vec::new(),
         task: None,
+        post: None,
     }
 }
 
@@ -75,6 +85,8 @@ fn start_copy(content: &MessageContent) -> Option<&'static str> {
         body,
         attachments,
         task: None,
+        // A wake delivers a channel post, never a start line, whatever its body.
+        post: None,
     } = content
     else {
         return None;
@@ -150,6 +162,7 @@ pub(super) fn start_line_due(
 #[derive(Debug, Clone, Copy)]
 pub(super) enum StartLineDisposition {
     Track(MessageId),
+    PlainFallback(MessageId),
     Off,
     Unidentified,
 }
@@ -158,35 +171,48 @@ impl AgentRuntime {
     /// Queue `id`'s start line once its start, respawn or clear proved
     /// Ready on `session` (`None`: an editor without a session). Call only
     /// under the agent's reservation. The call logs a failure and returns
-    /// Unidentified without vetoing the caller's Ready.
+    /// Unidentified without vetoing the caller's Ready. `resume_cols` is set
+    /// only for a saved handover; zero means the width is unknown.
     pub(super) async fn queue_start_line(
         &self,
         id: &AgentId,
         session: Option<&SessionId>,
-        resume: bool,
+        resume_cols: Option<usize>,
     ) -> StartLineDisposition {
-        use StartLineDisposition::{Off, Track, Unidentified};
+        use StartLineDisposition::{Off, PlainFallback, Track, Unidentified};
         if (self.spawn_env)(SWITCH).as_deref() == Some("off") {
             return Off;
         }
         let queued = async {
-            let state = self.org.snapshot().await?;
+            let (state, seq) = self.org.snapshot_at().await?;
             if let Some((reused, copy)) = existing_start_line(&state, id, session) {
                 // Keep one open slot; a carried plain note is not a resume.
-                return Ok((!resume || copy == RESUME_LINE).then_some(reused));
+                return Ok((resume_cols.is_none() || copy == RESUME_LINE).then_some(Track(reused)));
             }
             let mut line = start_line(id);
-            if resume {
+            let fits = resume_cols.is_some_and(|cols| {
+                seq.checked_add(1)
+                    .is_some_and(|next| resume_fits(cols, MessageId::new(next)))
+            });
+            if fits {
                 line.body = RESUME_LINE.into();
             }
+            let disposition: fn(MessageId) -> _ = if resume_cols.is_some() && !fits {
+                PlainFallback
+            } else {
+                Track
+            };
             let sent = self
                 .org
                 .execute(OrgCommand::SendMessage(line), chrono::Utc::now())
                 .await?;
-            Ok::<_, super::OrgServiceError>(sent.first().map(|event| MessageId::new(event.seq)))
+            Ok::<_, super::OrgServiceError>(
+                sent.first()
+                    .map(|event| disposition(MessageId::new(event.seq))),
+            )
         };
         match queued.await {
-            Ok(Some(id)) => Track(id),
+            Ok(Some(disposition)) => disposition,
             Ok(None) => Unidentified,
             Err(error) => {
                 tracing::warn!(agent = %id, %error, "Start line could not be identified");

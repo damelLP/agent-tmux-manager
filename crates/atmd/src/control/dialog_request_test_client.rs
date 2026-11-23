@@ -7,6 +7,8 @@ use tokio::sync::{Notify, Semaphore};
 pub(super) enum At {
     Server,
     Capture,
+    Survey,
+    FailEnter,
     Navigation,
     OtherFrame,
     AdvanceClock { deadline: tokio::time::Instant },
@@ -48,6 +50,7 @@ impl TmuxClient for Paused {
         Box::pin(async move {
             let result = self.inner.raw_command(command, args).await;
             if (matches!(self.at, At::Server) && args.contains(&"#{socket_path}"))
+                || (matches!(self.at, At::Survey) && args.contains(&"capture-pane"))
                 || (matches!(self.at, At::OtherFrame)
                     && args.contains(&"capture-pane")
                     && args.contains(&"%2"))
@@ -87,6 +90,9 @@ impl TmuxClient for Paused {
     {
         Box::pin(async move {
             let result = self.inner.send_keys(pane, keys).await;
+            if matches!(self.at, At::FailEnter) && keys == "Enter" {
+                return Err(TmuxError::NotFound);
+            }
             if matches!(self.at, At::Navigation) && keys != "Enter" && keys != "C-c" {
                 self.wait().await;
             }

@@ -35,6 +35,7 @@ class Run:
         for line in lines(os.path.join(out, "outputs", "atm.log")):
             if line.strip():
                 self.calls.append(json.loads(line))
+        self.tmux_calls = lines(os.path.join(out, "outputs", "tmux.log"))
         self.events = []
         for line in lines(os.path.join(out, "transcript.jsonl")):
             try:
@@ -201,6 +202,72 @@ def last_line_marker(r):
 def no_dialog(r):
     used = [t["name"] for t in r.tool_uses if t.get("name") in ("AskUserQuestion", "EnterPlanMode", "ExitPlanMode")]
     return not used, f"dialog tools called: {used or 'none'}"
+
+
+def named_calls(r, command):
+    return [(i, c) for i, c in enumerate(r.calls) if c["argv"][:1] == [command]]
+
+
+def named_wake(r):
+    reads = [(i, c) for i, c in named_calls(r, "inbox")
+             if c["argv"] == ["inbox", "--id", "m47"] and c.get("rc") == 0 and c.get("delivery")]
+    return reads[0] if reads else (None, {})
+
+
+def post_flags(call):
+    argv = call["argv"][1:]
+    flags = dict(zip(argv[::2], argv[1::2]))
+    return flags if len(flags) * 2 == len(argv) else {}
+
+
+def named_reads_wake(r):
+    idx, _ = named_wake(r)
+    read = r.first_index(lambda t: t.get("name") == "Bash"
+                         and t.get("input", {}).get("command", "") == "atm inbox --id m47"
+                         and t.get("id") not in r.failed_tools)
+    attach = r.first_index(lambda t: reads_file(r, t, "briefs/wake.md"))
+    post = r.first_index(lambda t: t.get("name") == "Bash"
+                         and t.get("input", {}).get("command", "").startswith("atm post "))
+    ok = idx is not None and None not in (read, attach, post) and read < attach < post
+    return ok, f"successful inbox log index {idx}; read, attachment, reply tool indices {read}, {attach}, {post}"
+
+
+def named_replies_and_acks(r):
+    read, row = named_wake(r)
+    posts, acks = named_calls(r, "post"), named_calls(r, "ack")
+    if read is None or len(posts) != 1:
+        return False, f"inbox event {read}, {len(posts)} post attempts"
+    post, call = posts[0]
+    hint = row["delivery"].get("target")
+    flags = post_flags(call)
+    targets = {k: flags[k] for k in ("--reply", "--to", "--channel") if k in flags}
+    if len(hint or []) != 2 or targets != dict([hint]) or not flags.get("--body") or call.get("rc") != 0 or read >= post:
+        return False, f"reply target {targets}, expected {hint}; rc={call.get('rc')}"
+    if row["delivery"]["status"] != "delivered":
+        return not acks, f"pre-read wake; {len(acks)} ack attempts"
+    ok = (len(acks) == 1 and acks[0][0] > post and acks[0][1]["argv"] == ["ack", "m47"]
+          and acks[0][1].get("rc") == 0)
+    return ok, f"reply at {post}; ack attempts {[c['argv'] for _, c in acks]}"
+
+
+def named_posts_tagged_brief(r):
+    posts = named_calls(r, "post")
+    if len(posts) != 1:
+        return False, f"expected one post, saw {len(posts)} attempts"
+    call = posts[0][1]
+    flags = post_flags(call)
+    expected = {"--tag": "project/member", "--kind": "brief", "--task": "unit-1",
+                "--attach": "@RUN@/briefs/dispatch.md"}
+    ok = (call.get("rc") == 0 and flags.get("--body") and not named_calls(r, "ack")
+          and not ({"--to", "--reply", "--channel"} & flags.keys())
+          and all(flags.get(key) == value for key, value in expected.items()))
+    return bool(ok), f"post flags {flags}; rc={call.get('rc')}"
+
+
+def named_no_legacy_or_pane_writes(r):
+    old = [c["argv"] for c in r.calls if c["argv"][:1] and c["argv"][0] in WRITES | {"msg", "wake"}]
+    tmux = r.tmux_calls
+    return not (old or tmux), f"legacy ATM writes: {old}; raw tmux calls: {len(tmux)}"
 
 
 def unfinished(out, r):

@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-history-limit-max","method":"channel.history","params":{"channel":"alpha","limit":200}},
+  "response": {"type":"response","id":"channel-history-limit-max","result":{"seq":0,"channel":"alpha","posts":[],"more":false}},
+  "ignore": []
+}

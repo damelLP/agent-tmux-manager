@@ -24,6 +24,7 @@ fn with_message() -> (OrgState, MessageId) {
             body: "save".into(),
             attachments: Vec::new(),
             task: None,
+            post: None,
         }),
     ];
     for (seq, event) in events.iter().enumerate() {

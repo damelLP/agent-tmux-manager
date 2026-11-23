@@ -232,6 +232,7 @@ pub(super) async fn execute(
                                 PaneKey::Escape => "Escape",
                                 PaneKey::Up => "Up",
                                 PaneKey::Down => "Down",
+                                PaneKey::CtrlU => "C-u",
                             },
                         )
                         .await
@@ -370,7 +371,7 @@ async fn present(
         .await?
         .ok_or_else(|| ReservationError::PaneGone { pane: pane.clone() })
 }
-pub(super) async fn capture(
+pub(in crate::control) async fn capture(
     client: &dyn TmuxClient,
     pane: &PaneId,
     format: CaptureFormat,

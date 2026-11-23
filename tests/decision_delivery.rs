@@ -72,6 +72,11 @@ fn decision_answer_reference_and_state_survive_real_daemon_restart() {
     let answer = resolve(&rig, &decision);
     assert_eq!(answer["changed"], true);
     let id = sent(&mut watch, &seat, &decision);
+    // U8: the question and its one reply, which woke the asker by that row.
+    let thread = |rig: &MessageRig| rig.decision_thread(&decision);
+    let asked = (seat.id.clone(), "asked".into(), vec!["owner".into()]);
+    let replied = ("system".into(), "resolved".into(), vec![seat.id.clone()]);
+    assert_eq!(thread(&rig), [asked.clone(), replied.clone()]);
     let delivered = watch.wait("the confirmed answer", about("msg.delivered", &id));
     assert_eq!(
         delivered["body"]["confirmation"],
@@ -104,6 +109,11 @@ fn decision_answer_reference_and_state_survive_real_daemon_restart() {
     );
     assert_eq!(inbox["messages"][0]["message_id"], id);
     assert!(!inbox["messages"][0]["read_at"].is_null());
+    assert_eq!(
+        thread(&rig),
+        [asked, replied],
+        "restart/repeat: no second reply"
+    );
     assert_eq!(
         rig.call("decision.list", json!({"count_only":true}), None)
             .unwrap()["pending_count"],

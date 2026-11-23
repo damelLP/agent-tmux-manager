@@ -217,12 +217,94 @@ async fn org_matches_text_fixtures_and_raw_json() {
     }
 }
 
+fn department_tree() -> Value {
+    let mut value = tree();
+    let section: serde_json::Map<String, Value> =
+        serde_json::from_str(include_str!("fixtures/atm_org/departments.json")).unwrap();
+    value.as_object_mut().unwrap().extend(section);
+    value
+}
+
+// Break caught: overlap duplicates project details, or text/JSON loses counts or names of problems.
+#[tokio::test]
+async fn org_matches_department_text_and_raw_json() {
+    let value = department_tree();
+    let raw = result(&["org", "--format", "json"], value.clone()).await;
+    success(&raw);
+    assert_eq!(serde_json::from_slice::<Value>(&raw.stdout).unwrap(), value);
+    let text = result(&["org"], value).await;
+    success(&text);
+    let section = include_str!("fixtures/atm_org/departments.txt");
+    let expected =
+        FIXTURES[0]
+            .1
+            .replacen("\nProject alpha", &format!("\n{section}\nProject alpha"), 1);
+    assert_eq!(String::from_utf8(text.stdout).unwrap(), expected);
+}
+
+// Break caught: report rows are missing, printed under the wrong department,
+// allow terminal controls, or lose future fields in JSON.
+#[tokio::test]
+async fn org_prints_would_wait_under_its_department() {
+    let mut value = department_tree();
+    value["departments"][1]["would_wait"] =
+        serde_json::from_str(include_str!("fixtures/atm_org/would-wait.json")).unwrap();
+    let raw = result(&["org", "--format", "json"], value.clone()).await;
+    success(&raw);
+    assert_eq!(serde_json::from_slice::<Value>(&raw.stdout).unwrap(), value);
+    let output = result(&["org"], value).await;
+    success(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let (_, tools) = text.split_once("  Tools (tools)\n").unwrap();
+    let (tools, _) = tools.split_once("No department:").unwrap();
+    assert!(
+        tools.contains("    Would wait: alpha/build-3 (roster full: 2 of 1 for alpha/build-*)\n"),
+        "{text}"
+    );
+    assert!(
+        tools.contains("    Would wait: beta/worker\\n\\u{1b} (not on roster\\r\\u{1b})\n"),
+        "{text}"
+    );
+}
+
+// Break caught: a failed read disappears or a config value inserts fake terminal output.
+#[tokio::test]
+async fn org_displays_problem_only_and_escapes_department_text() {
+    let mut value = tree();
+    value["departments"] = json!([]);
+    value["department_problems"] = json!(["bad.toml line 3: invalid value"]);
+    let output = result(&["org"], value).await;
+    success(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Departments:\n  none loaded\nNo department: alpha, beta, gamma\nDepartment problems:\n  bad.toml line 3: invalid value\n"));
+
+    let mut value = department_tree();
+    value["departments"][0]["title"] = json!("Apps\n\u{001b}");
+    value["departments"][0]["goal"] = json!("Goal\r\u{001b}");
+    value["departments"][0]["projects"] = json!(["alpha", "gamma"]);
+    value["departments"][1]["problems"][0] = json!("tools.toml:projects: typo\n\u{001b}");
+    value["department_problems"][0] = json!("bad.toml\n\u{001b} line 3: invalid value");
+    let output = result(&["org"], value).await;
+    success(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    for escaped in [
+        "Apps\\n\\u{1b} (apps)",
+        "Goal\\r\\u{1b}",
+        "typo\\n\\u{1b}",
+        "bad.toml\\n\\u{1b} line 3",
+    ] {
+        assert!(text.contains(escaped), "{text}");
+    }
+    assert!(text.contains("No department: none\n"));
+    assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+}
+
 // Break caught: reserialization discards nested additions or terminal controls leak.
 #[tokio::test]
 async fn org_preserves_additive_fields_and_escapes_controls() {
     let mut value = tree();
     value["future"] = json!({"keep":"é\u{009b}"});
-    value["departments"] = json!([
+    value["future_collection"] = json!([
         {"id":"north", "projects":["alpha", "beta"]},
         {"id":"south", "projects":["alpha"]}
     ]);

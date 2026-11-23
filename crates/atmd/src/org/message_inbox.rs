@@ -6,11 +6,14 @@
 
 use super::message_types::{
     Address, DeliveryPhase, DeliveryStatus, DeliveryView, InboxEntry, InboxParams, InboxResult,
-    MessageId,
+    MessageId, PostContext,
 };
 use super::messages::MessageError;
 use crate::{control::reservation::PaneId, server::methods::CallContext};
-use atm_org::{AgentId, Message, MessageContent, OrgState};
+use atm_org::{
+    channel_query::{post, wake_for},
+    AgentId, Message, MessageContent, OrgState, PostPresentation,
+};
 use chrono::{DateTime, Utc};
 
 /// Bound on one serialized inbox page, entries and framing included. A body is
@@ -26,14 +29,25 @@ pub(super) fn caller_address(
     state: &OrgState,
     caller: &CallContext,
 ) -> Result<Address, MessageError> {
-    let Some(pane) = &caller.from_pane else {
-        return Ok(Address::Owner);
-    };
-    let pane = PaneId::parse(pane.0.as_str())
-        .map_err(|_| MessageError::InvalidParams("from_pane is not a pane id".into()))?;
-    Ok(state
-        .agent_for_pane(pane.as_str())
-        .map_or(Address::Owner, |agent| Address::Agent(agent.id.clone())))
+    let pane = caller_pane(caller)?;
+    Ok(address_for_pane(state, pane.as_ref().map(PaneId::as_str)))
+}
+
+pub(super) fn caller_pane(caller: &CallContext) -> Result<Option<PaneId>, MessageError> {
+    caller
+        .from_pane
+        .as_ref()
+        .map(|pane| {
+            PaneId::parse(pane.0.as_str())
+                .map_err(|_| MessageError::InvalidParams("from_pane is not a pane id".into()))
+        })
+        .transpose()
+}
+
+/// The pane, if present, has already been validated by admission.
+pub(super) fn address_for_pane(state: &OrgState, pane: Option<&str>) -> Address {
+    pane.and_then(|pane| state.agent_for_pane(pane))
+        .map_or(Address::Owner, |agent| Address::Agent(agent.id.clone()))
 }
 
 /// What the scheduler knows about an undelivered message beyond its durable
@@ -77,8 +91,14 @@ pub(super) fn delivery_view(message: &Message, progress: Progress) -> DeliveryVi
     }
 }
 
-/// Shared full/metadata row projection; redact before serialized byte accounting.
-pub(super) fn project_entry(message: &Message, managed: bool, progress: Progress) -> InboxEntry {
+/// Shared row projection before byte accounting. Only the full-content branch
+/// may consult post presentation; a managed row never joins a linked post.
+pub(super) fn project_entry(
+    state: &OrgState,
+    message: &Message,
+    managed: bool,
+    progress: Progress,
+) -> InboxEntry {
     let content = if managed {
         MessageContent {
             delivery_notice: None,
@@ -88,9 +108,18 @@ pub(super) fn project_entry(message: &Message, managed: bool, progress: Progress
             body: String::new(),
             attachments: Vec::new(),
             task: None,
+            post: None,
         }
     } else {
-        message.content.clone()
+        let mut content = message.content.clone();
+        if let Some(presentation) = state.wake_presentation(&content) {
+            content.body = presentation.body().to_owned();
+            if matches!(presentation, PostPresentation::Removed) {
+                content.attachments.clear();
+                content.task = None;
+            }
+        }
+        content
     };
     let delivery = delivery_view(message, progress);
     let delivery = if managed {
@@ -115,7 +144,35 @@ pub(super) fn project_entry(message: &Message, managed: bool, progress: Progress
         status: message.status,
         read_at: message.read_at,
         delivery,
+        post_context: None,
     }
+}
+
+fn inbox_row_id(
+    state: &OrgState,
+    caller: &Address,
+    recipient: &Address,
+    id: MessageId,
+) -> Result<MessageId, MessageError> {
+    if post(state, id).is_none() {
+        return Ok(id);
+    }
+    if caller != recipient {
+        return Err(MessageError::Refused(
+            "a post id names only the caller's own inbox row".into(),
+        ));
+    }
+    wake_for(state, id, caller)
+        .ok_or_else(|| MessageError::Refused(format!("post {id} has no inbox row for {caller}")))
+}
+
+fn inbox_post_context(state: &OrgState, id: Option<MessageId>) -> Option<PostContext> {
+    let content = &post(state, id?)?.content;
+    Some(PostContext {
+        channel: content.channel.clone(),
+        thread: content.thread,
+        session_id: content.session_id.clone(),
+    })
 }
 
 /// One page of `who`'s inbox as `caller` may see it, in sequence order.
@@ -163,6 +220,7 @@ pub(super) fn inbox(
     }
     let wanted: Vec<&Message> = match p.id {
         Some(id) => {
+            let id = inbox_row_id(state, caller, &who, id)?;
             let message = state
                 .message(&id)
                 .ok_or_else(|| MessageError::NotFound(format!("message {id} was not found")))?;
@@ -184,7 +242,10 @@ pub(super) fn inbox(
             more = true;
             break;
         }
-        let entry = project_entry(message, managed, progress(message));
+        let mut entry = project_entry(state, message, managed, progress(message));
+        if !managed {
+            entry.post_context = inbox_post_context(state, message.content.post);
+        }
         let size = serde_json::to_vec(&entry)
             .map_err(|error| MessageError::Internal(error.to_string()))?
             .len()
@@ -229,6 +290,7 @@ mod tests {
                 body: "PRIVATE body\n\u{001b}\"\\é".repeat(4096),
                 attachments: vec!["PRIVATE attachment".into()],
                 task: Some("PRIVATE task".parse().unwrap()),
+                post: None,
             },
             sent_at: now,
             status: DeliveryStatus::Failed,
@@ -252,7 +314,9 @@ mod tests {
             blocked_by: Some(MessageId::new(3)),
             ..Default::default()
         };
-        let full = serde_json::to_value(project_entry(&message, false, progress.clone())).unwrap();
+        let state = OrgState::default();
+        let full =
+            serde_json::to_value(project_entry(&state, &message, false, progress.clone())).unwrap();
         assert_eq!(
             full,
             json!({
@@ -266,7 +330,8 @@ mod tests {
                     "retry_at":null, "blocked_by":null}
             })
         );
-        let metadata = serde_json::to_value(project_entry(&message, true, progress)).unwrap();
+        let metadata =
+            serde_json::to_value(project_entry(&state, &message, true, progress)).unwrap();
         assert_eq!(
             metadata,
             json!({
@@ -333,6 +398,7 @@ mod tests {
                     body: format!("SECRET body{}", "x".repeat(INBOX_PAGE_BYTES)),
                     attachments: vec![format!("SECRET path{}", "y".repeat(300_000))],
                     task: Some("SECRET task".parse().unwrap()),
+                    post: None,
                 }),
             );
             if matches!(
@@ -493,5 +559,190 @@ mod tests {
             "owner still observes the original oversized body"
         );
         assert_eq!(state, before);
+    }
+
+    fn wake_state() -> OrgState {
+        use serde_json::json;
+        let mut state = OrgState::default();
+        let base = "2026-01-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for (seq, kind, body) in [
+            (
+                1,
+                "project.registered",
+                json!({"project_id":"alpha","root":"/sample/alpha"}),
+            ),
+            (
+                2,
+                "agent.adopted",
+                json!({"agent_id":"alpha/lead","pane":"%1","session_id":"s-past"}),
+            ),
+            (
+                3,
+                "agent.adopted",
+                json!({"agent_id":"alpha/worker","pane":"%2","session_id":"s-reader"}),
+            ),
+            (
+                10,
+                "msg.sent",
+                json!({"from":"system","to":"alpha/worker","kind":"note","body":"old note","attachments":[]}),
+            ),
+            (
+                13,
+                "channel.posted",
+                json!({"channel":"alpha","author":"alpha/lead","session_id":"s-past","kind":"question",
+                "body":"Review @owner","attachments":[],"mentions":["owner"],"wake":["owner","alpha/worker"],"route":false}),
+            ),
+            (
+                14,
+                "msg.sent",
+                json!({"from":"alpha/lead","to":"alpha/worker","kind":"question","body":"Review @owner","attachments":[],"post":"m13"}),
+            ),
+            (
+                16,
+                "channel.posted",
+                json!({"channel":"alpha","author":"alpha/worker","session_id":"s-reader","thread":"m13","kind":"note",
+                "body":"Reply","attachments":[],"mentions":[],"wake":["owner"],"route":false}),
+            ),
+            (
+                18,
+                "msg.sent",
+                json!({"from":"alpha/worker","to":"owner","kind":"note","body":"Reply","attachments":[],"post":"m16"}),
+            ),
+            (
+                19,
+                "msg.sent",
+                json!({"from":"alpha/lead","to":"owner","kind":"question","body":"Review @owner","attachments":[],"post":"m13"}),
+            ),
+            (
+                20,
+                "agent.session_bound",
+                json!({"agent_id":"alpha/lead","session_id":"s-new"}),
+            ),
+        ] {
+            let event = OrgEvent::from_parts(kind, &body).unwrap().unwrap();
+            let now = base + chrono::Duration::seconds(i64::try_from(seq).unwrap());
+            state.apply(seq, now, &event).unwrap();
+        }
+        state
+    }
+
+    fn query(
+        state: &OrgState,
+        caller: &str,
+        params: serde_json::Value,
+        grant: Option<&AgentId>,
+    ) -> Result<InboxResult, MessageError> {
+        let params = serde_json::from_value(params).unwrap();
+        inbox(state, &caller.parse().unwrap(), &params, grant, |_| {
+            Progress::default()
+        })
+    }
+
+    // Break: using the current author binding, adding context to legacy rows, or leaking it to a manager.
+    #[test]
+    fn inbox_join_is_additive_and_preserves_manager_redaction() {
+        use serde_json::{json, to_value};
+        let state = wake_state();
+        let before = state.clone();
+        let worker = "alpha/worker".parse().unwrap();
+        let full =
+            to_value(query(&state, "alpha/worker", json!({"id":"m14"}), None).unwrap()).unwrap();
+        assert_eq!(
+            full,
+            json!({"messages":[{
+            "message_id":"m14","content":{"from":"alpha/lead","to":"alpha/worker","kind":"question",
+                "body":"Review @owner","attachments":[],"task":null,"post":"m13"},
+            "sent_at":"2026-01-01T12:00:14Z","status":"queued","read_at":null,
+            "delivery":{"phase":"queued","reason":null,"attempt":0,"pane":null,"session_id":null,"confirmation":null,"retry_at":null,"blocked_by":null},
+            "post_context":{"channel":"alpha","thread":null,"session_id":"s-past"}
+        }],"unread_count":2,"next_after":null})
+        );
+        let reply = to_value(query(&state, "owner", json!({"id":"m18"}), None).unwrap()).unwrap();
+        assert_eq!(
+            reply["messages"][0]["post_context"],
+            json!({"channel":"alpha","thread":"m13","session_id":"s-reader"})
+        );
+        assert_eq!(reply["messages"][0]["content"]["post"], "m16");
+        let manager = to_value(
+            query(
+                &state,
+                "alpha/lead",
+                json!({"for":"alpha/worker","id":"m14"}),
+                Some(&worker),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let row = &manager["messages"][0];
+        assert!(row.get("post_context").is_none());
+        assert_eq!(
+            row["content"],
+            json!({"from":"alpha/lead","to":"alpha/worker","kind":"question","body":"","attachments":[],"task":null})
+        );
+        assert_eq!(row["delivery"], full["messages"][0]["delivery"]);
+        let plain =
+            to_value(query(&state, "alpha/worker", json!({"id":"m10"}), None).unwrap()).unwrap();
+        assert!(plain["messages"][0].get("post_context").is_none());
+        assert!(plain["messages"][0]["content"].get("post").is_none());
+        let parsed: InboxResult = serde_json::from_value(plain.clone()).unwrap();
+        assert_eq!(to_value(parsed).unwrap(), plain);
+        assert_eq!(state, before);
+    }
+
+    // Break: resolving by the requested inbox owner or altering old row IDs, unread filters, or errors.
+    #[test]
+    fn inbox_resolves_a_post_to_each_callers_own_row_only() {
+        use serde_json::json;
+        let mut state = wake_state();
+        let worker = "alpha/worker".parse().unwrap();
+        for (caller, id) in [("owner", 19), ("alpha/worker", 14)] {
+            let result = query(&state, caller, json!({"id":"m13"}), None).unwrap();
+            assert_eq!(result.messages.len(), 1);
+            assert_eq!(result.messages[0].message_id, MessageId::new(id));
+        }
+        for (caller, grant) in [("owner", None), ("alpha/lead", Some(&worker))] {
+            assert!(
+                matches!(query(&state,caller,json!({"for":"alpha/worker","id":"m13"}),grant),
+                Err(MessageError::Refused(reason)) if reason == "a post id names only the caller's own inbox row")
+            );
+            assert_eq!(
+                query(
+                    &state,
+                    caller,
+                    json!({"for":"alpha/worker","id":"m14"}),
+                    grant
+                )
+                .unwrap()
+                .messages[0]
+                    .message_id,
+                MessageId::new(14)
+            );
+        }
+        assert!(
+            matches!(query(&state,"alpha/lead",json!({"id":"m13"}),None), Err(MessageError::Refused(reason)) if reason == "post m13 has no inbox row for alpha/lead")
+        );
+        assert!(matches!(
+            query(&state, "alpha/worker", json!({"id":"m99"}), None),
+            Err(MessageError::NotFound(_))
+        ));
+        state
+            .apply(
+                21,
+                "2026-01-01T12:00:21Z".parse().unwrap(),
+                &OrgEvent::MessageRead {
+                    message_ids: vec![MessageId::new(14)],
+                },
+            )
+            .unwrap();
+        let filtered = query(
+            &state,
+            "alpha/worker",
+            json!({"id":"m13","unread_only":true}),
+            None,
+        )
+        .unwrap();
+        assert!(filtered.messages.is_empty());
+        assert_eq!(filtered.unread_count, 1);
+        assert_eq!(filtered.next_after, None);
     }
 }

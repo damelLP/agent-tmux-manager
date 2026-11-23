@@ -9,7 +9,7 @@ use crate::{
     notify::{notify_argv, run_notify, NotifyConfig, NotifyError, NOTIFY_TIMEOUT},
     org::message_delivery::inbox_reference,
 };
-use atm_org::{Address, DecisionId, DecisionStatus, MessageId, OrgEvent, OrgState};
+use atm_org::{channel_query, Address, DecisionId, DecisionStatus, MessageId, OrgEvent, OrgState};
 use std::{fmt, future::Future, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -30,9 +30,21 @@ impl fmt::Display for Subject {
 }
 fn still_open(state: &OrgState, subject: Subject) -> bool {
     match subject {
-        Subject::Message(id) => state
-            .message(&id)
-            .is_some_and(|m| m.content.to == Address::Owner && m.read_at.is_none()),
+        // A wake of a post he has already been shown is not news (N6), and a
+        // question's row is pinged as its decision (U8).
+        Subject::Message(id) => state.message(&id).is_some_and(|m| {
+            m.content.to == Address::Owner
+                && m.read_at.is_none()
+                && !m.content.post.is_some_and(|post| {
+                    super::channel_post::owner_has_seen(state, post)
+                        || channel_query::post(state, post).is_some_and(|p| {
+                            p.content
+                                .decision
+                                .as_ref()
+                                .is_some_and(|step| step.step == super::decision_steps::ASKED)
+                        })
+                })
+        }),
         Subject::Decision(id) => state
             .decision(&id)
             .is_some_and(|d| d.status == DecisionStatus::Pending),

@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-history-unknown-field","method":"channel.history","params":{"channel":"alpha","unexpected":true}},
+  "response": {"type":"response","id":"channel-history-unknown-field","error":{"code":"invalid_params","message":"unknown field `unexpected`, expected one of `channel`, `thread`, `include_shared_replies`, `before`, `after`, `limit`"}},
+  "ignore": []
+}

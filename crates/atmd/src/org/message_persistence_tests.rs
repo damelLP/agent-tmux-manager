@@ -210,8 +210,8 @@ async fn restart_replays_messages_read_state_and_attempts() {
         body,
         format!(
             "{attempted} blocked: daemon restarted after an unconfirmed attempt; owner \
-             resolution required; waiting behind it: none. Inspect the pane; atm msg retry \
-             {attempted} --accept-duplicate-risk or atm msg give-up {attempted}"
+             resolution required; waiting behind it: none. Inspect the pane; atm wake retry \
+             {attempted} --accept-duplicate-risk or atm wake give-up {attempted}"
         )
     );
 
@@ -530,7 +530,13 @@ impl Process {
     }
 
     async fn give_up(&self, id: MessageId) {
-        let gave_up = guarded(self.messages.give_up(ResolveParams { id }, caller(None)));
+        let gave_up = guarded(self.messages.give_up(
+            GiveUpParams {
+                id,
+                relay_words: None,
+            },
+            caller(None),
+        ));
         assert_eq!(gave_up.await.unwrap().status, DeliveryStatus::Failed);
     }
 

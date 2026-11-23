@@ -663,6 +663,7 @@ async fn a_silent_turn_end_is_answered_after_the_delay_audit_first() {
             body: reminder_text(&task, "assigned", "p/lead"),
             attachments: vec![],
             task: Some(task),
+            post: None,
         }
     );
 }
@@ -741,6 +742,7 @@ async fn the_next_silent_turn_end_is_told_to_the_creator() {
             ),
             attachments: vec![],
             task: Some(task.clone()),
+            post: None,
         }
     );
     assert_eq!(rig.count("task.reminded"), 1);
@@ -769,6 +771,7 @@ async fn mail_on_its_way_holds_the_reminder_until_it_is_typed() {
             body: "An answer".into(),
             attachments: vec![],
             task: None,
+            post: None,
         }))
         .await;
     // A second seat with a task of its own, and no mail.

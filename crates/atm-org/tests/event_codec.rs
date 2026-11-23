@@ -246,3 +246,99 @@ fn legacy_message_decoder_ignores_delivery_notice() {
     assert_eq!(old.attachments, ["details.md"]);
     assert_eq!(old.task, Some("t3".parse().unwrap()));
 }
+
+#[allow(clippy::unwrap_used)] // test builder
+fn report(post: Option<MessageId>) -> OrgEvent {
+    OrgEvent::MessageSent(MessageContent {
+        delivery_notice: None,
+        from: "p/lead".parse().unwrap(),
+        to: Address::Owner,
+        kind: MessageKind::Report,
+        body: "done".into(),
+        attachments: vec!["r.md".into()],
+        task: Some("t1".parse().unwrap()),
+        post,
+    })
+}
+
+#[test]
+fn message_without_post_keeps_legacy_bytes() {
+    // The journal stores `to_body()`; these are the exact bytes written before `post` existed.
+    let legacy = r#"{"attachments":["r.md"],"body":"done","from":"p/lead","kind":"report","task":"t1","to":"owner"}"#;
+    let event = report(None);
+    assert_eq!(serde_json::to_string(&event.to_body()).unwrap(), legacy);
+    let read = OrgEvent::from_parts("msg.sent", &serde_json::from_str(legacy).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, event);
+    let null = json!({"from":"p/lead", "to":"owner", "kind":"report", "body":"done",
+        "attachments":["r.md"], "task":"t1", "post":null});
+    let read = OrgEvent::from_parts("msg.sent", &null).unwrap().unwrap();
+    assert_eq!(read, event, "an explicit null reads as no post");
+    assert_eq!(serde_json::to_string(&read.to_body()).unwrap(), legacy);
+}
+
+#[test]
+fn message_post_link_round_trips_and_legacy_reader_ignores_it() {
+    #[derive(serde::Deserialize)]
+    struct LegacyMessageContent {
+        from: Address,
+        to: Address,
+        body: String,
+        task: Option<TaskId>,
+    }
+    let body = json!({"from":"p/lead", "to":"owner", "kind":"report", "body":"done",
+        "attachments":["r.md"], "task":"t1", "post":"m500"});
+    let event = OrgEvent::from_parts("msg.sent", &body).unwrap().unwrap();
+    assert_eq!(event, report(Some(MessageId::new(500))));
+    assert_eq!(event.to_body(), body);
+    let old: LegacyMessageContent = serde_json::from_value(event.to_body()).unwrap();
+    assert_eq!(
+        (old.from.to_string(), old.to),
+        ("p/lead".into(), Address::Owner)
+    );
+    assert_eq!(
+        (old.body, old.task),
+        ("done".into(), Some("t1".parse().unwrap()))
+    );
+    for bad in [json!("500"), json!(500), json!("m05"), json!({"id":"m5"})] {
+        let mut malformed = body.clone();
+        malformed["post"] = bad;
+        assert!(
+            OrgEvent::from_parts("msg.sent", &malformed).is_err(),
+            "{malformed}"
+        );
+    }
+}
+
+#[test]
+fn same_except_post_ignores_only_post() {
+    let OrgEvent::MessageSent(base) = report(None) else {
+        panic!("not a message")
+    };
+    let linked = MessageContent {
+        post: Some(MessageId::new(9)),
+        ..base.clone()
+    };
+    assert!(base.same_except_post(&linked) && linked.same_except_post(&base));
+    type Edit = fn(&mut MessageContent);
+    let edits: [(&str, Edit); 7] = [
+        ("from", |c| c.from = Address::System),
+        ("to", |c| c.to = "p/other".parse().unwrap()),
+        ("kind", |c| c.kind = MessageKind::Note),
+        ("body", |c| c.body.push('!')),
+        ("attachments", |c| c.attachments.clear()),
+        ("task", |c| c.task = None),
+        ("delivery_notice", |c| {
+            c.delivery_notice = Some(DeliveryNotice {
+                source_message_id: MessageId::new(1),
+                reason: "focus".into(),
+            })
+        }),
+    ];
+    for (field, edit) in edits {
+        let mut other = linked.clone();
+        edit(&mut other);
+        assert!(!base.same_except_post(&other), "{field} must count");
+    }
+}

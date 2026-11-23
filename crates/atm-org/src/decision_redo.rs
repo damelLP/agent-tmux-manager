@@ -69,14 +69,30 @@ impl OrgState {
                 && !progress.completed.contains(id)
         })
     }
-    /// Exact committed msg.sent content is the completion marker, not delivery.
+    /// Committed msg.sent content (apart from a wake's `post` link) is the
+    /// completion marker, not delivery.
     #[must_use]
     pub fn redo_notices(&self) -> Vec<MessageContent> {
+        self.redo_notices_by_decision()
+            .into_iter()
+            .map(|(_, note)| note)
+            .collect()
+    }
+    /// The unsent redo notices with their decision. A task whose `redo:<task>`
+    /// step is posted is skipped: its rows are the wake repair's to write.
+    #[must_use]
+    pub fn redo_notices_by_decision(&self) -> Vec<(DecisionId, MessageContent)> {
         self.redo_history
-            .values()
-            .flat_map(|r| &r.notices)
-            .filter(|note| !self.messages().any(|m| m.content == **note))
-            .cloned()
+            .iter()
+            .flat_map(|(id, r)| r.notices.iter().map(move |note| (*id, note)))
+            .filter(|(id, note)| {
+                note.task.as_ref().is_none_or(|task| {
+                    crate::channel_query::decision_post(self, *id, &format!("redo:{task}"))
+                        .is_none()
+                })
+            })
+            .filter(|(_, note)| !self.messages().any(|m| m.content.same_except_post(note)))
+            .map(|(id, note)| (id, note.clone()))
             .collect()
     }
     pub(crate) fn track_redo_transition(&mut self, event: &OrgEvent) {
@@ -131,7 +147,7 @@ impl OrgState {
                 }
             }
             for to in recipients {
-                notices.push(MessageContent { delivery_notice: None, from: Address::System, to, kind: MessageKind::Note, body: format!("Task {task_id} needs redo after decision {id} was overruled: {}\nIt was reopened and unassigned. Read the new answer before assigning or submitting it again. No files were reverted.", resolution.option), attachments: vec![], task: Some(task_id.clone()) });
+                notices.push(MessageContent { delivery_notice: None, from: Address::System, to, kind: MessageKind::Note, body: format!("Task {task_id} needs redo after decision {id} was overruled: {}\nIt was reopened and unassigned. Read the new answer before assigning or submitting it again. No files were reverted.", resolution.option), attachments: vec![], task: Some(task_id.clone()), post: None });
             }
             // Reuse accounting's ordinary pre-transition hook; this is not a
             // second durable task event or a relaxation of task.set_state.

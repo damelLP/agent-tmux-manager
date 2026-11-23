@@ -286,6 +286,9 @@ pub enum PaneKey {
     Escape,
     Up,
     Down,
+    /// tmux `C-u`: a harness's line-clearing key, used only to take back
+    /// atm's own unsent reference (s3-5c).
+    CtrlU,
 }
 
 /// Selected by the consumer's adapter policy; never caller-supplied tmux flags.

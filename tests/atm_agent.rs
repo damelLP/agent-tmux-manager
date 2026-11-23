@@ -222,6 +222,82 @@ async fn agent_cli_roots_default_to_cwd_only_for_up_and_adopt() {
     }
 }
 
+// Break caught: an absent approval changes the request, the CLI drops an
+// explicit one, or the warning corrupts stdout or reaches a terminal unescaped.
+#[tokio::test]
+async fn agent_up_sends_only_an_explicit_hire() {
+    let ready = json!({"agent_id":"project/lead", "pane":"%7", "state":"ready"});
+    let plain = exchange(
+        &["agent", "up", "lead", "--project-root", "/project"],
+        "agent.up",
+        json!({"project_root":"/project", "name":"lead"}),
+        json!({"type":"response", "id":"r1", "result":ready}),
+    )
+    .await;
+    assert!(plain.status.success());
+    assert_eq!(plain.stdout, b"project/lead\t%7\tready\n");
+    assert!(plain.stderr.is_empty());
+
+    let mut warned = ready;
+    warned["warning"] = json!("department policy incomplete\n\u{1b}");
+    for format in ["text", "json"] {
+        let output = exchange(
+            &[
+                "agent",
+                "up",
+                "lead",
+                "--project-root",
+                "/project",
+                "--hire",
+                "d42",
+                "--format",
+                format,
+            ],
+            "agent.up",
+            json!({"project_root":"/project", "name":"lead", "hire":"d42"}),
+            json!({"type":"response", "id":"r1", "result":warned}),
+        )
+        .await;
+        assert!(output.status.success(), "{output:?}");
+        if format == "text" {
+            assert_eq!(output.stdout, plain.stdout);
+            assert_eq!(
+                output.stderr,
+                b"Warning: department policy incomplete\\n\\u{1b}\n"
+            );
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                warned
+            );
+            assert!(output.stderr.is_empty());
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rpc.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let output = command(
+        &["agent", "up", "lead", "--hire", "d0042"],
+        dir.path(),
+        &socket,
+    )
+    .output()
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("expected d followed by canonical u64 decimal"));
+    std::future::poll_fn(|cx| {
+        assert!(
+            listener.poll_accept(cx).is_pending(),
+            "a malformed hire connected"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn agent_cli_help_describes_actions_and_kill() {
     let dir = tempfile::tempdir().unwrap();

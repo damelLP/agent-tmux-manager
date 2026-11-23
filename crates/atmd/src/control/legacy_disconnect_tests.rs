@@ -265,6 +265,7 @@ async fn parked(half_close: bool, then_disconnect: bool) {
     } else {
         untagged(&mock, "%1");
         mock.set_next_raw_output("0 1");
+        mock_shell(&mock, "%1");
         release.send(()).unwrap();
         job.await.unwrap().unwrap();
         let reply = read(&mut connection.peer).await;
@@ -374,6 +375,7 @@ async fn daemon_disconnect_preserves_earlier_parked_survivor() {
         assert_eq!(daemon.subscriber_count().await, 0);
         untagged(&mock, "%1");
         mock.set_next_raw_output("0 1");
+        mock_shell(&mock, "%1");
         release.send(()).unwrap();
         job.await.unwrap().unwrap();
         let reply = read(&mut survivor).await;
@@ -414,6 +416,7 @@ async fn full_disconnect_after_paste_still_finishes_enter() {
         );
         untagged(&mock, "%1");
         mock.set_next_raw_output("0 1");
+        mock_shell(&mock, "%1");
         let mut connection = connection(control.clone(), registry).await;
         send(&mut connection).await;
         entered.notified().await;

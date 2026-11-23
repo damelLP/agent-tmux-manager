@@ -9,7 +9,7 @@
 //! a process identity, so `Harness` never permits input on its own: callers
 //! still require the adapter's exact screen, the pane tag and focus.
 
-use crate::control::reservation::{CaptureFormat, PaneCapture};
+use crate::control::reservation::{CaptureFormat, PaneCapture, PaneKey};
 use atm_core::harness_control::{
     ControlPolicy, ControlScreen, HookListEntry, ScreenInput, ScreenTextFormat,
 };
@@ -108,12 +108,19 @@ pub fn foreground(
     }
 }
 
+type LegacySendVeto = fn(ScreenInput<'_>, &str, Option<bool>) -> Option<&'static str>;
+
 /// One harness's screen readers and lifecycle policy, as data.
 pub struct AgentScreen {
     harness: Harness,
     policy: &'static ControlPolicy,
     staged: fn(ScreenInput<'_>, &str) -> Option<bool>,
     control: fn(ScreenInput<'_>, Option<ScreenCursor>) -> ControlScreen,
+    inbox_paste: Option<fn(ScreenInput<'_>) -> bool>,
+    legacy_send_veto: Option<LegacySendVeto>,
+    legacy_submit_veto: Option<fn(ScreenInput<'_>, bool) -> Option<&'static str>>,
+    /// The key that clears a single-row draft, where a real capture proved it.
+    retract: Option<PaneKey>,
     hooks_valid: fn(&[HookListEntry]) -> bool,
     pub(crate) version: fn(&SessionDomain) -> Option<&str>,
     pub(crate) remember_version: fn(&mut SessionDomain, &StatusLineData),
@@ -135,6 +142,11 @@ static SCREENS: [AgentScreen; 3] = [
         policy: &atm_claude_adapter::screen::CONTROL_POLICY,
         staged: atm_claude_adapter::screen::staged_draft_matches,
         control: atm_claude_adapter::screen::observe_control_screen,
+        inbox_paste: Some(atm_claude_adapter::screen::inbox_survey_ready),
+        legacy_send_veto: Some(atm_claude_adapter::screen::legacy_send_veto),
+        legacy_submit_veto: Some(atm_claude_adapter::screen::legacy_submit_veto),
+        // Proven on real captures: see the adapter's `screen` module docs.
+        retract: Some(PaneKey::CtrlU),
         hooks_valid: no_hook_list,
         version: atm_claude_adapter::status_line::session_version,
         remember_version: atm_claude_adapter::status_line::remember_session_version,
@@ -144,6 +156,10 @@ static SCREENS: [AgentScreen; 3] = [
         policy: &atm_pi_adapter::screen::CONTROL_POLICY,
         staged: atm_pi_adapter::screen::staged_draft_matches,
         control: atm_pi_adapter::screen::observe_control_screen,
+        inbox_paste: None,
+        legacy_send_veto: None,
+        legacy_submit_veto: None,
+        retract: None,
         hooks_valid: no_hook_list,
         version: |_| None,
         remember_version: |_, _| {},
@@ -153,6 +169,10 @@ static SCREENS: [AgentScreen; 3] = [
         policy: &atm_codex_adapter::screen::CONTROL_POLICY,
         staged: atm_codex_adapter::screen::staged_draft_matches,
         control: atm_codex_adapter::screen::observe_control_screen,
+        inbox_paste: None,
+        legacy_send_veto: None,
+        legacy_submit_veto: None,
+        retract: None,
         hooks_valid: atm_codex_adapter::screen::validate_hook_list,
         version: |_| None,
         remember_version: |_, _| {},
@@ -163,6 +183,24 @@ static SCREENS: [AgentScreen; 3] = [
 #[must_use]
 pub fn agent_screen(harness: Harness) -> Option<&'static AgentScreen> {
     SCREENS.iter().find(|screen| screen.harness == harness)
+}
+
+/// An adapter may veto legacy input from the viewport alone. An unmanaged
+/// pane need not have a baseline; this read never grants input or pins a harness.
+pub(crate) fn legacy_send_veto(capture: &PaneCapture, text: &str) -> Option<&'static str> {
+    SCREENS.iter().find_map(|screen| {
+        (screen.legacy_send_veto?)(
+            screen.input(capture)?,
+            text,
+            capture.inspection.bracketed_paste,
+        )
+    })
+}
+
+pub(crate) fn legacy_submit_veto(capture: &PaneCapture, moves: bool) -> Option<&'static str> {
+    SCREENS
+        .iter()
+        .find_map(|screen| (screen.legacy_submit_veto?)(screen.input(capture)?, moves))
 }
 
 impl AgentScreen {
@@ -182,6 +220,13 @@ impl AgentScreen {
     #[must_use]
     pub fn policy(&self) -> &'static ControlPolicy {
         self.policy
+    }
+
+    /// The key that takes back atm's own unsent single-row reference; `None`
+    /// leaves it in the editor (no key is proven for this harness).
+    #[must_use]
+    pub fn retract(&self) -> Option<PaneKey> {
+        self.retract
     }
 
     #[must_use]
@@ -210,6 +255,16 @@ impl AgentScreen {
         expected: &str,
     ) -> Option<bool> {
         (self.staged)(self.harness_input(capture, baseline)?, expected)
+    }
+
+    /// Additional readiness only for bracketed paste of atm's inbox pointer.
+    #[must_use]
+    pub(super) fn inbox_paste(&self, capture: &PaneCapture, baseline: &PaneBaseline) -> bool {
+        capture.inspection.bracketed_paste == Some(true)
+            && self
+                .inbox_paste
+                .zip(self.harness_input(capture, baseline))
+                .is_some_and(|(read, input)| read(input))
     }
 
     /// The default (everything Unknown) unless the harness is in the foreground.

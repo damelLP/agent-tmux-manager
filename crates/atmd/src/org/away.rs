@@ -11,10 +11,12 @@
 //! - While away, [`apply_pending`] reports every pending decision the away
 //!   table would record. The writer decides each report against the away flag
 //!   as it is then, so a report that arrives after `owner.back` takes nothing.
-//! - [`missing_notices`] tells a requester what became of its decision. Like
-//!   the answer message, a notice's exact `msg.sent` is its completion marker:
-//!   the bridge fills a missing one after a restart and never sends two. The
-//!   texts are therefore a persistence contract, not presentation only.
+//! - [`notice`] tells a requester what became of its decision, as a reply in
+//!   the question's thread (`decision_steps`), or as a message for a decision
+//!   without a question post. Like the answer message, a notice's exact
+//!   content is its completion marker: the bridge fills a missing one after a
+//!   restart and never sends two. The texts are therefore a persistence
+//!   contract, not presentation only.
 //!
 //! Both run inside the decision bridge's reconcile, which also watches
 //! `owner.` events, so a decision requested before `owner.away` is handled
@@ -270,7 +272,7 @@ pub(super) async fn apply_pending(
 
 /// What a requester is told about its decision. Status decides for a decision
 /// that was taken; a waiting one is only announced while the owner is away.
-fn notice(decision: &Decision, away: bool) -> Option<MessageContent> {
+pub(super) fn notice(decision: &Decision, away: bool) -> Option<MessageContent> {
     let Address::Agent(_) = &decision.request.requester else {
         return None;
     };
@@ -323,15 +325,22 @@ fn notice(decision: &Decision, away: bool) -> Option<MessageContent> {
         body,
         attachments: vec![],
         task: None,
+        post: None,
     })
 }
 
-/// The notices no `msg.sent` carries yet.
+/// The notices no `msg.sent` carries yet: the previous bridge's list;
+/// `decision_steps::replies` now decides. Kept as the rollback tests' oracle.
+#[cfg(test)]
 pub(super) fn missing_notices(state: &OrgState) -> Vec<MessageContent> {
     let away = state.owner().away_since.is_some();
     state
         .decisions()
         .filter_map(|decision| notice(decision, away))
-        .filter(|content| !state.messages().any(|m| m.content == *content))
+        .filter(|content| {
+            !state
+                .messages()
+                .any(|m| m.content.same_except_post(content))
+        })
         .collect()
 }

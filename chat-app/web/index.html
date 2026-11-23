@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#171a26">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/src/chat.css">
+  <title>atm chat</title>
+</head>
+<body>
+  <div id="connection-label" class="sr-only" role="status"></div>
+  <div id="connection-banner" class="banner" hidden><strong></strong><small></small></div>
+  <div id="update-banner" class="banner update" hidden><strong>Update ready</strong><button id="update-reload" type="button">Reload</button></div>
+  <main id="app" data-pane="home" data-phase="reconnecting">
+    <aside class="pane side" aria-label="Conversations">
+      <header><h1>atm</h1><span class="conn" aria-hidden="true"></span></header>
+      <button id="open-settings" type="button" class="item" aria-controls="settings">
+        <span class="avatar" aria-hidden="true"></span><span class="item-name">You</span>
+        <span class="settings-link">Settings <span aria-hidden="true">›</span></span>
+      </button>
+      <div class="scroll" id="side-log">
+        <div id="needs-home">
+          <section id="needs" aria-labelledby="needs-title">
+            <header><div class="head"><h2 id="needs-title">Needs you</h2><small>Answer here</small></div></header>
+            <div class="opts" id="keep-all">
+              <button id="keep-picks" type="button" hidden></button>
+              <small id="keep-status" class="ask-state" role="status" hidden></small>
+            </div>
+            <div id="cards"></div>
+          </section>
+        </div>
+        <nav id="channels" aria-label="Channels"></nav>
+      </div>
+    </aside>
+    <section id="settings" class="pane settings" aria-labelledby="settings-title">
+      <header><button id="settings-back" type="button" class="back" aria-label="Back">‹</button><h2 id="settings-title">Settings</h2></header>
+      <div class="scroll"><div class="settings-content">
+        <p id="notifications-copy">Alerts on this phone for direct messages, @mentions and decisions</p>
+        <div class="opts"><button id="notifications" type="button" aria-describedby="notifications-copy" hidden>Notifications: Off</button></div>
+      </div></div>
+    </section>
+    <div id="needs-wide" class="pane"></div>
+    <section class="pane channel" aria-label="Channel">
+      <header><button id="home-back" type="button" class="back" aria-label="Back">‹</button>
+        <div class="head"><h2 id="channel-title"></h2><small id="channel-people"></small></div>
+        <span class="conn" aria-hidden="true"></span></header>
+      <div id="channel-log" class="scroll log" tabindex="0" aria-label="Channel posts">
+        <button id="older" class="older" type="button" hidden>Load older posts</button><div id="posts"></div>
+      </div>
+      <div id="channel-readonly" class="read-only" hidden>This conversation is read only.</div>
+      <form id="channel-form" class="compose" hidden>
+        <div class="compose-row"><div class="attach"><button type="button" class="attach-plus" aria-label="Attach" aria-expanded="false">+</button>
+          <div class="attach-choices" hidden><button type="button">Photos</button><button type="button">Files</button></div>
+          <input type="file" accept="image/*" multiple hidden><input type="file" multiple hidden>
+        </div>
+        <div class="compose-box"><textarea rows="1" aria-label="Message"></textarea>
+          <button type="submit" aria-label="Send" disabled><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path class="send-icon" d="M12 19V5m-6 6 6-6 6 6"/><path class="retry-icon" d="M18 8a7 7 0 1 0 1 8m-1-12v4h-4"/>
+          </svg></button>
+        </div></div><div class="picks" hidden></div><p role="status"></p>
+      </form>
+    </section>
+    <section class="pane thread" aria-label="Thread or channel details">
+      <header><button id="thread-back" type="button" class="back" aria-label="Back to channel" hidden>‹</button>
+        <div class="head"><h2 id="thread-title"></h2><small id="thread-subtitle"></small></div>
+        <span class="conn" aria-hidden="true"></span></header>
+      <div id="thread-log" class="scroll log" tabindex="0" aria-label="Thread replies"><div id="replies"></div></div>
+      <div id="thread-readonly" class="read-only" hidden>This conversation is read only.</div>
+      <form id="thread-form" class="compose" hidden>
+        <div class="compose-row"><div class="attach"><button type="button" class="attach-plus" aria-label="Attach" aria-expanded="false">+</button>
+          <div class="attach-choices" hidden><button type="button">Photos</button><button type="button">Files</button></div>
+          <input type="file" accept="image/*" multiple hidden><input type="file" multiple hidden>
+        </div>
+        <div class="compose-box"><textarea rows="1" aria-label="Reply in thread"></textarea>
+          <button type="submit" aria-label="Send" disabled><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path class="send-icon" d="M12 19V5m-6 6 6-6 6 6"/><path class="retry-icon" d="M18 8a7 7 0 1 0 1 8m-1-12v4h-4"/>
+          </svg></button>
+        </div></div><div class="picks" hidden></div><label hidden><input type="checkbox"> Also send to chat</label><p role="status"></p>
+      </form>
+    </section>
+    <dialog id="photo-view" aria-label="Attachment">
+      <form method="dialog"><button autofocus>Close</button></form><img id="full-photo" alt="" hidden>
+      <pre id="file-text" tabindex="0" hidden></pre>
+      <div id="file-markdown" class="body" tabindex="0" hidden></div><a id="file-download" hidden>Download</a>
+    </dialog>
+    <dialog id="decision-confirm" aria-labelledby="decision-title" aria-describedby="decision-copy">
+      <strong id="decision-title"></strong>
+      <p id="decision-copy"></p>
+      <label id="decision-reason" hidden>Reason (optional)<input id="decision-input" type="text"></label>
+      <div class="opts">
+        <button id="decision-cancel" type="button" autofocus>Cancel</button>
+        <button id="decision-accept" type="button"></button>
+      </div>
+    </dialog>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

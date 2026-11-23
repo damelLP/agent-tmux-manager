@@ -329,7 +329,7 @@ fn lost_hook_blocks() {
     let text = told["body"]["body"].as_str().unwrap();
     assert!(text.contains("waiting behind it: none. "), "{text}");
     assert!(
-        text.contains(&format!("atm msg retry {id} --accept-duplicate-risk")),
+        text.contains(&format!("atm wake retry {id} --accept-duplicate-risk")),
         "a latched hold offers the owner's retry: {text}"
     );
     assert_eq!(attempts(&mut watch, &rig, &id).len(), 1);

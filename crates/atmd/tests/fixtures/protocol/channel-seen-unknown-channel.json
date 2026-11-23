@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-seen-unknown-channel","method":"channel.seen","params":{"channel":"owner+alpha/lead","through":"m1"}},
+  "response": {"type":"response","id":"channel-seen-unknown-channel","error":{"code":"unknown_channel","message":"channel owner+alpha/lead is not known; use an id from channel.list (when posting to a person, use to)"}},
+  "ignore": []
+}

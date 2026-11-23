@@ -68,6 +68,7 @@ async fn reservation_parked_send_reresolves_registry_instead_of_reusing_old_pane
         .await
         .unwrap();
     mock.set_next_raw_output("0 1");
+    mock_shell(&mock, "%2");
     release.send(()).unwrap();
     job.await.unwrap().unwrap();
     assert_eq!(send.await.unwrap().unwrap(), "%2");

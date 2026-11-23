@@ -7,6 +7,7 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s evals/atm-skills 
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -180,6 +181,135 @@ class RunStartsFresh(unittest.TestCase):
             self.assertEqual(holds(os.path.join(tmp, "missing")).returncode, 64)
             g = grade.main(HOLDS, out)
             self.assertEqual(g["summary"]["passed"], 0, g["expectations"])
+
+
+class NamedWakeGrading(unittest.TestCase):
+    """A trace must reply successfully to the displayed target, then ack its wake."""
+
+    def expects_reply_and_ack(self, calls):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            graders = os.path.join(tmp, "case", "graders")
+            os.makedirs(graders)
+            with open(os.path.join(graders, "01-named-replies-and-acks.md"), "w") as f:
+                f.write("Reply once using the hint, then ack the delivered wake.\n")
+            write_run(out, 0, FINISHED)
+            with open(os.path.join(out, "outputs", "atm.log"), "w") as f:
+                f.writelines(json.dumps(call) + "\n" for call in calls)
+            return grade.main(os.path.dirname(graders), out)["expectations"][0]
+
+    def test_wrong_id_order_duplicates_or_failed_mutation_do_not_pass(self):
+        read = {"argv": ["inbox", "--id", "m47"], "rc": 0,
+                "delivery": {"status": "delivered", "target": ["--reply", "m41"]}}
+        reply = {"argv": ["post", "--reply", "m41", "--body", "Read."], "rc": 0}
+        ack = {"argv": ["ack", "m47"], "rc": 0}
+        good = self.expects_reply_and_ack([read, reply, ack])
+        self.assertTrue(good["passed"], good["evidence"])
+        for calls in (
+            [], [read, ack, reply], [read, reply], [read, reply, reply, ack],
+            [read, reply, ack, ack], [read, {**reply, "rc": 1}, ack],
+            [read, {**reply, "argv": ["post", "--reply", "m90", "--body", "Read."]}, ack],
+            [read, reply, {**ack, "argv": ["ack", "m90"]}],
+        ):
+            with self.subTest(calls=calls):
+                self.assertFalse(self.expects_reply_and_ack(calls)["passed"])
+
+    def test_pre_read_queued_wake_must_not_be_acked(self):
+        read = {"argv": ["inbox", "--id", "m47"], "rc": 0,
+                "delivery": {"status": "queued", "target": ["--reply", "m41"]}}
+        reply = {"argv": ["post", "--reply", "m41", "--body", "Read."], "rc": 0}
+        self.assertTrue(self.expects_reply_and_ack([read, reply])["passed"])
+        # The real CLI can cancel queued delivery by acking; success is still wrong here.
+        self.assertFalse(self.expects_reply_and_ack([read, reply, {"argv": ["ack", "m47"], "rc": 0}])["passed"])
+
+    def test_direct_hint_does_not_authorize_a_cross_channel_thread_reply(self):
+        read = {"argv": ["inbox", "--id", "m47"], "rc": 0,
+                "delivery": {"status": "delivered", "target": ["--to", "other/lead"]}}
+        reply = {"argv": ["post", "--to", "other/lead", "--body", "Read."], "rc": 0}
+        ack = {"argv": ["ack", "m47"], "rc": 0}
+        self.assertTrue(self.expects_reply_and_ack([read, reply, ack])["passed"])
+        reply["argv"][1:3] = ["--reply", "m41"]
+        self.assertFalse(self.expects_reply_and_ack([read, reply, ack])["passed"])
+
+
+class NamedFixtureDriver(unittest.TestCase):
+    """Run the real case packaging, stand-in CLI and graders with a fake driver."""
+
+    DRIVER = r'''#!/usr/bin/python3
+import json, os, shlex, subprocess, sys
+from pathlib import Path
+
+prompt, staged = sys.argv[1:]
+top = Path.cwd().parent
+assert Path(os.environ["HOME"]) == top / "home"
+assert Path(os.environ["ATM_SOCKET"]) == top / "s" / "atm.sock"
+assert "TMUX" not in os.environ
+assert set(p.name for p in Path(staged).iterdir()) == {"atm-member", "atm-lead"}
+
+def event(kind, **content):
+    print(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": kind, "id": "t" + str(event.count), "input": content}
+    ]}}))
+    event.count += 1
+
+event.count = 0
+
+def atm(*args):
+    event("Bash", command=shlex.join(["atm", *args]))
+    return subprocess.check_output(["atm", *args], text=True)
+
+if prompt.startswith("/atm-skills:atm-member\n"):
+    assert (Path(staged) / "atm-member/references/atm-named-agents.md").is_file()
+    assert "Agent: project/member;" in atm("me")
+    assert "[m47] Read: atm inbox --id m47" in prompt
+    wake = atm("inbox", "--id", "m47")
+    attach = Path(next(line.removeprefix("attach: ") for line in wake.splitlines() if line.startswith("attach: ")))
+    event("Read", file_path=str(attach))
+    body = attach.read_text().strip().split("with: ")[1]
+    hint = next(shlex.split(line) for line in wake.splitlines() if line.startswith("reply: "))
+    reply = hint[hint.index("--reply") + 1]
+    assert "thread=m41" in atm("post", "--reply", reply, "--body", body)
+    assert "1 marked read" in atm("ack", "m47")
+else:
+    assert prompt.startswith("/atm-skills:atm-lead\n")
+    assert "Agent: project/lead;" in atm("me")
+    attach = Path.cwd() / "briefs/dispatch.md"
+    assert attach.is_file()
+    assert "woke: project/member" in atm("post", "--kind", "brief", "--body", "Read the attached brief",
+                                         "--tag", "project/member", "--attach", str(attach), "--task", "unit-1")
+print(json.dumps({"type": "result", "subtype": "success", "result": "Done."}))
+'''
+
+    def test_two_named_cases_stage_the_named_skills_and_grade_actual_calls(self):
+        skills = Path(HERE).parents[1] / "crates/atm/assets/atm-skills"
+        for family, name in [("atm-member", "read-reply-ack"), ("atm-lead", "dispatch-tagged-brief")]:
+            case = Path(HERE) / family / name
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                driver = Path(tmp) / "driver"
+                driver.write_text(self.DRIVER)
+                driver.chmod(0o755)
+                out = Path(tmp) / "out"
+                result = subprocess.run(
+                    ["bash", os.path.join(HERE, "run.sh"), case, skills, out],
+                    env={**os.environ, "ATM_EVAL_NAMED_DRIVER": str(driver)},
+                    timeout=60, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, (result.stderr, (out / "stderr.txt").read_text()))
+                report = grade.main(case, out)
+                self.assertEqual(report["summary"]["pass_rate"], 1.0, report["expectations"])
+                # Even a rejected legacy call disqualifies a read/reply/ack trace.
+                with (out / "outputs/atm.log").open("a") as log:
+                    log.write(json.dumps({"argv": ["msg", "send"], "rc": 2}) + "\n")
+                self.assertEqual(grade.main(case, out)["summary"]["failed"], 1)
+
+    def test_named_case_without_driver_cannot_run_billed_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Path(HERE) / "atm-member/read-reply-ack"
+            env = {**os.environ, "HOME": tmp, "ATM_EVAL_NAMED_DRIVER": ""}
+            result = subprocess.run(["bash", os.path.join(HERE, "run.sh"), case, HERE,
+                                     Path(tmp) / "out"], env=env, timeout=60, capture_output=True)
+            self.assertEqual(result.returncode, 64)
+            self.assertIn(b"named cases require ATM_EVAL_NAMED_DRIVER", result.stderr)
 
 
 if __name__ == "__main__":

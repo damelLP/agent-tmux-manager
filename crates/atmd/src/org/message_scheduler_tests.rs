@@ -19,13 +19,14 @@ use super::super::{
         utc, worker, Rig,
     },
     messages::{
-        is_focus_notice, AgentId, GiveUpResult, InboxEntry, InboxParams, ResolveParams,
-        MESSAGE_ADMISSION_LIMIT,
+        is_focus_notice, AgentId, GiveUpParams, GiveUpResult, InboxEntry, InboxParams,
+        ResolveParams, MESSAGE_ADMISSION_LIMIT,
     },
     start_line::delivery_line,
 };
 use super::*;
 use crate::org::message_delivery::MESSAGE_RESOLUTION_BUDGET;
+use crate::server::methods::CallContext;
 use atm_core::{Harness, InputState, LifecycleEvent, SessionId, SessionStatus};
 use atm_org::OrgEvent;
 use std::collections::BTreeMap;
@@ -33,10 +34,22 @@ use tokio::sync::{broadcast, mpsc, Semaphore};
 
 const OPEN: usize = 1 << 20;
 
+fn blocked_notice(id: MessageId, reason: &str, behind: &[MessageId], latched: bool) -> String {
+    super::blocked_notice(id, reason, behind, latched, false, None)
+}
+
+/// The retract effect for a test that must never reach it (s3-5c).
+fn no_retract() -> Retract {
+    Arc::new(|_, id, _| Box::pin(async move { panic!("no retract expected for {id}") }))
+}
+
 /// What the observer answers for each recipient; a test changes it as it goes.
 #[derive(Clone)]
 struct Screens {
     seen: Arc<Mutex<HashMap<AgentId, RecipientObservation>>>,
+    /// The editor's one-row text per recipient, for the exact staged match
+    /// (s3-5c); none means the adapter cannot tell.
+    boxes: Arc<Mutex<HashMap<AgentId, String>>>,
     calls: Arc<Mutex<BTreeMap<AgentId, usize>>>,
     /// Closed, it holds every observation after it was counted.
     gate: Arc<Semaphore>,
@@ -46,6 +59,7 @@ impl Default for Screens {
     fn default() -> Self {
         Self {
             seen: Arc::default(),
+            boxes: Arc::default(),
             calls: Arc::default(),
             gate: Arc::new(Semaphore::new(OPEN)),
         }
@@ -55,6 +69,15 @@ impl Default for Screens {
 impl Screens {
     fn set(&self, agent: AgentId, observation: RecipientObservation) {
         self.seen.lock().unwrap().insert(agent, observation);
+    }
+
+    /// What the recipient's editor holds on one row; None: unreadable.
+    fn set_box(&self, agent: AgentId, text: Option<&str>) {
+        let mut boxes = self.boxes.lock().unwrap();
+        match text {
+            Some(text) => boxes.insert(agent, text.into()),
+            None => boxes.remove(&agent),
+        };
     }
 
     /// The observer fails for this recipient from now on.
@@ -72,9 +95,12 @@ impl Screens {
 
     fn effect(&self) -> Observe {
         let screens = self.clone();
-        Arc::new(move |agent: Agent| {
+        Arc::new(move |agent: Agent, reference: Option<String>| {
             let screens = screens.clone();
             Box::pin(async move {
+                let staged = reference.and_then(|line| {
+                    (screens.boxes.lock().unwrap().get(&agent.id)).map(|text| *text == line)
+                });
                 *screens
                     .calls
                     .lock()
@@ -83,7 +109,7 @@ impl Screens {
                     .or_default() += 1;
                 pass(&screens.gate).await;
                 (screens.seen.lock().unwrap().get(&agent.id).cloned())
-                    .map(|seen| (seen, None))
+                    .map(|seen| (seen, None, None, staged))
                     .ok_or_else(|| MessageError::Unavailable("no observation scripted".into()))
             })
         })
@@ -103,6 +129,7 @@ fn ready(pane: &str, session: &str) -> RecipientObservation {
         }),
         presence: PanePresence::Alive,
         facts: empty_editor(),
+        inbox_paste: false,
         copy_mode: Some(false),
         focused: Some(false),
     }
@@ -294,6 +321,7 @@ impl Bench {
             Rig::scheduled(Effects {
                 deliver,
                 observe: screens.effect(),
+                retract: no_retract(),
             })
             .await
         } else {
@@ -357,6 +385,15 @@ impl Bench {
         let (seq, event) = found.unwrap_or_else(|_| panic!("never committed: {what}"));
         self.rig.folded(seq).await;
         event
+    }
+
+    /// A deadline makes a note due; only its committed fold makes it visible.
+    async fn notice(&mut self, id: MessageId, reason: &str) {
+        let expected = key(id, reason);
+        self.event(reason, |event| {
+            matches!(event, OrgEvent::MessageSent(content) if content.delivery_notice.as_ref() == Some(&expected))
+        })
+        .await;
     }
 
     /// Every committed event the test has not taken yet.
@@ -424,7 +461,28 @@ impl Bench {
     }
 
     async fn give_up(&self, id: MessageId) -> Result<DeliveryStatus, MessageError> {
-        let result = guarded(self.rig.messages.give_up(ResolveParams { id }, owner())).await;
+        let result = guarded(self.rig.messages.give_up(
+            GiveUpParams {
+                id,
+                relay_words: None,
+            },
+            owner(),
+        ))
+        .await;
+        result.map(|result| result.status)
+    }
+
+    async fn give_up_as(
+        &self,
+        id: MessageId,
+        caller: CallContext,
+        words: Option<&str>,
+    ) -> Result<DeliveryStatus, MessageError> {
+        let p = GiveUpParams {
+            id,
+            relay_words: words.map(str::to_owned),
+        };
+        let result = guarded(self.rig.messages.give_up(p, caller)).await;
         result.map(|result| result.status)
     }
 
@@ -553,6 +611,7 @@ impl ManualJob {
                     Box::pin(async { panic!("busy message must not dispatch input") })
                 }),
                 observe: screens.effect(),
+                retract: no_retract(),
             },
             worker(),
         );
@@ -620,7 +679,18 @@ impl ManualJob {
 
     /// Synthetic original exit; scheduling fake tests do not claim pane input.
     async fn recovery_original() -> (Self, MessageId, AttemptScope) {
-        let mut rig = Self::new().await;
+        Self::new()
+            .await
+            .held_original(ExecutorHold::InputOutcomeUnknown, EffectCertainty::Applied)
+            .await
+    }
+
+    async fn held_original(
+        self,
+        hold: ExecutorHold,
+        paste: EffectCertainty,
+    ) -> (Self, MessageId, AttemptScope) {
+        let mut rig = self;
         rig.turn(atm_core::TurnState::NotRunning);
         let id = rig.send().await;
         guarded(rig.job.observe()).await.unwrap();
@@ -656,17 +726,17 @@ impl ManualJob {
             HistoryUpdate::Paste {
                 id,
                 pane: scope.pane.clone(),
-                certainty: EffectCertainty::Applied,
+                certainty: paste,
             },
             HistoryUpdate::Held {
                 id,
                 attempt_seq: seq,
-                hold: ExecutorHold::InputOutcomeUnknown,
+                hold,
             },
             HistoryUpdate::AttemptExited {
                 id,
                 attempt_seq: seq,
-                paste: EffectCertainty::Applied,
+                paste,
                 enter: EffectCertainty::NotStarted,
                 cancelled: false,
             },
@@ -685,8 +755,17 @@ impl ManualJob {
 
     async fn give_up(&mut self, id: MessageId) -> GiveUpResult {
         let messages = self.messages.clone();
-        let call =
-            spawn_polled(async move { messages.give_up(ResolveParams { id }, owner()).await });
+        let call = spawn_polled(async move {
+            messages
+                .give_up(
+                    GiveUpParams {
+                        id,
+                        relay_words: None,
+                    },
+                    owner(),
+                )
+                .await
+        });
         self.round(0).await;
         guarded(call).await.unwrap().unwrap()
     }
@@ -796,7 +875,13 @@ async fn recovery_owner_resolution_revokes_before_recipient_slot() {
                     .map(|r| r.status)
             } else {
                 messages
-                    .give_up(ResolveParams { id }, owner())
+                    .give_up(
+                        GiveUpParams {
+                            id,
+                            relay_words: None,
+                        },
+                        owner(),
+                    )
                     .await
                     .map(|r| r.status)
             }
@@ -1107,13 +1192,13 @@ fn blocked_notice_text_is_pinned() {
     assert_eq!(
         blocked_notice(id, "dialog is open", &[], false),
         "m5 blocked: dialog is open; waiting behind it: none. \
-         Delivery resumes when this clears; atm msg give-up m5 cancels it"
+         Delivery resumes when this clears; atm wake give-up m5 cancels it"
     );
     assert_eq!(
         blocked_notice(id, PROBABLY, &[next, last], true),
         "m5 blocked: unconfirmed, probably delivered; inspect before resending; \
          waiting behind it: m7, m9. Inspect the pane; \
-         atm msg retry m5 --accept-duplicate-risk or atm msg give-up m5"
+         atm wake retry m5 --accept-duplicate-risk or atm wake give-up m5"
     );
     // The executor's diagnostic replaces the policy's words for its own holds.
     let reason = |hold| blocked_reason(FailureReason::ProbablyDelivered, hold);
@@ -1378,7 +1463,7 @@ fn unobserved(id: MessageId) -> String {
     format!(
         "{id} waiting: recipient demo/worker could not be observed for 120 s. \
          It stays queued and is delivered when the pane can be read again; \
-         atm msg give-up {id} cancels it"
+         atm wake give-up {id} cancels it"
     )
 }
 
@@ -1387,6 +1472,56 @@ async fn waits_unobserved(bench: &Bench, id: MessageId) {
     assert_eq!(view.status, DeliveryStatus::Queued);
     assert_eq!(view.delivery.phase, DeliveryPhase::Waiting);
     assert_eq!(view.delivery.reason.as_deref(), Some(UNOBSERVED_REASON));
+}
+
+// Break caught: collapse an owned shell-list refusal into the generic wait,
+// retain its text on the next unrelated failure, or surface arbitrary errors.
+#[tokio::test(start_paused = true)]
+async fn shell_list_loss_shows_only_its_owned_wait() {
+    const MISSING: &str = "/etc/shells is missing (using built-in shell names)";
+    const UNREADABLE: &str = "/etc/shells could not be read (using built-in shell names)";
+    const EMPTY: &str = "/etc/shells has no usable shell entries";
+    let mut rig = ManualJob::new().await;
+    let id = rig.send().await;
+    let cases = [
+        (MessageError::Refused(MISSING.into()), MISSING),
+        (MessageError::Unavailable(MISSING.into()), UNOBSERVED_REASON),
+        (MessageError::Refused(UNREADABLE.into()), UNREADABLE),
+        (MessageError::Refused(EMPTY.into()), EMPTY),
+        (MessageError::Refused(UNCONFIRMED.into()), UNCONFIRMED),
+        (
+            MessageError::Refused(format!("{MISSING}; other detail")),
+            UNOBSERVED_REASON,
+        ),
+        (MessageError::Timeout, UNOBSERVED_REASON),
+    ];
+    for (error, want) in cases {
+        let error = Arc::new(Mutex::new(Some(error)));
+        rig.job.effects.observe = Arc::new(move |_, _| {
+            let error = error.lock().unwrap().take().unwrap();
+            Box::pin(async move { Err(error) })
+        });
+        // The owned round completes; the default executor panics if entered.
+        rig.round(0).await;
+        let entry = rig
+            .messages
+            .inbox(
+                InboxParams {
+                    recipient: Some(Address::Agent(worker())),
+                    id: Some(id),
+                    ..page()
+                },
+                owner(),
+            )
+            .await
+            .unwrap()
+            .messages
+            .pop()
+            .unwrap();
+        assert_eq!(entry.status, DeliveryStatus::Queued);
+        assert_eq!(entry.delivery.phase, DeliveryPhase::Waiting);
+        assert_eq!(entry.delivery.reason.as_deref(), Some(want));
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -1403,6 +1538,7 @@ async fn unobservable_recipient_says_so_tells_the_owner_once_and_never_pastes() 
     assert!(bench.notes().await.is_empty());
     // one notice at it, by the job's own wake,
     bench.pass(2).await;
+    bench.notice(id, "unobserved").await;
     assert_eq!(bench.notes().await, [unobserved(id)]);
     // and none after that. The message only waits: nothing is held.
     bench.pass(3600).await;
@@ -1476,6 +1612,7 @@ async fn one_owned_job_observation_per_guard_poll_however_often_it_wakes() {
     let effects = Effects {
         deliver: Arc::new(|_, _, _| Box::pin(async { panic!("blind job dispatched input") })),
         observe: bench.screens.effect(),
+        retract: no_retract(),
     };
     let service = bench.rig.messages.service().unwrap();
     let mut job = Box::pin(Job::new(service, effects, worker()).run());
@@ -1637,10 +1774,11 @@ async fn a_sustained_loss_after_ready_gets_its_full_window_and_one_notice() {
 
 #[tokio::test(start_paused = true)]
 async fn one_unobserved_notice_for_the_oldest_open_message() {
-    let bench = Bench::blind().await;
+    let mut bench = Bench::blind().await;
     let first = bench.send(worker(), "first").await;
     let second = bench.send(worker(), "second").await;
     bench.pass(3600).await;
+    bench.notice(first, "unobserved").await;
     assert_eq!(bench.notes().await, [unobserved(first)]);
     for id in [first, second] {
         waits_unobserved(&bench, id).await;
@@ -1717,7 +1855,7 @@ async fn non_focus_wait_preserves_observation_loss_for_the_next_message() {
 
 #[tokio::test(start_paused = true)]
 async fn an_agent_without_a_pane_ends_the_loss() {
-    let bench = Bench::blind().await;
+    let mut bench = Bench::blind().await;
     let id = bench.send(worker(), "brief").await;
     bench.pass(100).await;
     // Down, so without a pane: that is known about the recipient, not lost.
@@ -1729,6 +1867,7 @@ async fn an_agent_without_a_pane_ends_the_loss() {
         })
         .await;
     bench.pass(100).await;
+    bench.notice(id, "blocked.agent_unavailable").await;
     let down = blocked_notice(id, "recipient agent is stuck or down", &[], false);
     assert_eq!(bench.notes().await, std::slice::from_ref(&down));
     // Back on a pane nobody can read: a new loss, counted from here.
@@ -1743,6 +1882,7 @@ async fn an_agent_without_a_pane_ends_the_loss() {
     bench.pass(119).await;
     assert_eq!(bench.notes().await.len(), 1);
     bench.pass(2).await;
+    bench.notice(id, "unobserved").await;
     assert_eq!(bench.notes().await, [down, unobserved(id)]);
 }
 
@@ -1901,6 +2041,7 @@ async fn observation_back_after_the_notice_delivers() {
     bench.script(Act::Deliver);
     let id = bench.send(worker(), "brief").await;
     bench.pass(121).await;
+    bench.notice(id, "unobserved").await;
     assert_eq!(bench.notes().await, [unobserved(id)]);
     bench.screens.set(worker(), ready("%1", "s1"));
     assert_eq!(bench.entered().await, id);
@@ -1920,6 +2061,7 @@ async fn observation_of_another_pane_or_session_is_a_loss() {
         bench.pass(118).await;
         assert!(bench.notes().await.is_empty());
         bench.pass(3600).await;
+        bench.notice(id, "unobserved").await;
         assert_eq!(bench.notes().await, [unobserved(id)]);
         assert!(bench.entries().is_empty());
     }
@@ -1957,6 +2099,75 @@ async fn owner_focus_notice_is_inbox_only_and_told_once() {
     assert_eq!(bench.notes().await.len(), 1);
 }
 
+// s3-stuckseat case 2. Break: a revalidating seat whose box holds unsent text
+// shows "recipient agent is starting or clearing", or the text omits the pane.
+#[tokio::test(start_paused = true)]
+async fn starting_seat_with_a_draft_names_the_draft_and_its_pane() {
+    let mut rig = ManualJob::new().await;
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+    );
+    rig.command(OrgCommand::Revalidate { agent_id: worker() })
+        .await;
+    let id = rig.send().await;
+    rig.round(0).await;
+    assert_eq!(
+        rig.job.service.board.progress(id).reason.as_deref(),
+        Some("input box holds unsent text in %1")
+    );
+}
+
+// s3-stuckseat case 3, seen in the sealed rig (R6, R8). Break: a message
+// blocked at the readiness deadline stays blocked once its agent is Ready
+// again (a latch), instead of being pasted at the next safe look.
+#[tokio::test(start_paused = true)]
+async fn not_ready_timeout_is_delivered_once_the_agent_is_ready() {
+    let mut bench = Bench::new().await;
+    bench.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+    );
+    bench
+        .rig
+        .run(OrgCommand::Revalidate { agent_id: worker() })
+        .await;
+    let id = bench.send(worker(), "brief").await;
+    // Past the readiness timeout (120 s): blocked, not failed.
+    bench.pass(300).await;
+    let view = bench.entry(worker(), id).await.delivery;
+    assert_eq!(view.phase, DeliveryPhase::Blocked);
+    assert_eq!(
+        view.reason.as_deref(),
+        Some("recipient agent did not become ready before the readiness deadline")
+    );
+    bench.screens.set(worker(), ready("%1", "s1"));
+    bench
+        .rig
+        .run(OrgCommand::EditorReady { agent_id: worker() })
+        .await;
+    assert_eq!(bench.entered().await, id);
+}
+
+// s3-stuckseat (lead's ask a). Break: a queue behind a seat whose session is
+// unconfirmed since a restart says "recipient cannot be observed".
+#[tokio::test(start_paused = true)]
+async fn unconfirmed_session_wait_says_so() {
+    let mut rig = ManualJob::new().await;
+    rig.job.effects.observe =
+        Arc::new(|_, _| Box::pin(async { Err(MessageError::Refused(UNCONFIRMED.into())) }));
+    let id = rig.send().await;
+    rig.round(0).await;
+    assert_eq!(
+        rig.job.service.board.progress(id).reason.as_deref(),
+        Some(UNCONFIRMED)
+    );
+    assert_eq!(
+        UNCONFIRMED,
+        "recipient session not confirmed since the restart; waits for its next harness event"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn fresh_busy_row_has_no_blocked_notice() {
     let mut bench = Bench::blind().await;
@@ -1990,7 +2201,7 @@ async fn blocked_reason_notice_is_told_once_and_lists_followers() {
         bench.notes().await,
         [format!(
             "{first} blocked: {reason}; waiting behind it: {second}. \
-             Delivery resumes when this clears; atm msg give-up {first} cancels it"
+             Delivery resumes when this clears; atm wake give-up {first} cancels it"
         )]
     );
     // No durable state changed, and the notes themselves start nothing.
@@ -2270,7 +2481,9 @@ async fn owner_retry_reaches_a_new_attempt_of_the_same_message() {
         Some(key(id, "blocked.probably_delivered"))
     );
     assert_eq!(
-        guarded(rig.job.resolve(Resolve::Retry, id)).await.unwrap(),
+        guarded(rig.job.resolve(Resolve::Retry, id, None))
+            .await
+            .unwrap(),
         DeliveryStatus::Delivering
     );
     // Activity while released must not hold the old attempt again.
@@ -2426,9 +2639,15 @@ async fn give_up_warning_is_advisory_for_queued_held_and_repeated_calls() {
         bench.entry(worker(), id).await.status,
         DeliveryStatus::Delivering
     );
-    let result = guarded(bench.rig.messages.give_up(ResolveParams { id }, owner()))
-        .await
-        .unwrap();
+    let result = guarded(bench.rig.messages.give_up(
+        GiveUpParams {
+            id,
+            relay_words: None,
+        },
+        owner(),
+    ))
+    .await
+    .unwrap();
     assert_editor_warning(result, id, &format!("[{id}] Read: atm inbox --id {id}"));
     bench.reference(id, "s1", "%1");
     bench
@@ -2604,8 +2823,17 @@ async fn give_up_waits_for_active_cleanup() {
     let id = bench.send(worker(), "brief").await;
     assert_eq!(bench.worked().await, id);
     let messages = bench.rig.messages.clone();
-    let mut give_up =
-        tokio::spawn(async move { messages.give_up(ResolveParams { id }, owner()).await });
+    let mut give_up = tokio::spawn(async move {
+        messages
+            .give_up(
+                GiveUpParams {
+                    id,
+                    relay_words: None,
+                },
+                owner(),
+            )
+            .await
+    });
     // The attempt is still in its cleanup: the decision is not served.
     bench.pass(20).await;
     assert!(!give_up.is_finished());
@@ -2629,7 +2857,13 @@ async fn resolution_timeout_is_typed_and_starts_nothing_later() {
     let timeout = bench
         .rig
         .messages
-        .give_up(ResolveParams { id }, owner())
+        .give_up(
+            GiveUpParams {
+                id,
+                relay_words: None,
+            },
+            owner(),
+        )
         .await;
     assert!(matches!(timeout, Err(MessageError::Timeout)), "{timeout:?}");
     // The service's own budget, below the router's 60 s.
@@ -2657,7 +2891,13 @@ async fn only_the_owner_resolves_and_only_known_agent_messages() {
     let agent = bench
         .rig
         .messages
-        .give_up(ResolveParams { id }, pane("%1"))
+        .give_up(
+            GiveUpParams {
+                id,
+                relay_words: None,
+            },
+            pane("%1"),
+        )
         .await;
     let refused = agent.unwrap_err();
     assert_eq!(
@@ -2677,6 +2917,110 @@ async fn only_the_owner_resolves_and_only_known_agent_messages() {
         bench.give_up(report).await.unwrap_err().to_string(),
         format!("message {report} is already delivered")
     );
+}
+
+// s3-giverelay. Break: any agent, the owner with words, or a seat with no
+// designation passes; the relay without words passes; the words never reach
+// the journal; the owner's plain give-up or the existing conflicts change.
+#[tokio::test(start_paused = true)]
+async fn designated_relay_gives_up_in_the_owners_words() {
+    let mut bench = Bench::new().await;
+    // Messages to demo/other only wait (its pane is not focused).
+    bench
+        .screens
+        .set(other(), with(ready("%2", "s2"), |o| o.focused = None));
+    let first = bench.send(other(), "stale").await;
+    let second = bench.send(other(), "stale too").await;
+    bench.pass(1).await;
+    let words = "Cancel them";
+    let refusal = |who: &str| format!("{who} may not confirm as relay for message {first}");
+    // No relay designated yet: demo/worker is refused like anyone else.
+    let refused = bench
+        .give_up_as(first, pane("%1"), Some(words))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.to_string(), refusal("demo/worker"));
+    assert_eq!(code(refused), "refused");
+    bench
+        .rig
+        .run(OrgCommand::Owner(atm_org::OwnerCommand::SetRelay {
+            by: Address::Owner,
+            agent: Some(worker()),
+        }))
+        .await;
+    bench.committed();
+    // Another agent, and the owner himself, may not relay.
+    for (caller, who) in [(pane("%2"), "demo/other"), (owner(), "owner")] {
+        let refused = bench
+            .give_up_as(first, caller, Some(words))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.to_string(), refusal(who));
+        assert_eq!(code(refused), "refused");
+    }
+    // Without his words the relay is an ordinary agent.
+    let refused = bench.give_up_as(first, pane("%1"), None).await.unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "only the owner may retry or give up a delivery"
+    );
+    assert!(bench.committed().iter().all(|e| failed(e).is_none()));
+    assert_eq!(
+        bench.entry(other(), first).await.status,
+        DeliveryStatus::Queued
+    );
+    // The designated relay with his words gives up; the journal keeps them.
+    assert_eq!(
+        bench
+            .give_up_as(first, pane("%1"), Some(words))
+            .await
+            .unwrap(),
+        DeliveryStatus::Failed
+    );
+    let reason =
+        "owner gave up on delivery; confirmed in his words, relayed by demo/worker: 'Cancel them'";
+    let events = bench.committed();
+    let failures: Vec<_> = events.iter().filter_map(failed).collect();
+    assert_eq!(failures, vec![(first, reason, true)]);
+    assert_eq!(
+        bench.entry(other(), first).await.delivery.reason.as_deref(),
+        Some(reason)
+    );
+    // Already failed: Failed as today, and nothing more is written.
+    assert_eq!(
+        bench
+            .give_up_as(first, pane("%1"), Some("again"))
+            .await
+            .unwrap(),
+        DeliveryStatus::Failed
+    );
+    assert!(bench.committed().iter().all(|e| failed(e).is_none()));
+    // The owner's plain give-up is unchanged.
+    assert_eq!(bench.give_up(second).await.unwrap(), DeliveryStatus::Failed);
+    assert_eq!(
+        bench
+            .entry(other(), second)
+            .await
+            .delivery
+            .reason
+            .as_deref(),
+        Some("owner gave up on delivery")
+    );
+    // A delivered message refuses the relay as it refuses the owner.
+    let held = bench.probably_delivered().await;
+    bench.reference(held, "s1", "%1");
+    bench
+        .event("delivered", |e| delivered(e) == Some(held))
+        .await;
+    let refused = bench
+        .give_up_as(held, pane("%1"), Some(words))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        format!("message {held} is already delivered")
+    );
+    assert_eq!(code(refused), "conflict");
 }
 
 #[tokio::test(start_paused = true)]
@@ -2923,6 +3267,14 @@ async fn executor_error_before_an_attempt_backs_off_and_shows_why() {
 async fn message_without_evidence_is_blocked_until_evidence_has_room() {
     let mut bench = Bench::blind().await;
     bench.script(Act::Deliver);
+    // Keep the reference holder observed but busy. An actual observation
+    // loss there can independently publish an unobserved note at this deadline.
+    bench.screens.set(
+        other(),
+        with(ready("%2", "s2"), |o| {
+            o.facts.turn = TurnState::Running;
+        }),
+    );
     let known = bench.send(other(), "registered").await;
     // Evidence is full: the next message's reference is refused.
     let evidence = bench.rig.rt.evidence.clone();
@@ -2942,6 +3294,7 @@ async fn message_without_evidence_is_blocked_until_evidence_has_room() {
     bench.screens.set(worker(), ready("%1", "s1"));
     bench.screens.gate.add_permits(OPEN);
     bench.pass(120).await;
+    bench.notice(unknown, "evidence_unavailable").await;
     // A ready pane is not enough: without evidence nothing is decided.
     assert_eq!(bench.entries(), []);
     let reason = "message service unavailable: message evidence reference capacity exhausted";
@@ -2997,6 +3350,7 @@ async fn step_on_a_message_delivered_meanwhile_evaluates_again() {
     let effects = Effects {
         deliver: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
         observe: bench.screens.effect(),
+        retract: no_retract(),
     };
     let mut queued = service.board.queued.subscribe();
     let mut job = Job::new(service.clone(), effects, worker());
@@ -3035,6 +3389,7 @@ async fn step_on_a_message_failed_meanwhile_registers_nothing() {
     let effects = Effects {
         deliver: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
         observe: bench.screens.effect(),
+        retract: no_retract(),
     };
     let mut queued = service.board.queued.subscribe();
     let mut job = Job::new(service.clone(), effects, worker());
@@ -3187,6 +3542,428 @@ fn key(id: MessageId, reason: &str) -> atm_org::DeliveryNotice {
     atm_org::DeliveryNotice {
         source_message_id: id,
         reason: reason.into(),
+    }
+}
+
+/// A real editable role file, with a different recorded manager in the journal.
+async fn notice_roles(rig: &ManualJob, recorded: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let roles = root.path().join(".atm/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    rig.command(OrgCommand::RegisterProject {
+        project_id: worker().project,
+        root: root.path().to_str().unwrap().into(),
+        move_root: true,
+    })
+    .await;
+    rig.command(OrgCommand::RegisterProject {
+        project_id: "org".parse().unwrap(),
+        root: root.path().join("other").to_str().unwrap().into(),
+        move_root: false,
+    })
+    .await;
+    for (name, at) in [("demo/old", "%2"), ("org/lead", "%3")] {
+        let agent_id: AgentId = name.parse().unwrap();
+        rig.command(OrgCommand::Adopt {
+            agent_id: agent_id.clone(),
+            pane: at.into(),
+            session_id: None,
+        })
+        .await;
+        // Registered but Down: manager routing must not require an active pane.
+        rig.command(OrgCommand::Down {
+            agent_id,
+            reason: "not running".into(),
+        })
+        .await;
+    }
+    rig.command(OrgCommand::Down {
+        agent_id: worker(),
+        reason: "install recorded role".into(),
+    })
+    .await;
+    rig.command(OrgCommand::Up {
+        agent_id: worker(),
+        role: atm_org::parse_role("worker", &manager_role(recorded)).unwrap(),
+    })
+    .await;
+    rig.command(OrgCommand::Adopt {
+        agent_id: worker(),
+        pane: "%1".into(),
+        session_id: Some("s1".into()),
+    })
+    .await;
+    (root, roles.join("worker.md"))
+}
+
+fn manager_role(manager: &str) -> String {
+    format!("+++\nharness='pi'\nmanager='{manager}'\n+++\n")
+}
+
+async fn entries_to(rig: &ManualJob, to: &str) -> Vec<InboxEntry> {
+    rig.messages
+        .inbox(
+            InboxParams {
+                recipient: Some(to.parse().unwrap()),
+                ..page()
+            },
+            owner(),
+        )
+        .await
+        .unwrap()
+        .messages
+}
+
+// Break caught: read the recorded manager (or Owner) instead of the current
+// one, fan out copies, or turn an informational note into a delivery action.
+#[tokio::test(start_paused = true)]
+async fn blocked_and_unobserved_follow_current_manager() {
+    let mut rig = ManualJob::new().await;
+    let (_root, role) = notice_roles(&rig, "old").await;
+    std::fs::write(&role, manager_role("old")).unwrap();
+    let id = rig.send().await;
+    let follower = rig.send().await;
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| {
+            o.facts.turn = TurnState::Unknown;
+        }),
+    );
+    rig.round(0).await;
+    std::fs::write(&role, manager_role("org/lead")).unwrap();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    // The shared role reader uses a detached OS thread, not paused-time I/O.
+    tokio::time::resume();
+    rig.recovery_round().await;
+    tokio::time::pause();
+    rig.screens.lose(&worker());
+    rig.round(0).await;
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::time::resume();
+    rig.recovery_round().await;
+
+    assert!(owner_entries(&rig).await.is_empty(), "no Owner copy");
+    assert!(
+        entries_to(&rig, "demo/old").await.is_empty(),
+        "no old manager copy"
+    );
+    let entries = entries_to(&rig, "org/lead").await;
+    let expected = [
+        // s3-busy: this look reads an empty editor with no dialog and an
+        // unread turn, so the note names that instead of "readiness".
+        ("blocked.readiness_timeout", format!("{id} blocked: atm cannot read the turn state on %1; atm will recheck automatically; waiting behind it: {follower}. Delivery resumes when this clears; the owner can cancel it with atm wake give-up {id}")),
+        ("unobserved", format!("{id} waiting: recipient demo/worker could not be observed for 120 s. It stays queued; delivery can resume when the pane can be read again. The owner can cancel it with atm wake give-up {id}")),
+    ];
+    assert_eq!(entries.len(), expected.len());
+    for (note, (reason, body)) in entries.iter().zip(expected) {
+        assert_eq!(
+            (note.status, note.delivery.attempt),
+            (DeliveryStatus::Queued, 0)
+        );
+        assert_eq!(note.content.from, Address::System);
+        assert_eq!(note.content.kind, MessageKind::Note);
+        assert_eq!(note.content.delivery_notice, Some(key(id, reason)));
+        assert_eq!(note.content.body, body);
+        assert!(note.content.attachments.is_empty() && note.content.task.is_none());
+    }
+    let worker_mail = entries_to(&rig, "demo/worker").await;
+    assert_eq!(worker_mail[0].delivery.phase, DeliveryPhase::Waiting);
+    assert_eq!(worker_mail[1].delivery.blocked_by, Some(id));
+    assert!(worker_mail
+        .iter()
+        .all(|m| m.status == DeliveryStatus::Queued && m.delivery.attempt == 0));
+    rig.stop().await;
+}
+
+async fn assert_down_notice_stays_with_owner(content: MessageContent) {
+    let mut rig = ManualJob::new().await;
+    // If the writer wrongly tries to route, the manager exists even when the
+    // detached reader cannot find a current role.
+    let (_root, _role) = notice_roles(&rig, "org/lead").await;
+    rig.command(OrgCommand::SendMessage(content)).await;
+    let id = *rig.job.service.open(&worker()).unwrap().last().unwrap();
+    rig.command(OrgCommand::Down {
+        agent_id: worker(),
+        reason: "stopped".into(),
+    })
+    .await;
+    rig.recovery_round().await;
+
+    let manager = entries_to(&rig, "org/lead").await;
+    assert!(
+        manager.is_empty(),
+        "manager got the blocked notice for {id}"
+    );
+    let owner = owner_entries(&rig).await;
+    assert_eq!(owner.len(), 1);
+    assert_eq!(
+        owner[0].content.delivery_notice,
+        Some(key(id, "blocked.agent_unavailable"))
+    );
+    rig.stop().await;
+}
+
+// Break caught: a blocked System bootstrap shifts its Owner notification to an agent.
+#[tokio::test(start_paused = true)]
+async fn nonordinary_notice_system_start_line_stays_with_owner() {
+    assert_down_notice_stays_with_owner(super::super::start_line::start_line(&worker())).await;
+}
+
+// Break caught: a self-send routes to a distinct manager, despite the self-manager guard.
+#[tokio::test(start_paused = true)]
+async fn nonordinary_notice_self_send_stays_with_owner() {
+    assert_down_notice_stays_with_owner(MessageContent {
+        from: Address::Agent(worker()),
+        to: Address::Agent(worker()),
+        ..note("a note to myself".into())
+    })
+    .await;
+}
+
+// Break caught: unusable current roles drop the recorded fallback, explicit
+// Owner loses to fallback, or self-addressed diagnostic mail loops.
+#[tokio::test]
+async fn current_manager_owner_and_recorded_fallbacks() {
+    for (fresh, recorded, to) in [
+        (Some(manager_role("owner")), "old", "owner"),
+        (None, "old", "demo/old"),
+        (Some("+++\nharness='pi'\n+++\n".into()), "old", "demo/old"),
+        (Some("+++\n[harness\n+++\n".into()), "old", "demo/old"),
+        (Some(manager_role("missing")), "old", "demo/old"),
+        (Some(manager_role("missing")), "missing", "owner"),
+        (Some(manager_role("worker")), "old", "owner"),
+    ] {
+        let mut rig = ManualJob::new().await;
+        let (_root, role) = notice_roles(&rig, recorded).await;
+        if let Some(text) = &fresh {
+            std::fs::write(role, text).unwrap();
+        }
+        let id = rig.send().await;
+        rig.job
+            .blocked_notice(
+                id,
+                "hold.input_outcome_unknown",
+                "input outcome unknown",
+                true,
+            )
+            .await
+            .unwrap();
+        let messages = entries_to(&rig, to).await;
+        assert_eq!(messages.len(), 1, "current={fresh:?}, recorded={recorded}");
+        let note = &messages[0];
+        assert_eq!(
+            note.content.delivery_notice,
+            Some(key(id, "hold.input_outcome_unknown"))
+        );
+        let advice = if to == "owner" {
+            format!("Inspect the pane; atm wake retry {id} --accept-duplicate-risk or atm wake give-up {id}")
+        } else {
+            assert!(owner_entries(&rig).await.is_empty());
+            format!("Ask the owner to inspect the pane; only the owner can run atm wake retry {id} --accept-duplicate-risk or atm wake give-up {id}")
+        };
+        assert_eq!(
+            note.content.body,
+            format!("{id} blocked: input outcome unknown; waiting behind it: none. {advice}")
+        );
+        rig.stop().await;
+    }
+}
+
+// Break caught: retarget the replayed lifetime key or widen the family to
+// focus, running-turn reminders, or terminal failures.
+#[tokio::test]
+async fn current_manager_leaves_old_keys_and_owner_only_families_alone() {
+    let rig = ManualJob::new().await;
+    let (_root, role) = notice_roles(&rig, "old").await;
+    std::fs::write(role, manager_role("org/lead")).unwrap();
+    let id = rig.send().await;
+    let mut legacy = note("legacy diagnostic".into());
+    let legacy_key = key(id, "blocked.readiness_timeout");
+    legacy.delivery_notice = Some(legacy_key.clone());
+    rig.command(OrgCommand::SendMessage(legacy)).await;
+    let records = rig.journal.lock().unwrap().clone();
+    rig.stop().await;
+    let mut rig = ManualJob::from_records(records).await;
+    rig.job
+        .blocked_notice(id, "blocked.readiness_timeout", "new diagnostic", false)
+        .await
+        .unwrap();
+    let reasons = ["focus", "running_turn", "failed.attempt_limit"];
+    for reason in ["focus", "running_turn"] {
+        rig.job
+            .publish(id, reason, note(reason.into()))
+            .await
+            .unwrap();
+    }
+    rig.command(OrgCommand::DeliveryFailed {
+        message_id: id,
+        reason: FailureReason::AttemptLimit.to_string(),
+        final_failure: true,
+    })
+    .await;
+    rig.recovery_round().await;
+    let owner = owner_entries(&rig).await;
+    assert_eq!(owner.len(), 4);
+    assert_eq!(owner[0].content.body, "legacy diagnostic");
+    assert_eq!(owner[0].content.delivery_notice, Some(legacy_key));
+    for (note, reason) in owner[1..].iter().zip(reasons) {
+        assert_eq!(note.content.delivery_notice, Some(key(id, reason)));
+    }
+    assert!(entries_to(&rig, "org/lead").await.is_empty());
+    assert!(entries_to(&rig, "demo/old").await.is_empty());
+    rig.stop().await;
+}
+
+// Break caught: retry a lost append under the edited manager, or recursively
+// direct a blocked manager-addressed note to that manager's manager.
+#[tokio::test(start_paused = true)]
+async fn current_manager_lost_append_keeps_one_audience_and_one_hop() {
+    let mut rig = ManualJob::new().await;
+    let (root, role) = notice_roles(&rig, "old").await;
+    std::fs::write(&role, manager_role("org/lead")).unwrap();
+    let id = rig.send().await;
+    rig.turn(TurnState::Running);
+    while rig.appends.try_recv().is_ok() {}
+    rig.gate.forget_permits(usize::MAX);
+    tokio::time::resume();
+    {
+        let mut publication =
+            Box::pin(
+                rig.job
+                    .blocked_notice(id, "evidence_unavailable", "first diagnostic", false),
+            );
+        tokio::select! {
+            result = &mut publication => panic!("returned before append barrier: {result:?}"),
+            entered = guarded(rig.appends.recv()) => assert_eq!(entered, Some(())),
+        }
+        std::fs::write(&role, manager_role("old")).unwrap();
+        tokio::time::pause();
+        tokio::time::advance(COMMIT_BUDGET).await;
+        assert!(guarded(publication).await.is_err());
+    }
+    rig.gate.add_permits(1);
+    rig.round(0).await;
+    rig.job
+        .blocked_notice(id, "evidence_unavailable", "changed diagnostic", false)
+        .await
+        .unwrap();
+    let notes = entries_to(&rig, "org/lead").await;
+    assert_eq!(notes.len(), 1);
+    let first = &notes[0];
+    assert_eq!(
+        first.content.delivery_notice,
+        Some(key(id, "evidence_unavailable"))
+    );
+    assert_eq!(first.content.body, format!("{id} blocked: first diagnostic; waiting behind it: none. Delivery resumes when this clears; the owner can cancel it with atm wake give-up {id}"));
+    assert!(entries_to(&rig, "demo/old").await.is_empty());
+    assert!(owner_entries(&rig).await.is_empty());
+
+    let manager_roles = root.path().join("other/.atm/roles");
+    std::fs::create_dir_all(&manager_roles).unwrap();
+    std::fs::write(manager_roles.join("lead.md"), manager_role("demo/old")).unwrap();
+    rig.job.recipient = "org/lead".parse().unwrap();
+    tokio::time::resume();
+    rig.recovery_round().await; // The manager is Down, so its own mail is blocked.
+    let owners = owner_entries(&rig).await;
+    assert_eq!(owners.len(), 1);
+    assert_eq!(
+        owners[0].content.delivery_notice,
+        Some(key(first.message_id, "blocked.agent_unavailable"))
+    );
+    assert!(entries_to(&rig, "demo/old").await.is_empty());
+    rig.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn enter_not_sent_notice_matches_recovery_eligibility() {
+    for case in [
+        "eligible owner",
+        "eligible manager",
+        "uncertain",
+        "used",
+        "revoked",
+        "lost",
+    ] {
+        let rig = ManualJob::new().await;
+        let role = if case == "eligible manager" {
+            let (root, role) = notice_roles(&rig, "old").await;
+            std::fs::write(role, manager_role("org/lead")).unwrap();
+            Some(root)
+        } else {
+            None
+        };
+        let paste = if case == "uncertain" {
+            EffectCertainty::Unknown
+        } else {
+            EffectCertainty::Applied
+        };
+        let (mut rig, id, scope) = rig.held_original(ExecutorHold::EnterNotSent, paste).await;
+        let rt = &rig.job.service.rt;
+        let now = rt.clock.now().unwrap();
+        if case == "used" {
+            drop(
+                rt.evidence
+                    .claim_recovery(&rt.history, scope, false, now)
+                    .unwrap(),
+            );
+        } else if case == "revoked" {
+            rt.history.revoke_recovery(id).unwrap();
+        }
+        rig.turn(TurnState::Running);
+        if case == "lost" {
+            rig.screens.lose(&worker());
+        }
+        // The scheduler must publish copy without exercising the attempt fake,
+        // which panics if a busy or unobserved recipient reaches dispatch.
+        tokio::time::resume();
+        rig.recovery_round().await;
+        tokio::time::pause();
+        let to = if role.is_some() { "org/lead" } else { "owner" };
+        let notes = entries_to(&rig, to).await;
+        assert_eq!(notes.len(), 1, "{case}");
+        assert_eq!(
+            notes[0].content.delivery_notice,
+            Some(key(id, "hold.enter_not_sent")),
+            "{case}"
+        );
+        // s3-stuckseat 5b: the notice names atm's reference and what clears it.
+        let advice = match (case.starts_with("eligible"), role.is_some()) {
+            (true, false) => "atm presses Enter once when the seat is idle, nobody is in the pane, the editor holds exactly that reference line and the pane passes its safety checks; or press Enter there yourself if the editor holds exactly that reference line.".to_owned(),
+            (true, true) => "atm presses Enter once when the seat is idle, nobody is in the pane, the editor holds exactly that reference line and the pane passes its safety checks; or ask the owner to press Enter there if the editor holds exactly that reference line.".to_owned(),
+            (false, _) => format!("atm cannot press Enter on the current evidence: press Enter there yourself if the editor holds exactly that reference line, or give it up with atm wake give-up {id}."),
+        };
+        assert_eq!(notes[0].content.body, format!("{id} blocked: atm's reference {id} is waiting for Enter in %1; waiting behind it: none. Do not type in that pane. {advice}"), "{case}");
+        let source = entries_to(&rig, "demo/worker").await;
+        assert_eq!(source[0].delivery.phase, DeliveryPhase::Blocked);
+        assert_eq!(source[0].delivery.attempt, 1);
+        if role.is_some() {
+            assert!(owner_entries(&rig).await.is_empty());
+            rig.command(OrgCommand::Adopt {
+                agent_id: "org/lead".parse().unwrap(),
+                pane: "%3".into(),
+                session_id: Some("manager-session".into()),
+            })
+            .await;
+            let retry = rig
+                .messages
+                .retry(ResolveParams { id }, pane("%3"))
+                .await
+                .unwrap_err();
+            let cancel = rig
+                .messages
+                .give_up(
+                    GiveUpParams {
+                        id,
+                        relay_words: None,
+                    },
+                    pane("%3"),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(retry, MessageError::Refused(_)));
+            assert!(matches!(cancel, MessageError::Refused(_)));
+        }
+        rig.stop().await;
     }
 }
 
@@ -3900,4 +4677,846 @@ async fn terminal_notice_tags_are_semantic_for_all_known_causes() {
         .collect();
     assert_eq!(actual, expected);
     rig.stop().await;
+}
+
+// s3-stuckseat case 5a, seen live twice on a Claude lead (journal: the seat
+// started a turn of its own 0.4-0.6 s after atm's paste, so Enter was
+// withheld): once that turn ends and the box still holds exactly the
+// reference, the one-shot recovery presses Enter, unfocused. Break: the
+// harness's own turn (a busy session row, then idle again) spends or revokes
+// the recovery, leaving atm's reference in the box for good.
+#[tokio::test(start_paused = true)]
+async fn enter_not_sent_reference_is_finished_once_the_harness_turn_ends() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, id, _) = ManualJob::new()
+        .await
+        .held_original(ExecutorHold::EnterNotSent, EffectCertainty::Applied)
+        .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    rig.job.effects.deliver = Arc::new(move |rt, id, _| {
+        let called = called.clone();
+        Box::pin(async move {
+            called.fetch_add(1, Ordering::SeqCst);
+            let now = rt.clock.now()?;
+            let scope = rt.history.recovery_candidate(id, now)?.unwrap();
+            let claim = rt.evidence.claim_recovery(&rt.history, scope, false, now)?;
+            drop(claim);
+            Ok(())
+        })
+    });
+    // The harness's own turn: its row works, the screen shows a turn running
+    // with the reference still staged below it.
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| {
+            o.facts.turn = atm_core::TurnState::Running;
+            o.facts.input = InputState::Draft;
+            if let Some(row) = o.session.as_mut() {
+                row.status = SessionStatus::Working;
+            }
+        }),
+    );
+    rig.recovery_round().await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no Enter while the turn runs"
+    );
+    // The turn ends; the reference is still staged; the owner is elsewhere.
+    rig.turn(atm_core::TurnState::NotRunning);
+    rig.round(5_000).await;
+    rig.recovery_round().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one Enter-only recovery");
+    let _ = id;
+}
+
+// s3-stuckseat case 5, the lead's ruling Q6. Break: the one-shot Enter runs
+// while the owner may be in the pane (focused, or focus unknown).
+#[tokio::test(start_paused = true)]
+async fn enter_not_sent_reference_waits_while_the_owner_may_be_in_the_pane() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for focus in [Some(true), None] {
+        let (mut rig, _, _) = ManualJob::new()
+            .await
+            .held_original(ExecutorHold::EnterNotSent, EffectCertainty::Applied)
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        rig.job.effects.deliver = Arc::new(move |_, _, _| {
+            let called = called.clone();
+            Box::pin(async move {
+                called.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        rig.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| {
+                o.facts.input = InputState::Draft;
+                o.focused = focus;
+            }),
+        );
+        for _ in 0..3 {
+            rig.round(5_000).await;
+            rig.recovery_round().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{focus:?}");
+    }
+}
+
+// s3-stuckseat case 5b. Break: a reference atm pasted without Enter reads as
+// "editor staging is unproven" (a person cannot act on that), or the notice
+// does not say what clears it: atm's own Enter once nobody is in the pane,
+// the owner's Enter, or a give-up.
+#[tokio::test(start_paused = true)]
+async fn enter_not_sent_names_atms_reference_and_what_clears_it() {
+    for (paste, advice) in [
+        (
+            EffectCertainty::Applied,
+            "atm presses Enter once when the seat is idle, nobody is in the pane, the editor holds exactly that reference line and the pane passes its safety checks; or press Enter there yourself if the editor holds exactly that reference line.",
+        ),
+        (
+            EffectCertainty::Unknown,
+            "atm cannot press Enter on the current evidence: press Enter there yourself if the editor holds exactly that reference line, or give it up with atm wake give-up",
+        ),
+    ] {
+        let (mut rig, id, _) = ManualJob::new()
+            .await
+            .held_original(ExecutorHold::EnterNotSent, paste)
+            .await;
+        rig.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| {
+                o.facts.input = InputState::Draft;
+                o.focused = Some(true);
+            }),
+        );
+        tokio::time::resume();
+        rig.recovery_round().await;
+        tokio::time::pause();
+        let shown = format!("atm's reference {id} is waiting for Enter in %1");
+        assert_eq!(
+            rig.job.service.board.progress(id).reason.as_deref(),
+            Some(shown.as_str()),
+            "{paste:?}"
+        );
+        let notes = rig.notes().await;
+        assert_eq!(notes.len(), 1, "{paste:?}");
+        assert!(
+            notes[0].starts_with(&format!("{id} blocked: {shown}; waiting behind it: none. Do not type in that pane. {advice}")),
+            "{paste:?}: {}",
+            notes[0]
+        );
+    }
+}
+
+// s3-5c S2. Break: a held message's text comes from its hold, not from the
+// editor: a reference the owner cleared or replaced still "waits for Enter".
+// Unread (the adapter cannot tell), the hold's 5b words stay.
+#[tokio::test(start_paused = true)]
+async fn held_reference_text_comes_from_the_editor() {
+    let held = |id| format!("atm's reference {id} is waiting for Enter in %1");
+    let gone = |id| {
+        format!("atm's reference {id} is no longer in the input box in %1; Enter was not sent")
+    };
+    for (case, input, editor) in [
+        ("holds it", InputState::Draft, Some(true)),
+        ("other text", InputState::Draft, Some(false)),
+        ("empty", InputState::Empty, None),
+        ("unread", InputState::Draft, None),
+    ] {
+        let (mut rig, id, _) = ManualJob::new()
+            .await
+            .held_original(ExecutorHold::EnterNotSent, EffectCertainty::Applied)
+            .await;
+        // Focused: no Enter recovery, only the words.
+        rig.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| {
+                o.facts.input = input;
+                o.focused = Some(true);
+            }),
+        );
+        let reference = inbox_reference(id);
+        let text = match editor {
+            Some(true) => Some(reference.as_str()),
+            Some(false) => Some("the owner's own draft"),
+            None => None,
+        };
+        rig.screens.set_box(worker(), text);
+        tokio::time::resume();
+        rig.recovery_round().await;
+        tokio::time::pause();
+        let expected = match case {
+            "other text" | "empty" => gone(id),
+            _ => held(id),
+        };
+        assert_eq!(
+            rig.job.service.board.progress(id).reason.as_deref(),
+            Some(expected.as_str()),
+            "{case}"
+        );
+    }
+}
+
+// s3-5c S2. Break: after a restart atm's own reference in the editor reads
+// as the policy's "restarted" only, as if someone else's text were there.
+#[tokio::test(start_paused = true)]
+async fn restarted_attempt_names_its_reference_from_the_editor() {
+    for (case, own) in [("own reference", true), ("plain draft", false)] {
+        let first = ManualJob::new().await;
+        let id = first.send().await;
+        first
+            .command(OrgCommand::DeliveryAttempted {
+                message_id: id,
+                attempt: 1,
+                pane: "%1".into(),
+            })
+            .await;
+        let bytes = serde_json::to_vec(&*first.journal.lock().unwrap()).unwrap();
+        first.stop().await;
+        let mut second = ManualJob::from_records(serde_json::from_slice(&bytes).unwrap()).await;
+        second.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+        );
+        let reference = inbox_reference(id);
+        let text = if own { reference.as_str() } else { "a draft" };
+        second.screens.set_box(worker(), Some(text));
+        second.round(0).await;
+        let expected = if own {
+            format!("atm's reference {id} is waiting for Enter in %1")
+        } else {
+            FailureReason::Restarted.to_string()
+        };
+        assert_eq!(
+            second.job.service.board.progress(id).reason.as_deref(),
+            Some(expected.as_str()),
+            "{case}"
+        );
+        second.stop().await;
+    }
+}
+
+// s3-5c S2. Break: a message behind atm's own failed reference reads "input
+// box holds unsent text", as if the owner were typing there.
+#[tokio::test(start_paused = true)]
+async fn queued_message_names_a_failed_reference_in_the_editor() {
+    for (case, own) in [("failed reference", true), ("plain draft", false)] {
+        let (mut rig, first, _) = ManualJob::new()
+            .await
+            .held_original(ExecutorHold::EnterNotSent, EffectCertainty::Applied)
+            .await;
+        rig.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| {
+                o.facts.input = InputState::Draft;
+                o.focused = Some(true);
+            }),
+        );
+        rig.give_up(first).await;
+        let second = rig.send().await;
+        rig.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+        );
+        let reference = inbox_reference(first);
+        let text = if own { reference.as_str() } else { "a draft" };
+        rig.screens.set_box(worker(), Some(text));
+        // A harness with no retract key: the reference is named, not cleared.
+        rig.job.effects.retract = retract_fake(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            vec![Retracted::Refused],
+            rig.screens.clone(),
+        );
+        rig.round(0).await;
+        let expected = if own {
+            format!("input box holds atm's unsent reference {first} in %1")
+        } else {
+            "input box holds unsent text in %1".to_owned()
+        };
+        assert_eq!(
+            rig.job.service.board.progress(second).reason.as_deref(),
+            Some(expected.as_str()),
+            "{case}"
+        );
+    }
+}
+
+/// A retract fake that counts its calls and answers `outcomes` in turn (the
+/// last one from then on). A cleared editor then reads empty, as the real key
+/// leaves it (s3-5c).
+fn retract_fake(
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    outcomes: Vec<Retracted>,
+    screens: Screens,
+) -> Retract {
+    let outcomes = Arc::new(Mutex::new(VecDeque::from(outcomes)));
+    Arc::new(move |_, _, _| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let outcome = {
+            let mut outcomes = outcomes.lock().unwrap();
+            if outcomes.len() > 1 {
+                outcomes.pop_front().unwrap()
+            } else {
+                *outcomes.front().unwrap()
+            }
+        };
+        if outcome == Retracted::Cleared {
+            screens.set_box(worker(), None);
+            screens.set(worker(), ready("%1", "s1"));
+        }
+        Box::pin(async move { Ok(outcome) })
+    })
+}
+
+/// A delivery fake that counts the attempts it is asked for.
+fn counted_deliver(calls: Arc<std::sync::atomic::AtomicUsize>) -> Deliver {
+    Arc::new(move |_, _, _| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    })
+}
+
+/// A message to the worker whose reference atm pasted without Enter, given
+/// up by the owner (a final failure), and a second message queued behind it.
+async fn failed_reference(rig: ManualJob) -> (ManualJob, MessageId, MessageId) {
+    let (mut rig, first, _) = rig
+        .held_original(ExecutorHold::EnterNotSent, EffectCertainty::Applied)
+        .await;
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| {
+            o.facts.input = InputState::Draft;
+            o.focused = Some(true);
+        }),
+    );
+    rig.give_up(first).await;
+    let second = rig.send().await;
+    // Idle, unfocused, the editor holding exactly the first reference.
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+    );
+    rig.screens.set_box(worker(), Some(&inbox_reference(first)));
+    (rig, first, second)
+}
+
+// s3-5c. Break: atm's own reference left by a finally failed message holds
+// every later delivery, or atm retracts it more than once, or says nothing.
+#[tokio::test(start_paused = true)]
+async fn failed_reference_is_retracted_once_then_the_queue_moves_on() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, first, second) = failed_reference(ManualJob::new().await).await;
+    let (retracts, attempts) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    rig.job.effects.retract = retract_fake(
+        retracts.clone(),
+        vec![Retracted::Cleared],
+        rig.screens.clone(),
+    );
+    rig.job.effects.deliver = counted_deliver(attempts.clone());
+    for _ in 0..6 {
+        rig.round(5_000).await;
+    }
+    assert_eq!(retracts.load(Ordering::SeqCst), 1);
+    let notes = rig.notes().await;
+    let cleared = format!("atm cleared its unsent reference {first} from %1");
+    assert_eq!(
+        notes.iter().filter(|n| **n == cleared).count(),
+        1,
+        "{notes:?}"
+    );
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 1,
+        "{second} was never attempted"
+    );
+}
+
+// s3-5c. Break: the retract runs on anything but exactly atm's reference of
+// a finally failed message, in an idle editor nobody is focused on. Which
+// harness has a key is the executor's to check (an adopted seat has no role).
+#[tokio::test(start_paused = true)]
+async fn retract_never_runs_on_anything_else() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for case in [
+        "beside a draft",
+        "unread",
+        "focused",
+        "unknown focus",
+        "running",
+        "dialog",
+        "copy mode",
+        "lost",
+        "late receipt",
+        "still open",
+    ] {
+        let base = ManualJob::new().await;
+        let (mut rig, first) = if case == "still open" {
+            let (rig, first, _) = base
+                .held_original(ExecutorHold::EnterNotSent, EffectCertainty::Applied)
+                .await;
+            rig.screens.set(
+                worker(),
+                with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+            );
+            rig.screens.set_box(worker(), Some(&inbox_reference(first)));
+            (rig, first)
+        } else {
+            let (rig, first, _) = failed_reference(base).await;
+            (rig, first)
+        };
+        let reference = inbox_reference(first);
+        let draft = |change: fn(&mut RecipientObservation)| {
+            with(
+                with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+                change,
+            )
+        };
+        match case {
+            "beside a draft" => rig
+                .screens
+                .set_box(worker(), Some(&format!("{reference} and mine"))),
+            "unread" => rig.screens.set_box(worker(), None),
+            "focused" => rig.screens.set(worker(), draft(|o| o.focused = Some(true))),
+            "unknown focus" => rig.screens.set(worker(), draft(|o| o.focused = None)),
+            "running" => rig
+                .screens
+                .set(worker(), draft(|o| o.facts.turn = TurnState::Running)),
+            "dialog" => rig.screens.set(
+                worker(),
+                draft(|o| o.facts.dialog = DialogState::Permission),
+            ),
+            "copy mode" => rig
+                .screens
+                .set(worker(), draft(|o| o.copy_mode = Some(true))),
+            "lost" => rig.screens.lose(&worker()),
+            "late receipt" => {
+                rig.command(OrgCommand::Delivered {
+                    message_id: first,
+                    session_id: "s1".into(),
+                    confirmation: "fixture".into(),
+                })
+                .await
+            }
+            _ => {}
+        }
+        let retracts = Arc::new(AtomicUsize::new(0));
+        rig.job.effects.retract = retract_fake(
+            retracts.clone(),
+            vec![Retracted::Cleared],
+            rig.screens.clone(),
+        );
+        rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+        for _ in 0..3 {
+            rig.round(5_000).await;
+        }
+        assert_eq!(retracts.load(Ordering::SeqCst), 0, "{case}");
+    }
+}
+
+// s3-5c. Break: a retract whose key left text behind is tried again, or the
+// owner's manager hears of it more than once.
+#[tokio::test(start_paused = true)]
+async fn retract_that_left_text_is_reported_once_and_never_retried() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, first, _) = failed_reference(ManualJob::new().await).await;
+    let retracts = Arc::new(AtomicUsize::new(0));
+    rig.job.effects.retract =
+        retract_fake(retracts.clone(), vec![Retracted::Left], rig.screens.clone());
+    rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+    for _ in 0..3 {
+        rig.round(40_000).await;
+    }
+    assert_eq!(retracts.load(Ordering::SeqCst), 1);
+    let left = format!("atm tried once to clear its unsent reference {first} from %1, but the input box may still hold text; clear it there. atm will not try again.");
+    let notes = rig.notes().await;
+    assert_eq!(notes.iter().filter(|n| **n == left).count(), 1, "{notes:?}");
+}
+
+// s3-5c. Break: a retract that sent nothing is reported, never tried again,
+// or tried again at every guard poll.
+#[tokio::test(start_paused = true)]
+async fn retract_refused_before_the_key_is_tried_again_after_a_pause() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, first, _) = failed_reference(ManualJob::new().await).await;
+    let retracts = Arc::new(AtomicUsize::new(0));
+    rig.job.effects.retract = retract_fake(
+        retracts.clone(),
+        vec![Retracted::Refused, Retracted::Cleared],
+        rig.screens.clone(),
+    );
+    rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+    rig.round(0).await;
+    assert_eq!(retracts.load(Ordering::SeqCst), 1);
+    assert!(rig
+        .notes()
+        .await
+        .iter()
+        .all(|n| !n.contains("unsent reference")));
+    rig.round(29_000).await;
+    assert_eq!(retracts.load(Ordering::SeqCst), 1, "within the pause");
+    rig.round(1_000).await;
+    assert_eq!(retracts.load(Ordering::SeqCst), 2);
+    let cleared = format!("atm cleared its unsent reference {first} from %1");
+    assert!(rig.notes().await.contains(&cleared));
+}
+
+// s3-5c (the lead's Q2). Break: after a restart atm no longer knows its own
+// failed reference, so a promotion leaves it in the editor for good.
+#[tokio::test(start_paused = true)]
+async fn failed_reference_is_retracted_after_a_restart_from_the_log() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (rig, first, _) = failed_reference(ManualJob::new().await).await;
+    let bytes = serde_json::to_vec(&*rig.journal.lock().unwrap()).unwrap();
+    rig.stop().await;
+    let mut second = ManualJob::from_records(serde_json::from_slice(&bytes).unwrap()).await;
+    second.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+    );
+    second
+        .screens
+        .set_box(worker(), Some(&inbox_reference(first)));
+    let retracts = Arc::new(AtomicUsize::new(0));
+    second.job.effects.retract = retract_fake(
+        retracts.clone(),
+        vec![Retracted::Cleared],
+        second.screens.clone(),
+    );
+    second.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+    second.round(0).await;
+    assert_eq!(retracts.load(Ordering::SeqCst), 1);
+    second.stop().await;
+}
+
+// s3-5c S2. Break: once the draft wait has lasted the readiness budget, the
+// blocked message behind atm's own failed reference reads "draft present"
+// again, as if the owner had typed it.
+#[tokio::test(start_paused = true)]
+async fn blocked_draft_wait_names_a_failed_reference() {
+    use std::sync::atomic::AtomicUsize;
+    let (mut rig, first, second) = failed_reference(ManualJob::new().await).await;
+    // A harness with no retract key: the reference stays and is named.
+    rig.job.effects.retract = retract_fake(
+        Arc::new(AtomicUsize::new(0)),
+        vec![Retracted::Refused],
+        rig.screens.clone(),
+    );
+    rig.round(0).await;
+    rig.round(121_000).await;
+    let progress = rig.job.service.board.progress(second);
+    assert_eq!(progress.phase, Some(DeliveryPhase::Blocked));
+    assert_eq!(
+        progress.reason.as_deref(),
+        Some(format!("input box holds atm's unsent reference {first} in %1").as_str())
+    );
+}
+
+// s3-5c. Break: a reference attempted on the agent's old pane is matched in
+// its new pane's editor, so atm clears text there that it never typed.
+#[tokio::test(start_paused = true)]
+async fn reference_from_an_old_pane_is_never_retracted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, first, _) = failed_reference(ManualJob::new().await).await;
+    rig.command(OrgCommand::Down {
+        agent_id: worker(),
+        reason: "fixture".into(),
+    })
+    .await;
+    rig.command(OrgCommand::Adopt {
+        agent_id: worker(),
+        pane: "%2".into(),
+        session_id: Some("s1".into()),
+    })
+    .await;
+    rig.send().await;
+    // The new pane's editor shows the same text, idle and unfocused.
+    rig.screens.set(
+        worker(),
+        with(ready("%2", "s1"), |o| o.facts.input = InputState::Draft),
+    );
+    rig.screens.set_box(worker(), Some(&inbox_reference(first)));
+    let retracts = Arc::new(AtomicUsize::new(0));
+    rig.job.effects.retract = retract_fake(
+        retracts.clone(),
+        vec![Retracted::Cleared],
+        rig.screens.clone(),
+    );
+    rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+    for _ in 0..3 {
+        rig.round(5_000).await;
+    }
+    assert_eq!(retracts.load(Ordering::SeqCst), 0);
+}
+
+// s3-5c. Break: the owner puts atm's cleared reference back (Claude's
+// Ctrl+Y) and atm clears it again: once per message means once.
+#[tokio::test(start_paused = true)]
+async fn retracted_reference_put_back_by_the_owner_is_left_alone() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, first, _) = failed_reference(ManualJob::new().await).await;
+    let retracts = Arc::new(AtomicUsize::new(0));
+    rig.job.effects.retract = retract_fake(
+        retracts.clone(),
+        vec![Retracted::Cleared],
+        rig.screens.clone(),
+    );
+    rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+    rig.round(0).await;
+    assert_eq!(retracts.load(Ordering::SeqCst), 1);
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+    );
+    rig.screens.set_box(worker(), Some(&inbox_reference(first)));
+    for _ in 0..3 {
+        rig.round(40_000).await;
+    }
+    assert_eq!(retracts.load(Ordering::SeqCst), 1);
+}
+
+// s3-5c (review SHOULD 2). Break: after a restart (every promotion) atm
+// presses Ctrl-U again on a reference it already retracted, because only the
+// old job knew: the committed note is the never-again marker.
+#[tokio::test(start_paused = true)]
+async fn retract_note_holds_once_across_a_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for outcome in [Retracted::Cleared, Retracted::Left] {
+        let (mut rig, first, _) = failed_reference(ManualJob::new().await).await;
+        let retracts = Arc::new(AtomicUsize::new(0));
+        rig.job.effects.retract =
+            retract_fake(retracts.clone(), vec![outcome], rig.screens.clone());
+        rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+        rig.round(0).await;
+        assert_eq!(retracts.load(Ordering::SeqCst), 1, "{outcome:?}");
+        let bytes = serde_json::to_vec(&*rig.journal.lock().unwrap()).unwrap();
+        rig.stop().await;
+        let mut second = ManualJob::from_records(serde_json::from_slice(&bytes).unwrap()).await;
+        // The same reference in an idle, unfocused editor (Ctrl+Y after a
+        // clear, or the text a Left retract left).
+        second.screens.set(
+            worker(),
+            with(ready("%1", "s1"), |o| o.facts.input = InputState::Draft),
+        );
+        second
+            .screens
+            .set_box(worker(), Some(&inbox_reference(first)));
+        let again = Arc::new(AtomicUsize::new(0));
+        second.job.effects.retract = retract_fake(
+            again.clone(),
+            vec![Retracted::Cleared],
+            second.screens.clone(),
+        );
+        second.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+        for _ in 0..3 {
+            second.round(40_000).await;
+        }
+        assert_eq!(again.load(Ordering::SeqCst), 0, "{outcome:?}");
+        second.stop().await;
+    }
+}
+
+// s3-5c (review NIT 2). Break: an executor that ended without an outcome
+// after it may have sent the key (a deadline, a worker failure) leaves the
+// job free to press Ctrl-U again on the next look.
+#[tokio::test(start_paused = true)]
+async fn retract_without_an_outcome_is_not_tried_again_by_the_job() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, _, _) = failed_reference(ManualJob::new().await).await;
+    let retracts = Arc::new(AtomicUsize::new(0));
+    let counted = retracts.clone();
+    rig.job.effects.retract = Arc::new(move |_, _, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(MessageError::Timeout) })
+    });
+    rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+    for _ in 0..3 {
+        rig.round(40_000).await;
+    }
+    assert_eq!(retracts.load(Ordering::SeqCst), 1);
+}
+
+// s3-5c (review SHOULD 1). Break: the retract waits for an admission permit,
+// so the owner's decision and shutdown queue behind eight busy deliveries.
+#[tokio::test(start_paused = true)]
+async fn retract_never_waits_for_admission() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (mut rig, _, _) = failed_reference(ManualJob::new().await).await;
+    let retracts = Arc::new(AtomicUsize::new(0));
+    rig.job.effects.retract = retract_fake(
+        retracts.clone(),
+        vec![Retracted::Cleared],
+        rig.screens.clone(),
+    );
+    rig.job.effects.deliver = counted_deliver(Arc::new(AtomicUsize::new(0)));
+    let admissions = rig.job.service.rt.admissions.clone();
+    let all = admissions.available_permits() as u32;
+    let held = admissions.clone().try_acquire_many_owned(all).unwrap();
+    // `round` returns (guarded against a hang) with nothing sent.
+    rig.round(0).await;
+    assert_eq!(retracts.load(Ordering::SeqCst), 0);
+    drop(held);
+    rig.round(1_000).await;
+    assert_eq!(
+        retracts.load(Ordering::SeqCst),
+        1,
+        "tried again at the next poll"
+    );
+}
+
+// Break: the wait or blocked note fails to name the unread turn or implies
+// the user must start a turn instead of letting the scheduler recheck.
+#[tokio::test(start_paused = true)]
+async fn readiness_wait_names_an_unread_turn() {
+    let mut rig = ManualJob::new().await;
+    rig.screens.set(
+        worker(),
+        with(ready("%1", "s1"), |o| o.facts.turn = TurnState::Unknown),
+    );
+    let id = rig.send().await;
+    rig.round(0).await;
+    let unread = "atm cannot read the turn state on %1; atm will recheck automatically";
+    let progress = rig.job.service.board.progress(id);
+    assert_eq!(
+        (progress.phase, progress.reason.as_deref()),
+        (Some(DeliveryPhase::Waiting), Some(unread))
+    );
+    rig.round(121_000).await;
+    let progress = rig.job.service.board.progress(id);
+    assert_eq!(
+        (progress.phase, progress.reason.as_deref()),
+        (Some(DeliveryPhase::Blocked), Some(unread))
+    );
+    let notes = rig.notes().await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with(&format!("{id} blocked: {unread}; ")),
+        "{}",
+        notes[0]
+    );
+}
+
+// Captured: Claude Code 2.1.330, 2026-11-22, read-only tmux capture-pane -p -e -N.
+// Break: a partial notice is accepted as idle, or the blocked head stops being
+// observed and holds the FIFO even after the idle screen becomes readable.
+#[tokio::test(start_paused = true)]
+async fn blocked_unread_turn_rechecks_and_delivers_without_a_new_turn() {
+    let capture = include_str!("../../../atm-claude-adapter/tests/fixtures/screen_styled_update-installed-idle_2.1.330.txt");
+    let idle = capture
+        .lines()
+        .skip(1)
+        .map(|row| row.strip_suffix('|').unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let notice = "✔ Update installed · /restart to apply";
+    assert_eq!(idle.matches(notice).count(), 1);
+    // Synthetic: drop the restart suffix but keep the two-cell right margin.
+    let partial = idle.replace(
+        notice,
+        &format!(
+            "{:>width$}",
+            "✔ Update installed ·",
+            width = notice.chars().count()
+        ),
+    );
+    let read = |screen| {
+        atm_claude_adapter::screen::observe_control_screen(
+            atm_core::ScreenInput::Styled(screen),
+            None,
+        )
+        .facts
+    };
+    let unread = read(&partial);
+    assert_eq!(
+        (unread.input, unread.turn, &unread.dialog),
+        (InputState::Empty, TurnState::Unknown, &DialogState::None)
+    );
+    let readable = read(&idle);
+    assert_eq!(
+        (readable.input, readable.turn, &readable.dialog),
+        (InputState::Empty, TurnState::NotRunning, &DialogState::None)
+    );
+
+    let mut bench = Bench::new().await;
+    bench.script(Act::Deliver);
+    bench
+        .screens
+        .set(worker(), with(ready("%1", "s1"), |o| o.facts = unread));
+    let first = bench.send(worker(), "head").await;
+    let follower = bench.send(worker(), "follower").await;
+    bench.notice(first, "blocked.readiness_timeout").await;
+    let head = bench.entry(worker(), first).await;
+    let behind = bench.entry(worker(), follower).await;
+    assert_eq!(
+        (head.status, head.delivery.phase, head.delivery.attempt),
+        (DeliveryStatus::Queued, DeliveryPhase::Blocked, 0)
+    );
+    assert_eq!(
+        (
+            behind.status,
+            behind.delivery.blocked_by,
+            behind.delivery.attempt
+        ),
+        (DeliveryStatus::Queued, Some(first), 0)
+    );
+    assert!(bench.entries().is_empty());
+
+    // Change only what the next observation returns. No lifecycle hook,
+    // retry command, or new message wakes the job.
+    bench
+        .screens
+        .set(worker(), with(ready("%1", "s1"), |o| o.facts = readable));
+    for id in [first, follower] {
+        assert_eq!(bench.entered().await, id);
+        let attempt = bench
+            .event("next committed attempt", |event| attempted(event).is_some())
+            .await;
+        assert_eq!(attempted(&attempt), Some((id, 1, "%1")));
+        let delivery = bench
+            .event("next committed delivery", |event| {
+                delivered(event).is_some()
+            })
+            .await;
+        assert_eq!(delivered(&delivery), Some(id));
+        let entry = bench.entry(worker(), id).await;
+        assert_eq!(
+            (entry.status, entry.delivery.attempt),
+            (DeliveryStatus::Delivered, 1)
+        );
+    }
+    assert!(bench.entries().is_empty());
+    assert_eq!(bench.notes().await.len(), 1);
+}
+
+// s3-busy. Break: the unread-turn words replace the policy's own words for
+// a look that does not read an empty editor with no dialog.
+#[tokio::test(start_paused = true)]
+async fn other_readiness_waits_keep_their_words() {
+    for (case, change) in [
+        (
+            "input unread",
+            (|o: &mut RecipientObservation| {
+                o.facts.turn = TurnState::Unknown;
+                o.facts.input = InputState::Unknown;
+            }) as fn(&mut RecipientObservation),
+        ),
+        ("dialog unread", |o: &mut RecipientObservation| {
+            o.facts.turn = TurnState::Unknown;
+            o.facts.dialog = DialogState::Unknown;
+        }),
+    ] {
+        let mut rig = ManualJob::new().await;
+        rig.screens.set(worker(), with(ready("%1", "s1"), change));
+        let id = rig.send().await;
+        rig.round(0).await;
+        rig.round(121_000).await;
+        let progress = rig.job.service.board.progress(id);
+        assert_eq!(progress.phase, Some(DeliveryPhase::Blocked), "{case}");
+        assert_eq!(
+            progress.reason.as_deref(),
+            Some(FailureReason::ReadinessTimeout.to_string().as_str()),
+            "{case}"
+        );
+    }
 }

@@ -86,6 +86,10 @@ pub struct RoleConfig {
     pub cache_minutes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_minutes: Option<u32>,
+    /// The role groups this seat answers to (`@builders`), each a name in the
+    /// id grammar. Empty is not serialized, so role snapshots keep their bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 fn default_cwd() -> String {
     ".".into()
@@ -138,6 +142,7 @@ fn parse_front_matter(name: &str, text: &str) -> Result<RoleConfig, ConfigError>
         "context_line",
         "cache_minutes",
         "idle_minutes",
+        "groups",
     ];
     for key in table.keys() {
         if !KEYS.contains(&key.as_str()) {
@@ -160,6 +165,12 @@ fn parse_front_matter(name: &str, text: &str) -> Result<RoleConfig, ConfigError>
     })?;
     let mut config: RoleConfig = table.try_into().map_err(toml_error)?;
     config.harness = definition.harness;
+    if let Some(bad) = config.groups.iter().find(|g| validate_name(g).is_err()) {
+        return Err(ConfigError::Role {
+            name: name.into(),
+            problem: format!("invalid group name {bad:?}"),
+        });
+    }
     crate::auto_handover::handover_settings(&config).map_err(|problem| ConfigError::Role {
         name: name.into(),
         problem: problem.to_string(),

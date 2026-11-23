@@ -386,18 +386,30 @@ fn real_daemon_restart_preserves_tasks_reviews_messages_and_pending_decision() {
         inbox_facts(&rig, Some(&lead.pane)),
         inbox_facts(&rig, Some(&worker.pane)),
     ];
-    let messages = rig
-        .test
-        .tail(0)
-        .into_iter()
-        .filter(|e| {
-            e["kind"] == "msg.sent"
-                && e["body"]["task"]
-                    .as_str()
-                    .is_some_and(|id| ids.iter().any(|s| s == id))
-        })
-        .count();
-    assert_eq!(messages, 6);
+    let task_comms = |e: &Value| {
+        matches!(e["kind"].as_str(), Some("msg.sent" | "channel.posted"))
+            && e["body"]["task"]
+                .as_str()
+                .is_some_and(|id| ids.iter().any(|s| s == id))
+    };
+    let comms: Vec<_> = rig.test.tail(0).into_iter().filter(task_comms).collect();
+    let posts: Vec<_> = comms
+        .iter()
+        .filter(|e| e["kind"] == "channel.posted")
+        .collect();
+    assert_eq!(posts.len(), 6, "each task wake has a native post");
+    assert_eq!(comms.len(), 12);
+    for posted in posts {
+        let seq = posted["seq"].as_u64().unwrap();
+        let post = format!("m{seq}");
+        let rows: Vec<_> = comms
+            .iter()
+            .filter(|e| e["kind"] == "msg.sent" && e["body"]["post"] == post)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["seq"].as_u64().unwrap() > seq);
+        assert_eq!(posted["body"]["wake"], json!([rows[0]["body"]["to"]]));
+    }
     let end = rig.test.cursor();
     let decision = seed_pending_decision(&mut rig, &worker.id);
     rig.test.rig.start_daemon();
@@ -420,11 +432,15 @@ fn real_daemon_restart_preserves_tasks_reviews_messages_and_pending_decision() {
         .test
         .tail(end)
         .iter()
-        .any(|e| e["kind"] == "task.created"
-            || e["kind"] == "msg.sent"
-                && e["body"]["task"]
-                    .as_str()
-                    .is_some_and(|id| ids.iter().any(|s| s == id))));
+        .any(|e| e["kind"] == "task.created" || task_comms(e)));
+    assert_eq!(
+        rig.test
+            .tail(0)
+            .into_iter()
+            .filter(task_comms)
+            .collect::<Vec<_>>(),
+        comms
+    );
     rig.test.rig.stop_daemon();
     let state = replay(&rig.test.rig.root().join("state"));
     assert_eq!(

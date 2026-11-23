@@ -23,9 +23,9 @@ use tokio::io::{
     BufWriter, Interest,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -35,7 +35,9 @@ use atm_core::{SessionId, StatusLineData};
 use atm_pi_adapter::RawPiEvent;
 use atm_protocol::{error_code, ClientMessage, DaemonMessage, MessageType, ProtocolVersion};
 
-use super::methods::{CallContext, CallerId, CallerPane, MethodError, MethodRouter};
+use super::methods::{
+    CallContext, CallerId, CallerPane, ConnectionScope, MethodError, MethodRouter,
+};
 use super::MAX_TUI_CLIENTS;
 use crate::discovery::{DiscoveryResult, DiscoveryService};
 use crate::registry::{RegistryHandle, SessionEvent};
@@ -127,6 +129,7 @@ fn parent_rows_proven(
 /// - Event subscription (for TUI clients)
 /// - Graceful shutdown
 pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
+    scope: ScopeOwner,
     /// Buffered reader for incoming messages
     reader: BufReader<R>,
 
@@ -175,6 +178,24 @@ pub struct ConnectionHandler<R = OwnedReadHalf, W = OwnedWriteHalf> {
     message_evidence: Option<crate::org::message_evidence::MessageEvidence>,
     message_history: Option<crate::org::message_history::MessageHistoryHandle>,
     watcher: Option<Forwarder>,
+}
+
+struct ScopeOwner(watch::Sender<Option<Instant>>);
+
+fn close_scope(scope: &watch::Sender<Option<Instant>>) {
+    scope.send_if_modified(|closed| {
+        if closed.is_some() {
+            return false;
+        }
+        *closed = Some(Instant::now());
+        true
+    });
+}
+
+impl Drop for ScopeOwner {
+    fn drop(&mut self) {
+        close_scope(&self.0);
+    }
 }
 
 impl ConnectionHandler {
@@ -234,6 +255,7 @@ where
         methods: Arc<MethodRouter>,
     ) -> Self {
         Self {
+            scope: ScopeOwner(watch::Sender::new(None)),
             reader: BufReader::new(reader),
             writer: Arc::new(Mutex::new(BufWriter::new(writer))),
             registry,
@@ -315,6 +337,7 @@ where
         // Watch through EOF and protocol Disconnect while accepted work drains.
         let monitor = self.disconnect_monitor.take();
         let caller_gone = self.caller_gone.clone();
+        let scope = self.scope.0.clone();
         let result = {
             let processing = self.process_messages();
             tokio::pin!(processing);
@@ -322,7 +345,10 @@ where
                 biased;
                 result = peer_disconnected(monitor) => {
                     match result {
-                        Ok(()) => caller_gone.cancel(),
+                        Ok(()) => {
+                            close_scope(&scope);
+                            caller_gone.cancel();
+                        }
                         Err(error) => warn!(%error, "Disconnect monitor failed; preserving accepted work"),
                     }
                     processing.await
@@ -428,6 +454,7 @@ where
     async fn process_messages(&mut self) -> Result<(), ConnectionError> {
         let mut requests = JoinSet::new();
         let result = self.process_message_loop(&mut requests).await;
+        close_scope(&self.scope.0);
         self.stop_forwarder().await;
         self.stop_watcher().await;
         let mut writable = result.is_ok() && !self.peer_failed.is_cancelled();
@@ -627,6 +654,7 @@ where
                 };
                 let methods = Arc::clone(&self.methods);
                 let caller_gone = self.caller_gone.clone();
+                let scope = ConnectionScope(self.scope.0.subscribe());
                 requests.spawn(async move {
                     let result = tokio::select! {
                         biased;
@@ -635,7 +663,7 @@ where
                         {
                             Err(MethodError::new(error_code::UNAVAILABLE, "caller disconnected"))
                         }
-                        result = methods.call(context, &method, params) => result,
+                        result = methods.call_scoped(context, scope, &method, params) => result,
                     };
                     let response = match result {
                         Ok(value) => DaemonMessage::response_ok(id, value),
@@ -2530,6 +2558,7 @@ mod tests {
                 body: "brief".into(),
                 attachments: vec![],
                 task: None,
+                post: None,
             }),
         ];
         for (seq, event) in (1..).zip(events) {
@@ -2558,6 +2587,7 @@ mod tests {
                         }),
                         presence: PanePresence::Alive,
                         facts: atm_core::ScreenFacts::default(),
+                        inbox_paste: false,
                         copy_mode: Some(false),
                         focused: Some(false),
                     },
@@ -3326,6 +3356,7 @@ mod tests {
                         body: "brief".into(),
                         attachments: vec![],
                         task: None,
+                        post: None,
                     }),
                 ];
                 for (seq, event) in (1..).zip(events) {
@@ -3346,6 +3377,7 @@ mod tests {
                     }),
                     presence: PanePresence::Alive,
                     facts: atm_core::ScreenFacts::default(),
+                    inbox_paste: false,
                     copy_mode: Some(false),
                     focused: Some(false),
                 };
@@ -3481,6 +3513,98 @@ mod tests {
         );
         cancel.cancel();
         run.await.unwrap();
+    }
+
+    // Breaks if dispatch uses the caller label as socket identity, or if
+    // closing input waits for an unrelated accepted call before revoking it.
+    #[tokio::test(start_paused = true)]
+    async fn scoped_method_keeps_identity_until_input_ends() {
+        let (scopes, mut seen) =
+            tokio::sync::mpsc::unbounded_channel::<crate::server::methods::ConnectionScope>();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut router = MethodRouter::default();
+        router
+            .register_scoped("scoped", Duration::from_secs(30), move |_, scope, _| {
+                let scopes = scopes.clone();
+                async move {
+                    scopes.send(scope).unwrap();
+                    Ok(serde_json::Value::Null)
+                }
+            })
+            .unwrap();
+        router
+            .register("ordinary", Duration::from_secs(30), {
+                let (entered, release) = (entered.clone(), release.clone());
+                move |_, _| {
+                    let (entered, release) = (entered.clone(), release.clone());
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(serde_json::Value::Null)
+                    }
+                }
+            })
+            .unwrap();
+        let direct = router
+            .call(
+                CallContext {
+                    client_id: CallerId("caller".into()),
+                    from_pane: None,
+                },
+                "scoped",
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(direct.0.code, error_code::REFUSED);
+        let router = Arc::new(router);
+        let (mut r1, mut w1, _, t1) = request_connection(router.clone()).await;
+        let (mut r2, mut w2, _, t2) = request_connection(router).await;
+        let call = |method: &str| {
+            ClientMessage::request("id".into(), method.into(), serde_json::Value::Null, None)
+        };
+        for _ in 0..2 {
+            send_client(&mut w1, call("scoped")).await;
+            assert!(matches!(
+                receive(&mut r1).await,
+                DaemonMessage::Response {
+                    payload: atm_protocol::ResponsePayload::Result(_),
+                    ..
+                }
+            ));
+        }
+        send_client(&mut w2, call("scoped")).await;
+        receive(&mut r2).await;
+        let mut first = seen.try_recv().unwrap();
+        let same = seen.try_recv().unwrap();
+        let mut second = seen.try_recv().unwrap();
+        assert!(first.same_connection(&same));
+        assert!(!first.same_connection(&second));
+
+        send_client(&mut w1, call("ordinary")).await;
+        entered.notified().await;
+        let close = tokio::time::Instant::now();
+        w1.shutdown().await.unwrap();
+        timeout(Duration::from_secs(60), first.wait_closed())
+            .await
+            .unwrap();
+        assert_eq!(first.closed_at(), Some(close));
+        assert_eq!(same.closed_at(), Some(close));
+        assert_eq!(second.closed_at(), None);
+        assert!(!t1.is_finished());
+        release.notify_one();
+        assert!(matches!(
+            receive(&mut r1).await,
+            DaemonMessage::Response {
+                payload: atm_protocol::ResponsePayload::Result(_),
+                ..
+            }
+        ));
+        t1.await.unwrap();
+        send_client(&mut w2, ClientMessage::disconnect()).await;
+        second.wait_closed().await;
+        t2.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

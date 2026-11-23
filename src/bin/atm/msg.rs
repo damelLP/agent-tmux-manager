@@ -1,6 +1,10 @@
 //! One-shot confirmed-message commands. Bodies stay in the durable inbox.
-use super::output::stdout;
+use super::{
+    output::stdout,
+    rpc::{self, RpcError},
+};
 use anyhow::{bail, Context, Result};
+use atm_comms::channel_types::{ChannelKind, ChannelListResult};
 use atmd::org::messages::*;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{de::DeserializeOwned, Serialize};
@@ -59,12 +63,13 @@ pub enum MsgAction {
         format: MessageFormat,
     },
     /// Explicitly mark delivered messages in your inbox read
-    Ack {
-        #[arg(required = true)]
-        ids: Vec<MessageId>,
-        #[arg(long, value_enum, default_value = "text")]
-        format: MessageFormat,
-    },
+    Ack(AckArgs),
+    #[command(flatten)]
+    Resolve(WakeAction),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WakeAction {
     /// Retry a latched delivery with the same ID (duplicates are possible)
     Retry {
         id: MessageId,
@@ -76,10 +81,34 @@ pub enum MsgAction {
     /// Cancel a held delivery; a late receipt may still confirm it
     GiveUp {
         id: MessageId,
+        /// The owner's verbatim words; only with --relay --confirm
+        #[arg(requires_all = ["relay", "confirm"])]
+        words: Option<String>,
+        /// Give up as the owner's designated relay; needs --confirm and WORDS
+        #[arg(long, requires_all = ["confirm", "words"])]
+        relay: bool,
+        /// Confirm the owner asked for this give-up in WORDS
+        #[arg(long, requires_all = ["relay", "words"])]
+        confirm: bool,
         #[arg(long, value_enum, default_value = "text")]
         format: MessageFormat,
     },
 }
+
+#[derive(Clone, Copy)]
+pub(super) enum WakeNames {
+    Legacy,
+    Final,
+}
+
+#[derive(Debug, Args)]
+pub struct AckArgs {
+    #[arg(required = true)]
+    ids: Vec<MessageId>,
+    #[arg(long, value_enum, default_value = "text")]
+    format: MessageFormat,
+}
+
 #[derive(Debug, Args)]
 pub struct InboxArgs {
     #[arg(long = "for", value_parser = super::agent_target::parse_address)]
@@ -103,15 +132,38 @@ pub(super) async fn request<P: Serialize, R: DeserializeOwned>(
     params: P,
     budget: Duration,
 ) -> Result<(R, serde_json::Value)> {
-    let value = super::rpc::call(method, serde_json::to_value(params)?, budget)
+    let value = rpc::call(method, serde_json::to_value(params)?, budget)
         .await
         .map_err(|error| match error {
-            super::rpc::RpcError::Timeout => anyhow::Error::new(MessageError::Timeout),
+            RpcError::Timeout => anyhow::Error::new(MessageError::Timeout),
             other => anyhow::Error::new(other),
         })?;
     let result =
         serde_json::from_value(value.clone()).context("invalid message result from daemon")?;
     Ok((result, value))
+}
+
+async fn request_wake<P: Serialize, R: DeserializeOwned>(
+    names: WakeNames,
+    final_name: &str,
+    legacy: &str,
+    params: P,
+    budget: Duration,
+) -> Result<(R, serde_json::Value)> {
+    if matches!(names, WakeNames::Legacy) {
+        return request(legacy, params, budget).await;
+    }
+    tokio::time::timeout(budget, async {
+        match request(final_name, &params, budget).await {
+            Err(error) if matches!(error.downcast_ref::<RpcError>(), Some(RpcError::TooOld)) => {
+                // Connected.methods omitted the final name; no request was sent.
+                request(legacy, params, budget).await
+            }
+            result => result,
+        }
+    })
+    .await
+    .map_err(|_| MessageError::Timeout)?
 }
 
 pub(super) async fn inbox_request(params: InboxParams) -> Result<InboxResult> {
@@ -236,12 +288,14 @@ pub(super) async fn cmd_msg_with_lookup_budget(
             );
             stdout(|out| output(&raw, format, &text, out))
         }
-        MsgAction::Ack { ids, format } => {
-            let (result, raw): (AckResult, _) =
-                request("msg.ack", AckParams { ids }, MESSAGE_RPC_TIMEOUT).await?;
-            stdout(|out| output(&raw, format, &format!("{} marked read", result.count), out))
-        }
-        MsgAction::Retry {
+        MsgAction::Ack(args) => cmd_ack(args, WakeNames::Legacy).await,
+        MsgAction::Resolve(action) => cmd_wake(action, WakeNames::Legacy).await,
+    }
+}
+
+pub(super) async fn cmd_wake(action: WakeAction, names: WakeNames) -> Result<()> {
+    match action {
+        WakeAction::Retry {
             id,
             accept_duplicate_risk,
             format,
@@ -249,7 +303,9 @@ pub(super) async fn cmd_msg_with_lookup_budget(
             if !accept_duplicate_risk {
                 bail!("Inspect the pane first; retry can duplicate delivery. Repeat with --accept-duplicate-risk.");
             }
-            let (result, raw): (RetryResult, _) = request(
+            let (result, raw): (RetryResult, _) = request_wake(
+                names,
+                "wake.retry",
                 "msg.retry",
                 ResolveParams { id },
                 MESSAGE_RESOLUTION_TIMEOUT,
@@ -262,10 +318,17 @@ pub(super) async fn cmd_msg_with_lookup_budget(
             );
             stdout(|out| output(&raw, format, &text, out))
         }
-        MsgAction::GiveUp { id, format } => {
-            let (result, raw): (GiveUpResult, _) = request(
+        WakeAction::GiveUp {
+            id, words, format, ..
+        } => {
+            let (result, raw): (GiveUpResult, _) = request_wake(
+                names,
+                "wake.give_up",
                 "msg.give_up",
-                ResolveParams { id },
+                GiveUpParams {
+                    id,
+                    relay_words: words,
+                },
                 MESSAGE_RESOLUTION_TIMEOUT,
             )
             .await?;
@@ -278,10 +341,82 @@ pub(super) async fn cmd_msg_with_lookup_budget(
     }
 }
 
+pub(super) async fn cmd_ack(AckArgs { ids, format }: AckArgs, names: WakeNames) -> Result<()> {
+    let (result, raw): (AckResult, _) = request_wake(
+        names,
+        "wake.ack",
+        "msg.ack",
+        AckParams { ids },
+        MESSAGE_RPC_TIMEOUT,
+    )
+    .await?;
+    stdout(|out| output(&raw, format, &format!("{} marked read", result.count), out))
+}
+
+pub(super) fn render_content(
+    task: Option<&TaskId>,
+    attachments: &[String],
+    body: &str,
+    out: &mut impl Write,
+) -> Result<()> {
+    if let Some(task) = task {
+        writeln!(out, "task: {}", escaped(&task.to_string(), false))?;
+    }
+    for path in attachments {
+        writeln!(out, "attach: {}", escaped(path, false))?;
+    }
+    for line in escaped(body, true).split('\n') {
+        writeln!(out, "  {line}")?;
+    }
+    Ok(())
+}
+
+fn wants_reply_hint(entry: &InboxEntry) -> bool {
+    entry.content.post.is_some()
+        && entry.content.from != Address::System
+        && entry
+            .post_context
+            .as_ref()
+            .is_some_and(|context| context.channel.is_known())
+}
+
+fn render_post_context(
+    entry: &InboxEntry,
+    channels: Option<&ChannelListResult>,
+    out: &mut impl Write,
+) -> Result<()> {
+    let Some((post, context)) = entry.content.post.zip(entry.post_context.as_ref()) else {
+        return Ok(());
+    };
+    writeln!(
+        out,
+        "post: {post} channel={} thread={}",
+        escaped(&context.channel.to_string(), false),
+        context
+            .thread
+            .map_or_else(|| "-".into(), |id| id.to_string()),
+    )?;
+    if let Some(channels) = channels.filter(|_| wants_reply_hint(entry)) {
+        if channels.channels.iter().any(|row| {
+            row.id == context.channel && row.writable && row.kind == ChannelKind::Project
+        }) {
+            writeln!(out, "reply: atm post --reply {post} --body '...'")?;
+        } else {
+            writeln!(
+                out,
+                "reply: atm post --to {} --body '...'",
+                entry.content.from
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn render_inbox(
     result: &InboxResult,
     recipient: Option<&Address>,
     unread: bool,
+    channels: Option<&ChannelListResult>,
     out: &mut impl Write,
 ) -> Result<()> {
     for entry in &result.messages {
@@ -322,15 +457,8 @@ fn render_inbox(
             write!(out, " reason={}", escaped(reason, false))?;
         }
         writeln!(out)?;
-        if let Some(task) = &c.task {
-            writeln!(out, "task: {}", escaped(&task.to_string(), false))?;
-        }
-        for path in &c.attachments {
-            writeln!(out, "attach: {}", escaped(path, false))?;
-        }
-        for line in escaped(&c.body, true).split('\n') {
-            writeln!(out, "  {line}")?;
-        }
+        render_post_context(entry, channels, out)?;
+        render_content(c.task.as_ref(), &c.attachments, &c.body, out)?;
     }
     writeln!(out, "{} unread", result.unread_count)?;
     if let Some(id) = result.next_after {
@@ -372,10 +500,30 @@ pub(super) async fn cmd_inbox_with_lookup_budget(
         MESSAGE_RPC_TIMEOUT,
     )
     .await?;
-    stdout(|out| match args.format {
-        MessageFormat::Json => output(&raw, args.format, "", out),
-        MessageFormat::Text => render_inbox(&result, recipient.as_ref(), args.unread, out),
-    })
+    match args.format {
+        MessageFormat::Json => stdout(|out| output(&raw, args.format, "", out)),
+        MessageFormat::Text => {
+            // Ask as the caller, not the --for recipient. A failed lookup must
+            // not hide the inbox or turn into a guess at how to reply.
+            let channels = if result.messages.iter().any(wants_reply_hint) {
+                super::channels::list(false)
+                    .await
+                    .ok()
+                    .map(|(list, _)| list)
+            } else {
+                None
+            };
+            stdout(|out| {
+                render_inbox(
+                    &result,
+                    recipient.as_ref(),
+                    args.unread,
+                    channels.as_ref(),
+                    out,
+                )
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +555,7 @@ mod tests {
             },
             None,
             false,
+            None,
             &mut Broken
         )
         .is_err());
@@ -471,6 +620,35 @@ mod tests {
                 super::super::Args::try_parse_from(help).unwrap_err().kind(),
                 clap::error::ErrorKind::DisplayHelp
             );
+        }
+    }
+    // s3-giverelay. Break: a partial relay form reaches the daemon (as the
+    // owner's give-up or without his words), or the full form stops parsing.
+    #[test]
+    fn give_up_relay_needs_relay_confirm_and_words_together() {
+        for group in ["wake", "msg"] {
+            let parse = |tail: &[&str]| {
+                let mut args = vec!["atm", group, "give-up"];
+                args.extend(tail);
+                super::super::Args::try_parse_from(args)
+            };
+            assert!(parse(&["--relay", "--confirm", "m1", "Cancel them"]).is_ok());
+            assert!(parse(&["m1", "--relay", "--confirm", "Cancel them"]).is_ok());
+            for partial in [
+                &["--relay", "m1", "Cancel them"][..],
+                &["--confirm", "m1", "Cancel them"],
+                &["--relay", "--confirm", "m1"],
+                &["--relay", "m1"],
+                &["--confirm", "m1"],
+                &["m1", "Cancel them"],
+            ] {
+                let error = parse(partial).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "{group} {partial:?}"
+                );
+            }
         }
     }
     #[test]

@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-list-unknown-field","method":"channel.list","params":{"unexpected":true}},
+  "response": {"type":"response","id":"channel-list-unknown-field","error":{"code":"invalid_params","message":"unknown field `unexpected`, expected `all`"}},
+  "ignore": []
+}

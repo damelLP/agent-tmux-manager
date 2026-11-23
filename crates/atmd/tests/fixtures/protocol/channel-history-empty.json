@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-history-empty","method":"channel.history","params":{"channel":"alpha"}},
+  "response": {"type":"response","id":"channel-history-empty","result":{"seq":0,"channel":"alpha","posts":[],"more":false}},
+  "ignore": []
+}

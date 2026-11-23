@@ -549,7 +549,12 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
 
     // Subscribed before discovery, so the notifier sees every session.
     let message_notify_cancel = cancel_token.child_token();
-    let config = read_startup_config(atm_tui::setup::atm_config_path()).await;
+    let config_path = atm_tui::setup::atm_config_path();
+    let departments_dir = config_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|parent| parent.join("departments"));
+    let config = read_startup_config(config_path).await;
     // The server starts the message service on this policy. An invalid one
     // leaves the message methods unavailable with this reason.
     if let Err(reason) = &config.delivery {
@@ -605,6 +610,8 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
     services.org = org;
     services.raw = raw.clone();
     services.delivery_policy = Some(config.delivery);
+    services.departments_dir = departments_dir;
+    services.router_settings = router_from(config.router);
     // An invalid section never leaves the reminder on with guessed settings.
     services.reminder = reminder_from(config.reminder);
     let server = DaemonServer::with_services(&socket_path, services, cancel_token);
@@ -655,6 +662,7 @@ async fn run_daemon(socket_path: PathBuf, state_dir: PathBuf) -> Result<()> {
 struct StartupConfig {
     notify: Result<Option<NotifyConfig>, String>,
     delivery: Result<atm_org::delivery::DeliveryPolicy, String>,
+    router: Result<atm_org::channel_policy::RouterSettings, String>,
     /// `None` when `[reminder]` turns the reminder off.
     reminder: Result<Option<atm_org::reminder::ReminderSettings>, String>,
 }
@@ -673,6 +681,11 @@ fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
         #[serde(default)]
         delivery: atm_org::delivery::DeliveryPolicy,
     }
+    #[derive(serde::Deserialize)]
+    struct RouterSection {
+        #[serde(default)]
+        router: atm_org::channel_policy::RouterSettings,
+    }
 
     match text {
         Ok(text) => {
@@ -685,6 +698,11 @@ fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
                     .map_err(|_| {
                         "invalid config: malformed TOML or invalid [delivery] settings".into()
                     }),
+                router: toml::from_str::<RouterSection>(&text)
+                    .map(|config| config.router)
+                    .map_err(|_| {
+                        "invalid config: malformed TOML or invalid [router] settings".into()
+                    }),
                 reminder: atmd::org::task_reminder::parse_reminder_settings(&text),
             }
         }
@@ -693,10 +711,20 @@ fn parse_startup_config(text: Result<Option<String>>) -> StartupConfig {
             StartupConfig {
                 notify: Err(reason.clone()),
                 delivery: Err(reason.clone()),
+                router: Err("could not read [router] configuration".into()),
                 reminder: Err(reason),
             }
         }
     }
+}
+
+fn router_from(
+    config: Result<atm_org::channel_policy::RouterSettings, String>,
+) -> atm_org::channel_policy::RouterSettings {
+    config.unwrap_or_else(|reason| {
+        warn!(%reason, "Invalid router configuration; using the stopgap");
+        Default::default()
+    })
 }
 
 /// The reminder's settings for the server. A section that could not be read
@@ -962,6 +990,47 @@ mod tests {
                 legacy.as_os_str()
             );
         }
+    }
+
+    #[test]
+    fn router_config_defaults_overrides_and_isolates_bad_section() {
+        let read = |text: &str| parse_startup_config(Ok(Some(text.into())));
+        for config in [
+            parse_startup_config(Ok(None)),
+            read(""),
+            read("[notify]\ncommand=['true']"),
+        ] {
+            let settings = config.router.unwrap();
+            assert!(!settings.enabled);
+            assert_eq!(settings.timeout_secs, 20);
+        }
+        let settings = read("[router]\nenabled=true\ntimeout_secs=12")
+            .router
+            .unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.timeout_secs, 12);
+        assert_eq!(
+            read("[router]\nenabled=true\ntimeout_secs=0")
+                .router
+                .unwrap()
+                .timeout_secs,
+            0
+        );
+        for text in [
+            "[router]\nenabled='SECRET'",
+            "[router]\nunknown='SECRET'",
+            "[router",
+        ] {
+            let config = read(text);
+            assert!(!config.router.as_ref().unwrap_err().contains("SECRET"));
+            assert!(!router_from(config.router).enabled);
+        }
+        let mixed = read("[notify]\ncommand=['true']\n[router]\nbad=true\n[delivery]");
+        assert!(mixed.notify.unwrap().is_some() && mixed.delivery.is_ok());
+        assert!(mixed.router.is_err());
+        let unreadable = parse_startup_config(Err(anyhow::anyhow!("config read timed out")));
+        assert!(unreadable.router.is_err());
+        assert!(!router_from(unreadable.router).enabled);
     }
 
     #[test]

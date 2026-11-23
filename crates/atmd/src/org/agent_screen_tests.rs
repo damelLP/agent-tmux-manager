@@ -588,3 +588,16 @@ fn hooks_valid_is_false_without_a_hook_list() {
     // Codex's own validator decides; an empty list is not atm's eleven rows.
     assert!(!agent_screen(Harness::Codex).unwrap().hooks_valid(&[]));
 }
+
+// s3-5c. Break: atm sends a line-clearing key to a harness for which no real
+// capture proved one (pi, Codex), or Claude loses the key its captures proved
+// (2.1.325 P3 fixtures; 2.1.327 and 2.1.330 rig captures): its own failed
+// reference would then hold every later delivery.
+#[test]
+fn retract_key_is_data_per_harness() {
+    use crate::control::reservation::PaneKey;
+    let key = |harness| agent_screen(harness).unwrap().retract();
+    assert_eq!(key(Harness::ClaudeCode), Some(PaneKey::CtrlU));
+    assert_eq!(key(Harness::Pi), None);
+    assert_eq!(key(Harness::Codex), None);
+}

@@ -49,7 +49,8 @@ fn base_inspect(
         facts.dialog = dialog;
         return (facts, None);
     }
-    editor(&lines, styled).unwrap_or_default()
+    let (facts, draft, ..) = editor(&lines, styled).unwrap_or_default();
+    (facts, draft)
 }
 
 fn base_staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bool> {
@@ -143,7 +144,7 @@ fn base_observe_control_screen(
     }
     // Without a complete header, only already-recognized ordinary facts apply.
     if let Some((start, end)) = header {
-        if let Some((facts, _)) = editor_facts(&lines, styled, Some(end), before_footer, footer) {
+        if let Some((facts, ..)) = editor_facts(&lines, styled, Some(end), before_footer, footer) {
             result.facts = facts;
         }
         if lines.get(..start).unwrap_or_default().iter().any(|line| {

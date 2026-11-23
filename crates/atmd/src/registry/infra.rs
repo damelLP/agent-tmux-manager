@@ -78,6 +78,11 @@ impl SessionInfrastructure {
         }
     }
 
+    /// The tracked process's start ticks, set together with `pid`.
+    pub(super) fn process_start_time(&self) -> Option<u64> {
+        self.process_start_time
+    }
+
     /// Checks if the tracked process is still alive.
     ///
     /// Returns `true` if:

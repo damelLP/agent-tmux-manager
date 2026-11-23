@@ -314,6 +314,7 @@ impl RegistryActor {
             .map(|(session, infra)| PaneSession {
                 view: SessionView::from_domain_at(session, self.clock.utc_now()),
                 pid: infra.pid,
+                process_start: infra.process_start_time(),
                 start: infra.start.clone(),
                 harness_version: crate::org::agents::agent_screen(session.harness)
                     .and_then(|screen| (screen.version)(session))

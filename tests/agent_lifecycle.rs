@@ -353,6 +353,201 @@ fn agent_up_ready_tagged_env_pi() {
     up_is_ready_tagged_and_announced(StandInMode::Pi, true);
 }
 
+/// Exercise the real CLI, decision bridge, daemon and tmux with inert Pi panes.
+#[test]
+fn atm_cli_hire_refuses_then_starts_the_approved_seat() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start(mode);
+    let child = support::started_config(mode);
+    let mut parent = support::config(mode);
+    parent.columns = child.columns;
+    parent.rows = child.rows * 2 + 1;
+    let manager = test.shell_agent("hire-manager", &parent);
+    test.role("manager", mode, "");
+    test.adopt("manager", &manager);
+    test.role("lead", mode, "manager='manager'\n");
+    let config = test.rig.root().join("config/atm/departments");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("tools.toml"),
+        "title='Tools'\nprojects=['project']\nroster=['project/manager']\n[hire]\nmode='enforce'\n",
+    )
+    .unwrap();
+    let log = test.next_stand_in("hire-lead", &child);
+    let panes = || {
+        checked(
+            test.rig
+                .tmux(&["list-panes", "-a", "-F", "#{pane_id} #{@atm-agent}"]),
+        )
+    };
+    let before = panes();
+    let cli = |bound: bool, args: &[&str]| {
+        let mut command = test
+            .rig
+            .command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
+        command.args(args);
+        if bound {
+            command
+                .env("TMUX", test.rig.tmux_env())
+                .env("TMUX_PANE", &manager.pane_id);
+        }
+        test.rig.run(&mut command)
+    };
+    let up = [
+        "agent",
+        "up",
+        "lead",
+        "--project-root",
+        test.project.to_str().unwrap(),
+        "--format",
+        "json",
+    ];
+    let mut watch = delivery_support::Watch::on(&test.rig, test.cursor());
+    let refused = cli(true, &up);
+    assert!(!refused.status.success(), "unenforced start: {refused:?}");
+    let request = watch.wait("the durable hire request", |event| {
+        event["kind"] == "decision.requested"
+    });
+    assert_eq!(request["body"]["title"], "Hire project/lead");
+    assert_eq!(request["body"]["requester"], "project/manager");
+    assert_eq!(request["body"]["kind"], "hire");
+    let id = format!("d{}", request["seq"]);
+    let retry = cli(true, &up);
+    for output in [refused, retry] {
+        assert!(
+            !output.status.success() && output.stdout.is_empty(),
+            "{output:?}"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!(
+                "department tools: not on roster; hire decision {id} is pending"
+            )),
+            "{stderr}"
+        );
+    }
+    let question = watch.wait("the hire question", |event| {
+        event["kind"] == "channel.posted"
+            && event["body"]["decision"] == json!({"decision_id":id, "step":"asked"})
+    });
+    assert_eq!(question["body"]["wake"], json!(["owner"]));
+    watch.catch_up_to(test.cursor());
+    assert_eq!(watch.all(|e| e["kind"] == "decision.requested").len(), 1);
+    assert!(watch
+        .all(|e| e["kind"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("agent."))
+            && e["body"]["agent_id"] == "project/lead")
+        .is_empty());
+    assert_eq!(panes(), before);
+    assert!(!log.exists(), "the candidate ran before approval");
+
+    let denied = cli(true, &["decide", &id, "approve"]);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("only the owner may resolve"));
+    checked(cli(false, &["decide", &id, "approve"]));
+    let answer = watch.wait("the threaded hire answer", |event| {
+        event["kind"] == "channel.posted"
+            && event["body"]["decision"] == json!({"decision_id":id, "step":"resolved"})
+    });
+    assert_eq!(answer["body"]["thread"], format!("m{}", question["seq"]));
+    assert_eq!(answer["body"]["wake"], json!(["project/manager"]));
+    let args = [&up[..], &["--hire", &id]].concat();
+    let result: serde_json::Value = serde_json::from_str(&checked(cli(true, &args))).unwrap();
+    assert_eq!(result["agent_id"], "project/lead");
+    assert_eq!(result["state"], "ready");
+    let pane = result["pane"].as_str().unwrap();
+    assert_eq!(test.tag(pane), "project/lead");
+    let launched = test.rig.observe_pane(pane.into(), mode, log);
+    assert_ne!(launched.pid, manager.pid);
+    assert!(test
+        .rig
+        .journal(&launched)
+        .iter()
+        .any(|e| e["kind"] == "rendered"));
+    drop(watch);
+    test.rig.close();
+}
+
+/// The named manager has roster room, but an off-list model must not reach tmux.
+#[test]
+fn agent_up_off_list_model_does_not_launch() {
+    let mode = StandInMode::Pi;
+    let mut test = AgentRig::start(mode);
+    let child = support::started_config(mode);
+    let mut parent = support::config(mode);
+    parent.columns = child.columns;
+    parent.rows = child.rows * 2 + 1;
+    let manager = test.shell_agent("model-manager", &parent);
+    test.role("manager", mode, "");
+    test.adopt("manager", &manager);
+    test.role("lead", mode, "manager='manager'\nmodel='test-pro:max'\n");
+    let dir = test.rig.root().join("config/atm/departments");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tools.toml"), "title='Tools'\nprojects=['project']\nroster=['project/lead']\n[hire]\nmode='enforce'\n[spend]\nmodels=['test-lite*']\n").unwrap();
+    let log = test.next_stand_in("off-list", &child);
+    let panes = || {
+        checked(
+            test.rig
+                .tmux(&["list-panes", "-a", "-F", "#{pane_id} #{@atm-agent}"]),
+        )
+    };
+    let before = panes();
+    let mut watch = delivery_support::Watch::on(&test.rig, test.cursor());
+    let mut command = test
+        .rig
+        .command(std::path::Path::new(env!("CARGO_BIN_EXE_atm")));
+    command
+        .args([
+            "agent",
+            "up",
+            "lead",
+            "--project-root",
+            test.project.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .env("TMUX", test.rig.tmux_env())
+        .env("TMUX_PANE", &manager.pane_id);
+    let output = test.rig.run(&mut command);
+    assert!(
+        !output.status.success() && output.stdout.is_empty(),
+        "off-list start reached launch: {output:?}"
+    );
+    let request = watch.wait("the off-list hire request", |event| {
+        event["kind"] == "decision.requested"
+    });
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let reason = "department tools: model \"test-pro:max\" is not allowed";
+    assert!(
+        stderr.contains(&format!(
+            "{reason}; hire decision d{} is pending",
+            request["seq"]
+        )),
+        "{stderr}"
+    );
+    assert_eq!(request["body"]["title"], "Hire project/lead");
+    assert_eq!(request["body"]["kind"], "hire");
+    assert!(request["body"]["context"]
+        .as_str()
+        .unwrap()
+        .contains(reason));
+    watch.wait("the bridged hire question", |event| {
+        event["kind"] == "channel.posted"
+            && event["body"]["decision"]["decision_id"] == format!("d{}", request["seq"])
+    });
+    watch.catch_up_to(test.cursor());
+    assert_eq!(watch.all(|e| e["kind"] == "decision.requested").len(), 1);
+    assert!(watch
+        .all(|e| e["body"]["agent_id"] == "project/lead"
+            || e["body"]["action"]["agent"] == "project/lead")
+        .is_empty());
+    assert_eq!(panes(), before);
+    assert!(!log.exists(), "the off-list candidate ran");
+    drop(watch);
+    test.rig.close();
+}
+
 /// `agent.up` from a pane of the private server: the daemon splits it, tags
 /// the new pane, types the launch command into its shell and waits for the
 /// harness. `bound`: the harness announces a session at its start, and Ready

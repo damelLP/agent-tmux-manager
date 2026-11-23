@@ -803,8 +803,23 @@ async fn carry_back_down_holder_uses_the_original_reporting_line() {
         .collect();
     assert_eq!(
         rows.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
-        ["task.verdict", "task.cost_recorded", "msg.sent"]
+        [
+            "task.verdict",
+            "task.cost_recorded",
+            "channel.posted",
+            "msg.sent"
+        ]
     );
+    let post_id = atm_org::MessageId::new(rows[2].seq);
+    let wake_id = atm_org::MessageId::new(rows[3].seq);
+    assert_eq!(reply["notification"]["message_id"], json!(wake_id));
+    assert_eq!(rows[2].body["channel"], "alpha/other+gamma/chief");
+    assert_eq!(rows[2].body["author"], "gamma/chief");
+    assert_eq!(rows[2].body["kind"], "note");
+    assert_eq!(rows[2].body["task"], json!(id));
+    assert_eq!(rows[2].body["wake"], json!(["alpha/other"]));
+    assert_eq!(rows[2].body["route"], false);
+    assert_eq!(rows[2].body["body"], rows[3].body["body"]);
     let note = format!("Accepted via fix {fix} (review {review}); Covers the outstanding changes.");
     assert_eq!(
         rows[0].body,
@@ -818,9 +833,9 @@ async fn carry_back_down_holder_uses_the_original_reporting_line() {
     assert_eq!(state.task(&fix), before.task(&fix));
     assert_eq!(state.task(&review), before.task(&review));
     assert_eq!(
-        rows[2].body,
+        rows[3].body,
         json!({
-            "from":"gamma/chief", "to":"alpha/other", "kind":"note", "task":id, "attachments":[],
+            "from":"gamma/chief", "to":"alpha/other", "kind":"note", "task":id, "attachments":[], "post":post_id,
             "body":format!("Task {id} accepted via fix {fix} (review {review}).\nInspect the recorded reason: atm task get {id}\nRe-check current state before acting; this note does not request a resume."),
         })
     );

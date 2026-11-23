@@ -104,6 +104,7 @@ fn expected(key: &str) -> ScreenFacts {
         "codex.idle.u5" | "codex.idle.after-turn" | "codex.interrupted.u5" => (Unknown, NotRunning, None, NotFresh),
         "codex.clear-menu.u5" => (Draft, NotRunning, Other, NotFresh),
         "codex.update.u5" | "codex.update.restart" => (Unknown, TurnUnknown, Other, NotFresh),
+        "claude.background-agent-list" => (Unknown, TurnUnknown, DialogUnknown, NotFresh),
         "claude.draft-identical.rich-enabled" // Separate update/focus-warning footer: U5b unsupported case.
         | "claude.shell.u5" | "claude.shell.final" | "codex.shell.u5" | "codex.shell.final"
         | "pi.shell.u5" | "pi.shell.final" | "codex.draft.rich" | "codex.draft.poor"
@@ -905,7 +906,7 @@ fn every_native_source_replayed_through_tmux_matches_real_fixture_and_pinned_fac
     let sources = sources();
     assert_eq!(
         sources.len(),
-        78,
+        79,
         "review expectations when the catalog grows"
     );
     for mode in [StandInMode::Claude, StandInMode::Codex, StandInMode::Pi] {

@@ -6,5 +6,5 @@
   "unread_messages": [{"message_id": "m7", "kind": "brief", "from": "owner", "first_line": "Read the attached brief"}],
   "memory": {"path": "/project/.atm/memory/worker.md", "exists": false},
   "open_tasks": [],
-  "report_command": "atm msg send --to project/lead --kind report --body 'DONE: <result>'"
+  "report_command": "atm post --tag project/lead --kind report --body 'DONE: <result>'"
 }

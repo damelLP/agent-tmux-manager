@@ -32,6 +32,7 @@ fn content(to: AgentId) -> MessageContent {
         body: "brief".into(),
         attachments: vec![],
         task: None,
+        post: None,
     }
 }
 fn observation(status: SessionStatus) -> RecipientObservation {
@@ -49,6 +50,7 @@ fn observation(status: SessionStatus) -> RecipientObservation {
         }),
         presence: PanePresence::Alive,
         facts,
+        inbox_paste: false,
         copy_mode: Some(false),
         focused: Some(false),
     }
@@ -414,7 +416,7 @@ fn running_revalidation_does_not_spend_not_ready_budget() {
         5_000,
     );
     for now in [125_000, 1_800_000] {
-        wait(f.consume(now), WaitReason::SessionBusy);
+        wait(f.consume(now), WaitReason::AgentStartingBusy);
         assert_eq!(f.snapshot(now).live.agent_not_ready_since, None);
     }
 }
@@ -430,6 +432,12 @@ fn replayed_starting_turn_ended_with_draft_gets_not_ready_window_from_recovery()
 }
 
 fn assert_replayed_not_ready_window(turn: TurnState, input: InputState) {
+    // A Starting agent's wait names the draft its look shows (s3-stuckseat).
+    let shown = if input == InputState::Draft {
+        WaitReason::InputNotEmpty
+    } else {
+        WaitReason::AgentNotReady
+    };
     // Replay holds only transitions: Running since 00:06 was not logged.
     // Starting began at 00:05; recovery is 19:59, first sample 20:00.
     let mut f = Fixture::recovered(4, 1_199_000);
@@ -441,13 +449,13 @@ fn assert_replayed_not_ready_window(turn: TurnState, input: InputState) {
     obs.facts.turn = turn;
     obs.facts.input = input;
     f.observe(obs.clone(), 1_200_000);
-    wait(f.consume(1_200_000), WaitReason::AgentNotReady);
+    wait(f.consume(1_200_000), shown);
     assert_eq!(
         f.snapshot(1_200_000).live.agent_not_ready_since,
         Some(at(1_199_000))
     );
     f.observe(obs.clone(), 1_250_000);
-    wait(f.consume(1_318_999), WaitReason::AgentNotReady);
+    wait(f.consume(1_318_999), shown);
     blocked(f.consume(1_319_000), FailureReason::AgentNotReadyTimeout);
     f.observe(obs, 1_400_000);
     assert_eq!(
@@ -494,7 +502,7 @@ fn non_running_observation_starts_one_fresh_not_ready_window() {
             Some(at(300_000))
         );
         f.observe(obs, 400_000);
-        wait(f.step(419_999), WaitReason::AgentNotReady);
+        wait(f.step(419_999), WaitReason::InputNotEmpty);
         blocked(f.step(420_000), FailureReason::AgentNotReadyTimeout);
     }
 }
@@ -521,7 +529,7 @@ fn lost_running_evidence_starts_clock_once_but_keeps_focus_precedence() {
     let live = f.snapshot(2_200_000).live;
     assert_eq!(live.running_turn_since, Some(at(2_100_000)));
     assert_eq!(live.agent_not_ready_since, None);
-    wait(f.step(2_200_000), WaitReason::SessionBusy);
+    wait(f.step(2_200_000), WaitReason::AgentStartingBusy);
 }
 
 #[test]
@@ -757,6 +765,38 @@ fn down_to_starting_gets_new_budget() {
     );
     wait(f.step(319_999), WaitReason::AgentNotReady);
     blocked(f.step(320_000), FailureReason::AgentNotReadyTimeout);
+}
+
+#[test]
+fn survey_short_clocks_keep_start_line_input_separate() {
+    let mut f = Fixture::new(0);
+    f.apply(clear_requested(), 1);
+    f.apply(clear_start_line(), 2);
+    let start = MessageId::new(f.seq);
+    bind_clear(&mut f, 3);
+    // The older pointer supplies the shared read; only the promoted start
+    // line is eligible for a short stale-blocker clock.
+    assert_eq!(f.snapshot(3).blocked_by, Some(start));
+    let mut obs = observation(SessionStatus::Working);
+    let row = obs.session.as_mut().unwrap();
+    row.id = "fresh".into();
+    row.last_event_at = Some(at(-120_000));
+    obs.facts.input = InputState::Draft;
+    f.observe(obs.clone(), 10);
+    let start_snapshot = |f: &Fixture, ms| f.history.snapshot(start, at(ms)).unwrap();
+    assert_eq!(
+        start_snapshot(&f, 10).live.stale_blocker_since,
+        Some(at(10))
+    );
+
+    // Synthetic contradictory observation at the history seam. A real survey
+    // proof requires an empty composer; EmptySince and Unknown would both
+    // clear this clock. A draft makes an accidentally shared input observable.
+    obs.facts.turn = TurnState::Unknown;
+    obs.inbox_paste = true;
+    f.observe(obs, 20);
+    assert_eq!(f.snapshot(20).live.input_line, InputLine::NonEmpty);
+    assert_eq!(start_snapshot(&f, 20).live.stale_blocker_since, None);
 }
 
 #[test]
@@ -999,6 +1039,30 @@ fn input_turn_dialog_truth_table_and_unknown_focus() {
     obs.focused = None;
     f.observe(obs, 0);
     wait(f.step(20_000), WaitReason::OwnerFocused);
+}
+
+#[test]
+fn empty_since_restarts_when_survey_proof_changes() {
+    let mut f = Fixture::new(0);
+    let ordinary = observation(SessionStatus::Idle);
+    let mut survey = ordinary.clone();
+    survey.facts.turn = TurnState::Unknown;
+    survey.inbox_paste = true;
+    for (observation, ms, expected_since) in [
+        (&ordinary, 0, 0),
+        (&ordinary, 100, 0),
+        (&survey, 200, 200),
+        (&survey, 300, 200),
+        (&ordinary, 400, 400),
+        (&ordinary, 500, 400),
+    ] {
+        f.observe(observation.clone(), ms);
+        assert_eq!(
+            f.snapshot(ms).live.input_line,
+            InputLine::EmptySince(at(expected_since)),
+            "observation at {ms} ms"
+        );
+    }
 }
 
 #[test]
@@ -3665,4 +3729,95 @@ fn recovery_claim_failure_registers_nothing() {
         .claim_recovery(scope, false, false, at(3))
         .is_err());
     assert_eq!(f.history.recovery_registrations(), 0);
+}
+
+fn final_failure(f: &mut Fixture, id: MessageId, final_failure: bool, ms: i64) {
+    f.apply(
+        OrgEvent::MessageDeliveryFailed {
+            message_id: id,
+            reason: "fixture".into(),
+            final_failure,
+        },
+        ms,
+    );
+}
+
+fn delivered(f: &mut Fixture, id: MessageId, ms: i64) {
+    f.apply(
+        OrgEvent::MessageDelivered {
+            message_id: id,
+            session_id: "s1".into(),
+            confirmation: "fixture".into(),
+        },
+        ms,
+    );
+}
+
+fn last_attempted(f: &Fixture) -> Option<MessageId> {
+    f.history
+        .last_attempted(&agent())
+        .unwrap()
+        .map(|message| message.id)
+}
+
+// s3-5c. Break: the one message whose reference atm can have left in the
+// recipient's editor is lost: a failure (final or not) forgets it, a later
+// attempt of another message does not replace it, its own delivery does not
+// clear it, or a late receipt of an older message clears the newer one.
+#[test]
+fn last_attempted_follows_attempts_failures_and_deliveries() {
+    let mut f = Fixture::new(0);
+    let first = f.id;
+    assert_eq!(last_attempted(&f), None, "sent, not attempted");
+    f.attempt(1);
+    assert_eq!(last_attempted(&f), Some(first));
+    final_failure(&mut f, first, false, 2);
+    assert_eq!(last_attempted(&f), Some(first), "queued for its retry");
+    final_failure(&mut f, first, true, 3);
+    let failed = f.history.last_attempted(&agent()).unwrap().unwrap();
+    assert_eq!(
+        (failed.id, failed.status),
+        (first, atm_org::DeliveryStatus::Failed)
+    );
+    f.apply(OrgEvent::MessageSent(content(agent())), 4);
+    let second = MessageId::new(f.seq);
+    assert_eq!(last_attempted(&f), Some(first), "sent, not attempted");
+    f.apply(
+        OrgEvent::MessageDeliveryAttempted {
+            message_id: second,
+            attempt: 1,
+            pane: "%1".into(),
+        },
+        5,
+    );
+    assert_eq!(last_attempted(&f), Some(second));
+    delivered(&mut f, first, 6);
+    assert_eq!(
+        last_attempted(&f),
+        Some(second),
+        "a late receipt of the old one"
+    );
+    delivered(&mut f, second, 7);
+    assert_eq!(
+        last_attempted(&f),
+        None,
+        "submitted: nothing left in the editor"
+    );
+}
+
+// s3-5c. Break: a restart forgets the reference a final failure left in an
+// editor, so a promotion leaves it there for good (the lead's Q2: from the log).
+#[test]
+fn last_attempted_is_rebuilt_by_replay() {
+    // Setup takes seqs 1-3; the attempt and its final failure are 4 and 5,
+    // all at or below the startup high-water mark.
+    let mut f = Fixture::new(5);
+    let id = f.id;
+    f.attempt(1);
+    assert!(
+        f.history.last_attempted(&agent()).is_err(),
+        "replay incomplete"
+    );
+    final_failure(&mut f, id, true, 2);
+    assert_eq!(last_attempted(&f), Some(id));
 }

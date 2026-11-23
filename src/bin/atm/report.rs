@@ -3,8 +3,8 @@ use super::msg::{escaped, output, MessageFormat};
 use anyhow::{bail, Context, Result};
 use atm_core::Money;
 use atm_org::{
-    Direction, OutcomeCounts, OverBudget, ProjectId, ProjectReport, Report, ReportParams,
-    TaskReport, Trend,
+    DepartmentCostReport, Direction, OutcomeCounts, OverBudget, ProjectId, ProjectReport, Report,
+    ReportParams, TaskReport, Trend,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use clap::Args;
@@ -31,6 +31,9 @@ struct Reply {
     _seq: u64,
     #[serde(flatten)]
     report: Report,
+    #[serde(default)]
+    departments: Vec<DepartmentCostReport>,
+    warning: Option<String>,
 }
 fn time(value: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
     value
@@ -308,7 +311,8 @@ fn render_task(task: &TaskReport, out: &mut impl Write) -> Result<()> {
     writeln!(out)?;
     Ok(())
 }
-fn render(report: &Report, out: &mut impl Write) -> Result<()> {
+fn render(reply: &Reply, out: &mut impl Write) -> Result<()> {
+    let report = &reply.report;
     header("Total", &totals(report.projects.iter()), "", out)?;
     writeln!(out)?;
     for project in &report.projects {
@@ -354,6 +358,36 @@ fn render(report: &Report, out: &mut impl Write) -> Result<()> {
             render_task(task, out)?;
         }
     }
+    if !reply.departments.is_empty() || reply.warning.is_some() {
+        writeln!(out, "\nDepartments:")?;
+        for department in &reply.departments {
+            let cost = if department.cost.is_none() && department.cost_unknown_tasks == 0 {
+                "no costed tasks in view".to_owned()
+            } else {
+                money(department.cost)
+            };
+            write!(
+                out,
+                "  {} ({}): {cost}",
+                escaped(&department.title, false),
+                department.id
+            )?;
+            if department.cost.is_some() {
+                write!(out, " harness-reported")?;
+            }
+            if department.cost_unknown_tasks > 0 {
+                write!(
+                    out,
+                    " ({} tasks with unknown cost)",
+                    department.cost_unknown_tasks
+                )?;
+            }
+            writeln!(out)?;
+        }
+        if let Some(warning) = &reply.warning {
+            writeln!(out, "  Warning: {}", escaped(warning, false))?;
+        }
+    }
     if let Some(after) = &report.next_after {
         writeln!(
             out,
@@ -375,7 +409,7 @@ pub async fn cmd_report(args: ReportArgs) -> Result<()> {
     .await?;
     let reply: Reply = serde_json::from_value(raw.clone()).context("invalid report from daemon")?;
     super::output::stdout(|out| match args.format {
-        MessageFormat::Text => render(&reply.report, out),
+        MessageFormat::Text => render(&reply, out),
         MessageFormat::Json => output(&raw, args.format, "", out),
     })
 }
@@ -436,7 +470,7 @@ mod tests {
             }
             let reply: Reply = serde_json::from_value(value).unwrap();
             let mut out = vec![];
-            render(&reply.report, &mut out).unwrap();
+            render(&reply, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
             assert!(text.contains(&format!("decisions 0 taken for you, 0 agent decided, {} relayed, 0 overruled, 0 tasks redone", relayed.unwrap_or(0))), "{text}");
         }

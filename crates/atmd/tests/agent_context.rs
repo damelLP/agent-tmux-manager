@@ -98,6 +98,7 @@ impl Rig {
                     body: body.into(),
                     attachments: vec![],
                     task: None,
+                    post: None,
                 }),
                 chrono::Utc::now(),
             )
@@ -140,7 +141,7 @@ async fn context_adopted_agent_reads_fresh_role_and_manager() {
     assert_eq!(missing["role_file"], json!(rig.role_path()));
     assert_eq!(
         missing["report_command"],
-        "atm msg send --to owner --kind report --body 'DONE: <result>'"
+        "atm post --tag owner --kind report --body 'DONE: <result>'"
     );
     assert_eq!(missing["open_tasks"], json!([]));
     assert_eq!(
@@ -153,7 +154,7 @@ async fn context_adopted_agent_reads_fresh_role_and_manager() {
     assert_eq!(first["manager"], "project/lead");
     assert_eq!(
         first["report_command"],
-        "atm msg send --to project/lead --kind report --body 'DONE: <result>'"
+        "atm post --tag project/lead --kind report --body 'DONE: <result>'"
     );
     rig.role("+++\nharness='pi'\nmanager='other/lead'\n+++\nRevised instructions\n");
     let revised = rig.context().await;
@@ -194,7 +195,7 @@ async fn context_started_agent_uses_live_file_not_stored_role_fallback() {
     assert_eq!(missing["role_file"], json!(rig.role_path()));
     assert_eq!(
         missing["report_command"],
-        "atm msg send --to owner --kind report --body 'DONE: <result>'"
+        "atm post --tag owner --kind report --body 'DONE: <result>'"
     );
     rig.role("+++\nharness='pi'\nmanager='fresh-manager'\n+++\nFresh body\n");
     let present = rig.context().await;
@@ -278,6 +279,7 @@ async fn context_summarizes_only_unread_for_caller_without_side_effects() {
                 body: "Member report".into(),
                 attachments: vec![],
                 task: None,
+                post: None,
             }),
             chrono::Utc::now(),
         )

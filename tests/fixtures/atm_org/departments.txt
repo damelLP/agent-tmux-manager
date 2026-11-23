@@ -1,0 +1,11 @@
+Departments:
+  Apps (apps)
+    Goal: Ship apps
+    alpha: 3 seats; 3 open tasks; 1 pending, 0 provisional decisions
+  Tools (tools)
+    alpha: 3 seats; 3 open tasks; 1 pending, 0 provisional decisions
+    beta: 3 seats; 1 open task; 0 pending, 1 provisional decisions
+No department: gamma
+Department problems:
+  tools.toml:projects: project missing is not registered
+  bad.toml line 3: invalid value

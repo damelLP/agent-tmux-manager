@@ -11,6 +11,13 @@
 /// The scheduler's production observer, tested on this file's rig.
 #[path = "message_observer_tests.rs"]
 mod observer;
+#[path = "message_retract_tests.rs"]
+mod retract;
+
+/// The retract effect for a test that must never reach it (s3-5c).
+fn no_retract() -> crate::org::message_scheduler::Retract {
+    Arc::new(|_, id, _| Box::pin(async move { panic!("no retract expected for {id}") }))
+}
 
 use super::*;
 use crate::{
@@ -814,7 +821,7 @@ fn screen(input: InputState, turn: TurnState, dialog: DialogState) -> ScreenFact
 /// Facts that allow `input`: the base every row changes one fact of.
 fn allowing(input: GuardedInput) -> DeliveryGuardFacts {
     let (editor, staged) = match input {
-        GuardedInput::Paste => (InputState::Empty, Some(false)),
+        GuardedInput::Paste | GuardedInput::InboxPaste => (InputState::Empty, Some(false)),
         GuardedInput::Enter => (InputState::Draft, Some(true)),
     };
     DeliveryGuardFacts {
@@ -1478,6 +1485,13 @@ enum Fold {
     Off,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnreadableFixture {
+    Plain,
+    RebindBeforeNote,
+    RecordedManager,
+}
+
 /// A real organisation writer whose appends stay in memory and pass a gate,
 /// one `Applied` writer (the service's fold loop, or the test by hand), the
 /// real control actor over per-pane tmux scripts and, for the attempt tests,
@@ -1532,7 +1546,16 @@ impl Rig {
         policy: DeliveryPolicy,
         scheduler: Option<Effects>,
     ) -> Self {
-        Self::start_with_harness(base, fold, agent, policy, scheduler, Harness::Pi, false).await
+        Self::start_with_harness(
+            base,
+            fold,
+            agent,
+            policy,
+            scheduler,
+            Harness::Pi,
+            UnreadableFixture::Plain,
+        )
+        .await
     }
 
     /// The Codex variant starts Ready after a clear: no binding or registry
@@ -1544,7 +1567,7 @@ impl Rig {
         policy: DeliveryPolicy,
         scheduler: Option<Effects>,
         harness: Harness,
-        rebind_before_diagnostic: bool,
+        unreadable: UnreadableFixture,
     ) -> Self {
         let gate = Arc::new(Semaphore::new(1));
         let (enter, entered) = mpsc::unbounded_channel();
@@ -1574,7 +1597,7 @@ impl Rig {
         ));
         // Opt-in FIFO seam for the race probe only. Other rigs talk to the
         // writer directly, including tests about its queue being full.
-        let requests = if rebind_before_diagnostic {
+        let requests = if unreadable == UnreadableFixture::RebindBeforeNote {
             let (routed, mut proxy) = mpsc::channel::<Request>(64);
             tokio::spawn(async move {
                 let mut rebind = true;
@@ -1648,17 +1671,28 @@ impl Rig {
         );
         let agents = if agent {
             let codex = harness == Harness::Codex;
-            let role = if codex { "codex" } else { "pi" };
+            let role = harness.short_tag();
+            let recorded_manager = unreadable == UnreadableFixture::RecordedManager;
+            // This fixture deliberately has no usable role path: the resolver
+            // uses the recorded manager without an OS read on a paused clock.
+            let (root, manager) = if recorded_manager {
+                ("recorded-manager-fixture", "manager='lead'\n")
+            } else {
+                ("/demo", "")
+            };
             let mut seed = vec![
                 OrgCommand::RegisterProject {
                     project_id: "demo".parse().unwrap(),
-                    root: "/demo".into(),
+                    root: root.into(),
                     move_root: false,
                 },
                 OrgCommand::Up {
                     agent_id: worker(),
-                    role: atm_org::parse_role("worker", &format!("+++\nharness='{role}'\n+++\n"))
-                        .unwrap(),
+                    role: atm_org::parse_role(
+                        "worker",
+                        &format!("+++\nharness='{role}'\n{manager}+++\n"),
+                    )
+                    .unwrap(),
                 },
                 OrgCommand::PaneCreated {
                     agent_id: worker(),
@@ -1669,6 +1703,20 @@ impl Rig {
                     session_id: SessionId::new(if codex { "old" } else { "s1" }),
                 },
             ];
+            if recorded_manager {
+                let lead: AgentId = "demo/lead".parse().unwrap();
+                seed.extend([
+                    OrgCommand::Up {
+                        agent_id: lead.clone(),
+                        role: atm_org::parse_role("lead", &format!("+++\nharness='{role}'\n+++\n"))
+                            .unwrap(),
+                    },
+                    OrgCommand::Down {
+                        agent_id: lead,
+                        reason: "not started in fixture".into(),
+                    },
+                ]);
+            }
             if codex {
                 seed.extend([
                     OrgCommand::Clear { agent_id: worker() },
@@ -1679,13 +1727,15 @@ impl Rig {
                 org.execute(command, utc()).await.unwrap();
             }
             if !codex {
-                registry.register(row("s1")).await.unwrap();
+                let mut row = row("s1");
+                row.harness = harness;
+                registry.register(row).await.unwrap();
             }
             // The agent service's check of the pane when it starts.
-            let idle = if codex {
-                codex_frame(CODEX_IDLE)
-            } else {
-                pi(IDLE)
+            let idle = match harness {
+                Harness::Codex => codex_frame(CODEX_IDLE),
+                Harness::ClaudeCode => observer::claude_resize_frame(40),
+                _ => pi(IDLE),
             };
             tmux.script_inspect(&pane(), Some(&idle.inspection))
                 .unwrap();
@@ -1718,7 +1768,13 @@ impl Rig {
             );
             guarded(agents.reconciled()).await.unwrap();
             assert_eq!(tmux.pending_reads(&pane()).unwrap(), 0);
-            let baseline = if codex { codex_baseline() } else { baseline() };
+            let baseline = match harness {
+                Harness::Codex => codex_baseline(),
+                Harness::ClaudeCode => PaneBaseline::adopted(100)
+                    .with_harness("claude".into())
+                    .unwrap(),
+                _ => baseline(),
+            };
             agents.record_baseline(worker(), "%1", baseline);
             agents
         } else {
@@ -1886,6 +1942,7 @@ impl Rig {
             body: "the body never reaches a terminal".into(),
             attachments: vec![],
             task: None,
+            post: None,
         })
     }
 
@@ -2282,7 +2339,7 @@ async fn ready_unbound_codex() -> (Rig, MessageId) {
         DeliveryPolicy::default(),
         None,
         Harness::Codex,
-        false,
+        UnreadableFixture::Plain,
     )
     .await;
     let recipient = rig.rt.agents.recipient(&worker()).await.unwrap();
@@ -3320,7 +3377,8 @@ async fn final_no_effect_attempt_is_not_left_to_policy_without_history_record() 
 async fn final_no_effect_attempt_ends_failed_with_one_owner_notice() {
     let effects = Effects {
         deliver: Arc::new(|rt, id, deadline| Box::pin(deliver(rt, id, deadline))),
-        observe: Arc::new(|_| Box::pin(async { Ok((idle_observation(), None)) })),
+        observe: Arc::new(|_, _| Box::pin(async { Ok((idle_observation(), None, None, None)) })),
+        retract: no_retract(),
     };
     let mut rig = Rig::start(Fold::Service, true, one_attempt(), Some(effects)).await;
     while rig.committed.try_recv().is_ok() {}
@@ -3364,7 +3422,8 @@ async fn final_no_effect_attempt_ends_failed_with_one_owner_notice() {
 async fn final_no_effect_attempt_with_a_work_error_ends_failed() {
     let effects = Effects {
         deliver: Arc::new(|rt, id, deadline| Box::pin(deliver(rt, id, deadline))),
-        observe: Arc::new(|_| Box::pin(async { Ok((idle_observation(), None)) })),
+        observe: Arc::new(|_, _| Box::pin(async { Ok((idle_observation(), None, None, None)) })),
+        retract: no_retract(),
     };
     let mut rig = Rig::start(Fold::Service, true, one_attempt(), Some(effects)).await;
     while rig.committed.try_recv().is_ok() {}
@@ -3822,6 +3881,162 @@ async fn unbound_codex_with_an_eligible_row_is_refused_before_commit() {
     assert!(rig.effects().is_empty(), "{:?}", rig.effects());
     assert!(rig.snapshot(id).message.last_attempt.is_none());
     assert_eq!(rig.snapshot(id).message.status, DeliveryStatus::Queued);
+}
+
+/// s3-d1: since a daemon restart the worker's pane shows only the discovery
+/// row of the process its recorded session runs in. `recorded`: that
+/// process's `session.process`, or none. The attempt starts once the pane
+/// changed under a parked reservation, so no observer pass reads its frames.
+async fn restarted_seat(
+    recorded: bool,
+) -> (Rig, MessageId, JoinHandle<Result<(), MessageError>>, u64) {
+    restarted_seat_seeing(recorded, |id| {
+        vec![pi(IDLE), pi(IDLE), staged(id), staged(id)]
+    })
+    .await
+}
+
+/// As `restarted_seat`, with the attempt's frames for the message's id.
+async fn restarted_seat_seeing(
+    recorded: bool,
+    frames: impl Fn(MessageId) -> Vec<PaneCapture>,
+) -> (Rig, MessageId, JoinHandle<Result<(), MessageError>>, u64) {
+    let mut rig = Rig::attempt().await;
+    let id = rig.ready_message().await;
+    let parked = rig.park().await;
+    let attempt = rig.spawn_deliver(id);
+    rig.admission_requested(id).await;
+    let registry = rig.rt.registry.clone();
+    guarded(registry.remove(SessionId::new("s1")))
+        .await
+        .unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    guarded(registry.register_discovered(
+        SessionId::pending_from_pid(pid),
+        pid,
+        cwd.path().to_path_buf(),
+        Some("%1".into()),
+        Harness::Pi,
+    ))
+    .await
+    .unwrap();
+    if recorded {
+        let start = crate::org::message_service_tests::own_process_start();
+        let seq = rig
+            .commit(crate::org::message_service_tests::own_process("s1", start))
+            .await;
+        rig.folded(seq).await;
+    }
+    let before = rig.org.status().unwrap();
+    rig.script(&frames(id));
+    parked.send(()).unwrap();
+    (rig, id, attempt, before)
+}
+
+/// s3-d1 review S1. Break: a retry on a process-matched discovery row is
+/// pasted although the harness has reported nothing since the restart (with
+/// hooks gone or a wrong match, nothing ever confirms it, and each retry
+/// would paste again). Attempt 1 types nothing here (the owner is on the
+/// pane) and is failed for its retry; attempt 2 waits with its reason: no
+/// attempt is committed and nothing is typed. The wait ends when the harness
+/// speaks and its row becomes the session's real row.
+#[tokio::test(start_paused = true)]
+async fn retry_on_a_process_matched_row_waits_for_the_harness() {
+    let (rig, id, attempt, before) =
+        restarted_seat_seeing(true, |_| vec![pi(IDLE), focused()]).await;
+    guarded(attempt).await.unwrap().unwrap();
+    assert_eq!(rig.pastes(), 0);
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.last_attempt_seq, Some(before + 1));
+    assert_eq!(snapshot.message.status, DeliveryStatus::Queued);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 2 });
+    guarded(rig.org.snapshot()).await.unwrap();
+    let committed = rig.org.status().unwrap();
+    // A whole attempt's frames: without the wait, attempt 2 would be typed.
+    rig.script(&[pi(IDLE), pi(IDLE), staged(id), staged(id)]);
+    let waited = rig.deliver(id).await;
+    assert!(
+        matches!(&waited, Err(MessageError::Refused(text)) if text == RETRY_WAITS_FOR_HARNESS),
+        "{waited:?}"
+    );
+    assert_eq!(rig.pastes(), 0);
+    guarded(rig.org.snapshot()).await.unwrap();
+    assert_eq!(
+        rig.org.status().unwrap(),
+        committed,
+        "no attempt was committed"
+    );
+    assert_eq!(rig.step(id), DeliveryStep::PasteNow { attempt: 2 });
+    let recipient = guarded(rig.rt.agents.recipient(&worker())).await.unwrap();
+    assert!(recipient.process_matched);
+    // The harness speaks: its row becomes the recorded session's own row.
+    guarded(rig.rt.registry.apply_lifecycle_event(
+        SessionId::new("s1"),
+        LifecycleEvent::WorkingEnd,
+        Harness::Pi,
+        Some(std::process::id()),
+        Some("%1".into()),
+    ))
+    .await
+    .unwrap();
+    let recipient = guarded(rig.rt.agents.recipient(&worker())).await.unwrap();
+    assert!(!recipient.process_matched && !recipient.unconfirmed);
+    assert_eq!(
+        recipient.session.map(|row| row.id),
+        Some(SessionId::new("s1"))
+    );
+}
+
+/// Break: the recipient ignores the recorded process: the gate refuses
+/// before any commit and nothing is typed (the unrecorded case shows it, as
+/// the worker's binding (2023) predates this process).
+#[tokio::test(start_paused = true)]
+async fn restarted_seat_matched_by_process_takes_a_delivery_without_a_harness_event() {
+    let (rig, id, attempt, _) = restarted_seat(false).await;
+    let delivered = guarded(attempt).await.unwrap();
+    assert!(
+        matches!(delivered, Err(MessageError::Refused(_))),
+        "{delivered:?}"
+    );
+    assert!(rig.effects().is_empty(), "{:?}", rig.effects());
+    assert!(rig.snapshot(id).message.last_attempt.is_none());
+
+    let (mut rig, id, attempt, before) = restarted_seat(true).await;
+    rig.audited().await;
+    // Typed with no harness event since the restart: the attempt is armed
+    // for the recorded session, and its own prompt-submit confirms it.
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    assert_eq!(rig.snapshot(id).last_attempt_seq, Some(before + 1));
+    rig.prompt("s1", inbox_reference(id));
+    guarded(attempt).await.unwrap().unwrap();
+    let snapshot = rig.snapshot(id);
+    assert_eq!(snapshot.message.status, DeliveryStatus::Delivered);
+    let state = guarded(rig.org.snapshot()).await.unwrap();
+    let receipt = state.message(&id).unwrap().receipt.clone().unwrap();
+    assert_eq!(receipt.session_id.as_str(), "s1");
+    assert_eq!(receipt.confirmation, "prompt_submit_exact_reference");
+}
+
+/// Known limit (F1): the matched process runs another session by now (a
+/// hand `/clear` while atmd was down). Its prompt-submit names the message
+/// but is not the attempted session: the message is held as probably
+/// landed, never confirmed for the other session and never typed again.
+#[tokio::test(start_paused = true)]
+async fn matched_seat_prompt_from_another_session_holds_the_message() {
+    let (mut rig, id, attempt, _) = restarted_seat(true).await;
+    rig.audited().await;
+    assert!(rig.typed(id), "{:?}", rig.effects());
+    rig.prompt("s9", inbox_reference(id));
+    let evidence = rig.rt.evidence.snapshot(id).unwrap();
+    assert!(evidence.probably_landed);
+    assert!(evidence.receipt.is_none());
+    let _ = guarded(attempt).await.unwrap();
+    assert!(rig.typed(id), "typed once: {:?}", rig.effects());
+    let snapshot = rig.snapshot(id);
+    assert_ne!(snapshot.message.status, DeliveryStatus::Delivered);
+    assert!(snapshot.message.receipt.is_none());
 }
 
 /// The same arrival race for a bound agent: another session's row does not

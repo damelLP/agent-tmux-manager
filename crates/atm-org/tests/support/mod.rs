@@ -22,6 +22,7 @@ pub fn content(to: Address) -> MessageContent {
         body: "Work".into(),
         attachments: vec!["brief.md".into()],
         task: None,
+        post: None,
     }
 }
 pub fn summary() -> SessionSummary {

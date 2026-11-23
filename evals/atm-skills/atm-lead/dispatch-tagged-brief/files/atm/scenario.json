@@ -1,0 +1,27 @@
+{
+  "own_pane": "%3",
+  "named_commands": [
+    {
+      "argv": [
+        "me"
+      ],
+      "stdout": "Agent: project/lead; manager: owner\nInstructions: Dispatch authorized briefs only.\nOpen tasks: none\nUnread: none\nReport: atm post --tag owner --kind report --body 'DONE: <result>'"
+    },
+    {
+      "argv": [
+        "post",
+        "--tag",
+        "project/member",
+        "--kind",
+        "brief",
+        "--task",
+        "unit-1",
+        "--attach",
+        "@RUN@/briefs/dispatch.md",
+        "--body",
+        "Read the attached brief"
+      ],
+      "stdout": "m59 posted channel=project thread=-; woke: project/member"
+    }
+  ]
+}

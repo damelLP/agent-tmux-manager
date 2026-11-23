@@ -210,7 +210,8 @@ fn refusal_name(refusal: &Refusal) -> &'static str {
         | Refusal::WrongRecipient { .. }
         | Refusal::InvalidRecipient(_)
         | Refusal::Task(_)
-        | Refusal::Away(_) => "not a decision refusal",
+        | Refusal::Away(_)
+        | Refusal::Channel(_) => "not a decision refusal",
     }
 }
 const REFUSALS: [&str; 10] = [

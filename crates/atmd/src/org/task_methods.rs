@@ -1,11 +1,13 @@
 //! Task schemas, parameter bounds and method/error registration.
 
 use super::{
-    tasks::{sequence, TaskError, TaskHandle},
+    department_directory::{DepartmentDirectory, DepartmentFiles},
+    tasks::{sequence, MutationResult, TaskError, TaskHandle},
     OrgHandle, OrgServiceError,
 };
 use crate::server::methods::{parse_params, MethodError, MethodRouter};
 use atm_org::{
+    department::{task_budget_default, BudgetDefaultSources},
     Address, AgentId, ApplyError, DecisionId, ProjectId, Refusal, TaskBudget, TaskCommand,
     TaskCreated, TaskFile, TaskFileKind, TaskId, TaskKind, TaskMeasure, TaskRefusal, TaskState,
     TaskSubmission, TaskVerdict,
@@ -185,12 +187,44 @@ fn encode(value: impl Serialize) -> Result<serde_json::Value, MethodError> {
     serde_json::to_value(value).map_err(|e| MethodError::new(error_code::INTERNAL, e.to_string()))
 }
 
+#[derive(Serialize)]
+struct CreateResult {
+    #[serde(flatten)]
+    mutation: MutationResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_budget_from: Option<BudgetDefaultSources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+fn fill_default_budget(
+    directory: Option<DepartmentDirectory>,
+    project: Option<&ProjectId>,
+    budget: &mut Option<TaskBudget>,
+) -> (Option<BudgetDefaultSources>, Option<String>) {
+    let (Some(directory), Some(project)) = (directory, project) else {
+        return (None, None);
+    };
+    if !directory.problems.is_empty() {
+        let warning =
+            format!("department policy incomplete; no default task budget applied for {project}");
+        tracing::warn!(%warning);
+        return (None, Some(warning));
+    }
+    let sources = task_budget_default(&directory.departments, project).map(|(value, sources)| {
+        *budget = Some(value);
+        sources
+    });
+    (sources, None)
+}
+
 /// Always advertised; unavailable persistence cannot yield a successful mutation.
 pub fn register_task_methods(router: &mut MethodRouter, org: OrgHandle) -> Result<(), MethodError> {
     register_task_methods_with_reporting(
         router,
         org,
         super::reporting_line::ReportingFiles::default(),
+        DepartmentFiles::new(None),
     )
 }
 
@@ -198,6 +232,7 @@ pub(crate) fn register_task_methods_with_reporting(
     router: &mut MethodRouter,
     org: OrgHandle,
     reporting: super::reporting_line::ReportingFiles,
+    departments: DepartmentFiles,
 ) -> Result<(), MethodError> {
     let tasks = TaskHandle::new(org.clone()).with_reporting_files(reporting.clone());
     macro_rules! mutation {
@@ -223,36 +258,50 @@ pub(crate) fn register_task_methods_with_reporting(
             let org = org.clone();
             let intent = intent.clone();
             let reporting = reporting.clone();
+            let departments = departments.clone();
             async move {
-                let p: CreateParams = parse_params(params)?;
+                let mut p: CreateParams = parse_params(params)?;
                 create(&p)?;
-                let (creator, project_id) = intent
-                    .check(
-                        &org,
-                        &caller,
-                        p.project_id.as_ref(),
-                        p.measure.clone(),
-                        &reporting,
-                    )
-                    .await?;
-                encode(
-                    tasks
-                        .mutate(caller, move |_| {
-                            TaskCommand::Create(TaskCreated {
-                                project_id,
-                                title: p.title,
-                                kind: p.kind,
-                                creator,
-                                parent: p.parent,
-                                judges: p.judges,
-                                measure: p.measure,
-                                budget: p.budget,
-                                files: p.files,
-                                rests_on: p.rests_on,
-                            })
+                let admission = intent.check(
+                    &org, &caller, p.project_id.as_ref(), p.measure.clone(), &reporting,
+                );
+                let ((creator, project_id), directory) = if p.budget.is_none() && departments.is_configured() {
+                    // Read the whole directory alongside admission, not after a
+                    // potentially long authority check. Do not wait for the scan
+                    // when admission refuses or produces an unplaced task.
+                    let scan = departments.read();
+                    tokio::pin!(admission, scan);
+                    tokio::select! {
+                        biased;
+                        admitted = &mut admission => {
+                            let admitted = admitted?;
+                            let directory = if admitted.1.is_some() { Some(scan.await) } else { None };
+                            (admitted, directory)
+                        }
+                        directory = &mut scan => (admission.await?, Some(directory)),
+                    }
+                } else {
+                    (admission.await?, None)
+                };
+                let (default_budget_from, warning) =
+                    fill_default_budget(directory, project_id.as_ref(), &mut p.budget);
+                let mutation = tasks
+                    .mutate(caller, move |_| {
+                        TaskCommand::Create(TaskCreated {
+                            project_id,
+                            title: p.title,
+                            kind: p.kind,
+                            creator,
+                            parent: p.parent,
+                            judges: p.judges,
+                            measure: p.measure,
+                            budget: p.budget,
+                            files: p.files,
+                            rests_on: p.rests_on,
                         })
-                        .await?,
-                )
+                    })
+                    .await?;
+                encode(CreateResult { mutation, default_budget_from, warning })
             }
         },
     )?;
@@ -388,11 +437,475 @@ pub(crate) fn register_task_methods_with_reporting(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::methods::{CallContext, CallerId};
-    use crate::{eventlog::Envelope, org::Request};
+    use crate::server::methods::{router, CallContext, CallerId, CallerPane, MethodServices};
+    use crate::{eventlog::Envelope, org::Request, registry::RegistryHandle};
     use atm_org::{OrgCommand, OrgState};
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::{
+        fs,
+        future::{poll_fn, Future},
+        path::PathBuf,
+        pin::Pin,
+        task::Poll,
+    };
     use tokio::sync::{broadcast, mpsc, watch};
+    use tokio_util::sync::CancellationToken;
+
+    struct World {
+        dir: tempfile::TempDir,
+        org: OrgHandle,
+        cancel: CancellationToken,
+    }
+    impl Drop for World {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+    impl World {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let cancel = CancellationToken::new();
+            let org = OrgHandle::open(dir.path().join("state"), cancel.clone()).await;
+            Self { dir, org, cancel }
+        }
+
+        async fn project(&self, name: &str) -> PathBuf {
+            let root = self.dir.path().join(name);
+            fs::create_dir_all(root.join(".atm/roles")).unwrap();
+            fs::write(
+                root.join(".atm/intent.md"),
+                "## How we will know\n- owner\n",
+            )
+            .unwrap();
+            self.org
+                .execute(
+                    OrgCommand::RegisterProject {
+                        project_id: name.parse().unwrap(),
+                        root: root.to_str().unwrap().into(),
+                        move_root: false,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            root
+        }
+
+        fn departments(&self) -> PathBuf {
+            self.dir.path().join("departments")
+        }
+
+        fn department(&self, id: &str, project: &str, mode: &str, rule: &str) {
+            let dir = self.departments();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("{id}.toml")),
+                format!("title='{id}'\nprojects=['{project}']\n[hire]\nmode='{mode}'\n{rule}\n"),
+            )
+            .unwrap();
+        }
+
+        fn router(&self) -> MethodRouter {
+            // No task method calls the registry; no fake responses are needed.
+            let (commands, _receive) = mpsc::channel(1);
+            let (events, _) = broadcast::channel(1);
+            let mut services = MethodServices::new(RegistryHandle::new(commands, events));
+            services.org = self.org.clone();
+            services.departments_dir = Some(self.departments());
+            router(services).unwrap()
+        }
+    }
+
+    fn caller(pane: Option<&str>) -> CallContext {
+        CallContext {
+            client_id: CallerId("create-default-budget".into()),
+            from_pane: pane.map(|pane| CallerPane(pane.into())),
+        }
+    }
+
+    fn request() -> Value {
+        json!({"title":"Work","measure":{"kind":"owner"}})
+    }
+
+    fn legacy_reply(id: &Value) -> Value {
+        json!({"task_id":id,"changed":true,"notification":null})
+    }
+
+    fn only_create(
+        log: &mut broadcast::Receiver<std::sync::Arc<Envelope>>,
+        answer: &Value,
+    ) -> Value {
+        let event = log.try_recv().unwrap();
+        assert_eq!(event.kind, "task.created");
+        assert_eq!(answer["task_id"], format!("t{}", event.seq));
+        assert!(matches!(
+            log.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        event.body.clone()
+    }
+
+    async fn create_and_check(
+        world: &World,
+        router: &MethodRouter,
+        pane: Option<&str>,
+        params: Value,
+        budget: Value,
+    ) -> (Value, Value) {
+        let mut log = world.org.committed.subscribe();
+        let answer = router
+            .call(caller(pane), "task.create", params)
+            .await
+            .unwrap();
+        let event = only_create(&mut log, &answer);
+        assert_eq!(event["budget"], budget, "persisted task.created: {event}");
+        let received = router
+            .call(
+                caller(pane),
+                "task.get",
+                json!({"task_id":answer["task_id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(received["task"]["budget"], budget, "stored task");
+        (answer, received)
+    }
+
+    // Break caught: using the caller's project, returning provenance without
+    // persisting the effective budget, or blending a default into an explicit budget.
+    #[tokio::test]
+    async fn create_defaults_only_the_admitted_project() {
+        let world = World::new().await;
+        let alpha = world.project("alpha").await;
+        let beta = world.project("beta").await;
+        world.project("gamma").await;
+        for (id, pane, role, manager) in [
+            (
+                "alpha/manager",
+                "%1",
+                alpha.join(".atm/roles/manager.md"),
+                "owner",
+            ),
+            (
+                "beta/worker",
+                "%2",
+                beta.join(".atm/roles/worker.md"),
+                "alpha/manager",
+            ),
+        ] {
+            fs::write(
+                role,
+                format!("+++\nharness='pi'\nmanager='{manager}'\n+++\n"),
+            )
+            .unwrap();
+            world
+                .org
+                .execute(
+                    OrgCommand::Adopt {
+                        agent_id: id.parse().unwrap(),
+                        pane: pane.into(),
+                        session_id: None,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+        }
+        world.department(
+            "caller",
+            "alpha",
+            "enforce",
+            "[spend]\ntask_budget={turns=1,cost={microdollars=0}}",
+        );
+        world.department(
+            "tools",
+            "beta",
+            "report",
+            "[spend]\ntask_budget={turns=8,cost={microdollars=500000}}",
+        );
+        world.department(
+            "apps",
+            "beta",
+            "enforce",
+            "[spend]\ntask_budget={turns=20,cost={microdollars=120000}}",
+        );
+        let router = world.router();
+        let mut p = request();
+        p["project_id"] = json!("beta");
+        let budget = json!({"turns":8,"cost":{"microdollars":120000},"deadline":null});
+        let (reply, got) =
+            create_and_check(&world, &router, Some("%1"), p.clone(), budget.clone()).await;
+        assert_eq!(
+            reply,
+            json!({"task_id":reply["task_id"],"changed":true,"notification":null,
+            "default_budget_from":{"turns":"tools","cost":"apps"}})
+        );
+        assert_eq!(got["task"]["project_id"], "beta");
+        assert_eq!(got["task"]["creator"], "alpha/manager");
+        assert_eq!(
+            got["budget_status"],
+            json!({"crossed":[],"notification":null})
+        );
+        let id = reply["task_id"].clone();
+        p["budget"] = Value::Null;
+        let (reply, _) =
+            create_and_check(&world, &router, Some("%1"), p.clone(), budget.clone()).await;
+        assert_eq!(
+            reply["default_budget_from"],
+            json!({"turns":"tools","cost":"apps"})
+        );
+        for (explicit, stored) in [
+            (
+                json!({"turns":9}),
+                json!({"turns":9,"cost":null,"deadline":null}),
+            ),
+            (json!({}), json!({"turns":null,"cost":null,"deadline":null})),
+            (
+                json!({"deadline":"2099-01-01T00:00:00Z"}),
+                json!({"turns":null,"cost":null,"deadline":"2099-01-01T00:00:00Z"}),
+            ),
+        ] {
+            p["budget"] = explicit;
+            let (reply, _) = create_and_check(&world, &router, Some("%1"), p.clone(), stored).await;
+            assert_eq!(reply, legacy_reply(&reply["task_id"]));
+        }
+        p["budget"] = json!({"cost":{"microdollars":-1}});
+        let before = world.org.status().unwrap();
+        let error = router
+            .call(caller(Some("%1")), "task.create", p.clone())
+            .await
+            .unwrap_err()
+            .0;
+        assert!(
+            error.message.contains("budget.cost") && error.message.contains("must not be negative"),
+            "{error:?}"
+        );
+        assert_eq!(world.org.status().unwrap(), before);
+
+        p["project_id"] = json!("gamma");
+        p.as_object_mut().unwrap().remove("budget");
+        let (reply, _) = create_and_check(&world, &router, None, p.clone(), Value::Null).await;
+        assert_eq!(reply, legacy_reply(&reply["task_id"]));
+        world.department("no-budget", "gamma", "report", "[spend]\nmodels=['*']");
+        let (reply, _) = create_and_check(&world, &router, None, p, Value::Null).await;
+        assert_eq!(reply, legacy_reply(&reply["task_id"]));
+        fs::remove_dir_all(world.departments()).unwrap();
+        let got = router
+            .call(caller(None), "task.get", json!({"task_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            got["task"]["budget"], budget,
+            "a default is a stored budget, not a live projection"
+        );
+        let mut p = request();
+        p["project_id"] = json!("beta");
+        let (reply, _) = create_and_check(&world, &router, None, p, Value::Null).await;
+        assert_eq!(reply, legacy_reply(&reply["task_id"]));
+    }
+
+    fn router_on_lane(org: OrgHandle, departments: DepartmentFiles) -> MethodRouter {
+        let mut router = MethodRouter::default();
+        register_task_methods_with_reporting(&mut router, org, Default::default(), departments)
+            .unwrap();
+        router
+    }
+
+    fn assert_warning(answer: &Value) {
+        assert_eq!(
+            *answer,
+            json!({"task_id":answer["task_id"],"changed":true,"notification":null,
+            "warning":"department policy incomplete; no default task budget applied for alpha"})
+        );
+    }
+
+    // Break caught: a failed scan suppresses the creation or treats the readable
+    // subset as sufficient to compute a minimum.
+    #[tokio::test]
+    async fn create_without_default_on_incomplete_department_read() {
+        let world = World::new().await;
+        world.project("alpha").await;
+        world.department("tools", "alpha", "report", "[spend]\ntask_budget={turns=8}");
+        fs::write(world.departments().join("bad.toml"), "title=[\n").unwrap();
+        let closed = DepartmentFiles::new(Some(world.departments()));
+        closed.slot.close();
+        for router in [
+            world.router(),
+            router_on_lane(world.org.clone(), closed.clone()),
+        ] {
+            let (reply, got) =
+                create_and_check(&world, &router, None, request(), Value::Null).await;
+            assert_warning(&reply);
+            assert!(got.get("budget_status").is_none());
+            let mut p = request();
+            p["budget"] = json!({});
+            let (reply, _) = create_and_check(
+                &world,
+                &router,
+                None,
+                p,
+                json!({"turns":null,"cost":null,"deadline":null}),
+            )
+            .await;
+            assert_eq!(reply, legacy_reply(&reply["task_id"]));
+        }
+        let disabled = DepartmentFiles::new(None);
+        disabled.slot.close();
+        let router = router_on_lane(world.org.clone(), disabled);
+        let (reply, _) = create_and_check(&world, &router, None, request(), Value::Null).await;
+        assert_eq!(reply, legacy_reply(&reply["task_id"]));
+    }
+
+    // Fence the first snapshot only; all mutation operations go to the real actor.
+    fn gated_world(org: &OrgHandle) -> (OrgHandle, mpsc::Receiver<Request>) {
+        let (requests, receive) = mpsc::channel(8);
+        (
+            OrgHandle {
+                requests,
+                ..org.clone()
+            },
+            receive,
+        )
+    }
+
+    fn release_admission(inbox: &mut mpsc::Receiver<Request>, state: OrgState) {
+        let Request::Snapshot(reply) = inbox.try_recv().unwrap() else {
+            panic!("expected intent's policy snapshot");
+        };
+        reply.send(state).unwrap();
+    }
+
+    fn use_real_writer(mut inbox: mpsc::Receiver<Request>, org: &OrgHandle) {
+        let requests = org.requests.clone();
+        tokio::spawn(async move {
+            while let Some(request) = inbox.recv().await {
+                requests.send(request).await.unwrap();
+            }
+        });
+    }
+
+    async fn poll_once<F: Future>(mut call: Pin<&mut F>) -> Poll<F::Output> {
+        poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await
+    }
+
+    // Break caught: the department read is first polled after intent (adding a
+    // serial five-second budget), or a refused admission waits for the reader.
+    #[tokio::test]
+    async fn create_starts_department_read_while_intent_is_pending() {
+        let world = World::new().await;
+        let files = DepartmentFiles::new(Some(world.departments()));
+        let held = files.slot.acquire().await.unwrap();
+        let (org, mut inbox) = gated_world(&world.org);
+        let router = router_on_lane(org, files.clone());
+        let mut log = world.org.committed.subscribe();
+        let mut p = request();
+        p["project_id"] = json!("missing");
+        let mut call = Box::pin(router.call(caller(None), "task.create", p));
+        assert!(poll_once(call.as_mut()).await.is_pending());
+        // The department future queued for the lane in the same poll as the
+        // held intent snapshot. The semaphore reserves the slot for it on release.
+        drop(held);
+        assert!(
+            matches!(
+                files.slot.try_acquire(),
+                Err(tokio::sync::TryAcquireError::NoPermits)
+            ),
+            "department reader did not enter while intent was pending"
+        );
+        release_admission(&mut inbox, OrgState::default());
+        let Poll::Ready(Err(error)) = poll_once(call.as_mut()).await else {
+            panic!("intent refusal must return without waiting for the scan");
+        };
+        assert_eq!(error.0.code, "not_found");
+        assert!(
+            files.slot.try_acquire().is_ok(),
+            "refusal did not release the queued read"
+        );
+        assert!(matches!(
+            log.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    // Break caught: a held department slot puts the mutation on the read's
+    // deadline or returns a timeout instead of one unbudgeted committed task.
+    #[tokio::test]
+    async fn create_commits_once_after_department_slot_times_out() {
+        let world = World::new().await;
+        world.project("alpha").await;
+        world.department("tools", "alpha", "report", "[spend]\ntask_budget={turns=8}");
+        let admitted = world.org.snapshot().await.unwrap();
+        let files = DepartmentFiles::new(Some(world.departments()));
+        let _held = files.slot.acquire().await.unwrap();
+        let (org, mut inbox) = gated_world(&world.org);
+        let router = router_on_lane(org, files.clone());
+        let mut log = world.org.committed.subscribe();
+        let mut call = Box::pin(router.call(caller(None), "task.create", request()));
+        // While the clock is paused, both operations wait on in-memory gates.
+        // The snapshot reply is ready before advancing; intent file I/O is
+        // polled only after resuming the real clock.
+        tokio::time::pause();
+        assert!(poll_once(call.as_mut()).await.is_pending());
+        release_admission(&mut inbox, admitted);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::resume();
+        use_real_writer(inbox, &world.org);
+        let answer = call.await.unwrap();
+        assert_warning(&answer);
+        assert_eq!(only_create(&mut log, &answer)["budget"], Value::Null);
+        assert_eq!(world.org.snapshot().await.unwrap().tasks().count(), 1);
+    }
+
+    // Break caught: an explicit budget starts the optional scan, or an
+    // unplaced admission keeps waiting on the department reader.
+    #[tokio::test]
+    async fn create_does_not_wait_for_departments_without_a_default_target() {
+        let world = World::new().await;
+        world.department("tools", "alpha", "report", "[spend]\ntask_budget={turns=8}");
+        for (budget, stored) in [
+            (None, Value::Null),
+            (
+                Some(json!({})),
+                json!({"turns":null,"cost":null,"deadline":null}),
+            ),
+        ] {
+            let files = DepartmentFiles::new(Some(world.departments()));
+            let held = files.slot.acquire().await.unwrap();
+            let (org, mut inbox) = gated_world(&world.org);
+            let router = router_on_lane(org, files.clone());
+            let mut log = world.org.committed.subscribe();
+            let mut p = request();
+            if let Some(value) = &budget {
+                p["budget"] = value.clone();
+            }
+            let mut call = Box::pin(router.call(caller(None), "task.create", p));
+            assert!(poll_once(call.as_mut()).await.is_pending());
+            if budget.is_some() {
+                drop(held);
+                let held_again = files
+                    .slot
+                    .try_acquire()
+                    .expect("explicit budget started a department read");
+                release_admission(&mut inbox, OrgState::default());
+                assert!(poll_once(call.as_mut()).await.is_pending());
+                drop(held_again);
+            } else {
+                release_admission(&mut inbox, OrgState::default());
+                assert!(poll_once(call.as_mut()).await.is_pending());
+                drop(held);
+                assert!(
+                    files.slot.try_acquire().is_ok(),
+                    "unplaced task still waiting for departments"
+                );
+            }
+            use_real_writer(inbox, &world.org);
+            let answer = call.await.unwrap();
+            assert_eq!(answer, legacy_reply(&answer["task_id"]));
+            let event = only_create(&mut log, &answer);
+            assert!(event["project_id"].is_null());
+            assert_eq!(event["budget"], stored);
+        }
+    }
 
     // Break caught: the router discards an admitted mutation result at 30s,
     // even though create's policy admission and mutation have separate budgets.

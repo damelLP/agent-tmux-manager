@@ -2461,6 +2461,80 @@ async fn handover_clear_does_not_claim_a_carried_plain_start_is_a_resume() {
     }
 }
 
+use crate::org::agent_lifecycle::ClearOutcome;
+use crate::org::start_line::StartLineDisposition;
+
+async fn saved_clear_at_width(c: &mut Clearing, before: u16, after: u16) -> ClearOutcome {
+    use crate::org::agent_lifecycle::{ClearAttempt, SavedSeat};
+    for screen in [CLAUDE_CONVERSATION, CLAUDE_CONVERSATION, CLAUDE_STAGED, CLAUDE_STAGED] {
+        c.frame_with(screen, |capture| capture.inspection.pane.width = before);
+    }
+    c.frame_with(CLAUDE_CLEARED, |capture| capture.inspection.pane.width = after);
+    c.follow_up();
+    c.follow_up();
+    let agents = c.agents.clone();
+    let call = tokio::spawn(async move {
+        agents.clear_handover(
+            SavedSeat { agent: lead(), pane: pane("%1"), session: "old".into() },
+            None,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+        ).await
+    });
+    c.awaiting_session().await;
+    c.session_start("new", Some("clear")).await;
+    let ClearAttempt::Cleared(clear) = call.await.unwrap().unwrap() else {
+        panic!("the saved clear did not succeed");
+    };
+    assert_eq!(clear.result.session_id, Some("new".into()));
+    clear
+}
+
+// Break caught: width comes from the old editor (or from the capture text)
+// instead of the metadata in the Ready proof. Width only chooses the copy.
+// Synthetic widths; malformed metadata (including zero) cannot prove Ready.
+#[tokio::test(start_paused = true)]
+async fn handover_clear_uses_the_replacement_width() {
+    for (before, after, plain) in [(120, 64, true), (64, 120, false)] {
+        let mut c = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+        let clear = saved_clear_at_width(&mut c, before, after).await;
+        let state = c.rig.org.snapshot().await.unwrap();
+        let note = state.messages().next().unwrap();
+        assert_eq!(state.messages().count(), 1);
+        let expected = if plain {
+            "New session: run the shell command atm me"
+        } else {
+            "Run atm me; read its memory file; resume open work or report and stop."
+        };
+        assert_eq!(note.content.body, expected, "{before} -> {after}");
+        assert!(matches!(clear.start_line, StartLineDisposition::PlainFallback(id) if plain && id == note.id)
+            || matches!(clear.start_line, StartLineDisposition::Track(id) if !plain && id == note.id));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_narrow_saved_clear_does_not_replace_an_open_resume_line() {
+    let mut c = Clearing::new(Harness::ClaudeCode, Old::SameProcess).await;
+    let mut note = crate::org::start_line::start_line(&lead());
+    note.body = "Run atm me; read its memory file; resume open work or report and stop.".into();
+    c.rig.command(OrgCommand::SendMessage(note.clone())).await;
+    let clear = saved_clear_at_width(&mut c, 120, 64).await;
+    let state = c.rig.org.snapshot().await.unwrap();
+    let original = state.messages().next().unwrap();
+    assert_eq!(state.messages().count(), 1);
+    assert_eq!(original.content, note);
+    assert!(matches!(clear.start_line, StartLineDisposition::Track(id) if id == original.id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_saved_start_append_reports_no_fallback() {
+    let rig = Rig::gated_with_failure(None, Some("msg.sent")).await;
+    let mut c = Clearing::on(rig, Harness::ClaudeCode, Old::SameProcess).await;
+    let clear = saved_clear_at_width(&mut c, 120, 64).await;
+    assert!(matches!(clear.start_line, StartLineDisposition::Unidentified));
+    assert_eq!(c.agent().await.status, AgentStatus::Ready);
+    assert_eq!(c.rig.org.snapshot().await.unwrap().messages().count(), 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_clear_with_start_lines_off_queues_none() {
     let mut rig = Rig::new().await;

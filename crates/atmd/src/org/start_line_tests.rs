@@ -5,7 +5,7 @@ use super::message_delivery::inbox_reference;
 use super::message_evidence::{AttemptScope, MessageEvidence};
 use super::messages::{focus_notice, MessageClock};
 use super::start_line::{
-    delivery_line, is_start_line, start_line, start_line_due, start_reference,
+    delivery_line, is_start_line, resume_fits, start_line, start_line_due, start_reference,
 };
 use crate::control::reservation::PaneId;
 use atm_core::{Harness, LifecycleEvent, SessionId};
@@ -37,6 +37,18 @@ fn start_line_is_one_printable_line_naming_the_shell_command() {
     }
 }
 
+// Break caught: an exact-size pane is rejected, or the size check forgets
+// the chrome or the extra digit the ID can gain after the read.
+#[test]
+fn resume_fit_reserves_chrome_and_an_id_digit() {
+    for (next, min) in [(99, 80), (999_999, 84), (1_000_000, 85)] {
+        let id = MessageId::new(next);
+        assert!(resume_fits(min, id), "{id} at {min} columns");
+        assert!(!resume_fits(min - 1, id), "{id} at {} columns", min - 1);
+        assert!(!resume_fits(0, id), "{id} with unknown width");
+    }
+}
+
 #[test]
 fn only_canonical_or_historical_start_notes_get_the_current_start_text() {
     let id = MessageId::new(42);
@@ -51,6 +63,7 @@ fn only_canonical_or_historical_start_notes_get_the_current_start_text() {
             body: "New session: run the shell command atm me".into(),
             attachments: vec![],
             task: None,
+            post: None,
         }
     );
     let mut historical = line.clone();
@@ -209,6 +222,7 @@ fn a_start_line_is_due_unless_one_is_open_or_this_session_had_one() {
             body: "agent demo/lead: start did not complete".into(),
             attachments: vec![],
             task: None,
+            post: None,
         })
     };
     // The first event after the setup has sequence 4.
@@ -398,4 +412,53 @@ async fn only_the_start_text_confirms_a_start_line() {
     let receipt = confirmed.receipt(id).unwrap().unwrap();
     assert_eq!(receipt.session_id.as_str(), "s1");
     assert_eq!(receipt.confirmation, "prompt_submit_exact_reference");
+}
+
+#[test]
+fn a_wake_row_is_never_a_start_line() {
+    // A channel post can say anything, including a start or resume line. Its
+    // wake row gets the ordinary inbox reference and never jumps the queue.
+    let id = MessageId::new(501);
+    let seat = agent("lead");
+    let mut resume = start_line(&seat);
+    resume.body = RESUME.into();
+    let historical = MessageContent {
+        body: "New session: run atm me".into(),
+        ..start_line(&seat)
+    };
+    for note in [start_line(&seat), resume, historical] {
+        assert!(is_start_line(&note), "the plain note is a start line");
+        let wake = MessageContent {
+            post: Some(MessageId::new(4)),
+            ..note
+        };
+        assert!(!is_start_line(&wake), "{wake:?}");
+        assert_eq!(delivery_line(id, &wake), inbox_reference(id));
+        let bound = SessionId::new("s1");
+        assert!(start_line_due(
+            &state(&[posted(&seat), sent(wake)]),
+            &seat,
+            Some(&bound)
+        ));
+    }
+}
+
+/// A post in project `demo` that wakes `to`; folded at sequence 4 by `state`.
+fn posted(to: &AgentId) -> OrgEvent {
+    OrgEvent::ChannelPosted(atm_org::PostContent {
+        channel: atm_org::ChannelId::Project("demo".parse().unwrap()),
+        author: Address::Owner,
+        session_id: None,
+        kind: MessageKind::Note,
+        body: "hold W2".into(),
+        attachments: vec![],
+        task: None,
+        thread: None,
+        mentions: vec![],
+        wake: vec![Address::Agent(to.clone())],
+        route: false,
+        decision: None,
+        client_key: None,
+        also_in_chat: false,
+    })
 }

@@ -2,7 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use atm_org::{
-    OrgCommand, OrgState, TaskActor, TaskCommand, TaskCreated, TaskState, TaskSubmission,
+    channel_query::{post, wake_for},
+    Address, DeliveryStatus, Mention, Message, MessageId, OrgCommand, OrgState, TaskActor,
+    TaskCommand, TaskCreated, TaskState, TaskSubmission,
 };
 use atmd::{
     org::OrgHandle,
@@ -189,6 +191,51 @@ impl Drop for Rig {
     }
 }
 
+// Verify the native post while returning the original representation for exact
+// rollback comparisons: older message readers ignore only the added post field.
+fn legacy_task_wake(state: &OrgState, message: &Message, channel: &str) -> Value {
+    let id = message
+        .content
+        .post
+        .expect("automatic wake must link its post");
+    let post = &post(state, id).expect("linked post must be native").content;
+    let m = &message.content;
+    assert_eq!(post.channel.to_string(), channel);
+    assert!(id < message.id);
+    assert_eq!(post.author, m.from);
+    assert_eq!(post.kind, m.kind);
+    assert_eq!(post.body, m.body);
+    assert_eq!(post.attachments, m.attachments);
+    assert_eq!(post.task, m.task);
+    assert_eq!(post.wake, std::slice::from_ref(&m.to));
+    let mention = match &m.to {
+        Address::Owner => Mention::Owner,
+        Address::Agent(seat) => Mention::Seat(seat.clone()),
+        Address::System => panic!("system cannot be woken"),
+    };
+    assert_eq!(post.mentions, [mention]);
+    assert!(!post.route);
+    assert_eq!(post.thread, None);
+    assert_eq!(post.decision, None);
+    assert_eq!(post.client_key, None);
+    assert_eq!(wake_for(state, id, &m.to), Some(message.id));
+    assert_eq!(
+        state
+            .messages()
+            .filter(|m| m.content.post == Some(id))
+            .count(),
+        1
+    );
+    let mut legacy = m.clone();
+    legacy.post = None;
+    serde_json::to_value(legacy).unwrap()
+}
+
+fn queued_id(result: &Value) -> MessageId {
+    assert_eq!(result["notification"]["status"], "queued", "{result}");
+    serde_json::from_value(result["notification"]["message_id"].clone()).unwrap()
+}
+
 // Break caught: revocation strands the former holder, wakes the new one twice, or forges attribution.
 #[tokio::test]
 async fn ownership_changes_notify_previous_holder() {
@@ -278,7 +325,7 @@ async fn ownership_changes_notify_previous_holder() {
                 "missing former-holder notice for {state}->{change}"
             );
             assert_eq!(
-                serde_json::to_value(&notes[0].content).unwrap(),
+                legacy_task_wake(&snapshot, notes[0], "project"),
                 json!({
                     "from":"owner","to":"project/worker","kind":"note","task":"t6","attachments":[],
                     "body":format!("Task t6 changed: {change}.\nInspect current state and assignee: atm task get t6\nDo not continue obsolete work or resume/clear on this note alone."),
@@ -331,7 +378,15 @@ async fn ownership_changes_notify_previous_holder() {
         )
         .await;
         let state = rig.snapshot().await;
-        let recipients: Vec<_> = state.messages().map(|m| m.content.to.to_string()).collect();
+        let recipients: Vec<_> = state
+            .messages()
+            .map(|m| {
+                legacy_task_wake(&state, m, "project")["to"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
         assert_eq!(
             recipients,
             if creator == "project/lead" {
@@ -427,6 +482,14 @@ async fn withdrawal_is_not_every_work_start() {
                 &report,
                 "withdrawal must not rewrite the old Report"
             );
+            let legacy = legacy_task_wake(&state, &report, "project");
+            assert_eq!(legacy["to"], to);
+            if creator == "system" {
+                assert!(legacy["body"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("\nCreator is system; report routed to owner."));
+            }
         }
         assert_eq!(
             state.task(&id.parse().unwrap()).unwrap().state,
@@ -450,7 +513,15 @@ async fn withdrawal_is_not_every_work_start() {
                 )
                 .unwrap();
             assert_eq!(
-                serde_json::to_value(&note.content).unwrap(),
+                legacy_task_wake(
+                    &state,
+                    note,
+                    if to == "owner" {
+                        "project/worker+owner"
+                    } else {
+                        "project"
+                    }
+                ),
                 json!({
                     "from":"project/worker","to":to,"kind":"note","task":id,"attachments":[],
                     "body":format!("Task {id} changed: submission_withdrawn.\nInspect current state and assignee: atm task get {id}\nDo not continue obsolete work or resume/clear on this note alone."),
@@ -555,7 +626,7 @@ async fn displaced_live_review_gets_invalidation_not_resume() {
             .collect();
         assert_eq!(review_notes.len(), 1, "missing linked live reviewer Note");
         assert_eq!(
-            serde_json::to_value(&review_notes[0].content).unwrap(),
+            legacy_task_wake(&state, review_notes[0], "project"),
             json!({
                 "from":"project/lead","to":"project/reviewer","kind":"note","task":review,"attachments":[],
                 "body":format!("Task t6 changed: review_superseded.\nInspect current state and assignee: atm task get t6\nDo not continue obsolete work or resume/clear on this note alone.\nReview task: atm task get {review}; re-check the judged task above before continuing."),
@@ -738,6 +809,7 @@ async fn all_nine_methods_success_and_refusal_wire_fixtures() {
 #[tokio::test]
 async fn automatic_messages_name_task_and_preserve_actor_files_and_noops() {
     let rig = Rig::new().await;
+    let cursor = rig.org.status().unwrap();
     let assigned = rig
         .ok(
             None,
@@ -745,16 +817,28 @@ async fn automatic_messages_name_task_and_preserve_actor_files_and_noops() {
             json!({"task_id":"t6","agent_id":"project/worker"}),
         )
         .await;
-    assert_eq!(
-        assigned,
-        json!({"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m8"}})
-    );
+    assert_eq!(assigned["task_id"], "t6");
+    assert_eq!(assigned["changed"], true);
     let state = rig.snapshot().await;
-    let brief = state.message(&atm_org::MessageId::new(8)).unwrap();
+    let brief = state.message(&queued_id(&assigned)).unwrap();
     assert_eq!(
-        serde_json::to_value(&brief.content).unwrap(),
+        legacy_task_wake(&state, brief, "project"),
         json!({"from":"owner","to":"project/worker","kind":"brief","body":"Task t6 assigned: Task\nInspect the task: atm task get t6\nRead the attached brief files before starting.","attachments":["briefs/task.md"],"task":"t6"})
     );
+    let records = rig
+        .org
+        .tail(atmd::org::TailParams {
+            after_seq: cursor,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        records.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        ["task.assigned", "channel.posted", "msg.sent"]
+    );
+    assert_eq!(records[1].body["wake"], json!(["project/worker"]));
+    assert_eq!(records[2].body["post"], json!(brief.content.post));
     assert_eq!(
         rig.ok(
             Some("%1"),
@@ -781,7 +865,7 @@ async fn automatic_messages_name_task_and_preserve_actor_files_and_noops() {
     let state = rig.snapshot().await;
     let report = state.message(&id).unwrap();
     assert_eq!(
-        serde_json::to_value(&report.content).unwrap(),
+        legacy_task_wake(&state, report, "project"),
         json!({"from":"project/worker","to":"owner","kind":"report","body":"Task t6 submitted (result): Task\nSubmitted by project/worker; inspect the task: atm task get t6\nRead the attached submission files before giving a verdict.","attachments":["report.md"],"task":"t6"})
     );
     assert_eq!(
@@ -850,7 +934,7 @@ async fn nonfinal_verdicts_queue_one_actor_signed_answer() {
                     assert_eq!(state.task(review).unwrap().state, TaskState::Accepted);
                 }
                 assert_eq!(
-                    serde_json::to_value(&state.message(&id).unwrap().content).unwrap(),
+                    legacy_task_wake(&state, state.message(&id).unwrap(), "project"),
                     json!({
                         "from":from,"to":"project/worker","kind":"answer","body":body,
                         "attachments":[],"task":"t6",
@@ -1033,6 +1117,7 @@ async fn self_task_mutations_commit_without_message_events() {
                     body: "Explicit self message".into(),
                     attachments: vec![],
                     task: Some(id.clone()),
+                    post: None,
                 }),
                 now(),
             )
@@ -1081,7 +1166,7 @@ async fn submitted_report_goes_to_agent_creator_not_assigning_owner() {
     let state = rig.snapshot().await;
     let report = state.message(&message_id).unwrap();
     assert_eq!(
-        serde_json::to_value(&report.content).unwrap(),
+        legacy_task_wake(&state, report, "project"),
         json!({"from":"project/worker","to":"project/lead","kind":"report","body":"Task t7 submitted (result): Agent task\nSubmitted by project/worker; inspect the task: atm task get t7\nNo submission file is attached.","attachments":[],"task":"t7"})
     );
 }
@@ -1112,7 +1197,182 @@ async fn automatic_brief_attaches_only_brief_files() {
         .unwrap();
     let state = rig.snapshot().await;
     let brief = state.message(&message_id).unwrap();
-    assert_eq!(brief.content.attachments, ["briefs/task.md"]);
+    assert_eq!(
+        legacy_task_wake(&state, brief, "project")["attachments"],
+        json!(["briefs/task.md"])
+    );
+}
+
+async fn register_seat(rig: &Rig, project: &str, name: &str) -> String {
+    let root = rig.dir.path().join(project);
+    std::fs::create_dir(&root).unwrap();
+    rig.org
+        .execute(
+            OrgCommand::RegisterProject {
+                project_id: project.parse().unwrap(),
+                root: root.to_str().unwrap().into(),
+                move_root: false,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    let seat = format!("{project}/{name}");
+    rig.org
+        .execute(
+            OrgCommand::Adopt {
+                agent_id: seat.parse().unwrap(),
+                pane: "%5".into(),
+                session_id: None,
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    seat
+}
+
+// Break caught: sender posts as a nonmember, short same-name tags are ambiguous,
+// or an external creator receives the report in the creator's channel.
+#[tokio::test]
+async fn cross_project_task_brief_falls_back_to_direct_and_report_uses_submitter_project() {
+    let rig = Rig::new().await;
+    let other = register_seat(&rig, "remote", "lead").await;
+    let task = rig
+        .ok(
+            Some("%1"),
+            "task.create",
+            json!({
+                "title":"Cross-project work @owner", "measure":{"kind":"owner"},
+            }),
+        )
+        .await;
+    let id = &task["task_id"];
+    let brief = queued_id(
+        &rig.ok(
+            Some("%1"),
+            "task.assign",
+            json!({"task_id":id,"agent_id":other}),
+        )
+        .await,
+    );
+    let report = queued_id(
+        &rig.ok(Some("%5"), "task.submit", json!({"task_id":id}))
+            .await,
+    );
+    let state = rig.snapshot().await;
+    let brief = legacy_task_wake(
+        &state,
+        state.message(&brief).unwrap(),
+        "project/lead+remote/lead",
+    );
+    let report = legacy_task_wake(&state, state.message(&report).unwrap(), "remote");
+    assert_eq!(brief["to"], other);
+    assert_eq!(report["to"], "project/lead");
+    assert!(brief["body"]
+        .as_str()
+        .unwrap()
+        .contains("Cross-project work @owner"));
+    assert!(report["body"]
+        .as_str()
+        .unwrap()
+        .contains("Cross-project work @owner"));
+    assert_eq!(
+        state.messages().count(),
+        2,
+        "copied title must not wake the owner"
+    );
+}
+
+// Break caught: a queued wake depends on a live recipient or an unlisted channel.
+#[tokio::test]
+async fn task_post_to_down_seat_and_to_unlisted_project() {
+    for listed in [true, false] {
+        let rig = Rig::new().await;
+        let seat = if listed {
+            rig.org
+                .execute(
+                    OrgCommand::Down {
+                        agent_id: "project/worker".parse().unwrap(),
+                        reason: "fixture".into(),
+                    },
+                    now(),
+                )
+                .await
+                .unwrap();
+            "project/worker".to_owned()
+        } else {
+            register_seat(&rig, "remote", "worker").await
+        };
+        let row = queued_id(
+            &rig.ok(None, "task.assign", json!({"task_id":"t6","agent_id":seat}))
+                .await,
+        );
+        let state = rig.snapshot().await;
+        let row = state.message(&row).unwrap();
+        assert_eq!(row.status, DeliveryStatus::Queued);
+        assert_eq!(
+            legacy_task_wake(
+                &state,
+                row,
+                if listed {
+                    "project"
+                } else {
+                    "remote/worker+owner"
+                }
+            )["to"],
+            seat
+        );
+    }
+}
+
+// Break caught: bad automatic content rolls the task back or leaves a post the repair can wake.
+#[tokio::test]
+async fn oversize_automatic_brief_commits_task_but_neither_post_nor_wake() {
+    let rig = Rig::new().await;
+    for n in 0..32 {
+        rig.ok(
+            None,
+            "task.attach",
+            json!({"task_id":"t6","file":{"path":format!("extra-{n}.md"),"kind":"brief"}}),
+        )
+        .await;
+    }
+    let cursor = rig.org.status().unwrap();
+    let result = rig
+        .ok(
+            None,
+            "task.assign",
+            json!({"task_id":"t6","agent_id":"project/worker"}),
+        )
+        .await;
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["notification"]["status"], "unconfirmed");
+    let error = &result["notification"]["error"];
+    assert_eq!(error["code"], "invalid_params");
+    let desc = error["message"].as_str().unwrap();
+    assert!(desc.contains("at most 32 attachments are allowed"));
+    assert!(desc.contains("inspect the task and inbox before resending"));
+    assert_eq!(
+        rig.snapshot()
+            .await
+            .task(&"t6".parse().unwrap())
+            .unwrap()
+            .state,
+        TaskState::Assigned
+    );
+    let events = rig
+        .org
+        .tail(atmd::org::TailParams {
+            after_seq: cursor,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        ["task.assigned"]
+    );
 }
 
 // Break caught: name-only task authority, owner allowed to submit, or own verdict allowed.

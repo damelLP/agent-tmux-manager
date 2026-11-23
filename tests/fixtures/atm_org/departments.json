@@ -1,0 +1,25 @@
+{
+  "departments": [
+    {
+      "id": "apps",
+      "title": "Apps",
+      "goal": "Ship apps",
+      "head": "gamma/chief",
+      "projects": ["alpha"],
+      "roster": [{"seats": "alpha/lead", "max": 1, "live": 1, "future": [true]}],
+      "hire_mode": "report",
+      "problems": []
+    },
+    {
+      "id": "tools",
+      "title": "Tools",
+      "goal": null,
+      "head": null,
+      "projects": ["alpha", "missing", "beta"],
+      "roster": [{"seats": "alpha/build-*", "max": null, "live": 0}],
+      "hire_mode": "enforce",
+      "problems": ["tools.toml:projects: project missing is not registered"]
+    }
+  ],
+  "department_problems": ["bad.toml line 3: invalid value"]
+}

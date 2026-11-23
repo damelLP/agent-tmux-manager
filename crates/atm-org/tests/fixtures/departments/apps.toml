@@ -1,0 +1,49 @@
+# Department "apps". Draft D0 by agent-tmux-manager/departments-lead, 2026-11-21; owner's yes 10:28
+# ("Sounds awesome let's make it happen" = defaults on cp-s2-dept-1). The file name is the id.
+# Departments and projects are separate and many-to-many (owner, 16 Nov 20:49): this file names its
+# projects; no project names a department; ids and manager lines are unchanged.
+# Roster: a seat id, or `project/prefix*` where * is one or more digits (numbered copies of one job
+# description); `max` = live seats at once. Rosters start as today's role files.
+# Models: exact role-file `model` strings, or a trailing * for any rest.
+# Nothing here is enforced until D2/D3; hiring stays in report mode until the owner says "enforce".
+
+title = "Apps"
+goal = "Mansa and Baliyo: the owner's own apps"
+projects = ["mansa", "baliyo"]
+
+[hire]
+mode = "report"
+
+[[roster]]
+seats = "mansa/lead"
+[[roster]]
+seats = "mansa/quality"
+[[roster]]
+seats = "mansa/review"
+[[roster]]
+seats = "mansa/networth"
+[[roster]]
+seats = "mansa/autocat"
+[[roster]]
+seats = "mansa/autocat-build-*"
+max = 2
+[[roster]]
+seats = "mansa/build-*"
+max = 2
+[[roster]]
+seats = "baliyo/lead"
+[[roster]]
+seats = "baliyo/android"
+[[roster]]
+seats = "baliyo/qa"
+[[roster]]
+seats = "baliyo/review"
+[[roster]]
+seats = "baliyo/ux"
+[[roster]]
+seats = "baliyo/build-*"
+max = 2
+
+[spend]
+models = ["openai-codex/gpt-6.2-sol*", "claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5"]
+# task_budget: set at D3 from measured task turns, not guessed now.

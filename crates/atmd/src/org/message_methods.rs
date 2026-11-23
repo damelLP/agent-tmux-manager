@@ -1,6 +1,8 @@
 //! Strict message RPC registration, independent of runtime startup.
 
-use super::messages::{AckParams, Address, InboxParams, MessageError, MessageHandle, SendParams};
+use super::messages::{
+    AckParams, Address, GiveUpParams, InboxParams, MessageError, MessageHandle, SendParams,
+};
 use crate::server::methods::{parse_params, MethodError, MethodRouter};
 use atm_protocol::error_code;
 use std::time::Duration;
@@ -42,21 +44,27 @@ fn recipient(address: Option<&Address>) -> Result<(), MessageError> {
 }
 
 pub(super) fn validate_send(p: &SendParams) -> Result<(), MessageError> {
-    let invalid = if p.body.is_empty() && p.attachments.is_empty() {
+    validate_content(&p.body, &p.attachments, p.task.as_ref())?;
+    recipient(Some(&p.to))
+}
+
+/// The size limits of a message's body, attachments and task.
+pub(super) fn validate_content(
+    body: &str,
+    attachments: &[String],
+    task: Option<&atm_org::TaskId>,
+) -> Result<(), MessageError> {
+    let invalid = if body.is_empty() && attachments.is_empty() {
         Some("empty body requires an attachment")
-    } else if p.body.len() > 16 * 1024 {
+    } else if body.len() > 16 * 1024 {
         Some("body exceeds 16384 UTF-8 bytes")
-    } else if p.attachments.len() > 32 {
+    } else if attachments.len() > 32 {
         Some("at most 32 attachments are allowed")
-    } else if p.attachments.iter().any(String::is_empty) {
+    } else if attachments.iter().any(String::is_empty) {
         Some("attachments must not be empty")
-    } else if p.attachments.iter().any(|path| path.len() > 4096) {
+    } else if attachments.iter().any(|path| path.len() > 4096) {
         Some("attachment exceeds 4096 UTF-8 bytes")
-    } else if p
-        .task
-        .as_ref()
-        .is_some_and(|task| task.to_string().len() > 256)
-    {
+    } else if task.is_some_and(|task| task.to_string().len() > 256) {
         Some("task exceeds 256 UTF-8 bytes")
     } else {
         None
@@ -64,7 +72,7 @@ pub(super) fn validate_send(p: &SendParams) -> Result<(), MessageError> {
     if let Some(reason) = invalid {
         return Err(MessageError::InvalidParams(reason.into()));
     }
-    recipient(Some(&p.to))
+    Ok(())
 }
 
 fn validate_inbox(p: &InboxParams) -> Result<(), MessageError> {
@@ -96,6 +104,18 @@ fn validate_ack(p: &AckParams) -> Result<(), MessageError> {
     Ok(())
 }
 
+/// A relay's words, bounded like decide's relay note.
+fn validate_give_up(p: &GiveUpParams) -> Result<(), MessageError> {
+    let invalid = match p.relay_words.as_deref() {
+        Some(words) if words.trim().is_empty() => Some("a relayed give-up needs the owner's words"),
+        Some(words) if words.len() > 8192 => Some("owner words exceed 8192 UTF-8 bytes"),
+        _ => None,
+    };
+    invalid.map_or(Ok(()), |reason| {
+        Err(MessageError::InvalidParams(reason.into()))
+    })
+}
+
 /// Always advertised; valid requests to a disabled service never claim success.
 pub fn register_message_methods(
     router: &mut MethodRouter,
@@ -119,15 +139,19 @@ pub fn register_message_methods(
     // Each ordinary call: 8 s service budget + 2 s router margin = 10 s.
     register!("msg.send", 10, send, validate_send);
     register!("msg.inbox", 10, inbox, validate_inbox);
+    register!("wake.list", 10, inbox, validate_inbox);
     register!("msg.ack", 10, ack, validate_ack);
+    register!("wake.ack", 10, ack, validate_ack);
     // Retry: message_delivery::{ATTEMPT_WORK_BUDGET, ATTEMPT_CLEANUP_BUDGET}
     // are 30 + 10 s; + 5 s snapshot + 6 s execute + 4 s overhead = 55 s
     // MESSAGE_RESOLUTION_BUDGET, leaving 5 s before this 60 s router ceiling.
     register!("msg.retry", 60, retry);
+    register!("wake.retry", 60, retry);
     // Give-up uses the same ATTEMPT_WORK_BUDGET + ATTEMPT_CLEANUP_BUDGET:
     // 30 + 10 + 5 snapshot + 6 execute + 4 overhead = MESSAGE_RESOLUTION_BUDGET
     // (55 s), plus 5 s router margin. See message_delivery's constants.
-    register!("msg.give_up", 60, give_up);
+    register!("msg.give_up", 60, give_up, validate_give_up);
+    register!("wake.give_up", 60, give_up, validate_give_up);
     Ok(())
 }
 
@@ -253,5 +277,24 @@ mod tests {
         "msg.ack",
         json!({"ids":["m1","m2","m1"]}),
         json!({"ids":["m1","m2"]})
+    );
+    // s3-giverelay. Break: a relay records no words, or words past decide's note bound.
+    bound!(
+        give_up_relay_words_must_not_be_empty,
+        "msg.give_up",
+        json!({"id":"m1","relay_words":""}),
+        json!({"id":"m1","relay_words":"Cancel them"})
+    );
+    bound!(
+        give_up_relay_words_must_not_be_blank,
+        "wake.give_up",
+        json!({"id":"m1","relay_words":" \n\t "}),
+        json!({"id":"m1","relay_words":" Cancel them "})
+    );
+    bound!(
+        give_up_relay_words_have_8192_byte_limit,
+        "wake.give_up",
+        json!({"id":"m1","relay_words":format!("{}x", "é".repeat(4096))}),
+        json!({"id":"m1","relay_words":"é".repeat(4096)})
     );
 }

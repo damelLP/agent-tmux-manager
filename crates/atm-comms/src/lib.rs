@@ -2,6 +2,7 @@
 //!
 //! Thin for now: row schemas live here, while domain types remain in atm-org.
 
+pub mod channel_types;
 pub mod message_types;
 
 pub use atm_core::SessionId;

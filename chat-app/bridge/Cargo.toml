@@ -1,0 +1,33 @@
+[package]
+name = "atm-chat-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"] }
+clap = { version = "4.5", features = ["derive"] }
+base64 = "0.22"
+libc = "0.2"
+openssl = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio-io-timeout = "1.2"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+tokio = { version = "1", features = ["process", "test-util"] }
+tokio-tungstenite = "0.29"

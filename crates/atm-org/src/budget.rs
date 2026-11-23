@@ -83,6 +83,7 @@ pub fn budget_note(task: &Task) -> Option<MessageContent> {
         ),
         attachments: Vec::new(),
         task: Some(task.id.clone()),
+        post: None,
     })
 }
 

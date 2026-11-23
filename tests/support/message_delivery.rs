@@ -2,8 +2,9 @@
 //! a private daemon with a `[delivery]` config, stand-ins adopted as agents,
 //! the real `atm msg`/`atm inbox` CLI, and committed events through `watch`.
 //!
-//! Nothing here is a second stand-in or daemon fixture. Waits use committed
-//! events (`Watch`), stand-in events after a cursor taken before the action,
+//! Delivery cases use a real private daemon. The scripted peer only checks
+//! CLI request/response contracts. Waits use committed events (`Watch`),
+//! stand-in events after a cursor taken before the action,
 //! RPC answers, registered daemon-log writes, or private tmux hooks.
 //! Scheduler-only presentation polls remain explicitly deferred.
 //! "Nothing was typed" needs a fence showing the daemon decided: a committed
@@ -91,6 +92,132 @@ pub fn call_on(
     }
 }
 
+/// One expected CLI request or a handshake that omits its capability.
+#[allow(dead_code)] // Only the CLI contract test binary uses the scripted peer.
+pub enum CliStep {
+    Response {
+        method: &'static str,
+        params: Value,
+        payload: Value,
+    },
+    TooOld,
+}
+
+/// Exercise the real CLI against literal replies on a private socket.
+/// The caller supplies a sealed child with the fallback sentinel from task_cli.
+#[allow(dead_code)] // Other test binaries use only the real private rig.
+pub async fn run_cli_script(
+    dir: &Path,
+    command: tokio::process::Command,
+    pane: Option<&str>,
+    steps: Vec<CliStep>,
+) -> Output {
+    run_cli_script_with_methods(dir, command, pane, steps, None).await
+}
+
+/// When specified, advertise the same capability list on every handshake.
+#[allow(dead_code)]
+pub async fn run_cli_script_with_methods(
+    dir: &Path,
+    mut command: tokio::process::Command,
+    pane: Option<&str>,
+    steps: Vec<CliStep>,
+    advertised: Option<&[&str]>,
+) -> Output {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    use tokio::sync::watch;
+
+    let listener = UnixListener::bind(dir.join("rpc.sock")).unwrap();
+    let (exit, mut exited) = watch::channel(false);
+    let child = async {
+        let output = command.output().await.unwrap();
+        exit.send_replace(true);
+        output
+    };
+    let peer = async {
+        for step in steps {
+            let (mut read, mut write) = loop {
+                let (stream, _) = tokio::select! {
+                    biased;
+                    stream = listener.accept() => stream.unwrap(),
+                    _ = exited.wait_for(|done| *done) => return false,
+                };
+                let (read, write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let mut line = String::new();
+                // The client's readiness probe opens and closes without Connect.
+                if read.read_line(&mut line).await.unwrap() == 0 {
+                    continue;
+                }
+                assert_eq!(
+                    serde_json::from_str::<Value>(&line).unwrap()["type"],
+                    "connect"
+                );
+                break (read, write);
+            };
+            let methods = match (advertised, &step) {
+                (Some(methods), _) => methods,
+                (None, CliStep::Response { method, .. }) => std::slice::from_ref(method),
+                (None, CliStep::TooOld) => &[],
+            };
+            let hello = json!({"type":"connected","protocol_version":{"major":1,"minor":1},"client_id":"cli-test","methods":methods});
+            write
+                .write_all(format!("{hello}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut line = String::new();
+            if let CliStep::Response {
+                method,
+                params,
+                mut payload,
+            } = step
+            {
+                assert_ne!(
+                    read.read_line(&mut line).await.unwrap(),
+                    0,
+                    "missing request for {method}"
+                );
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["type"], "request");
+                assert_eq!(request["method"], method);
+                assert_eq!(request["params"], params);
+                assert_eq!(request.get("from_pane").and_then(Value::as_str), pane);
+                payload["type"] = json!("response");
+                payload["id"] = request["id"].clone();
+                write
+                    .write_all(format!("{payload}\n").as_bytes())
+                    .await
+                    .unwrap();
+                line.clear();
+            }
+            assert_eq!(
+                read.read_line(&mut line).await.unwrap(),
+                0,
+                "unexpected request: {line}"
+            );
+        }
+        tokio::select! {
+            biased;
+            extra = listener.accept() => panic!("unexpected connection after script: {extra:?}"),
+            _ = exited.wait_for(|done| *done) => {}
+        }
+        true
+    };
+    let (output, consumed) = tokio::time::timeout(GUARD, async { tokio::join!(child, peer) })
+        .await
+        .expect("CLI and its scripted peer must both finish");
+    assert!(
+        consumed,
+        "CLI exited before sending all expected requests: {output:?}"
+    );
+    assert!(
+        !dir.join("fallback").exists(),
+        "CLI tried to spawn atmd or tmux"
+    );
+    output
+}
+
 /// An adopted, Ready agent and the stand-in behind it.
 pub struct Recipient {
     pub pane: StandInPane,
@@ -171,6 +298,33 @@ impl MessageRig {
             params,
             from.map(|pane| pane.pane_id.clone()),
         )
+    }
+
+    /// U8: a decision's question thread as the owner reads it through
+    /// `channel.history`, one `(author, step, woke)` per post, oldest first.
+    #[allow(dead_code)] // Only the decision test binaries read threads.
+    pub fn decision_thread(&self, id: &str) -> Vec<(String, String, Vec<String>)> {
+        let row = self.call("decision.get", json!({"id":id}), None).unwrap();
+        let page = self
+            .call(
+                "channel.history",
+                json!({"channel":row["decision"]["channel"],"thread":row["decision"]["post_id"]}),
+                None,
+            )
+            .unwrap();
+        let text = |value: &Value| value.as_str().unwrap().to_owned();
+        page["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|post| {
+                (
+                    text(&post["author"]),
+                    text(&post["decision"]["step"]),
+                    post["woke"].as_array().unwrap().iter().map(text).collect(),
+                )
+            })
+            .collect()
     }
 
     /// The real CLI, as the owner or from an agent's pane.

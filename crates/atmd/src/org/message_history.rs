@@ -162,6 +162,8 @@ pub struct RecipientObservation {
     pub session: Option<SessionObservation>,
     pub presence: PanePresence,
     pub facts: ScreenFacts,
+    /// Additional empty-editor evidence only for the daemon's inbox pointer.
+    pub(crate) inbox_paste: bool,
     pub copy_mode: Option<bool>,
     pub focused: Option<bool>,
 }
@@ -270,6 +272,10 @@ struct RecipientHistory {
     input: InputLine,
     not_ready_since: Option<DateTime<Utc>>,
     running_turn_since: Option<DateTime<Utc>>,
+    /// The last message attempted to it, until that one is delivered: the
+    /// only one whose reference can be in its editor, because a paste needs
+    /// an empty editor. Folded from applied events, so replay rebuilds it.
+    last_attempted: Option<MessageId>,
 }
 
 impl Default for RecipientHistory {
@@ -283,11 +289,21 @@ impl Default for RecipientHistory {
             input: InputLine::Unknown,
             not_ready_since: None,
             running_turn_since: None,
+            last_attempted: None,
         }
     }
 }
 
 impl RecipientHistory {
+    fn input_for(&self, message: &Message) -> InputLine {
+        match &self.observation {
+            Some(obs) if obs.inbox_paste && super::start_line::is_start_line(&message.content) => {
+                InputLine::Unknown
+            }
+            _ => self.input,
+        }
+    }
+
     fn track_running(&mut self, running: bool, status: AgentStatus, now: DateTime<Utc>) {
         if running {
             self.running_turn_since.get_or_insert(now);
@@ -491,6 +507,7 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::TaskCostRecorded(_)
         | OrgEvent::TaskUsageObserved(_)
         | OrgEvent::SessionSummary(_)
+        | OrgEvent::SessionProcess(_)
         | OrgEvent::ControlSent(_)
         | OrgEvent::ControlSpawned(_)
         | OrgEvent::ControlKilled(_)
@@ -507,7 +524,14 @@ fn named_agent(event: &OrgEvent) -> Option<&AgentId> {
         | OrgEvent::OwnerAway(_)
         | OrgEvent::OwnerBack(_)
         | OrgEvent::OwnerRelaySet(_)
-        | OrgEvent::OwnerDigestCreated(_) => None,
+        | OrgEvent::OwnerDigestCreated(_)
+        // Channel facts name no agent's continuity; a wake is a `msg.sent`.
+        | OrgEvent::ChannelPosted(_)
+        | OrgEvent::ChannelRouted(_)
+        | OrgEvent::ChannelSeen(_)
+        | OrgEvent::ChannelPostEdited(_)
+        | OrgEvent::ChannelPostRemoved(_)
+        | OrgEvent::ChannelReacted(_) => None,
     }
 }
 
@@ -602,6 +626,19 @@ impl MessageHistory {
             .collect())
     }
 
+    /// The recipient's last attempted message while it is not delivered.
+    pub(super) fn last_attempted(
+        &self,
+        recipient: &AgentId,
+    ) -> Result<Option<Message>, MessageError> {
+        self.replayed()?;
+        let id = self
+            .recipients
+            .get(recipient)
+            .and_then(|h| h.last_attempted);
+        Ok(id.and_then(|id| self.state.message(&id)).cloned())
+    }
+
     fn queue(&self, recipient: &AgentId) -> Queue {
         let Some(open) = self.open.get(recipient) else {
             return Queue::default();
@@ -635,7 +672,7 @@ impl MessageHistory {
                 .map(|since| since.max(self.recovery_time));
             live.running_turn_since = history.running_turn_since;
             live.pane = history.pane;
-            live.input_line = history.input;
+            live.input_line = history.input_for(message);
             if let Some(obs) = &history.observation {
                 live.copy_mode = obs.copy_mode;
                 live.owner_focused = obs.focused.unwrap_or(true);
@@ -876,6 +913,7 @@ impl MessageHistory {
             let mut live: RecipientLiveView = shared
                 .get_or_insert_with(|| self.shared_live(message, agent, Some(history), now))
                 .clone();
+            live.input_line = history.input_for(message);
             live.other_delivery_in_flight = queue.blocked_by(*id).is_some();
             track.apply(&mut live);
             let mut previous = track.stale_blocker;
@@ -995,6 +1033,13 @@ impl MessageHistory {
             open.remove(&id);
         }
         if let Some(history) = self.recipients.get_mut(recipient) {
+            match event {
+                OrgEvent::MessageDeliveryAttempted { .. } => history.last_attempted = Some(id),
+                OrgEvent::MessageDelivered { .. } if history.last_attempted == Some(id) => {
+                    history.last_attempted = None;
+                }
+                _ => {}
+            }
             if !is_open && history.start_first == Some(id) {
                 history.start_first = None;
             } else if is_open
@@ -1148,18 +1193,20 @@ impl MessageHistory {
                     },
                     PanePresence::Unknown => PaneLiveness::Unknown,
                 };
+                let idle =
+                    observation.facts.turn == TurnState::NotRunning || observation.inbox_paste;
+                let continued = history
+                    .observation
+                    .as_ref()
+                    .is_some_and(|old| old.inbox_paste == observation.inbox_paste);
                 history.input = if observation.presence != PanePresence::Alive {
                     InputLine::Unknown
                 } else {
-                    match (
-                        observation.facts.input,
-                        observation.facts.turn,
-                        &observation.facts.dialog,
-                    ) {
+                    match (observation.facts.input, idle, &observation.facts.dialog) {
                         (InputState::Draft, _, _) => InputLine::NonEmpty,
-                        (InputState::Empty, TurnState::NotRunning, DialogState::None) => {
-                            match history.input {
-                                InputLine::EmptySince(at) => InputLine::EmptySince(at),
+                        (InputState::Empty, true, DialogState::None) => {
+                            match (history.input, continued) {
+                                (InputLine::EmptySince(at), true) => InputLine::EmptySince(at),
                                 _ => InputLine::EmptySince(now),
                             }
                         }
@@ -1526,6 +1573,18 @@ impl MessageHistoryHandle {
         match self.inner.as_ref() {
             HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
             HistoryBackend::Live { state, .. } => history_state(state)?.open_ordered(recipient),
+        }
+    }
+
+    /// The one message whose reference can be in the recipient's editor
+    /// (s3-5c): its last attempted message, while that is not delivered.
+    pub(super) fn last_attempted(
+        &self,
+        recipient: &AgentId,
+    ) -> Result<Option<Message>, MessageError> {
+        match self.inner.as_ref() {
+            HistoryBackend::Disabled(reason) => Err(MessageError::Unavailable(reason.clone())),
+            HistoryBackend::Live { state, .. } => history_state(state)?.last_attempted(recipient),
         }
     }
 

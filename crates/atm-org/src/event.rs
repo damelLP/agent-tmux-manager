@@ -26,6 +26,17 @@
 //! accept owner-addressed keys must be upgraded before any routed note is written.
 //! Pre-key readers ignore the field and cannot preserve deduplication. Unkeyed
 //! notes do not claim keys and may be followed by one keyed note after upgrade.
+//!
+//! `channel.posted`, `channel.routed` and `channel.seen` are additive kinds, with
+//! bodies [`crate::PostContent`], [`crate::PostRouted`] and [`crate::ChannelSeen`];
+//! older readers skip them. A post's id is `m<seq>`, in the message id space. A
+//! wake is an ordinary `msg.sent` whose optional `post` names the post it delivers,
+//! omitted when absent; older readers fold it as a complete message. The channel
+//! module states the later-form rule for these bodies.
+//!
+//! `session.process` is an additive kind with body [`SessionProcess`]: the
+//! harness process a session's confirmed row ran in. It names no agent, so
+//! nothing that watches `agent.*` facts reacts to it; older readers skip it.
 
 use crate::{
     Address, AgentId, DecisionId, DecisionRequest, DecisionResolutionEvent, DecisionWithdrawal,
@@ -91,6 +102,47 @@ pub struct MessageContent {
     /// The note and its durable dedupe key are one committed `msg.sent` fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_notice: Option<DeliveryNotice>,
+    /// Present on a wake: the channel post this row delivers. Omitted when
+    /// absent, so a row without it keeps its older bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post: Option<MessageId>,
+}
+
+impl MessageContent {
+    /// Equal in everything but the `post` link. A notice that a later daemon
+    /// sent as a wake row is the same notice, so "already sent" checks use this.
+    #[must_use]
+    pub fn same_except_post(&self, other: &Self) -> bool {
+        // Exhaustive on purpose: a new field must say whether it counts.
+        let Self {
+            from,
+            to,
+            kind,
+            body,
+            attachments,
+            task,
+            delivery_notice,
+            post: _,
+        } = self;
+        *from == other.from
+            && *to == other.to
+            && *kind == other.kind
+            && *body == other.body
+            && *attachments == other.attachments
+            && *task == other.task
+            && *delivery_notice == other.delivery_notice
+    }
+}
+
+/// The process a session's confirmed row ran in: its pid and its start
+/// (`/proc/<pid>/stat` field 22, clock ticks since boot), so that a reused pid
+/// never matches. Written when a bound session's row is seen with a process
+/// other than the recorded one; the latest record wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProcess {
+    pub session_id: SessionId,
+    pub pid: u32,
+    pub process_start: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +284,8 @@ pub enum OrgEvent {
     TaskUsageObserved(crate::TaskUsageObserved),
     #[serde(rename = "session.summary")]
     SessionSummary(SessionSummary),
+    #[serde(rename = "session.process")]
+    SessionProcess(SessionProcess),
     #[serde(rename = "control.sent")]
     ControlSent(ControlAudit),
     #[serde(rename = "control.spawned")]
@@ -258,6 +312,18 @@ pub enum OrgEvent {
     OwnerRelaySet(crate::OwnerRelaySet),
     #[serde(rename = "owner.digest_created")]
     OwnerDigestCreated(crate::OwnerDigestCreated),
+    #[serde(rename = "channel.posted")]
+    ChannelPosted(crate::PostContent),
+    #[serde(rename = "channel.routed")]
+    ChannelRouted(crate::PostRouted),
+    #[serde(rename = "channel.seen")]
+    ChannelSeen(crate::ChannelSeen),
+    #[serde(rename = "channel.post_edited")]
+    ChannelPostEdited(crate::PostEdited),
+    #[serde(rename = "channel.post_removed")]
+    ChannelPostRemoved(crate::PostRemoved),
+    #[serde(rename = "channel.reacted")]
+    ChannelReacted(crate::PostReacted),
 }
 
 impl OrgEvent {
@@ -294,6 +360,7 @@ impl OrgEvent {
             Self::TaskCostRecorded(_) => "task.cost_recorded",
             Self::TaskUsageObserved(_) => "task.usage_observed",
             Self::SessionSummary(_) => "session.summary",
+            Self::SessionProcess(_) => "session.process",
             Self::ControlSent(_) => "control.sent",
             Self::ControlSpawned(_) => "control.spawned",
             Self::ControlKilled(_) => "control.killed",
@@ -307,6 +374,12 @@ impl OrgEvent {
             Self::OwnerBack(_) => "owner.back",
             Self::OwnerRelaySet(_) => "owner.relay_set",
             Self::OwnerDigestCreated(_) => "owner.digest_created",
+            Self::ChannelPosted(_) => "channel.posted",
+            Self::ChannelRouted(_) => "channel.routed",
+            Self::ChannelSeen(_) => "channel.seen",
+            Self::ChannelPostEdited(_) => "channel.post_edited",
+            Self::ChannelPostRemoved(_) => "channel.post_removed",
+            Self::ChannelReacted(_) => "channel.reacted",
         }
     }
 
@@ -356,6 +429,7 @@ impl OrgEvent {
                 | "task.cost_recorded"
                 | "task.usage_observed"
                 | "session.summary"
+                | "session.process"
                 | "control.sent"
                 | "control.spawned"
                 | "control.killed"
@@ -369,6 +443,12 @@ impl OrgEvent {
                 | "owner.back"
                 | "owner.relay_set"
                 | "owner.digest_created"
+                | "channel.posted"
+                | "channel.routed"
+                | "channel.seen"
+                | "channel.post_edited"
+                | "channel.post_removed"
+                | "channel.reacted"
         ) {
             return Ok(None);
         }

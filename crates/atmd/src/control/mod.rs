@@ -64,6 +64,8 @@ pub enum ControlError {
 }
 
 #[cfg(test)]
+pub(crate) mod legacy_survey_test;
+#[cfg(test)]
 mod operation_tests;
 #[cfg(test)]
 mod tests;

@@ -42,7 +42,7 @@
 //! history refused what it returned) is not a focused pane. While that lasts,
 //! the inbox shows "recipient cannot be observed" where the policy answers
 //! its unbounded focus wait, and once it has lasted the policy's readiness
-//! timeout the owner gets at most one notice per loss, for the oldest open
+//! timeout the seat's manager (or Owner) gets at most one notice per loss, for the oldest open
 //! message only, and never again for the same message while it remains open.
 //! A Stuck or Down recipient keeps its own blocked reason and notice instead,
 //! whatever the focus, and ends the measured loss without an unobserved notice:
@@ -52,11 +52,15 @@
 //! An observation that succeeded with an unknown focus is no loss; it waits
 //! as the next paragraph says.
 //!
-//! Notices go to the owner's inbox once per source message and semantic reason
-//! for its lifetime, after the state that caused them is applied. The retained
-//! keyed owner note is the committed index, rebuilt by replay; retry, closure
-//! and observation changes never rearm it. Pending publications reconcile a
-//! FIFO writer snapshot before resubmission. Committed final failures rebuild
+//! Notices go out once per source message and semantic reason for its lifetime.
+//! Blocked, hold and observation-loss notices go to the current manager (with
+//! Owner fallback); failure, focus, running-turn and notices about keyed notes
+//! stay Owner-only. The retained keyed note is the committed index, rebuilt by
+//! replay; retry, closure and role/observation changes never rearm it. Pending
+//! publications retain the chosen address and body across FIFO reconciliation.
+//! Known limit: a role edit, rebind, receipt or ack can win after the snapshot
+//! but before the unconditional append. One stale note for the key may arrive;
+//! it grants no input or resolution authority. Committed final failures rebuild
 //! missing notes even after the source closes. A transient condition whose first
 //! note never committed and vanished before a crash cannot be reconstructed. A focus
 //! notice needs a positive observation of the owner's focus: an unknown focus
@@ -64,8 +68,18 @@
 //! A positively running turn gets one informational owner note per queued,
 //! unattempted message after thirty minutes. Lost observations and new turns
 //! restart the eligibility clock, not the lifetime notice key.
+//! EnterNotSent wording previews eligibility at notice time; the executor may
+//! spend its one recovery claim and refuse input, and a later safe capture
+//! does not rearm it.
+//!
+//! Known limit: if the readiness notice commits first, the manager can receive
+//! two diagnoses for one unreadable episode. If the unreadable note is already
+//! reported when the job checks that same episode, the readiness notice is
+//! suppressed and the manager gets just one. Neither diagnostic grants input
+//! or resolution authority.
 
-use super::agent_unreadable::ScreenSample;
+use super::agent_proc::ShellListIssue;
+use super::agent_unreadable::{ScreenSample, ShortViewport};
 use super::agents::{AgentHandle, Recipient};
 use super::message_delivery::{attempt_session, deliver, observation, ATTEMPT_WORK_BUDGET};
 use super::message_history::{
@@ -73,10 +87,12 @@ use super::message_history::{
     RecipientObservation,
 };
 use super::message_inbox::Progress;
+use super::message_retract::{retract, Retracted};
 use super::messages::{
     focus_notice, Address, DeliveryPhase, DeliveryStatus, MessageContent, MessageError, MessageId,
     MessageKind, MessageRuntime, Service, FOCUS_NOTICE_REASON,
 };
+use super::start_line::delivery_line;
 use super::OrgServiceError;
 use crate::{
     control::{
@@ -85,7 +101,7 @@ use crate::{
     },
     eventlog::Envelope,
 };
-use atm_core::{DialogState, InputState, ScreenFacts, TurnState};
+use atm_core::{DialogState, InputState, ScreenFacts, SessionId, TurnState};
 use atm_org::{
     delivery::{
         busy_notice_due, next_delivery, DeliveryStep, FailureReason, PaneLiveness, WaitReason,
@@ -115,12 +131,37 @@ const OBSERVE_BUDGET: Duration = Duration::from_secs(5);
 /// What the inbox shows, in place of the policy's unbounded focus wait, while
 /// a recipient cannot be observed: nobody knows where the owner is.
 const UNOBSERVED: &str = "recipient cannot be observed";
+/// A Ready seat whose pane shows only a discovery row: its bound session is not
+/// confirmed until its harness's next event (known limit, s3-stuckseat D1).
+pub(super) const UNCONFIRMED: &str =
+    "recipient session not confirmed since the restart; waits for its next harness event";
+
+/// Only the scheduler's own fixed diagnoses may replace the generic wait.
+fn observation_loss_reason(error: &MessageError) -> &'static str {
+    let MessageError::Refused(text) = error else {
+        return UNOBSERVED;
+    };
+    [
+        UNCONFIRMED,
+        ShellListIssue::Missing.detail(),
+        ShellListIssue::Unreadable.detail(),
+        ShellListIssue::Empty.detail(),
+    ]
+    .into_iter()
+    .find(|reason| *reason == text.as_str())
+    .unwrap_or(UNOBSERVED)
+}
+
 /// One write of the job's own and its fold: 6 s organisation execute and the
 /// 4 s fold margin of the resolution budget (see `message_delivery`).
 const COMMIT_BUDGET: Duration = Duration::from_secs(10);
 /// Accounting after an attempt: the 5 s FIFO snapshot and the same 4 s margin.
 const ACCOUNTING_BUDGET: Duration = Duration::from_secs(9);
 const GIVE_UP_REASON: &str = "owner gave up on delivery";
+/// Notice keys of atm's one retract per message (s3-5c): committed, either
+/// one means it is never tried again.
+const RETRACT_CLEARED: &str = "hold.reference_cleared";
+const RETRACT_LEFT: &str = "hold.reference_left";
 const BUSY_NOTICE_REASON: &str = "running_turn";
 
 type Boxed<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -128,15 +169,47 @@ type Boxed<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub(super) type Deliver = Arc<
     dyn Fn(MessageRuntime, MessageId, Instant) -> Boxed<Result<(), MessageError>> + Send + Sync,
 >;
-/// A fresh observation of one recipient, or why there is none. It takes no
-/// reservation and sends nothing.
-type Observed = (RecipientObservation, Option<Instant>);
-pub(super) type Observe = Arc<dyn Fn(Agent) -> Boxed<Result<Observed, MessageError>> + Send + Sync>;
+/// A viewport hint and the recorded binding it described. It is not history
+/// evidence: the hint must never outlive a loss or a change of binding.
+#[derive(Clone)]
+pub(super) struct ShortRead {
+    viewport: ShortViewport,
+    binding: Option<SessionId>,
+    excluded: Option<SessionId>,
+}
+
+impl ShortRead {
+    fn matches(&self, agent: &Agent) -> bool {
+        agent.pane.as_deref() == Some(self.viewport.pane.as_str())
+            && agent.session_id == self.binding
+            && agent.excluded_session_id == self.excluded
+    }
+}
+
+/// A fresh observation with an unreadable episode and a geometry hint, if
+/// any, and the adapter's exact match of the editor with the reference it
+/// was given (s3-5c S2). It takes no reservation and sends nothing.
+type Observed = (
+    RecipientObservation,
+    Option<Instant>,
+    Option<ShortRead>,
+    Option<bool>,
+);
+pub(super) type Observe =
+    Arc<dyn Fn(Agent, Option<String>) -> Boxed<Result<Observed, MessageError>> + Send + Sync>;
+/// The guarded retract of a finally failed message's reference (s3-5c):
+/// `message_retract::retract`.
+pub(super) type Retract = Arc<
+    dyn Fn(MessageRuntime, MessageId, Instant) -> Boxed<Result<Retracted, MessageError>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub(super) struct Effects {
     pub deliver: Deliver,
     pub observe: Observe,
+    pub retract: Retract,
 }
 
 impl Effects {
@@ -146,9 +219,10 @@ impl Effects {
         let (control, agents) = (rt.control.clone(), rt.agents.clone());
         Self {
             deliver: Arc::new(|rt, id, deadline| Box::pin(deliver(rt, id, deadline))),
-            observe: Arc::new(move |agent| {
-                Box::pin(observe(control.clone(), agents.clone(), agent))
+            observe: Arc::new(move |agent, reference| {
+                Box::pin(observe(control.clone(), agents.clone(), agent, reference))
             }),
+            retract: Arc::new(|rt, id, deadline| Box::pin(retract(rt, id, deadline))),
         }
     }
 }
@@ -163,6 +237,7 @@ async fn observe(
     control: ControlHandle,
     agents: AgentHandle,
     agent: Agent,
+    reference: Option<String>,
 ) -> Result<Observed, MessageError> {
     let recipient = (agents.recipient(&agent.id).await)
         .map_err(|error| MessageError::Unavailable(error.to_string()))?;
@@ -171,25 +246,33 @@ async fn observe(
     let at = Instant::now();
     let screen = recipient.screen;
     let control = screen.control(&capture, &recipient.baseline);
+    let sample = ScreenSample::read(
+        screen,
+        &recipient.baseline,
+        &capture,
+        &recipient.pane,
+        Some(&agent.id.to_string()),
+        recipient.session_id.as_ref(),
+        &control,
+    );
+    let short_viewport = sample
+        .as_ref()
+        .and_then(|sample| sample.short_viewport(&capture, &control))
+        .map(|viewport| ShortRead {
+            viewport,
+            binding: recipient.session_id.clone(),
+            excluded: recipient.excluded.clone(),
+        });
     let episode = if matches!(recipient.status, AgentStatus::Starting | AgentStatus::Ready) {
-        agents
-            .screens()
-            .zip(ScreenSample::read(
-                screen,
-                &recipient.baseline,
-                &capture,
-                &recipient.pane,
-                Some(&agent.id.to_string()),
-                recipient.session_id.as_ref(),
-                &control,
-            ))
-            .and_then(|(tracker, sample)| {
-                tracker.record(&agent.id, sample, at, recipient.cursor, None)
-            })
+        agents.screens().zip(sample).and_then(|(tracker, sample)| {
+            tracker.record(&agent.id, sample, at, recipient.cursor, None)
+        })
     } else {
         None
     };
-    observed(&agent.id, &recipient, &capture, control.facts).map(|seen| (seen, episode))
+    let staged = reference.and_then(|line| screen.staged(&capture, &recipient.baseline, &line));
+    observed(&agent.id, &recipient, &capture, control.facts)
+        .map(|seen| (seen, episode, short_viewport, staged))
 }
 
 /// What one recipient answer and one capture of its pane say, through the
@@ -215,6 +298,9 @@ pub(super) fn observed(
         )));
     }
     if recipient.status == AgentStatus::Ready {
+        if recipient.unconfirmed && recipient.session.is_none() && recipient.session_id.is_some() {
+            return Err(MessageError::Refused(UNCONFIRMED.into()));
+        }
         attempt_session(
             recipient.status,
             recipient.session_id.as_ref(),
@@ -228,6 +314,24 @@ pub(super) fn observed(
 pub(super) enum Resolve {
     Retry,
     GiveUp,
+}
+
+/// A wait as the person waiting reads it: unsent text names its pane.
+fn wait_text(reason: WaitReason, pane: Option<&str>) -> String {
+    match (reason, pane) {
+        (WaitReason::InputNotEmpty, Some(pane)) => format!("{reason} in {pane}"),
+        _ => reason.to_string(),
+    }
+}
+
+/// An idle-looking seat whose turn state cannot be read (s3-busy).
+fn unread_turn(pane: &str) -> String {
+    format!("atm cannot read the turn state on {pane}; atm will recheck automatically")
+}
+
+/// Another message's reference in the editor, as the messages behind it read it.
+fn unsent_reference(staged: MessageId, pane: &str) -> String {
+    format!("input box holds atm's unsent reference {staged} in {pane}")
 }
 
 fn not_blocked(id: MessageId) -> MessageError {
@@ -249,6 +353,8 @@ impl Resolve {
 pub(super) struct Resolution {
     pub kind: Resolve,
     pub id: MessageId,
+    /// A relayed give-up's record of the owner's words.
+    pub relayed: Option<String>,
     pub reply: oneshot::Sender<Result<DeliveryStatus, MessageError>>,
 }
 
@@ -522,34 +628,50 @@ pub(super) fn failure_notice(id: MessageId, reason: &str) -> Option<MessageConte
     Some(content)
 }
 
-/// The owner's notice for a blocked message, with the messages that wait
-/// behind it. A retry is offered only for a latched hold: any other block
-/// refuses it.
-fn blocked_notice(id: MessageId, reason: &str, behind: &[MessageId], latched: bool) -> String {
+/// The note for a blocked message, with the messages that wait behind it.
+/// Only a latched hold offers retry, and only the owner can do it.
+fn blocked_notice(
+    id: MessageId,
+    reason: &str,
+    behind: &[MessageId],
+    latched: bool,
+    manager: bool,
+    enter_recovery: Option<bool>,
+) -> String {
     let behind = if behind.is_empty() {
         "none".to_string()
     } else {
         let ids: Vec<String> = behind.iter().map(ToString::to_string).collect();
         ids.join(", ")
     };
-    let advice = if latched {
-        format!(
-            "Inspect the pane; atm msg retry {id} --accept-duplicate-risk or atm msg give-up {id}"
-        )
-    } else {
-        format!("Delivery resumes when this clears; atm msg give-up {id} cancels it")
+    let advice = match (enter_recovery, latched, manager) {
+        (Some(true), _, false) => "Do not type in that pane. atm presses Enter once when the seat is idle, nobody is in the pane, the editor holds exactly that reference line and the pane passes its safety checks; or press Enter there yourself if the editor holds exactly that reference line.".into(),
+        (Some(true), _, true) => "Do not type in that pane. atm presses Enter once when the seat is idle, nobody is in the pane, the editor holds exactly that reference line and the pane passes its safety checks; or ask the owner to press Enter there if the editor holds exactly that reference line.".into(),
+        (Some(false), _, false) => format!("Do not type in that pane. atm cannot press Enter on the current evidence: press Enter there yourself if the editor holds exactly that reference line, or give it up with atm wake give-up {id}."),
+        (Some(false), _, true) => "Do not type in that pane. atm cannot press Enter on the current evidence: ask the owner to press Enter there if the editor holds exactly that reference line, or to give it up.".into(),
+        (None, true, true) => format!("Ask the owner to inspect the pane; only the owner can run atm wake retry {id} --accept-duplicate-risk or atm wake give-up {id}"),
+        (None, true, false) => format!("Inspect the pane; atm wake retry {id} --accept-duplicate-risk or atm wake give-up {id}"),
+        (None, false, true) => format!("Delivery resumes when this clears; the owner can cancel it with atm wake give-up {id}"),
+        (None, false, false) => format!("Delivery resumes when this clears; atm wake give-up {id} cancels it"),
     };
     format!("{id} blocked: {reason}; waiting behind it: {behind}. {advice}")
 }
 
-/// The owner's notice for a recipient that could not be observed for the
-/// policy's readiness timeout, in the blocked notice's form. Nothing is held:
-/// the message stays queued.
-fn unobserved_notice(id: MessageId, recipient: &AgentId, lasted: Duration) -> String {
+/// The note for a recipient that could not be observed for the policy's
+/// readiness timeout. Nothing is held: the message stays queued.
+fn unobserved_notice(
+    id: MessageId,
+    recipient: &AgentId,
+    lasted: Duration,
+    manager: bool,
+) -> String {
+    let after = if manager {
+        format!("It stays queued; delivery can resume when the pane can be read again. The owner can cancel it with atm wake give-up {id}")
+    } else {
+        format!("It stays queued and is delivered when the pane can be read again; atm wake give-up {id} cancels it")
+    };
     format!(
-        "{id} waiting: recipient {recipient} could not be observed for {} s. \
-         It stays queued and is delivered when the pane can be read again; \
-         atm msg give-up {id} cancels it",
+        "{id} waiting: recipient {recipient} could not be observed for {} s. {after}",
         lasted.as_secs()
     )
 }
@@ -563,6 +685,7 @@ fn note(body: String) -> MessageContent {
         body,
         attachments: vec![],
         task: None,
+        post: None,
     }
 }
 
@@ -582,8 +705,10 @@ struct Unaccounted {
 /// A span in which no observation of the recipient was usable.
 struct Lost {
     since: Instant,
-    /// The message whose notice tells the owner about this loss.
+    /// The message whose notice reports this loss.
     told: Option<MessageId>,
+    /// Fixed display reason for the latest loss, never error text from an effect.
+    reason: &'static str,
 }
 
 struct Job {
@@ -592,10 +717,18 @@ struct Job {
     recipient: AgentId,
     observed: Option<Instant>,
     unreadable_episode: Option<Instant>,
+    short_viewport: Option<ShortRead>,
     /// The last recorded observation's focus sample; None when it was lost.
     focused: Option<bool>,
     /// Inspection hint only; the claimed executor repeats every final guard.
     recovery_ready: bool,
+    /// The last look read an empty editor and no dialog, but not the turn:
+    /// some row near the editor is unknown (s3-busy).
+    turn_unread: bool,
+    /// The recipient's last attempted message at the last look, and whether
+    /// its editor held exactly that reference (false also for an empty
+    /// editor; None unknown). Not kept across a lost look (s3-5c S2).
+    staged: Option<(MessageId, Option<bool>)>,
     /// Set while the last observation failed or was refused.
     lost: Option<Lost>,
     unaccounted: Option<Unaccounted>,
@@ -603,6 +736,10 @@ struct Job {
     pending_notice: Option<MessageContent>,
     /// No attempt before this instant: the last one could not start.
     not_before: Option<Instant>,
+    /// No retract before this instant: the last one sent nothing.
+    retract_after: Option<Instant>,
+    /// The message this job has retracted, or tried to: never again here.
+    retracted: Option<MessageId>,
     /// Messages this job has put on the board.
     shown: BTreeSet<MessageId>,
 }
@@ -615,12 +752,17 @@ impl Job {
             recipient,
             observed: None,
             unreadable_episode: None,
+            short_viewport: None,
             focused: None,
             recovery_ready: false,
+            turn_unread: false,
+            staged: None,
             lost: None,
             unaccounted: None,
             pending_notice: None,
             not_before: None,
+            retract_after: None,
+            retracted: None,
             shown: BTreeSet::new(),
         }
     }
@@ -688,7 +830,9 @@ impl Job {
                 .acknowledge(settle.id, &settle.receipt)?;
         }
         while let Some(resolution) = service.board.next_resolution(&self.recipient) {
-            let result = self.resolve(resolution.kind, resolution.id).await;
+            let result = self
+                .resolve(resolution.kind, resolution.id, resolution.relayed)
+                .await;
             let _ = resolution.reply.send(result);
         }
         self.flush_notice().await?;
@@ -712,6 +856,9 @@ impl Job {
             return Ok(Next::Idle);
         }
         self.observe().await?;
+        if self.retract().await? {
+            return Ok(Next::Again);
+        }
         let mut next = Next::Change;
         for id in open {
             let step = self.step(id, queued).await?;
@@ -751,6 +898,90 @@ impl Job {
         );
     }
 
+    /// Take back atm's own reference that a finally failed message left in
+    /// the editor, once per message, when the last look allows it (s3-5c).
+    /// The executor repeats every guard on its own capture before the key,
+    /// and refuses a harness with no retract key (an adopted seat has no role
+    /// to tell, only its recipient screen). True when a key was or may have
+    /// been sent: look again first.
+    async fn retract(&mut self) -> Result<bool, MessageError> {
+        let Some(id) = self.staged().filter(|_| self.recovery_ready) else {
+            return Ok(false);
+        };
+        if self.retracted == Some(id)
+            || self
+                .retract_after
+                .is_some_and(|after| Instant::now() < after)
+        {
+            return Ok(false);
+        }
+        let service = self.service.clone();
+        let rt = &service.rt;
+        // A Failed message has no receipt: a receipt makes it Delivered.
+        let Some(message) = (service.message(id)?).filter(|m| m.status == DeliveryStatus::Failed)
+        else {
+            return Ok(false);
+        };
+        let tried = |reason: &str| DeliveryNotice {
+            source_message_id: id,
+            reason: reason.into(),
+        };
+        if service.has_delivery_notice(&tried(RETRACT_CLEARED))?
+            || service.has_delivery_notice(&tried(RETRACT_LEFT))?
+        {
+            return Ok(false);
+        }
+        // Never a wait for admission (the owner's decision and shutdown must
+        // not queue behind it): a retract is not urgent, the next poll retries.
+        let Ok(permit) = rt.admissions.clone().try_acquire_owned() else {
+            self.retract_after = Some(Instant::now() + rt.policy.settings().guard_poll_interval);
+            return Ok(false);
+        };
+        let deadline = Instant::now() + ATTEMPT_WORK_BUDGET;
+        let done = (self.effects.retract)(rt.clone(), id, deadline).await;
+        drop(permit);
+        // The executor checked this pane against the recipient's before the key.
+        let pane = (message.last_attempt).map(|a| a.pane).unwrap_or_default();
+        if !matches!(done, Ok(Retracted::Refused)) {
+            // Anything else may follow a key: once holds within this job, even
+            // without the committed note.
+            self.retracted = Some(id);
+        }
+        let (reason, body) = match done {
+            Ok(Retracted::Refused) => {
+                self.retract_after = Some(Instant::now() + ERROR_BACKOFF);
+                return Ok(false);
+            }
+            Ok(Retracted::Cleared) => (
+                RETRACT_CLEARED,
+                format!("atm cleared its unsent reference {id} from {pane}"),
+            ),
+            Ok(Retracted::Left) => (
+                RETRACT_LEFT,
+                format!("atm tried once to clear its unsent reference {id} from {pane}, but the input box may still hold text; clear it there. atm will not try again."),
+            ),
+            Err(error) => {
+                tracing::debug!(%id, %error, "Reference retract ended without an outcome");
+                return Ok(false);
+            }
+        };
+        self.observed = None;
+        self.publish_with(id, reason, |_| note(body)).await?;
+        Ok(true)
+    }
+
+    /// An unread turn on an editor read empty with no dialog, unless a short
+    /// viewport already explains it (its own note says to make the pane taller).
+    fn turn_unread(&self) -> bool {
+        self.turn_unread && self.short_viewport.is_none()
+    }
+
+    /// The message whose reference the editor held exactly at the last look.
+    fn staged(&self) -> Option<MessageId> {
+        self.staged
+            .and_then(|(id, exact)| (exact == Some(true)).then_some(id))
+    }
+
     /// One pane observation per guard poll at most; history keeps the last one.
     async fn observe(&mut self) -> Result<(), MessageError> {
         let service = self.service.clone();
@@ -758,6 +989,14 @@ impl Job {
         let now = rt.clock.now()?;
         let recipient = self.recipient.clone();
         let agent = service.agent(&self.recipient)?;
+        if !self
+            .short_viewport
+            .as_ref()
+            .zip(agent.as_ref())
+            .is_some_and(|(read, agent)| read.matches(agent))
+        {
+            self.short_viewport = None;
+        }
         let Some(agent) = agent.filter(|agent| agent.pane.is_some()) else {
             // No pane: nothing to look at, and nobody can be focused on it.
             // Said positively, so that the agent's applied status decides,
@@ -765,12 +1004,15 @@ impl Job {
             self.focused = Some(false);
             self.unreadable_episode = None;
             self.recovery_ready = false;
+            self.turn_unread = false;
+            self.staged = None;
             self.lost = None;
             let observation = RecipientObservation {
                 pane: None,
                 session: None,
                 presence: PanePresence::Unknown,
                 facts: ScreenFacts::default(),
+                inbox_paste: false,
                 copy_mode: None,
                 focused: Some(false),
             };
@@ -789,12 +1031,23 @@ impl Job {
         if self.observed.is_some_and(|at| at.elapsed() < poll) {
             return Ok(());
         }
-        let observed = tokio::time::timeout(OBSERVE_BUDGET, (self.effects.observe)(agent))
-            .await
-            .unwrap_or(Err(MessageError::Timeout));
+        // The one reference that can be in the editor: the last attempted
+        // message's, on this pane (s3-5c S2).
+        let candidate = (rt.history.last_attempted(&recipient)?)
+            .filter(|message| {
+                message.last_attempt.as_ref().map(|a| a.pane.as_str()) == agent.pane.as_deref()
+            })
+            .map(|message| (message.id, delivery_line(message.id, &message.content)));
+        let reference = candidate.as_ref().map(|(_, line)| line.clone());
+        let observed =
+            tokio::time::timeout(OBSERVE_BUDGET, (self.effects.observe)(agent, reference))
+                .await
+                .unwrap_or(Err(MessageError::Timeout));
         self.observed = Some(Instant::now());
         let now = rt.clock.now()?;
-        let recorded = observed.and_then(|(observation, episode)| {
+        let recorded = observed.and_then(|(observation, episode, short_viewport, staged)| {
+            // An empty editor positively holds no reference.
+            let staged = staged.or((observation.facts.input == InputState::Empty).then_some(false));
             let focused = observation.focused;
             let recovery_ready = observation.presence == PanePresence::Alive
                 && observation.facts.input == InputState::Draft
@@ -802,19 +1055,32 @@ impl Job {
                 && observation.facts.dialog == DialogState::None
                 && observation.copy_mode == Some(false)
                 && focused == Some(false);
+            let turn_unread = observation.presence == PanePresence::Alive
+                && observation.facts.input == InputState::Empty
+                && observation.facts.turn == TurnState::Unknown
+                && observation.facts.dialog == DialogState::None;
             let update = HistoryUpdate::Observed {
                 recipient: recipient.clone(),
                 observation,
             };
-            rt.history
-                .record(update, now)
-                .map(|()| (focused, recovery_ready, episode))
+            rt.history.record(update, now).map(|()| {
+                (
+                    focused,
+                    (recovery_ready, turn_unread),
+                    episode,
+                    short_viewport,
+                    staged,
+                )
+            })
         });
         match recorded {
-            Ok((focused, recovery_ready, episode)) => {
+            Ok((focused, (recovery_ready, turn_unread), episode, short_viewport, staged)) => {
                 self.focused = focused;
+                self.turn_unread = turn_unread;
                 self.unreadable_episode = episode;
+                self.short_viewport = short_viewport;
                 self.recovery_ready = recovery_ready;
+                self.staged = candidate.map(|(id, _)| (id, staged));
                 self.lost = None;
             }
             Err(error) => {
@@ -825,9 +1091,19 @@ impl Job {
                 tracing::debug!(%recipient, %error, "Recipient observation lost");
                 self.focused = None;
                 self.unreadable_episode = None;
+                self.short_viewport = None;
                 self.recovery_ready = false;
+                self.turn_unread = false;
+                self.staged = None;
                 let since = Instant::now();
-                (self.lost).get_or_insert(Lost { since, told: None });
+                let reason = observation_loss_reason(&error);
+                (self.lost)
+                    .get_or_insert(Lost {
+                        since,
+                        told: None,
+                        reason,
+                    })
+                    .reason = reason;
                 let _ = (rt.history).record(HistoryUpdate::ObservationLost { recipient }, now);
             }
         }
@@ -889,7 +1165,17 @@ impl Job {
                 reason: WaitReason::OwnerFocused,
             } if self.lost.is_some() => self.unobserved(&snapshot, until).await,
             DeliveryStep::Wait { until, reason } => {
-                self.show(id, DeliveryPhase::Waiting, Some(reason.to_string()), None);
+                let pane = snapshot.recipient.pane.as_deref();
+                let text = match (reason, self.staged(), pane) {
+                    (WaitReason::InputNotEmpty, Some(staged), Some(pane)) => {
+                        unsent_reference(staged, pane)
+                    }
+                    (WaitReason::InputUnknown, _, Some(pane)) if self.turn_unread() => {
+                        unread_turn(pane)
+                    }
+                    _ => wait_text(reason, pane),
+                };
+                self.show(id, DeliveryPhase::Waiting, Some(text), None);
                 if busy_notice_due(&snapshot.message, &snapshot.live, now) {
                     let body = format!(
                         "{} busy for {} min; message still queued ({id})",
@@ -953,7 +1239,47 @@ impl Job {
                     self.lost = None;
                 }
                 let latched = latched(&step);
-                let text = blocked_reason(reason, snapshot.hold);
+                // atm's own staged reference: say whose and where (s3-stuckseat
+                // 5b), from the editor when the last look read it (s3-5c S2).
+                let pane = snapshot.recipient.pane.as_deref();
+                let enter_not_sent = (snapshot.hold == Some(ExecutorHold::EnterNotSent))
+                    .then_some(snapshot.message.last_attempt.as_ref())
+                    .flatten();
+                let text = match (reason, self.staged(), pane, enter_not_sent) {
+                    (
+                        FailureReason::ProbablyDelivered
+                        | FailureReason::Restarted
+                        | FailureReason::DraftPresent
+                        | FailureReason::ReadinessTimeout,
+                        Some(staged),
+                        Some(pane),
+                        _,
+                    ) if staged == id => {
+                        format!("atm's reference {id} is waiting for Enter in {pane}")
+                    }
+                    (
+                        FailureReason::DraftPresent | FailureReason::ReadinessTimeout,
+                        Some(staged),
+                        Some(pane),
+                        _,
+                    ) => unsent_reference(staged, pane),
+                    (FailureReason::ReadinessTimeout, _, Some(pane), _) if self.turn_unread() => {
+                        unread_turn(pane)
+                    }
+                    (FailureReason::ProbablyDelivered, _, _, Some(attempt))
+                        if self.staged == Some((id, Some(false))) =>
+                    {
+                        format!(
+                            "atm's reference {id} is no longer in the input box in {}; Enter was not sent",
+                            attempt.pane
+                        )
+                    }
+                    (FailureReason::ProbablyDelivered, _, _, Some(attempt)) => format!(
+                        "atm's reference {id} is waiting for Enter in {}",
+                        attempt.pane
+                    ),
+                    _ => blocked_reason(reason, snapshot.hold),
+                };
                 self.show(id, DeliveryPhase::Blocked, Some(text.clone()), None);
                 let tag = blocked_notice_tag(reason, snapshot.hold);
                 // Starting is a state, not proof that parsing is what kept
@@ -1005,7 +1331,7 @@ impl Job {
 
     /// Evidence cannot answer for this message (its reference was refused at
     /// capacity, or the store is disabled). Nothing is decided without it:
-    /// the message is shown as blocked and the owner is told once, unless it
+    /// the message is shown as blocked and a notice goes out once, unless it
     /// only waits behind another message.
     async fn without_evidence(
         &mut self,
@@ -1039,7 +1365,11 @@ impl Job {
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Next, MessageError> {
         let id = snapshot.message.id;
-        self.show(id, DeliveryPhase::Waiting, Some(UNOBSERVED.into()), None);
+        let reason = match &self.lost {
+            Some(lost) => lost.reason,
+            _ => UNOBSERVED,
+        };
+        self.show(id, DeliveryPhase::Waiting, Some(reason.into()), None);
         let service = self.service.clone();
         let wake = service.rt.clock.deadline(until)?;
         let timeout = service.rt.policy.settings().readiness_timeout;
@@ -1052,8 +1382,16 @@ impl Job {
             return Ok(Next::At(wake.min(Instant::now() + (timeout - lasted))));
         }
         if snapshot.blocked_by.is_none() && *lost.told.get_or_insert(id) == id {
-            let body = unobserved_notice(id, &self.recipient, timeout);
-            self.publish(id, "unobserved", note(body)).await?;
+            let recipient = self.recipient.clone();
+            self.publish_with(id, "unobserved", |to| {
+                note(unobserved_notice(
+                    id,
+                    &recipient,
+                    timeout,
+                    *to != Address::Owner,
+                ))
+            })
+            .await?;
         }
         Ok(Next::At(wake))
     }
@@ -1198,6 +1536,7 @@ impl Job {
         &mut self,
         kind: Resolve,
         id: MessageId,
+        relayed: Option<String>,
     ) -> Result<DeliveryStatus, MessageError> {
         let service = self.service.clone();
         let rt = &service.rt;
@@ -1211,7 +1550,10 @@ impl Job {
             (Resolve::GiveUp, _) => {
                 self.commit(OrgCommand::DeliveryFailed {
                     message_id: id,
-                    reason: GIVE_UP_REASON.into(),
+                    reason: relayed.map_or_else(
+                        || GIVE_UP_REASON.into(),
+                        |words| format!("{GIVE_UP_REASON}; {words}"),
+                    ),
                     final_failure: true,
                 })
                 .await?;
@@ -1266,13 +1608,47 @@ impl Job {
         reason: &str,
         latched: bool,
     ) -> Result<(), MessageError> {
-        let behind: Vec<MessageId> = (self.service.open(&self.recipient).unwrap_or_default())
-            .into_iter()
-            .skip_while(|other| *other != id)
-            .skip(1)
-            .collect();
-        let body = blocked_notice(id, reason, &behind, latched);
-        self.publish(id, tag, note(body)).await
+        let service = self.service.clone();
+        let recipient = self.recipient.clone();
+        let short = self.short_viewport.clone();
+        self.publish_with(id, tag, |to| {
+            let behind: Vec<MessageId> = service
+                .open(&recipient)
+                .unwrap_or_default()
+                .into_iter()
+                .skip_while(|other| *other != id)
+                .skip(1)
+                .collect();
+            let short_reason = match tag {
+                "blocked.readiness_timeout" | "blocked.agent_not_ready_timeout" => short
+                    .filter(|read| {
+                        service
+                            .agent(&recipient)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|agent| read.matches(&agent))
+                    })
+                    .map(|read| format!("{reason} for {recipient}; {}", read.viewport)),
+                _ => None,
+            };
+            // Preview only. The recovery path still checks again after publication.
+            let enter_recovery = (tag == "hold.enter_not_sent").then(|| {
+                let rt = &service.rt;
+                rt.clock
+                    .now()
+                    .and_then(|now| rt.history.recovery_candidate(id, now))
+                    .is_ok_and(|candidate| candidate.is_some())
+            });
+            note(blocked_notice(
+                id,
+                short_reason.as_deref().unwrap_or(reason),
+                &behind,
+                latched,
+                *to != Address::Owner,
+                enter_recovery,
+            ))
+        })
+        .await
     }
 
     async fn focus_notice(&mut self, id: MessageId, recipient: &Agent) -> Result<(), MessageError> {
@@ -1284,12 +1660,22 @@ impl Job {
         Ok(())
     }
 
-    /// Retain an unresolved publication, not an assumed successful key.
     async fn publish(
         &mut self,
         id: MessageId,
         reason: &str,
-        mut content: MessageContent,
+        content: MessageContent,
+    ) -> Result<(), MessageError> {
+        self.publish_with(id, reason, |_| content).await
+    }
+
+    /// Retain an unresolved publication, not an assumed successful key. Read
+    /// the current role only if there is no pending or committed publication.
+    async fn publish_with(
+        &mut self,
+        id: MessageId,
+        reason: &str,
+        build: impl FnOnce(&Address) -> MessageContent,
     ) -> Result<(), MessageError> {
         self.flush_notice().await?;
         let key = DeliveryNotice {
@@ -1298,6 +1684,11 @@ impl Job {
         };
         if self.service.has_delivery_notice(&key)? {
             return self.service.settled().await;
+        }
+        let to = self.service.notice_manager(&key, &self.recipient).await?;
+        let mut content = build(&to);
+        if to != Address::Owner {
+            content.to = to;
         }
         content.delivery_notice = Some(key);
         self.pending_notice = Some(content);
@@ -1311,7 +1702,7 @@ impl Job {
         let key = content
             .delivery_notice
             .as_ref()
-            .ok_or_else(|| MessageError::Internal("owner notice has no key".into()))?;
+            .ok_or_else(|| MessageError::Internal("delivery notice has no key".into()))?;
         // A FIFO snapshot cannot overtake an accepted command whose reply was
         // lost. Failure is not absence: keep pending and submit no new write.
         let committed = self.service.reconcile_notice(key).await?;

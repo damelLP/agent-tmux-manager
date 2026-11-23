@@ -89,6 +89,8 @@ pub enum OrgCommand {
     Task(TaskCommand),
     ObserveTaskUsage(TaskUsageObservation),
     RecordSummary(SessionSummary),
+    /// The process a bound session's confirmed row runs in. A repeat writes nothing.
+    RecordProcess(SessionProcess),
     ControlSent(ControlAudit),
     ControlSpawned(ControlAudit),
     ControlKilled(ControlAudit),
@@ -105,6 +107,8 @@ pub enum OrgCommand {
         agent_id: AgentId,
         message_id: MessageId,
     },
+    /// Posts, routing answers and markers: see the channel policy.
+    Channel(ChannelCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -148,12 +152,16 @@ pub enum Refusal {
     Decision(#[from] DecisionRefusal),
     #[error(transparent)]
     Away(#[from] AwayRefusal),
+    #[error(transparent)]
+    Channel(#[from] ChannelRefusal),
 }
 
 impl OrgCommand {
     // The candidate shares validation with apply before policy can emit it.
-    fn event(&self) -> OrgEvent {
-        match self.clone() {
+    // None for a channel command: its facts depend on state, and the channel
+    // policy checks each one as it builds it.
+    fn event(&self) -> Option<OrgEvent> {
+        Some(match self.clone() {
             Self::RegisterProject {
                 project_id, root, ..
             } => OrgEvent::ProjectRegistered { project_id, root },
@@ -215,6 +223,7 @@ impl OrgCommand {
             Self::Task(command) => command.event(),
             Self::ObserveTaskUsage(input) => input.event(None),
             Self::RecordSummary(summary) => OrgEvent::SessionSummary(summary),
+            Self::RecordProcess(process) => OrgEvent::SessionProcess(process),
             Self::ControlSent(audit) => OrgEvent::ControlSent(audit),
             Self::ControlSpawned(audit) => OrgEvent::ControlSpawned(audit),
             Self::ControlKilled(audit) => OrgEvent::ControlKilled(audit),
@@ -234,7 +243,8 @@ impl OrgCommand {
                 agent_id,
                 message_id,
             },
-        }
+            Self::Channel(_) => return None,
+        })
     }
 }
 
@@ -247,7 +257,22 @@ impl OrgState {
         command: &OrgCommand,
         now: DateTime<Utc>,
     ) -> Result<Vec<OrgEvent>, Refusal> {
-        let event = command.event();
+        let resolved;
+        let command = match command {
+            OrgCommand::Channel(command) => return self.decide_channel(command, now),
+            // A post id becomes the reader's own row before today's checks run.
+            OrgCommand::ReadMessages { who, message_ids } => {
+                resolved = OrgCommand::ReadMessages {
+                    who: who.clone(),
+                    message_ids: self.own_rows(who, message_ids)?,
+                };
+                &resolved
+            }
+            command => command,
+        };
+        let Some(event) = command.event() else {
+            return Ok(vec![]); // Only channel commands, answered above.
+        };
         self.validate_event(&event)?;
         let changed = match command {
             OrgCommand::RegisterProject {
@@ -385,10 +410,11 @@ impl OrgState {
                 if content.to == Address::System {
                     return Err(Refusal::InvalidRecipient(Address::System));
                 }
-                content
-                    .delivery_notice
-                    .as_ref()
-                    .is_none_or(|notice| !self.has_delivery_notice(notice))
+                self.wake_row_allowed(content)?
+                    && content
+                        .delivery_notice
+                        .as_ref()
+                        .is_none_or(|notice| !self.has_delivery_notice(notice))
             }
             OrgCommand::DeliveryAttempted {
                 message_id,
@@ -483,6 +509,9 @@ impl OrgState {
             OrgCommand::RecordSummary(summary) => {
                 self.session_summary(&summary.session_id) != Some(summary)
             }
+            OrgCommand::RecordProcess(process) => {
+                self.session_process(&process.session_id) != Some(process)
+            }
             OrgCommand::ControlSent(audit)
             | OrgCommand::ControlSpawned(audit)
             | OrgCommand::ControlKilled(audit) => {
@@ -503,6 +532,7 @@ impl OrgState {
                 self.require_message(message_id)?;
                 true
             }
+            OrgCommand::Channel(_) => false, // Answered above.
         };
         Ok(if changed { vec![event] } else { vec![] })
     }

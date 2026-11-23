@@ -119,6 +119,10 @@ fn cli_exit_owned_child_reaps_during_unwind() {
     role::process::tests::owned_child_drop_reaps_on_unwind();
 }
 
+#[allow(dead_code)]
+#[path = "../crates/atmd/src/control/legacy_survey_test.rs"]
+mod survey_viewport;
+
 mod shutdown {
     use atm_tmux::{mock::MockCall, MockTmuxClient, PaneDirection, TmuxClient, TmuxError};
     use atmd::{control::service::spawn_control, org::OrgHandle};
@@ -208,6 +212,8 @@ mod shutdown {
             let org_cancel = CancellationToken::new();
             let org = OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
             let mock = MockTmuxClient::new();
+            mock.set_next_raw_output("0 1");
+            super::survey_viewport::mock_shell(&mock, "%7");
             let pasted = Arc::new(Notify::new());
             let release = Arc::new(Semaphore::new(0));
             let cancel = CancellationToken::new();
@@ -238,7 +244,11 @@ fn autostart_control(args: &[&str], expected: &[u8]) {
 [ "$1" = -u ] && shift
 if [ "$1" = -L ]; then shift; shift; fi
 case $1 in
-list-panes) printf '%%7\tprobe\t0\t1\t80\t24\t1\n' ;;
+list-panes)
+case "$*" in
+  *ATM-CAPTURE-v1*) while IFS= read -r row; do printf '%s\n' "$row"; done < "$CONTROL_TEST_VIEWPORT" ;;
+  *) printf '%%7\tprobe\t0\t1\t80\t24\t1\n' ;;
+esac ;;
 display-message)
 case "$*" in *'#{socket_path}'*) echo "$CONTROL_TEST_TMUX_SOCKET" ;; *) echo '0 1' ;; esac ;;
 split-window) echo %42 ;;
@@ -247,6 +257,12 @@ esac
     )
     .unwrap();
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let viewport = dir.path().join("viewport");
+    std::fs::write(
+        &viewport,
+        survey_viewport::viewport_stdout("%7", "shell$ \n", Some(true)),
+    )
+    .unwrap();
     let guard = control_support::Autostarted(dir.path().to_owned());
     assert!(!dir.path().join("atmd.sock").exists());
     let mut command = Command::new(env!("CARGO_BIN_EXE_atm"));
@@ -254,6 +270,7 @@ esac
         .env("PATH", &path)
         .env("TMUX", "private-stand-in")
         .env("TMUX_PANE", "%7")
+        .env("CONTROL_TEST_VIEWPORT", &viewport)
         .env("ATM_SPAWN_BIN", "true")
         .args(args);
     let out = command.output().unwrap();
@@ -430,6 +447,14 @@ async fn reply_and_peek_use_the_daemon_and_preserve_exact_output_and_refusals() 
     ] {
         mock.clear_calls();
         mock.set_next_raw_output(socket.to_str().unwrap());
+        if keys.last() == Some(&"Enter") {
+            survey_viewport::mock_viewport(
+                &mock,
+                "%5",
+                "Choose café?\n❯ 1. Sí\n  2. No\n",
+                Some(true),
+            );
+        }
         let out = atm(exe, dir.path(), &args);
         assert!(out.status.success(), "{args:?}: {out:?}");
         assert_eq!(out.stdout, expected.as_bytes());
@@ -614,11 +639,12 @@ async fn send_uses_daemon_registry_and_preserves_refusals() {
     mock.set_next_raw_output("ATM-PANE-v1\t%5\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
     mock.set_next_raw_output(""); // disabled org, positively untagged pane
     mock.set_next_raw_output("0 1");
+    survey_viewport::mock_shell(&mock, "%5");
     let out = atm(exe, dir.path(), &["send", "abc", "hello;"]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"Sent to %5 by tmux paste\n");
     assert!(
-        matches!(mock.calls().as_slice(), [MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::PasteText { pane, text }, MockCall::SendKeys { keys, .. }] if pane == "%5" && text == "hello;" && keys == "Enter")
+        matches!(mock.calls().as_slice(), [MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::RawCommand { .. }, MockCall::RawCommand { subcommand, args }, MockCall::PasteText { pane, text }, MockCall::SendKeys { keys, .. }] if subcommand == "list-panes" && args.iter().any(|arg| arg == "capture-pane") && pane == "%5" && text == "hello;" && keys == "Enter")
     );
     mock.clear_calls();
     mock.set_next_raw_output(tmux_socket.to_str().unwrap());

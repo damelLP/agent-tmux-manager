@@ -1,0 +1,41 @@
+Captured: Claude Code not recorded, not recorded, styled tmux viewport (sanitized).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✻ Waiting for 1 background agent to finish
+                                                                                                                                                     ✔ Update installed · /restart to apply
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [fixture] display placeholder 00 context · generic display status fixture
+  ⏵⏵ auto mode on (shift+tab to cycle) · ↓ to manage
+
+  ● main
+  ◯ general-purpose  Reading fixture input for local work only.                                                                                                    1m 23s · ↓ 123.4k tokens

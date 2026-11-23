@@ -128,8 +128,11 @@
 //! is provisional `by: owner` with `relayed_by` naming the recorder; self-relays
 //! have the same policy. A same-option provisional retry writes nothing, whatever
 //! its provenance; a different option returns [`DecisionRefusal::AlreadyTaken`].
-//! Closed decisions refuse. Only the owner's Resolve confirms or overrules it,
-//! retaining the relay fact and using the existing cap and frozen redo path.
+//! Closed decisions refuse. The owner's Resolve confirms or overrules a
+//! provisional choice, retaining the relay fact and using the existing cap and
+//! frozen redo path. The daemon also lets the designated relay confirm the
+//! same provisional option in the owner's words. This uses the same final
+//! Resolve; only the owner can overrule, and only while still provisional.
 //!
 //! # Away policy
 //!
@@ -176,6 +179,76 @@
 //! and what it waits for, and the limits passed in for its harness and model,
 //! it answers nothing, flag, save or clear. It never refuses a handover.
 //!
+//! # Channels
+//!
+//! A **post** is one fact in a channel (`channel.posted`, id `m<seq>`, in the
+//! message id space). A **wake** is one delivery of it to one address: an ordinary
+//! `msg.sent` row whose `post` names the post, so delivery, receipts, ack and
+//! retry run on it unchanged. A [`ChannelId`] is a project or a direct pair of
+//! addresses. Channels and membership are derived, never stored: every older
+//! `msg.sent` without `post` reads as a post of its direct channel, so old logs
+//! need no migration. An untagged post waits for one `channel.routed` answer;
+//! `channel.seen` moves a reader's marker forward. The fold's rules are in
+//! the module docs of `src/channel.rs`; [`channel_query`] reads the fold.
+//!
+//! Rollback rule for these bodies: open tags are strings and every channel enum
+//! has a read-only catch-all, so a promoted binary decodes anything a later one
+//! writes into the three kinds. Decoding is not the whole rule: it still refuses
+//! a record that names something it does not know, and that disables the
+//! organisation. So a later event kind must not create anything a `channel.*`
+//! record or a wake row then names (a post, a thread root, a decision); such a
+//! record needs a new kind too. [`MessageKind`] and [`Address`] have no catch-all:
+//! a new message kind or address form must not appear inside `channel.posted` or
+//! `msg.sent` until a catch-all for it exists in a promoted binary; until then a
+//! new form arrives as a new event kind.
+//!
+//! # Channel policy
+//!
+//! Channel commands arrive as [`OrgCommand::Channel`]. Their facts depend on
+//! state, so [`channel_policy`] builds each one and checks it against the
+//! fold's references before emitting it. A post's wake rows and acks by post id
+//! use the existing [`OrgCommand::SendMessage`] and [`OrgCommand::ReadMessages`].
+//! Checks run in the order listed.
+//!
+//! | Command | Check | Result |
+//! |---|---|---|
+//! | Post | unknown author; later-form channel or decision step; client key outside 1 to 64 bytes | refuses |
+//! | | a client key this author used, or a decision step already posted | no event; the queries name the first post |
+//! | | place: a listed channel (an internal post may open a direct channel: the decision bridge's question in the asker's DM with the owner, which wakes him unless it was asked before the daemon started; its tags, not the target, say whom it wakes); `Direct(to)`, the pair of author and `to` (neither the author nor `system`); `Reply`, the thread root of a post, reply or wake | refuses an unlisted channel, a bad recipient, an unknown post |
+//! | | member: in a project channel the owner, `system` and seats that are not down (any seat of the project when the daemon marks the post internal); in a direct channel its two parties; in any channel `system` posting a decision step internally (design 12 asks in the asker's DM with the owner when its project channel is not listed, and 6.1 step 3 would refuse `system` there) | refuses anyone else |
+//! | | tags: an unresolved inline `@name` stays text; an unresolved strict tag refuses. Internal posts scan only the strict tags so copied text cannot add mentions or wakes | refuses an unresolved strict tag |
+//! | | otherwise | `channel.posted`, waking the direct party, then the tagged (a group's seats that are not down), never the author |
+//! | Route | later router kind or stopgap cause; reason over 256 bytes; unknown post; post with `route: false` | refuses |
+//! | | an answer after the first: the same `by` and address set | no event; any other answer refuses (conflict) |
+//! | | an address that is the author, `system`, or no member (project: the owner or a seat that is not down; direct: the other party) | refuses |
+//! | | otherwise | `channel.routed`, duplicates dropped; the empty set is final |
+//! | Wake row (`SendMessage` with `post`) | a row for (post, recipient) exists | no event |
+//! | | sender not the author; a recipient neither the post nor its routing answer wakes; not a copy of the post (kind, body, attachments, task, no notice) | refuses |
+//! | ReadMessages | a post id: the reader's own row for it, or refuses | then today's ack, naming rows |
+//! | Seen | later-form channel; `through` not a post of the channel; unknown reader (by the fact's reference check) | refuses |
+//! | | otherwise | `channel.seen` only when the marker advances; for the owner, also `msg.read` for his unread rows whose post is at or before `through`, advance or not |
+//!
+//! A post is routed (`route: true`) when it wakes nobody, its author is not
+//! `system`, `no_route` is unset, and someone else in the channel can be woken.
+//! The owner is a member of every project channel, so route is false only for
+//! `system`, `no_route`, the owner when every seat of the project is down, and
+//! direct channels with `system`.
+//!
+//! The copy rule for wake rows is strict on purpose. A later producer whose row
+//! must differ from its post (a decision reply, say) relaxes it with a named
+//! reason.
+//!
+//! Until a router is attached, [`channel_policy::stopgap_wake`] answers every
+//! routed post. First match wins, and only addresses `Route` accepts qualify:
+//! (1) in a direct channel, the other party; (2) a thread reply wakes one
+//! target: the root's author, else the latest earlier replier other than this
+//! one, else the root's single wake, else nobody; (3) the owner's top-level post
+//! wakes the project's lead; (4) the lead's wakes every other seat that is
+//! starting, ready or clearing; (5) any other seat's wakes the lead; otherwise
+//! nobody. [`channel_policy::route_step`] says when a pending post falls to the
+//! stopgap: at once when routing is off or no router is there, at the end of a
+//! grace, or one timeout after the later of the post and the router's attach.
+//!
 //! # Compatibility direction
 //!
 //! A newer daemon must read every older log. An older daemon may fail on a newer
@@ -204,17 +277,23 @@
 pub mod auto_handover;
 mod away;
 pub mod budget;
+mod channel;
+pub mod channel_policy;
+pub mod channel_query;
 mod command;
 mod config;
 mod cost;
 mod decision;
+mod decision_due;
 mod decision_impact;
 mod decision_redo;
 pub mod delivery;
+pub mod department;
 mod event;
 pub mod idle;
 mod ids;
 mod intent;
+pub mod mention;
 pub mod message_query;
 pub mod reminder;
 mod replay;
@@ -223,10 +302,13 @@ mod return_digest;
 mod state;
 mod task;
 pub use away::*;
+pub use channel::*;
+pub use channel_policy::{ChannelCommand, ChannelRefusal, PostMutation, PostRequest, PostTarget};
 pub use command::*;
 pub use config::*;
 pub use cost::{TaskUsageObservation, TaskUsageObserved};
 pub use decision::*;
+pub use decision_due::*;
 pub use decision_impact::*;
 pub use decision_redo::*;
 pub use event::*;

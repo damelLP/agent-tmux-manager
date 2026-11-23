@@ -226,9 +226,35 @@ impl DaemonServer {
         } else {
             None
         };
+        // Writes the wake rows a crash or a dropped channel.post left missing:
+        // once now, after replay, then after each new post or routing answer.
+        let wakes_cancel = CancellationToken::new();
+        let (_, mut wakes_task) = crate::org::channel_post::spawn_wake_repair(
+            services.org.clone(),
+            crate::org::messages::MessageClock::new(
+                tokio::time::Instant::now(),
+                chrono::Utc::now(),
+            ),
+            wakes_cancel.clone(),
+        );
+        let routes_cancel = CancellationToken::new();
+        let started = chrono::Utc::now();
+        let routes = crate::org::channel_route::RouteHandle::new(
+            services.org.clone(),
+            services.router_settings,
+            crate::org::messages::MessageClock::new(tokio::time::Instant::now(), started),
+            started,
+        );
+        let routes_task = services
+            .org
+            .status()
+            .is_ok()
+            .then(|| routes.spawn(routes_cancel.clone()));
         let message_tap = services.message_tap.clone();
-        let result = self.run_with_services(services).await;
+        let result = self.run_with_services(services, routes).await;
         decisions_cancel.cancel();
+        wakes_cancel.cancel();
+        routes_cancel.cancel();
         // Reserved work stops at once and its cleanups run while control and
         // the organisation writer still exist; then each stage, in order and
         // by its bound (see `stop`), which logs a stage that overruns.
@@ -268,15 +294,35 @@ impl DaemonServer {
                 }
             }
         };
-        tokio::join!(drain_decisions, stop::stop_stages(stop_work, stages));
+        let drain_wakes = async {
+            if timeout(stop::MESSAGES, &mut wakes_task).await.is_err() {
+                warn!("Wake repair did not stop by its bound; aborting it");
+                wakes_task.abort();
+            }
+        };
+        let drain_routes = async {
+            if let Some(mut task) = routes_task {
+                if timeout(stop::MESSAGES, &mut task).await.is_err() {
+                    warn!("Channel routing did not stop by its bound; aborting it");
+                    task.abort();
+                }
+            }
+        };
+        tokio::join!(
+            drain_decisions,
+            drain_wakes,
+            drain_routes,
+            stop::stop_stages(stop_work, stages)
+        );
         result
     }
 
     async fn run_with_services(
         &self,
         services: methods::MethodServices,
+        routes: crate::org::channel_route::RouteHandle,
     ) -> Result<(), ServerError> {
-        let methods = Arc::new(methods::router(services.clone())?);
+        let methods = Arc::new(methods::router_with_routes(services.clone(), routes)?);
         // Remove existing socket file if present
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path).map_err(|e| ServerError::SocketSetup {
@@ -1064,6 +1110,7 @@ mod tests {
             body: "brief".into(),
             attachments: vec![],
             task: None,
+            post: None,
         }))
         .await;
         let id = MessageId::new(sent);

@@ -363,6 +363,59 @@ impl Rig {
         );
         (release, call, save)
     }
+
+    async fn finish_lagged_retry(
+        &mut self,
+        release: oneshot::Sender<()>,
+        mut call: Call,
+        save: MessageId,
+    ) {
+        *self.recorder.blocked.lock().unwrap() = None;
+        let before = Instant::now();
+        release.send(()).unwrap();
+        let next = tokio::time::timeout(GUARD, async {
+            tokio::select! {
+                biased;
+                next = self.cleared.recv() => next,
+                ended = &mut call => panic!("lag ended the handover before its retry: {ended:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(next, Some(id("worker")));
+        assert!(
+            Instant::now() >= before + Duration::from_millis(250),
+            "lag alone woke the retry"
+        );
+        tokio::time::resume();
+        let result = answer(call).await.unwrap();
+        assert_eq!(result.state, HandoverState::Cleared);
+        assert_eq!(result.message_id, save);
+        assert!(self.cleared.try_recv().is_err());
+    }
+
+    fn lag_committed(&mut self, harmless: &Arc<Envelope>) {
+        let mut witness = self.org.committed.subscribe();
+        for _ in 0..2048 {
+            self.org.committed.send(harmless.clone()).unwrap();
+        }
+        assert!(matches!(
+            witness.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        self.committed = self.org.committed.subscribe();
+    }
+
+    async fn lag_registry(&self) {
+        let mut witness = self.registry.subscribe();
+        for share in 0..4096 {
+            self.share("lead-1", share % 1000).await;
+        }
+        assert!(matches!(
+            witness.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -387,6 +440,22 @@ impl Drop for AdmissionGate {
 impl Rig {
     fn gate(&mut self, boundary: impl Into<Option<AdmissionWrite>>) -> AdmissionGate {
         let boundary = boundary.into();
+        self.gate_request(move |request| match request {
+            super::Request::Execute { command, .. } => match (boundary, command.as_ref()) {
+                (Some(AdmissionWrite::Queue), OrgCommand::SendMessage(content)) => {
+                    content.body.starts_with("Handover:")
+                }
+                (Some(AdmissionWrite::Audit), OrgCommand::SaveRequested { .. }) => true,
+                _ => false,
+            },
+            _ => false,
+        })
+    }
+
+    fn gate_request(
+        &mut self,
+        matches: impl Fn(&super::Request) -> bool + Send + 'static,
+    ) -> AdmissionGate {
         let real = self.org.clone();
         let (requests, mut receive) = mpsc::channel(64);
         self.service.org = OrgHandle {
@@ -397,17 +466,7 @@ impl Rig {
         let forwarding = tokio::spawn(async move {
             let mut armed = true;
             while let Some(request) = receive.recv().await {
-                let matches = match &request {
-                    super::Request::Execute { command, .. } => match (boundary, command.as_ref()) {
-                        (Some(AdmissionWrite::Queue), OrgCommand::SendMessage(content)) => {
-                            content.body.starts_with("Handover:")
-                        }
-                        (Some(AdmissionWrite::Audit), OrgCommand::SaveRequested { .. }) => true,
-                        _ => false,
-                    },
-                    _ => false,
-                };
-                if armed && matches {
+                if armed && matches(&request) {
                     armed = false;
                     held.send(request).unwrap();
                 } else {
@@ -471,7 +530,7 @@ fn audit_failure(request: MessageId) -> String {
          confirmed: organisation request timed out; accepted work may still complete; \
          the request may be queued or already delivered; nothing was cleared; inspect \
          `atm inbox --for p/worker --id {request}`; a later handover reuses it while queued \
-         or delivering; `atm msg give-up {request}` cancels an undelivered request"
+         or delivering; `atm wake give-up {request}` cancels an undelivered request"
     )
 }
 
@@ -739,7 +798,7 @@ async fn an_undelivered_request_stays_queued_and_the_next_handover_reuses_it() {
         format!(
             "the save request {request} was not delivered to p/worker in 600 s; \
              `atm inbox --for p/worker --id {request}` shows what holds it; it stays queued and \
-             a later handover reuses it; `atm msg give-up {request}` cancels it; \
+             a later handover reuses it; `atm wake give-up {request}` cancels it; \
              nothing was cleared"
         )
     );
@@ -1121,6 +1180,82 @@ async fn handover_requires_exact_replayed_resume_receipt_and_current_manager() {
     assert_eq!(rig.state().await.messages().count(), 3);
 }
 
+// Break caught: a final delivery failure is ignored and the resume watch
+// waits until its deadline instead of telling the manager why it failed.
+#[tokio::test]
+async fn handover_resume_evidence_reports_final_failure_before_deadline() {
+    use crate::org::start_line::{start_line, StartLineDisposition};
+
+    let mut rig = Rig::new().await;
+    let (release, call, save) = rig.hold_first_clear().await;
+    rig.run(OrgCommand::Clear {
+        agent_id: id("worker"),
+    })
+    .await;
+    let resume = MessageId::new(
+        rig.run(OrgCommand::SendMessage(start_line(&id("worker"))))
+            .await[0]
+            .seq,
+    );
+    let ready = rig
+        .run(OrgCommand::SessionBound {
+            agent_id: id("worker"),
+            session_id: "s2".into(),
+        })
+        .await[0]
+        .seq;
+    assert_eq!(rig.next("msg.sent").await.seq, resume.seq());
+    *rig.recorder.completion.lock().unwrap() = Some(ClearOutcome {
+        result: ClearResult {
+            agent_id: id("worker"),
+            session_id: Some("s2".into()),
+        },
+        ready_seq: Some(ready),
+        start_line: StartLineDisposition::Track(resume),
+    });
+
+    // Inhibit Tokio's auto-advance across detached journal and role reads.
+    // The channel closes on panic; real time is only an outer hang guard.
+    let (done, completed) = std::sync::mpsc::channel::<()>();
+    let (holding, clock_held) = oneshot::channel();
+    let mut clock_hold = tokio::task::spawn_blocking(move || {
+        holding.send(()).unwrap();
+        let _ = completed.recv_timeout(GUARD);
+    });
+    clock_held.await.unwrap();
+    tokio::time::pause();
+    let began = Instant::now();
+    let note = tokio::select! {
+        note = async {
+            release.send(()).unwrap();
+            assert_eq!(answer(call).await.unwrap().state, HandoverState::Cleared);
+            tokio::time::advance(Duration::from_secs(15)).await;
+            rig.run(OrgCommand::DeliveryFailed {
+                message_id: resume,
+                reason: "owner gave up".into(),
+                final_failure: true,
+            })
+            .await;
+            // A later lifecycle change is a fence: a watch that skipped
+            // the failure reports the wrong reason, without waiting 30 s.
+            rig.run(OrgCommand::SessionLost {
+                agent_id: id("worker"),
+            })
+            .await;
+            rig.next("msg.sent").await
+        } => note,
+        _ = &mut clock_hold => panic!("no terminal outcome from the resume watch before its virtual deadline"),
+    };
+    assert!(Instant::now() - began < Duration::from_secs(30));
+    assert_eq!(note.body["to"], "p/lead");
+    assert_eq!(
+        note.body["body"],
+        format!("handover of p/worker did not complete: saved ({save}); clear confirmed; resume not confirmed: start line {resume} failed: owner gave up.")
+    );
+    drop(done);
+    clock_hold.await.unwrap();
+}
+
 #[test]
 fn handover_resume_evidence_rejects_wrong_id_session_and_lifecycle() {
     use serde_json::json;
@@ -1169,12 +1304,29 @@ fn handover_resume_evidence_rejects_wrong_id_session_and_lifecycle() {
         facts.apply(&down, &seat, &old, resume),
         Err("the agent left the cleared lifecycle".into())
     );
-    let failed = event(
-        "msg.delivery_failed",
-        json!({"message_id":"m8", "reason":"owner gave up", "final_failure":true}),
+    // A different watch with no rejected receipt latched from above.
+    let mut facts = ResumeFacts {
+        bound: Some("s2".into()),
+        receipt: None,
+    };
+    let failure = |message_id, final_failure| {
+        let fact = OrgEvent::MessageDeliveryFailed {
+            message_id,
+            reason: "owner gave up".into(),
+            final_failure,
+        };
+        event(fact.kind(), fact.to_body())
+    };
+    assert_eq!(
+        facts.apply(&failure(MessageId::new(7), true), &seat, &old, resume),
+        Ok(None)
     );
     assert_eq!(
-        facts.apply(&failed, &seat, &old, resume),
+        facts.apply(&failure(resume, false), &seat, &old, resume),
+        Ok(None)
+    );
+    assert_eq!(
+        facts.apply(&failure(resume, true), &seat, &old, resume),
         Err("start line m8 failed: owner gave up".into())
     );
 }
@@ -1281,51 +1433,131 @@ async fn handover_clear_keeps_queued_pane_move_before_return() {
     let _ = actor.await;
 }
 
-// Break caught: a missed registry invalidation becomes permission to retry
-// against a now-matching tuple. A lagged receiver must fail closed.
+// Break caught: unrelated traffic overflows one broadcast while the first
+// preflight's no-effect refusal is pending. The existing backoff may retry.
 #[tokio::test]
-async fn handover_clear_does_not_retry_with_lagged_registry_evidence() {
+async fn handover_clear_recovers_lagged_registry_evidence() {
+    let mut rig = Rig::new().await;
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (release, call, save) = rig.hold_first_clear().await;
+    tokio::time::pause();
+    rig.lag_registry().await;
+    rig.finish_lagged_retry(release, call, save).await;
+}
+
+#[tokio::test]
+async fn handover_clear_recovers_lagged_committed_evidence() {
+    let mut rig = Rig::new().await;
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (release, call, save) = rig.hold_first_clear().await;
+    let saved = rig.next("agent.saved").await;
+    // Overflow just this notification ring; the authoritative cursor has not moved.
+    rig.lag_committed(&saved);
+    tokio::time::pause();
+    rig.finish_lagged_retry(release, call, save).await;
+}
+
+#[tokio::test]
+async fn handover_clear_rejects_missing_registry_row_hidden_by_lag() {
     let mut rig = Rig::new().await;
     *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
     let (release, call, _) = rig.hold_first_clear().await;
     tokio::time::pause();
-    let mut witness = rig.registry.subscribe();
-    for share in 0..4096 {
-        rig.share("s1", share % 1000).await;
-    }
-    assert!(matches!(
-        witness.try_recv(),
-        Err(broadcast::error::TryRecvError::Lagged(_))
-    ));
+    rig.registry.remove("s1".into()).await.unwrap();
+    rig.lag_registry().await;
     *rig.recorder.blocked.lock().unwrap() = None;
     release.send(()).unwrap();
-    let result = answer(call).await;
-    assert_eq!(refusal(result).0, error_code::UNAVAILABLE);
+    let (code, reason) = refusal(answer(call).await);
+    tokio::time::resume();
+    assert_eq!(code, error_code::REFUSED);
     assert!(
-        rig.cleared.try_recv().is_err(),
-        "registry lag allowed another preflight"
+        reason
+            .ends_with("agent p/worker no longer has its saved session s1 on %1; nothing was sent"),
+        "{reason}"
     );
+    assert!(rig.cleared.try_recv().is_err());
 }
 
-// Break caught: a parked wait-source error loses the last safe-editor refusal
-// in the RPC or the manager's terminal note.
 #[tokio::test]
-async fn handover_clear_reports_last_refusal_when_wait_source_lags() {
+async fn handover_clear_rejects_committed_lifecycle_hidden_by_lag() {
     let mut rig = Rig::new().await;
+    let journal = Arc::new(Mutex::new(Vec::<Envelope>::new()));
+    rig.service.org.reads = Some(super::watch::ReadAccess {
+        reader: super::storage::Reader::in_memory_for_test({
+            let journal = journal.clone();
+            move |after, fence, topics| {
+                assert!(
+                    topics.is_empty(),
+                    "finite cursor requires an unfiltered watch"
+                );
+                Ok(super::storage::Page {
+                    records: journal
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|event| after < event.seq && event.seq <= fence)
+                        .cloned()
+                        .collect(),
+                    scanned: fence,
+                })
+            }
+        }),
+    });
+    *rig.recorder.blocked.lock().unwrap() = Some("the editor is not empty and idle");
+    let (release, call, _) = rig.hold_first_clear().await;
+    let saved = rig.next("agent.saved").await;
+    let before = rig.state().await;
+    let lost = rig
+        .run(OrgCommand::SessionLost {
+            agent_id: id("worker"),
+        })
+        .await;
+    let bound = rig
+        .run(OrgCommand::SessionBound {
+            agent_id: id("worker"),
+            session_id: "s1".into(),
+        })
+        .await;
+    journal
+        .lock()
+        .unwrap()
+        .extend(lost.into_iter().chain(bound));
+    let after = rig.state().await;
+    for state in [&before, &after] {
+        let agent = state.agent(&id("worker")).unwrap();
+        assert_eq!(agent.status, atm_org::AgentStatus::Ready);
+        assert_eq!(agent.pane.as_deref(), Some("%1"));
+        assert_eq!(agent.session_id, Some("s1".into()));
+    }
+    // All retained notifications are harmless; only replay can see the change.
+    rig.lag_committed(&saved);
+    tokio::time::pause();
+    *rig.recorder.blocked.lock().unwrap() = None;
+    release.send(()).unwrap();
+    let (code, reason) = refusal(answer(call).await);
+    tokio::time::resume();
+    assert_eq!(code, error_code::REFUSED);
+    assert!(
+        reason
+            .ends_with("agent p/worker no longer has its saved session s1 on %1; nothing was sent"),
+        "{reason}"
+    );
+    assert!(rig.cleared.try_recv().is_err());
+}
+
+// Break caught: a genuine parked read failure loses the last safe-editor
+// refusal in the RPC or the manager's terminal note.
+#[tokio::test]
+async fn handover_clear_reports_last_refusal_when_reread_fails() {
+    let mut rig = Rig::new().await;
+    let mut reread = rig.gate_request(|r| matches!(r, super::Request::SnapshotAt(_)));
     *rig.recorder.blocked.lock().unwrap() = Some("the session is not idle");
     let (release, call, save) = rig.hold_first_clear().await;
     let saved = rig.next("agent.saved").await;
-    let mut witness = rig.org.committed.subscribe();
-    for _ in 0..2048 {
-        rig.org.committed.send(saved.clone()).unwrap();
-    }
-    assert!(matches!(
-        witness.try_recv(),
-        Err(broadcast::error::TryRecvError::Lagged(_))
-    ));
-    rig.committed = rig.org.committed.subscribe();
+    rig.lag_committed(&saved);
     tokio::time::pause();
     release.send(()).unwrap();
+    drop(reread.take().await); // the snapshot reply channel closes without an answer
     let (code, reply) = refusal(answer(call).await);
     tokio::time::resume();
     assert_eq!(code, error_code::UNAVAILABLE);
@@ -1344,6 +1576,67 @@ async fn handover_clear_reports_last_refusal_when_wait_source_lags() {
     );
     assert_eq!(note.body["to"], "p/lead");
     assert!(rig.cleared.try_recv().is_err());
+}
+
+// Break caught: expiry loses to a ready failed re-read, or cancellation
+// leaves a parked re-read live. Neither may reach another preflight.
+#[tokio::test]
+async fn handover_clear_bounds_lagged_reread_by_cutoff_and_shutdown() {
+    for cancel in [false, true] {
+        let mut rig = Rig::new().await;
+        let mut reread = rig.gate_request(|r| matches!(r, super::Request::SnapshotAt(_)));
+        *rig.recorder.blocked.lock().unwrap() = Some("the session is not idle");
+        let (release, call, _) = rig.hold_first_clear().await;
+        let saved = rig.next("agent.saved").await;
+        rig.lag_committed(&saved);
+        tokio::time::pause();
+        release.send(()).unwrap();
+        let held = reread.take().await;
+        *rig.recorder.blocked.lock().unwrap() = None;
+        if cancel {
+            rig.service_stop.cancel();
+        } else {
+            // The snapshot's own timeout also becomes ready on this clock jump.
+            tokio::time::advance(Duration::from_secs(20)).await;
+        }
+        let (code, reason) = refusal(answer(call).await);
+        drop(held);
+        tokio::time::resume();
+        if cancel {
+            assert_eq!(code, error_code::UNAVAILABLE);
+        } else {
+            assert_eq!(code, error_code::REFUSED);
+            assert!(reason.contains("clear retry window expired"), "{reason}");
+        }
+        assert!(rig.cleared.try_recv().is_err());
+    }
+}
+
+// Break caught: the watcher keeps its organisation sender until a pending
+// look reaches the read deadline, even after agent-service shutdown.
+#[tokio::test]
+async fn handover_watch_stops_while_snapshot_pending() {
+    let mut rig = Rig::new().await;
+    let mut fence = rig.gate_request(|request| matches!(request, super::Request::Snapshot(_)));
+    spawn_handover_watch(rig.service.clone(), rig.service_stop.clone());
+    tokio::time::pause();
+    rig.turn("s1").await;
+    let super::Request::Snapshot(reply) = fence.take().await else {
+        panic!("held request was not a watcher snapshot");
+    };
+    assert!(!reply.is_closed(), "the snapshot must still be pending");
+
+    // Leave the reply held so only cancellation can finish the look
+    // before the snapshot's virtual deadline.
+    let stopped_at = Instant::now();
+    rig.service_stop.cancel();
+    fence.finish(&mut rig).await;
+    assert_eq!(
+        stopped_at,
+        Instant::now(),
+        "watcher waited for the snapshot deadline after shutdown"
+    );
+    assert!(reply.is_closed(), "watcher kept waiting for the snapshot");
 }
 
 // Break caught: resolver shutdown leaves the detached job waiting on
@@ -1544,6 +1837,7 @@ async fn context_note_names_the_agent_its_share_and_its_manager() {
                 .into(),
             attachments: Vec::new(),
             task: None,
+            post: None,
         }
     );
     // The line is the policy's, passed in: nothing here knows 60.

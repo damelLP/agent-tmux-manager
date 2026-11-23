@@ -486,4 +486,47 @@ dialog.""",
 - Tests finding 3 of the 2026-11-03 skill analysis: other skills and plan
   mode may change how a turn ends.""",
 )
+# Named cases use a local driver and synthetic CLI outputs, never the billed runner.
+case(
+    os.path.join(ROOT, "atm-member"), "read-reply-ack",
+    "/atm-member\n[m47] Read: atm inbox --id m47",
+    "Read the inbox and attachment, reply once in the project thread, and ack the delivered wake.",
+    [("named-reads-wake", "Read m47 and its attachment before posting."),
+     ("named-replies-and-acks", "Reply to post m41, then ack delivered wake m47 exactly once."),
+     ("named-no-legacy-or-pane-writes", "Do not use legacy messages or raw pane commands.")],
+    {"briefs/wake.md": "# Reply check\n\nReply in this thread with: The fixture says ready.\n"},
+    {"own_pane": "%3", "named_commands": [
+        {"argv": ["me"], "stdout": "Agent: project/member; manager: project/lead\n"
+         "Instructions: Read the fixture and answer only when requested.\nOpen tasks: none\n"
+         "Unread m47 brief from=project/lead: Reply check; read: atm inbox --id m47\n"
+         "Report: atm post --tag project/lead --kind report --body 'DONE: <result>'"},
+        {"argv": ["inbox", "--id", "m47"], "stdout":
+         "m47 from=project/lead to=project/member kind=brief status=delivered sent=2026-11-20T00:00:00Z read=-\n"
+         "delivery: delivered pane=%3 attempt=1\npost: m41 channel=project thread=-\n"
+         "reply: atm post --reply m41 --body '...'\nattach: @RUN@/briefs/wake.md\n"
+         "  Reply check\n1 unread", "delivery": {"status": "delivered", "target": ["--reply", "m41"]}},
+        {"argv": ["post", "--reply", "m41", "--body", "The fixture says ready."],
+         "stdout": "m52 posted channel=project thread=m41; woke: project/lead"},
+        {"argv": ["ack", "m47"], "stdout": "1 marked read"},
+    ]},
+    "Synthetic: project wake, post, IDs and result for the named recipe. No model call.",
+)
+case(
+    os.path.join(ROOT, "atm-lead"), "dispatch-tagged-brief",
+    "/atm-lead\nSend one message-only brief for unit-1 to project/member. "
+    "Use @RUN@/briefs/dispatch.md and say 'Read the attached brief'. No durable task exists.",
+    "Post one tagged brief in the project channel, with the unit and the absolute attachment path.",
+    [("named-posts-tagged-brief", "Post once with strict tag, brief kind, task and absolute attachment."),
+     ("named-no-legacy-or-pane-writes", "Do not use legacy messages or raw pane commands.")],
+    {"briefs/dispatch.md": "# Unit 1\n\nRead this fixture and report the result.\n"},
+    {"own_pane": "%3", "named_commands": [
+        {"argv": ["me"], "stdout": "Agent: project/lead; manager: owner\n"
+         "Instructions: Dispatch authorized briefs only.\nOpen tasks: none\nUnread: none\n"
+         "Report: atm post --tag owner --kind report --body 'DONE: <result>'"},
+        {"argv": ["post", "--tag", "project/member", "--kind", "brief", "--task", "unit-1",
+                  "--attach", "@RUN@/briefs/dispatch.md", "--body", "Read the attached brief"],
+         "stdout": "m59 posted channel=project thread=-; woke: project/member"},
+    ]},
+    "Synthetic: bound lead and member; message-only assignment. No model call.",
+)
 print("ok")

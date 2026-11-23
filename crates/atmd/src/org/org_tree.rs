@@ -2,17 +2,23 @@
 
 use super::{
     agents::{eligible_live_row, list_entry},
+    department_directory::DepartmentDirectory,
     reporting_line::ReportingEdges,
     tasks::is_open,
 };
 use atm_core::{SessionStatus, SessionView};
 use atm_org::{
+    department::{self, DepartmentId, HireMode, RosterEntry},
     Address, AgentId, AgentStatus, DecisionStatus, DeliveryStatus, OrgState, ProjectId, Task,
     TaskId, TaskKind, TaskState,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct OrgTree {
@@ -22,7 +28,107 @@ pub(super) struct OrgTree {
     needs_owner: NeedsOwner,
     projects: Vec<Project>,
     unplaced_tasks: Vec<OpenTask>,
+    #[serde(flatten)]
+    department_section: Option<DepartmentSection>,
 }
+#[derive(Debug, Clone, Serialize)]
+struct DepartmentSection {
+    departments: Vec<DepartmentView>,
+    department_problems: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+struct DepartmentView {
+    id: DepartmentId,
+    title: String,
+    goal: Option<String>,
+    head: Option<AgentId>,
+    projects: Vec<ProjectId>,
+    roster: Vec<RosterUsage>,
+    hire_mode: HireMode,
+    problems: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_wait: Option<Vec<WouldWait>>,
+}
+#[derive(Debug, Clone, Serialize)]
+struct WouldWait {
+    seat: AgentId,
+    reason: String,
+}
+#[derive(Debug, Clone, Serialize)]
+struct RosterUsage {
+    seats: String,
+    max: Option<NonZeroU64>,
+    live: usize,
+}
+
+fn department_section(
+    state: &OrgState,
+    directory: &DepartmentDirectory,
+    current_models: &BTreeMap<AgentId, String>,
+) -> Option<DepartmentSection> {
+    if directory.departments.is_empty() && directory.problems.is_empty() {
+        return None;
+    }
+    let registered = state.projects().map(|project| project.id.clone()).collect();
+    let mut problems: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for problem in department::validate(&directory.departments, &registered) {
+        let id = problem.department_id();
+        problems
+            .entry(id.clone())
+            .or_default()
+            .push(format!("{id}.toml:{problem}"));
+    }
+    let live = OnceCell::new();
+    let count = |entry: &RosterEntry| live.get_or_init(|| department::live_counts(state))(entry);
+    let departments = directory
+        .departments
+        .iter()
+        .map(|dept| DepartmentView {
+            id: dept.id.clone(),
+            title: dept.title.clone(),
+            goal: dept.goal.clone(),
+            head: dept.head.clone(),
+            projects: dept.projects.clone(),
+            roster: dept
+                .roster
+                .iter()
+                .map(|entry| RosterUsage {
+                    seats: entry.seats.to_string(),
+                    max: entry.max,
+                    live: count(entry),
+                })
+                .collect(),
+            hire_mode: dept.hire_mode,
+            problems: problems.remove(&dept.id).unwrap_or_default(),
+            would_wait: (dept.hire_mode == HireMode::Report).then(|| {
+                state
+                    .agents()
+                    .filter(|agent| {
+                        agent.status != AgentStatus::Down
+                            && dept.projects.contains(&agent.id.project)
+                    })
+                    .filter_map(|agent| {
+                        let model = current_models
+                            .get(&agent.id)
+                            .map(String::as_str)
+                            .or_else(|| agent.role.as_ref().map(department::role_model));
+                        let reason =
+                            department::start_refusal(dept, &agent.id, true, model, &count)?;
+                        Some(WouldWait {
+                            seat: agent.id.clone(),
+                            reason: reason.to_string(),
+                        })
+                    })
+                    .collect()
+            }),
+        })
+        .collect();
+    Some(DepartmentSection {
+        departments,
+        department_problems: directory.problems.clone(),
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct Reporting {
     state: &'static str,
@@ -124,6 +230,7 @@ pub(super) fn project(
     seq: u64,
     rows: &[SessionView],
     edges: &ReportingEdges,
+    directory: &DepartmentDirectory,
     now: DateTime<Utc>,
 ) -> OrgTree {
     let mut items = Vec::new();
@@ -291,6 +398,7 @@ pub(super) fn project(
             items_total,
         },
         projects,
+        department_section: department_section(state, directory, &edges.current_models),
         unplaced_tasks: open
             .into_iter()
             .filter(|task| task_project(task).is_none())

@@ -65,10 +65,13 @@ pub use super::message_methods::register_message_methods;
 use super::message_scheduler::{self, Board, Effects, Resolution, Resolve};
 pub use super::message_types::*;
 use super::{
+    agent_context::manager_address,
     agents::{matches_agent, AgentHandle},
     message_delivery::MESSAGE_RESOLUTION_BUDGET,
     message_evidence::{AttemptScope, MessageEvidence},
     message_history::MessageHistoryHandle,
+    reporting_line::outcome_manager,
+    session_process::{process_confirmed, ProcessClock},
     start_line::delivery_line,
     EventWatch, OrgHandle, OrgServiceError,
 };
@@ -270,6 +273,7 @@ pub fn recipient_observation(
             PanePresence::Alive
         },
         facts,
+        inbox_paste: false,
         copy_mode: Some(capture.inspection.in_mode),
         focused: capture.focused,
     })
@@ -293,6 +297,7 @@ pub fn focus_notice(id: MessageId, pane: &PaneId) -> MessageContent {
         body: format!("{id} waiting: owner is focused on {pane}{FOCUS_NOTICE_SUFFIX}"),
         attachments: vec![],
         task: None,
+        post: None,
     }
 }
 
@@ -321,7 +326,7 @@ pub fn is_focus_notice(content: &MessageContent) -> bool {
 
 /// Send, inbox and ack answer within 8 s, queue wait and organisation work
 /// included; the router allows 10 s (see `message_methods`).
-const ORDINARY_BUDGET: Duration = Duration::from_secs(8);
+pub(super) const ORDINARY_BUDGET: Duration = Duration::from_secs(8);
 
 const SEND_IDENTITY_BUDGET: Duration = Duration::from_secs(5);
 /// Requests in flight. A full service refuses the next one; nothing is parked.
@@ -480,6 +485,8 @@ pub(super) struct Service {
     view: Mutex<View>,
     startup: watch::Sender<Startup>,
     requests: Semaphore,
+    /// One retained detached role-reader slot across all recipient jobs.
+    pub(super) notice_files: Arc<Semaphore>,
     /// The last sequence whose fold is complete: projection, history and the
     /// evidence registration. The scheduler's wake for committed changes.
     pub(super) folded: watch::Sender<u64>,
@@ -592,6 +599,45 @@ impl Service {
         Ok(self.view()?.state.has_delivery_notice(key))
     }
 
+    /// Only ordinary mail to a named seat may route; keyed notes stop here at
+    /// Owner if they themselves are blocked. No projection lock spans file I/O.
+    pub(super) async fn notice_manager(
+        &self,
+        key: &DeliveryNotice,
+        recipient: &AgentId,
+    ) -> Result<Address, MessageError> {
+        if !key.may_route_to_manager() {
+            return Ok(Address::Owner);
+        }
+        let (state, fallback) = {
+            let view = self.view()?;
+            let Some(source) = view.state.message(&key.source_message_id) else {
+                return Ok(Address::Owner);
+            };
+            let Address::Agent(id) = &source.content.to else {
+                return Ok(Address::Owner);
+            };
+            if id != recipient
+                || source.content.delivery_notice.is_some()
+                || source.content.from == Address::System
+                || source.content.from == source.content.to
+            {
+                return Ok(Address::Owner);
+            }
+            let fallback = view
+                .state
+                .agent(id)
+                .and_then(|agent| manager_address(id, agent.role.as_ref()))
+                .unwrap_or(Address::Owner);
+            (view.state.clone(), fallback)
+        };
+        let to = outcome_manager(&state, recipient, fallback, self.notice_files.clone()).await;
+        Ok(match to {
+            Address::Agent(ref manager) if manager == recipient => Address::Owner,
+            _ => to,
+        })
+    }
+
     /// The snapshot is queued behind accepted writes; an unhealthy/unknown
     /// writer is never treated as an empty key index. Wait for its exact fold.
     pub(super) async fn reconcile_notice(
@@ -613,6 +659,47 @@ impl Service {
 
     pub(super) fn message(&self, id: MessageId) -> Result<Option<Message>, MessageError> {
         Ok(self.view()?.state.message(&id).cloned())
+    }
+
+    /// `f` over the folded state and the sequence it is folded through, under
+    /// the projection lock: no await inside.
+    pub(super) fn read<T>(&self, f: impl FnOnce(&OrgState, u64) -> T) -> Result<T, MessageError> {
+        let view = self.view()?;
+        Ok(f(&view.state, view.cursor))
+    }
+
+    /// The send-time check: a Ready agent with a recorded real session whose
+    /// pane shows a discovered process that does not confirm that session,
+    /// and is not that session's own process either (`process_confirmed`).
+    /// The caller has waited for the fold of the committed cursor.
+    pub(super) async fn session_unconfirmed(&self, id: &AgentId) -> Result<bool, MessageError> {
+        let Some(agent) = self.agent(id)?.filter(|agent| {
+            agent.status == AgentStatus::Ready
+                && agent.session_id.as_ref().is_some_and(|id| !id.is_pending())
+        }) else {
+            return Ok(false);
+        };
+        let Some(pane) = agent.pane.as_deref() else {
+            return Ok(false);
+        };
+        let rows = tokio::time::timeout(SEND_IDENTITY_BUDGET, self.rt.registry.pane_sessions(pane))
+            .await
+            .map_err(|_| MessageError::Timeout)?
+            .map_err(|error| MessageError::Unavailable(format!("session registry: {error}")))?;
+        let views: Vec<_> = rows.iter().map(|row| row.view.clone()).collect();
+        if !unconfirmed_discovery(&agent, &views) {
+            return Ok(false);
+        }
+        // The discovery row may be the recorded session's own process.
+        let (recorded, harness) = self.read(|state, _| {
+            let recorded = (agent.session_id.as_ref()).and_then(|id| state.session_process(id));
+            (
+                recorded.cloned(),
+                super::agents::harness(state, &agent, &views),
+            )
+        })?;
+        let clock = recorded.is_none().then(ProcessClock::read).flatten();
+        Ok(process_confirmed(&agent, recorded.as_ref(), harness, &rows, clock).is_none())
     }
 
     /// Receipts evidence retains, for one recipient or for all. Bounded by
@@ -641,7 +728,7 @@ impl Service {
     /// One bounded request: admission without a waiter, then a deadline that
     /// covers the startup wait and all organisation work. A timeout does not
     /// roll back a command the writer already accepted.
-    async fn call<T>(
+    pub(super) async fn call<T>(
         &self,
         budget: Duration,
         work: impl Future<Output = Result<T, MessageError>>,
@@ -661,11 +748,23 @@ impl Service {
     /// Submit to the one organisation writer, then wait until the fold loop
     /// has accounted for what it committed, so the caller reads its own write.
     pub(super) async fn execute(&self, command: OrgCommand) -> Result<Vec<Envelope>, MessageError> {
+        self.execute_from(command, None).await
+    }
+
+    pub(super) async fn execute_from(
+        &self,
+        command: OrgCommand,
+        caller_pane: Option<String>,
+    ) -> Result<Vec<Envelope>, MessageError> {
         let notice = match &command {
             OrgCommand::SendMessage(content) => content.delivery_notice.clone(),
             _ => None,
         };
-        let committed = self.rt.org.execute(command, self.rt.clock.now()?).await?;
+        let committed = self
+            .rt
+            .org
+            .execute_command(command, self.rt.clock.now()?, caller_pane)
+            .await?;
         if let Some(last) = committed.last() {
             self.rt.history.folded(last.seq).await?;
         } else if let Some(key) = notice {
@@ -886,6 +985,7 @@ fn spawn_service(
         }),
         startup: watch::Sender::new(Startup::Replaying),
         requests: Semaphore::new(MAX_REQUESTS),
+        notice_files: Arc::new(Semaphore::new(1)),
         folded: watch::Sender::new(0),
         board,
     });
@@ -989,7 +1089,7 @@ impl MessageHandle {
         }
     }
 
-    fn live(&self) -> Result<&Service, MessageError> {
+    pub(super) fn live(&self) -> Result<&Service, MessageError> {
         match &self.inner {
             Backend::Disabled(reason) => Err(MessageError::Unavailable(reason.to_string())),
             Backend::Live(service) => Ok(service),
@@ -1016,27 +1116,10 @@ impl MessageHandle {
                 if let Address::Agent(id) = &p.to {
                     // Admission must include lifecycle changes committed since startup.
                     service.rt.history.folded(service.rt.org.status()?).await?;
-                    if let Some(agent) = service.agent(id)?.filter(|agent| {
-                        agent.status == AgentStatus::Ready
-                            && agent.session_id.as_ref().is_some_and(|id| !id.is_pending())
-                    }) {
-                        if let Some(pane) = agent.pane.as_deref() {
-                            let rows: Vec<_> = tokio::time::timeout(
-                                SEND_IDENTITY_BUDGET,
-                                service.rt.registry.pane_sessions(pane),
-                            )
-                            .await
-                            .map_err(|_| MessageError::Timeout)?
-                            .map_err(|error| MessageError::Unavailable(format!("session registry: {error}")))?
-                            .into_iter()
-                            .map(|row| row.view)
-                            .collect();
-                            if unconfirmed_discovery(&agent, &rows) {
-                                return Err(MessageError::Refused(format!(
-                                    "agent {id} has a discovered process but its recorded session is not confirmed; message not queued; inspect atm list and atm agent list before retrying"
-                                )));
-                            }
-                        }
+                    if service.session_unconfirmed(id).await? {
+                        return Err(MessageError::Refused(format!(
+                            "agent {id} has a discovered process but its recorded session is not confirmed; message not queued; inspect atm list and atm agent list before retrying"
+                        )));
                     }
                 }
                 let content = MessageContent {
@@ -1047,6 +1130,7 @@ impl MessageHandle {
                     body: p.body,
                     attachments: p.attachments,
                     task: p.task,
+                    post: None,
                 };
                 let committed = service.execute(OrgCommand::SendMessage(content)).await?;
                 let sent = committed.first().ok_or_else(|| {
@@ -1140,7 +1224,7 @@ impl MessageHandle {
         p: ResolveParams,
         caller: CallContext,
     ) -> Result<RetryResult, MessageError> {
-        let (status, _) = self.resolve(Resolve::Retry, p.id, caller).await?;
+        let (status, _) = self.resolve(Resolve::Retry, p.id, None, caller).await?;
         Ok(RetryResult {
             message_id: p.id,
             status,
@@ -1148,14 +1232,18 @@ impl MessageHandle {
     }
 
     /// Owner cancellation of any held Queued/Delivering message, not only Blocked.
+    /// The owner's designated relay may give up with his verbatim words, which
+    /// the failure reason keeps, as decide's relay confirmation does.
     /// An active attempt must settle first; a later receipt may still confirm it.
     /// Resolution uses the recipient slot, never an Observe reservation.
     pub async fn give_up(
         &self,
-        p: ResolveParams,
+        p: GiveUpParams,
         caller: CallContext,
     ) -> Result<GiveUpResult, MessageError> {
-        let (status, line) = self.resolve(Resolve::GiveUp, p.id, caller).await?;
+        let (status, line) = self
+            .resolve(Resolve::GiveUp, p.id, p.relay_words, caller)
+            .await?;
         Ok(GiveUpResult {
             message_id: p.id,
             status,
@@ -1175,6 +1263,7 @@ impl MessageHandle {
         &self,
         kind: Resolve,
         id: MessageId,
+        words: Option<String>,
         caller: CallContext,
     ) -> Result<(DeliveryStatus, String), MessageError> {
         let service = self.live()?;
@@ -1183,11 +1272,24 @@ impl MessageHandle {
                 let (reply, answer) = oneshot::channel();
                 let line = {
                     let view = service.view()?;
-                    if caller_address(&view.state, &caller)? != Address::Owner {
-                        return Err(MessageError::Refused(
-                            "only the owner may retry or give up a delivery".into(),
-                        ));
-                    }
+                    let relayed = match (caller_address(&view.state, &caller)?, words) {
+                        (Address::Owner, None) => None,
+                        (Address::Agent(by), Some(words))
+                            if view.state.owner().relay.as_ref() == Some(&by) =>
+                        {
+                            Some(super::decisions::relayed_words(&by, &words))
+                        }
+                        (other, Some(_)) => {
+                            return Err(MessageError::Refused(format!(
+                                "{other} may not confirm as relay for message {id}"
+                            )))
+                        }
+                        (_, None) => {
+                            return Err(MessageError::Refused(
+                                "only the owner may retry or give up a delivery".into(),
+                            ))
+                        }
+                    };
                     let message = view.state.message(&id).ok_or_else(|| {
                         MessageError::NotFound(format!("message {id} was not found"))
                     })?;
@@ -1196,7 +1298,12 @@ impl MessageHandle {
                         return Err(kind.refuse_delivered(id));
                     };
                     let line = delivery_line(id, &message.content);
-                    let resolution = Resolution { kind, id, reply };
+                    let resolution = Resolution {
+                        kind,
+                        id,
+                        relayed,
+                        reply,
+                    };
                     service.board.resolve(recipient.clone(), resolution)?;
                     line
                 };

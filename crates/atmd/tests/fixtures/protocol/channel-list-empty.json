@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-list-empty","method":"channel.list","params":null},
+  "response": {"type":"response","id":"channel-list-empty","result":{"seq":0,"channels":[]}},
+  "ignore": []
+}

@@ -41,7 +41,7 @@ macro_rules! text_serde {
 pub struct ProjectId(String);
 text_serde!(ProjectId);
 
-fn slug_chars(text: &str) -> bool {
+pub(crate) fn slug_chars(text: &str) -> bool {
     !text.is_empty()
         && !text.starts_with('-')
         && text.len() <= 32
@@ -225,6 +225,82 @@ impl fmt::Display for Address {
             Self::Agent(id) => id.fmt(f),
             Self::Owner => f.write_str("owner"),
             Self::System => f.write_str("system"),
+        }
+    }
+}
+
+/// Where a post lives. Text: a project id, or two distinct addresses joined by
+/// `+` in ascending [`Address`] order (the derived order: agents by project
+/// then name, then `owner`, then `system`; not text order), such as
+/// `p/lead+owner`. Any other text is [`ChannelId::Other`], a later form this
+/// version folds but never writes. Every text round-trips exactly.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ChannelId {
+    Project(ProjectId),
+    Direct(Address, Address),
+    /// Read-only: neither a project id nor a canonical pair.
+    Other(UnknownChannel),
+}
+
+/// The text of a channel id this version does not know. Only decoding makes one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnknownChannel(String);
+impl UnknownChannel {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl ChannelId {
+    /// The direct channel of two distinct addresses, given in either order.
+    #[must_use]
+    pub fn direct(a: Address, b: Address) -> Option<Self> {
+        match a.cmp(&b) {
+            std::cmp::Ordering::Less => Some(Self::Direct(a, b)),
+            std::cmp::Ordering::Greater => Some(Self::Direct(b, a)),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
+    /// False for a later form, and for a pair built out of order, which
+    /// commands refuse.
+    #[must_use]
+    pub fn is_known(&self) -> bool {
+        match self {
+            Self::Project(_) => true,
+            Self::Direct(a, b) => a < b,
+            Self::Other(_) => false,
+        }
+    }
+}
+impl From<String> for ChannelId {
+    fn from(text: String) -> Self {
+        if let Ok(project) = text.parse() {
+            return Self::Project(project);
+        }
+        let pair = text
+            .split_once('+')
+            .and_then(|(a, b)| Some((a.parse::<Address>().ok()?, b.parse::<Address>().ok()?)));
+        match pair {
+            // Address text is canonical, so an ordered pair prints as `text`.
+            Some((a, b)) if a < b => Self::Direct(a, b),
+            _ => Self::Other(UnknownChannel(text)),
+        }
+    }
+}
+impl From<ChannelId> for String {
+    fn from(value: ChannelId) -> Self {
+        value.to_string()
+    }
+}
+impl fmt::Display for ChannelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Project(id) => id.fmt(f),
+            Self::Direct(a, b) => write!(f, "{a}+{b}"),
+            Self::Other(text) => f.write_str(&text.0),
         }
     }
 }

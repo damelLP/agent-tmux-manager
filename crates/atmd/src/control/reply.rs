@@ -43,6 +43,13 @@ pub(super) struct PreparedReply {
     navigation: Option<(&'static str, usize)>,
 }
 
+impl PreparedReply {
+    pub(super) fn submit_moves(&self) -> Option<bool> {
+        (!matches!(self.outcome, ReplyOutcome::Escape { .. }))
+            .then(|| self.navigation.is_some_and(|(_, count)| count != 0))
+    }
+}
+
 pub(super) async fn prepare_reply(
     client: &(impl TmuxClient + ?Sized),
     pane_id: String,

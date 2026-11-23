@@ -27,6 +27,7 @@ fn content(from: &str, to: &str, body: &str) -> MessageContent {
         body: body.into(),
         attachments: vec!["SECRET attachment".into()],
         task: Some("SECRET task".parse().unwrap()),
+        post: None,
     }
 }
 fn row_ids(page: &Value) -> Vec<String> {

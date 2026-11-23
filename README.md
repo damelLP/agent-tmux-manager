@@ -5,7 +5,7 @@
 
 A live dashboard and a daemon-backed control plane for coding agents in tmux.
 
-**0.5.2 polishes the Work view, recognises more Claude Code screens, and prompts new sessions to resume after a saved handover.** ATM also includes owner decision answers and spoken-answer relays, message history, return digests, and evaluation reports. It is not a complete unattended workflow: see [known limits and not yet](#known-limits-and-not-yet).
+**0.6.0 adds private web and phone chat, channel commands, department reporting, and more reliable message delivery.** ATM also includes owner decision answers and spoken-answer relays, message history, return digests, and evaluation reports. It is not a complete unattended workflow: see [known limits and not yet](#known-limits-and-not-yet).
 
 ## What it does
 
@@ -16,14 +16,14 @@ ATM gives you a live dashboard and CLI for coding agents running in tmux, includ
 - **Named agents** — project-local roles with stable `project/name` identities, start/adopt/clear/respawn commands, and save-before-clear handover
 - **Durable coordination** — confirmed message references and inboxes, scoped history, project-attributed tasks with reviews and observed usage
 - **Owner choices** — TUI decision answers, provisional spoken-answer relay, standing rules, away/back return digests and evaluation reports
-- **Owner chat** — separate, window-first direct messages using the shared Owner inbox and existing delivery service
+- **Owner chat** — separate terminal direct messages, plus optional [ATM Chat](#optional-atm-chat) for phone and desktop browsers
 - **Workspaces** — create tmux sessions with built-in ATM sidebars, or inject sidebars into existing sessions
 - **Layouts** — preset multi-agent arrangements (solo, pair, squad, grid) with one command
 - **Tmux native** — status bar integration, popup picker, vim-style keybindings
 
 Named coordination is not a security sandbox or a guarantee of unattended agent behavior. A delivery receipt means the harness accepted a message reference, not that the model read it or completed the task. The named-agent skills are drafts; keep human review in the loop.
 
-- [Install and setup](#install-and-setup)
+- [Install and setup](#install-and-setup), including [optional ATM Chat](#optional-atm-chat)
 - [Named-agent/project quick start](#named-agentproject-quick-start)
 - [Upgrade](#upgrade)
 - [Dashboard and daemon](#dashboard-and-daemon), including [Work view](#work-view)
@@ -81,6 +81,18 @@ Codex launches through ATM require codex-cli **0.158.0 or later** for `--no-daem
 
 The pi integration forwards `agent_settled` (introduced in **pi 0.80.4**) instead of the earlier `agent_end` for final idle. Use **pi 1.5.2 or later** (1.5.2 tested), as required by [pi-atm](extensions/pi-atm/README.md#forwarded-events). Without `agent_settled`, pi rows can remain Working after every turn. Follow [Upgrade](#upgrade) before refreshing the forwarder.
 
+### Optional ATM Chat
+
+Build the [web client](chat-app/web/README.md) from a source checkout with **Node.js 24.x** and npm, and the [bridge](chat-app/README.md) with Rust 1.88 or later. The bridge links the system OpenSSL, so its build also needs the OpenSSL development files and `pkg-config`. Install the matching `atm` and `atmd` pair first; neither the Cargo install nor the binary archive includes the chat app.
+
+The bridge connects to `atmd` over its Unix socket and listens on loopback. It serves the built web client when started with `--page-dir` naming the client's `dist` directory, or when a `web/dist` directory sits beside its executable; otherwise it serves a placeholder page. Use **Tailscale Serve** for private HTTPS access and configure the owner login and tailnet HTTPS origin as described in the bridge README. Do not use Funnel or run the bridge on a host with untrusted local users.
+
+Files and notifications stay off unless the bridge is started with their flags; run `atm-chat-bridge --help` for the full list:
+
+- `--files-dir <dir>` turns on file uploads, stored in that directory, and downloads from it.
+- `--serve-root <dir>` also lets the app read files under an existing directory, given by its canonical absolute path and separate from the files directory and from other serve roots. It can be repeated and needs `--files-dir`.
+- `--notify-dir <dir>` turns on phone notifications and keeps their state in that directory, which must have mode 0700 and must not be inside a directory the bridge serves. Sending a notification also needs `curl` on the host.
+
 ## Named-agent/project quick start
 
 Run these commands from an ordinary, **unbound owner shell inside tmux**, in the project's main checkout. First complete [harness initialization and setup verification](#verify-harness-setup) in this HOME, including the package/registration check if using pi. Do not proceed just because setup exited successfully. Starting an agent starts that harness and can initiate a model turn; this is not a dry run.
@@ -94,9 +106,10 @@ Run these commands from an ordinary, **unbound owner shell inside tmux**, in the
    +++
    # Worker
    At each new session run the shell command `atm me`, read your role and
-   existing memory, then read the indicated inbox messages. Follow the brief;
-   ask the owner about missing requirements. Acknowledge delivered messages
-   with `atm msg ack <id>` after reading them.
+   existing memory, then run the exact inbox command from the wake. Read its
+   attachments and follow the brief. Use `atm decisions request` for a choice
+   the owner must make. Reply as the inbox suggests, then `atm ack <wake-id>`
+   after handling a Delivered wake.
    ```
 
    The `+++` section is TOML; the rest is the role's instruction body. `harness` can instead be `claude` or `codex`. An omitted manager means reports go to the owner. `skills = [...]` is metadata, not automatic skill loading.
@@ -113,11 +126,11 @@ Run these commands from an ordinary, **unbound owner shell inside tmux**, in the
 3. Put the actual task in `brief.md`, then send a reference from the owner shell:
 
    ```bash
-   atm msg send --to worker --kind brief --body 'Read the attached brief and report the result.' --attach "$PWD/brief.md"
+   atm post --to worker --kind brief --body 'Read the attached brief and report the result.' --attach "$PWD/brief.md"
    atm inbox --for worker
    ```
 
-   Attachment paths are literal references, not uploaded file contents. `queued` is not confirmation: inspect the inbox's delivery status. The agent receives `[mN] Read: atm inbox --id mN`, retrieves the body, and acknowledges only once Delivered. Focused panes, drafts, dialogs and running turns can hold delivery. Use `atm inbox --for owner` for the agent's report.
+   This example has no `lead` seat, so use a direct post; the worker can answer with `atm post --to owner --kind report --body 'DONE: …'`. In a project with a registered `lead` seat, the owner can instead post with `atm post --channel <project> --tag worker --kind brief --body '…'`. A bound seat can omit `--channel` for its own project. Attachment paths are literal references, not uploads. A posted/queued wake is not delivery confirmation: inspect the inbox status. The agent receives `[mN] Read: atm inbox --id mN`, reads it, and acks after handling Delivered. Focused panes, drafts, dialogs and running turns can hold delivery. Use `atm inbox --for owner` for the agent's report.
 
 4. Save context before replacing it, or stop it when finished:
 
@@ -242,6 +255,7 @@ Known reply limit: `-y`/`-n` can wait behind reserved work and do not re-check t
 ```bash
 atm agent up worker                          # start the agent of role "worker" in this project
 atm agent up worker --project-root ../other  # ... in another project
+atm agent up worker --hire d41              # retry with a direct owner hire approval
 atm agent clear worker                      # clear the agent's current context
 atm agent handover worker                   # ask it to save its state, then clear it
 atm agent respawn worker                    # replace its pane and start it again
@@ -250,9 +264,14 @@ atm agent down worker --kill                # stop the agent and kill its pane
 
 `atm agent down <agent>` releases the seat and leaves any existing pane and its program running; `atm agent down <agent> --kill` closes them instead.
 
-For `clear`, `handover`, `respawn`, `down`, `msg send --to` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
+After an `atmd` restart, if same-pane `atm agent adopt` reports that a seat's recorded session is unconfirmed, wait for the seat's next turn or, for Claude Code, resize its pane.
+
+For `clear`, `handover`, `respawn`, `down` and `inbox --for`, a bare name resolves in the caller's bound pane's project, or the current directory's project if unbound; `--project-root` selects a project explicitly, and `project/name` addresses another project's agent directly.
+`atm post --to` takes no `--project-root`; use `project/name` to reach an agent in another project.
 
 `atm agent up <name>` asks `atmd` to start the agent that `.atm/roles/<name>.md` under the project root describes. The project root is the current directory unless `--project-root` is given. `atmd` splits a new pane at 50% without moving your focus, waits there for an idle shell, types one launch line and Enter, and waits for the harness. The line is `cd <the role's cwd> && ATM_AGENT=<project>/<name>`, then the role's `command_prefix`, then the harness command with the role's `spawn_args` and `model`.
+
+If a [department](#departments) enforces hiring in the project, a named caller must be in the new seat's current manager line. An out-of-roster, over-cap or off-list model start from an authorized caller asks you to decide. Answer `atm decide d41 approve` from an unbound owner shell, then have the caller retry with `--hire d41`. A refusal can still register or update the project's root, but does not start the agent or touch tmux.
 
 - **Where the pane goes.** Below the pane you ran the command from. Run from outside tmux, where there is no such pane, it is below the first pane tmux lists that is the active pane of its window. A role can say `pane = "<left|right|above|below>:<agent name>"` to split on that side of another agent of the same project; that agent must have a pane. Any other form of `pane` is refused before any pane or agent record is changed (the project itself is registered first: `.atm/project.toml` is written the first time a project is used).
 - **It does not read `[harness.<name>]` in `config.toml`.** The binary and its default arguments are atm's built-in ones for the role's harness. `atm spawn` reads that table; `atm agent up` does not.
@@ -263,13 +282,13 @@ For `clear`, `handover`, `respawn`, `down`, `msg send --to` and `inbox --for`, a
 - **Prompts it cannot launch into, or launches into too early.** A prompt that redraws itself after it was read, or carries a clock, ends the start as `stuck`: with nothing typed if it changes before the launch line is typed, with the line typed and not run if it changes after. A prompt whose last line is empty, and a pane too small for the launch line once it wraps, end the start as `stuck` too (nothing typed, or the line typed and not run and left at the prompt for you). Startup output that ends without a newline (`Loading...`) can be taken for the prompt: the launch line is then typed after it, before the shell's own prompt, and usually runs when the shell gets to it.
 - **A start has 60 seconds** (the command itself waits up to 85). Once `atmd` knows the start is recorded, any failure, and the deadline, leave the agent `stuck` with the reason `start did not complete: <why>; inspect %N` and one note in your inbox. When the deadline ends it, the command fails with that same reason, not with a bare timeout. `atm agent clear` at its `--timeout-ms` and `atm agent respawn` at its 60 seconds answer the same way: the command fails with the reason the agent is then `stuck` with (`clear did not complete: <why>; inspect %N` for a clear), not with a bare timeout. Two cases end otherwise: if the answer to recording the start is lost, there is no `stuck` and no note, and the agent goes `down` at the next check of its pane; and if `atmd` cannot read its log or write the `stuck` record when the start ends, the agent stays `starting` and takes no further command until `atmd` is restarted. A pane the start created stays for you to look at. If the start failed before its pane was recorded, the agent then goes `down` and its reason keeps that text.
 - **Start dialogs.** `atmd` answers two questions a harness may ask at its start, each key only while the pane still shows that same question and no tmux client is focused on it. A folder trust dialog (Claude Code's, Codex's "Folder access") is accepted only when its folder is exactly one of the role's `trust_dirs` (resolved against the project root); any other folder ends the start as stuck with no key sent. Codex's update offer is skipped with one Escape. Every other question (Codex's "Hooks need review", a startup warning, a permission dialog) is left for you: the start ends as stuck, or waits until its 60 seconds are over.
-- **The start line.** When `atm agent up`, `atm agent respawn` or `atm agent clear` ends with the agent `ready`, `atmd` queues one note from `system` to the agent and types it into the agent's editor as `[mN] New session: run the shell command atm me`, so that the new session finds its role, memory file and messages by itself. The line names a shell command because a model read the shorter form as a request to run a personal skill. This starts a model turn. It is delivered like any message (see [Confirmed messages and inbox](#confirmed-messages-and-inbox)): only into an empty editor of an idle session, never into a draft or the pane you are focused on, and confirmed by the harness's own prompt event; you see it in `atm inbox --for <agent>`, and `atm me` does not list it. Messages to an agent are typed oldest first, so one queued before the start line is typed before it. A second start line is not queued while one to the agent is still waiting. A start or clear that does not end `ready` queues none, and neither does `atm agent adopt`. If the agent goes `down` or `stuck` before its start line is delivered (a respawn records it `down` for a moment, so it can do this too), the line is blocked: you get a `mN blocked: recipient agent is stuck or down` note and your `[notify]` command runs. Delivery resumes when the agent is `ready` again, and `atm msg give-up mN` cancels it. Set `ATM_SPAWN_START_LINE=off` in the environment `atmd` was started in to turn start lines off.
+- **The start line.** When `atm agent up`, `atm agent respawn` or `atm agent clear` ends with the agent `ready`, `atmd` queues one note from `system` to the agent and types it into the agent's editor as `[mN] New session: run the shell command atm me`, so that the new session finds its role, memory file and messages by itself. The line names a shell command because a model read the shorter form as a request to run a personal skill. This starts a model turn. It is delivered like any message (see [Confirmed messages and inbox](#confirmed-messages-and-inbox)): only into an empty editor of an idle session, never into a draft or the pane you are focused on, and confirmed by the harness's own prompt event; you see it in `atm inbox --for <agent>`, and `atm me` does not list it. Messages to an agent are typed oldest first, so one queued before the start line is typed before it. A second start line is not queued while one to the agent is still waiting. A start or clear that does not end `ready` queues none, and neither does `atm agent adopt`. If the agent goes `down` or `stuck` before its start line is delivered (a respawn records it `down` for a moment, so it can do this too), the line is blocked: you get a `mN blocked: recipient agent is stuck or down` note and your `[notify]` command runs. Delivery resumes when the agent is `ready` again, and `atm wake give-up mN` cancels it. Set `ATM_SPAWN_START_LINE=off` in the environment `atmd` was started in to turn start lines off.
 
-- **Start-line width.** ATM refuses to submit a wrapped start-line draft in Claude or pi: no Enter, so no automatic delivery confirmation; if the line was pasted, it stays in the editor for inspection. For `m123`, the text occupies 48 columns: synthetic edge-wrap checks fail below 50 pane columns for Claude (including its two-column prompt) and 48 for pi. Each extra ID digit needs another column. These are matcher checks, not verified real-harness wrapping boundaries.
+- **Start-line width.** For `m123`, the plain line occupies 48 columns; `[m123] Run atm me; read its memory file; resume open work or report and stop.` occupies 77 (70 for the body). Each extra ID digit adds a column. To queue the resume line after a saved handover, ATM needs the reference length plus three columns for editor chrome, and budgets one extra ID digit in case other writes advance the journal (84 pane columns for a six-digit next ID). If the pane is narrower at clear completion or the width is unknown, ATM queues the plain line instead. This is a conservative estimate, not a guarantee of real-harness fit. If a draft wraps anyway (for example, after a resize), ATM still refuses Enter and leaves the draft for inspection.
 
 ### Handing an agent over
 
-`atm agent handover <agent>` does in one command what a clear by hand needs three steps for. `atmd` sends the agent one message that asks it to write what its next session needs to `.atm/memory/<name>.md` in the project's main checkout. It waits until that turn has ended and the file has changed, and then clears the agent as `atm agent clear` does. Instead of the plain start line, the replacement is prompted: `Run atm me; read its memory file; resume open work or report and stop.`
+`atm agent handover <agent>` does in one command what a clear by hand needs three steps for. `atmd` sends the agent one message that asks it to write what its next session needs to `.atm/memory/<name>.md` in the project's main checkout. It waits until that turn has ended and the file has changed, and then clears the agent as `atm agent clear` does. If there is room, the replacement is prompted: `Run atm me; read its memory file; resume open work or report and stop.` Otherwise it gets the plain start line.
 
 ```bash
 atm agent handover worker                      # waits up to 10 minutes for the save, then clears
@@ -278,10 +297,10 @@ atm agent handover worker --format json        # {"agent_id":…,"message_id":"m
 ```
 
 - **Nothing is cleared unless the agent saved.** `atmd` notes the memory file's size and modification time when the command starts, just before it queues the request. Saved means that, once the save turn has ended, the file is there and either differs from that or is new. A change made before the request reaches the agent counts too, for example by an agent that writes its file and asks for its own handover in the same turn. The content is not read. If the save turn ends and the file is as it was, or it has been removed, the command fails with `<agent> ended its save turn and <file> did not change; nothing was cleared`.
-- **The request is an ordinary message** from `system`, typed as `[mN] Read: atm inbox --id mN` under the usual delivery rules: an idle agent, an empty editor, no dialog, and not the pane you are focused on. If it is not delivered within the timeout the command fails and says so. The request stays queued, the next `atm agent handover` of that agent reuses it, and `atm msg give-up mN` cancels it.
+- **The request is an ordinary message** from `system`, typed as `[mN] Read: atm inbox --id mN` under the usual delivery rules: an idle agent, an empty editor, no dialog, and not the pane you are focused on. If it is not delivered within the timeout the command fails and says so. The request stays queued, the next `atm agent handover` of that agent reuses it, and `atm wake give-up mN` cancels it.
 - **If the save turn does not end in time** the command fails with `<agent>'s save turn did not end in <n> s`, and adds `it waits at a dialog in %N` when the agent is waiting for an answer, for example a permission to write the file.
 - **A saved handover waits for a safe editor.** If the first clear preflight sends nothing because the pane is busy, focused, at a dialog or has a draft, `atmd` can check again for up to 20 seconds on the same pane and session. `atm agent list` shows why it is waiting. It never asks for a second save, deletes a draft or repeats a clear that may have sent input. A changed session or lost pane stops it. On failure the command identifies the save and the refusal; inspect `atm agent list` before trying again.
-- **Cleared is not the same as resumed.** The command still answers `cleared` when the clear itself is confirmed. For the outcome note, `atmd` waits up to another 30 seconds for both the new session's binding and a receipt for its exact start line. A success names the save message, old and new session IDs and delivered resume message. If the start line is disabled, held, or unconfirmed, the note says the clear succeeded but resume was not confirmed. It does not resend a prompt or send a second note if the receipt comes late. A receipt proves prompt acceptance, not that the agent read its memory.
+- **Cleared is not the same as resumed.** The command still answers `cleared` when the clear itself is confirmed. When a resume line is queued, `atmd` waits up to another 30 seconds for the new session's binding and an exact receipt. A success names the save message, old and new session IDs and delivered resume message. If the plain line was queued instead for width, the note identifies it as queued, not as a confirmed resume. If the start line is disabled, held, or unconfirmed, the note says the clear succeeded but resume was not confirmed. It does not resend a prompt or send a second note if the receipt comes late. A receipt proves prompt acceptance, not that the agent read its memory.
 - **Who hears the outcome.** After a save, the current role's manager gets one outcome note, falling back to the recorded manager at `agent up`, then to the owner. An explicit `manager = "owner"` wins. Before a save, a waiting command gets its error as an answer; an unclaimed failure goes in a note. From its own pane the command answers `started` at once so the agent can finish its turn, and the daemon carries on. From an agent's shell, whose tools may stop a long command, run a handover in the background.
 - **Only a `ready` agent with a known session** can be handed over, and one handover per agent runs at a time. Anyone may ask, as for messages.
 - **A restart of `atmd` during a handover** loses its in-flight work and its outcome note. The saved request or a clear already started may still have taken effect. Inspect the agent and its inbox before rerunning the command.
@@ -303,7 +322,7 @@ idle_minutes  = 48            # optional: default four fifths of cache_minutes, 
 - **It never does more than the command would.** Nothing is typed while a turn runs, over a draft, at a dialog or into the pane you are focused on: the request waits there as any message does, and after ten minutes the manager is told. Nothing is cleared unless the agent saved. A session that shows background work is left alone, and so is one that has done nothing but start.
 - **One try per session.** Whatever becomes of it, `atmd` asks no second time in that session; the next session has a try of its own. If the start-line turn already ends at or above its line, the note says that this session will not be handed over automatically: neither the context nor the idle rule runs in it, even after later work. A handover that could not start (the agent is not ready, another handover of it runs) sends nothing and does not count.
 - **A session whose cache has run out is not cleared.** With `"idle"` on, a seat idle for longer than `cache_minutes` is left as it is, and gets the note at its line. Clear it with a command.
-- **Limits.** All of it is in memory: after a restart of `atmd` nothing is done until a turn ends, and a handover the restart cut off is lost with its note. A request that was never delivered when the handover gave up stays queued, as for the command: once what held it is gone it is typed, the agent saves, and nothing clears the session. For an idle seat that late turn runs on a cold cache; `atm msg give-up mN` cancels the request. An older `atmd` refuses a role file that has these keys (`agent up` fails and `atm me` reports an invalid role), so remove them before going back to one.
+- **Limits.** All of it is in memory: after a restart of `atmd` nothing is done until a turn ends, and a handover the restart cut off is lost with its note. A request that was never delivered when the handover gave up stays queued, as for the command: once what held it is gone it is typed, the agent saves, and nothing clears the session. For an idle seat that late turn runs on a cold cache; `atm wake give-up mN` cancels the request. An older `atmd` refuses a role file that has these keys (`agent up` fails and `atm me` reports an invalid role), so remove them before going back to one.
   - After a daemon restart, a session with a recorded start line has its first turn end counted as "not worked"; at the line this excludes it from automatic handover for that session.
   - Even with all automatic rules off, every registry session's turn end copies the full organisation state; a Ready seat also reads its role file, and its line note waits for background work to end.
 
@@ -318,14 +337,16 @@ atm me --format json           # the same context as structured data
 
 `atm me` reads the current `.atm/roles/<name>.md` in the project's main checkout on every call. It shows your full agent id and manager, the role's instructions, unread messages (id, kind, sender and first line; the start line that pointed you here is left out), the absolute `.atm/memory/<name>.md` path and whether it exists, and unfinished tasks assigned to you (id, title, kind, state, agent and reason). Read an existing memory file for handover. The caller's pane binding determines identity, not the working directory or `ATM_AGENT`; an unbound caller gets a clear refusal.
 
-Every unread message includes `atm inbox --id mN` to retrieve its full body and attachments. Text adds `After handling a delivered message: atm msg ack <id>` after a nonempty unread list (replace `<id>` with the message id). Fetching context does **not** mark messages read: use `atm msg ack mN` explicitly after reading a Delivered message. Unread summaries include queued and failed messages too, in message sequence order.
+Every unread message includes `atm inbox --id mN` to retrieve its full body and attachments. Text adds `After handling a delivered message: atm ack <id>` after a nonempty unread list. Fetching context does **not** mark messages read: use `atm ack mN` after handling a Delivered wake, using the ID from the inbox line. Unread summaries also include queued and failed wakes, in message sequence order.
 
 The last line is the exact reporting template for your manager, for example:
 
 ```sh
-atm msg send --to project/lead --kind report --body 'DONE: <result>'
+atm post --tag project/lead --kind report --body 'DONE: <result>'
 # Replace the body; optionally add --attach /absolute/path/report.md.
 ```
+
+Use this form in a writable project channel; with no project channel, post directly with `--to <manager>` instead of `--tag`. A thread report can add `--reply` using the post ID from the inbox. `atm task submit` for a durable task already posts its report; don't send a second one.
 
 A missing role file is shown explicitly with `instructions: null` in JSON; the other context remains available and reports go to `owner`. A role with no manager also reports to `owner`. A bare manager name resolves in your project; a full `project/name` reaches another project. An invalid role or manager is refused, never replaced by cached instructions. Unexpected file errors are reported, not treated as missing. Memory is checked but never read or created by this command.
 
@@ -334,7 +355,7 @@ Role files are limited to 256 KiB and the context result to 512 KiB, without sil
 ### Organisation overview (`atm org`)
 
 ```sh
-atm org                         # needs-you summary, projects, seats and open work
+atm org                         # needs-you summary, departments, projects and open work
 atm org --format json            # original daemon reply, including additive fields
 ```
 
@@ -342,11 +363,13 @@ The first line is owner triage: deduplicated attention items, unread owner messa
 
 Each project shows its recorded seats, including down/stuck ones, nested under their managers. A cross-project manager is a reference such as `-> gamma/chief`, not a moved or duplicated seat. Broken lines show their error without hiding other seats. If reporting is unavailable, one note explains why and all seats remain in a flat list. Each seat shows state, harness, context percentage (or `-` when unavailable) and unfinished task IDs; open task summaries and pending/provisional decision counts follow. Open tasks belong to their recorded project, falling back to the current assignee's project then the agent creator's project for legacy tasks; unassigned legacy tasks created by owner/system appear under **Unplaced tasks**. A project can be a non-repository folder; role-only seats that have never registered are not listed.
 
-The view adds no visibility and is the same for named and unnamed callers: only metadata already available through agent/task lists and global owner/decision counts, never private decision titles/context/files or message bodies/attachments. It makes one `org.tree` request, not client-side joins or local role/Git/tmux lookups. The daemon takes one fold snapshot with its `seq`, one live registry read and one role-file pass; they are **not one atomic instant**. `seq` is the fold's replay/commit cursor, not a version of the registry or files. At most 100 attention items and 50 open task summaries per project are listed; `+N more` preserves the totals when those caps are hit. The complete response line, including its envelope, request id and newline, is limited to 512 KiB; an oversized reply is refused, not silently cut off.
+The view is the same for named and unnamed callers: department summaries, metadata already available through agent/task lists, and global owner/decision counts, never private decision titles/context/files or message bodies/attachments. It makes one `org.tree` request, without follow-up requests or local role/Git/tmux lookups. The daemon takes one fold snapshot with its `seq`, one live registry read, one role-file pass, and a fresh department-file pass when configured; they are **not one atomic instant**. `seq` is the fold's replay/commit cursor, not a version of the registry or files. At most 100 attention items and 50 open task summaries per project are listed; `+N more` preserves the totals when those caps are hit. The complete response line, including its envelope, request id and newline, is limited to 512 KiB; an oversized reply is refused, not silently cut off.
 
 The current daemon advertises `org.tree` with a 12-second request budget. Its role pass shares the retained reader lane used for task, decision and inbox manager authority: each recorded role is read once, limited to 256 KiB, with five seconds total for admission and the whole pass. A busy/timed-out reader returns `reporting.state = "unavailable"` with every seat flat (managers null), while preserving tasks, counts and other owner signals; configuration failures mark only affected reporting lines. Infrastructure failures still fail the read. Roles are reread on the next call; no cross-call cache is used.
 
-JSON preserves the daemon's raw reply, including nulls and unknown additive fields (such as future department records); consumers must ignore fields they do not know. Text escapes terminal controls. A daemon that does not advertise `org.tree` refuses with an upgrade/restart diagnostic; there is no local fallback.
+When department files are present, a **Departments** summary appears after owner triage and reporting status, before the detailed project list. A shared project shows its counts in every department that names it; its detailed row still appears once. **No department** lists projects not named by the successfully loaded files. Department read problems are shown there without changing attention or reporting lines. The reader has its own retained slot and a five-second budget in parallel with the rest of the request; a busy or hung read is a department problem, not a failure of the base view.
+
+JSON preserves the daemon's raw reply, including nulls and unknown additive fields; consumers must ignore fields they do not know. `departments` lists each declared project, optional head/goal, roster `{seats,max,live}` rows, hire mode and validation problems. `department_problems` lists file or directory issues. When nothing is loaded and there are no problems, both fields and the text block are absent. Older daemon replies without those fields still render normally. Text escapes terminal controls. A daemon that does not advertise `org.tree` refuses with an upgrade/restart diagnostic; there is no local fallback.
 
 `atm setup` writes **prefix then `O`** (uppercase) to its generated `tmux-bindings.conf`, alongside `C-s` for the sidebar popup. Source that file from your `.tmux.conf` using the path setup prints (by default):
 
@@ -355,6 +378,47 @@ source-file ~/.config/atm/tmux-bindings.conf
 ```
 
 Prefix-O opens `atm org` in a 90%-wide, 90%-high popup. This requires `less`; scroll to read and press `q` to close. The `C-s` sidebar popup is unchanged.
+
+### Departments
+
+Add `$XDG_CONFIG_HOME/atm/departments/<id>.toml` (normally under `~/.config/atm/departments`). The filename stem uses the agent-name grammar. `title` and a nonempty `projects` list of distinct registered project IDs are required. `goal` and `head` are optional; a head can be any `project/name` in a registered project, not necessarily a project the department lists. A department does not change the project's identity or who reports to whom.
+
+```toml
+# tools.toml
+title = "Tools"
+projects = ["tools-project"]
+```
+
+Add a `roster` before any TOML tables. Each item is a seat string or a table with `seats` and an optional positive `max` (live seats at once):
+
+```toml
+roster = ["tools-project/lead", { seats = "tools-project/build-*", max = 4 }]
+```
+
+The equivalent long form is:
+
+```toml
+[[roster]]
+seats = "tools-project/lead"
+
+[[roster]]
+seats = "tools-project/build-*"
+max = 4
+```
+
+`build-*` matches `build-1` and `build-12` but not `build-`, `build-x` or `build-hard-1`: the final `*` stands for one or more ASCII digits. `live` counts matching recorded seats that are not Down, including Starting. Optional `[hire] mode` is `"report"` (default) or `"enforce"`.
+
+- **Report:** `atm org` lists `Would wait` for each report department's live seats that miss its roster, exceed its cap or have an off-list model. It uses the current role from the existing reporting-line pass, or the role snapshot saved at `up` if no current role is available. With neither (for example, an adopted seat without a role file), only the roster is checked. The JSON field is `would_wait: [{seat, reason}]`. Each department is evaluated on its own; a seat already in an exactly full roster does not need a second slot. The report does not judge who may start it.
+- **Enforce:** Only `atm agent up` from a bound named seat is checked, and only in a project named by an enforcing department. The caller must first be the new seat's manager or above it in the current reporting line. Any one enforcing department with roster room **and** an allowed model is enough; passing one rule in each of two departments is not. An unbound owner start counts as your approval and bypasses the check.
+- **Hire decisions:** A roster or model miss after the manager check raises one `Hire <project>/<name>` decision (kind `hire`) with the role file and the reasons. Sequential retries name the same pending decision, even from different authorized callers. The refusal gives the current reasons; the card keeps its original context. If its role attachment no longer matches, have the pending decision withdrawn before asking again. Only a matching decision resolved directly by the owner with `approve` works, not a provisional or relayed answer. One `--hire` approval covers both rules and is reusable for that seat ID and exact role path even if the model changes, still subject to current manager authority and ordinary start checks. Move the role path and it needs a fresh approval.
+- **Read failures:** If the department directory is unreadable or incomplete and no loaded enforce rule covers the project, named starts follow the old path with a warning in the daemon log and on success (`stderr` in text, `warning` in JSON). This can allow starts an unread rule would have stopped. Known enforcing departments still apply even when another file is broken; if the manager line cannot be verified, the start is refused. A missing directory preserves the old behavior without a warning.
+- **Known limits:** This is a soft headcount check, not a hard quota or socket authentication. Two simultaneous checked starts can both see the last slot, and two simultaneous misses can raise duplicate pending cards. `adopt`, `respawn`, `clear`, `handover`, `down`, owner starts and unnamed `atm spawn` do not go through hiring.
+
+Under optional `[spend]`, `models` checks the role's declared model at `up`, not later model changes inside the harness. Patterns are case-sensitive exact strings, or a prefix followed by `*` for any suffix (including none). A role with no `model` matches as the literal `(default)`. Omit `models` to allow any model; `models = []` allows none.
+
+Under `[spend]`, `task_budget = { turns = 100, cost = { microdollars = 500000 } }` supplies a [default task budget](#task-budgets) for the department's projects in either hire mode. Set either limit or both, but not `deadline`.
+
+Unknown keys are refused at every level. Problems name the file and the TOML line when available, or the relevant key for a semantic problem. One bad file does not hide the other files. Only regular `.toml` files up to 16 KiB are read (no file symlinks); the scan examines up to 256 directory entries and reads at most the first 32 `.toml` candidates by filename. A scan beyond 256 entries reports a problem instead of returning an arbitrary partial listing.
 
 ### Sending text
 
@@ -365,32 +429,44 @@ ESC, NUL and DEL). These refusals send nothing. Newlines remain allowed unless
 bracketed paste is explicitly off; the existing copy-mode and dialog checks also
 apply.
 
+When ATM recognizes an open feedback survey, `atm send` refuses choice-forming
+text or Enter on a staged choice and, if bracketed paste is off or unknown,
+also refuses text with tabs or line breaks or starting with a survey choice;
+`atm reply` refuses Enter on a staged choice or `-o N` that would move. The RPC
+returns `refused` (CLI exit 1) and sends nothing; answer or dismiss the survey
+in the pane and retry (`atm reply -n` still sends Escape and `atm interrupt` is
+unaffected).
+
 ## Confirmed messages and inbox
 
-The message CLI is distinct from the immediate `atm send` command. It calls the daemon's `msg.*` service, with no direct-tmux fallback. `atmd` starts the runtime at startup using the configured delivery policy or its defaults.
+A **post** is the content in a channel; a **wake** is delivery to one recipient. One post may create several wakes with their own IDs. These commands use the daemon, with no raw-tmux fallback. `atm send` is pane input and `atm reply` answers an editor dialog; neither writes a channel post.
 
 ```sh
-atm msg send --to worker --kind brief --body 'Read the attached brief' --attach /absolute/path/brief.md --task task-1
-atm msg send --to owner --kind report --body 'Tests passed'
-atm inbox                             # your inbox; does not mark anything read
-atm inbox --for worker --unread --limit 100
-atm inbox --for owner --unread --limit 100
-atm inbox --id m123 --format json      # full original body, including newlines
-atm inbox --after m123 --limit 100      # explicit pagination; follow next_after
-atm msg ack m123 m124                  # only your delivered messages
-atm msg retry m123 --accept-duplicate-risk
-atm msg give-up m123
+# From a named seat, omit the target to post in its own project:
+atm post --tag project/worker --kind brief --body 'Read the attached brief' --attach /absolute/path/brief.md --task task-1
+atm channels --all                    # lists channel IDs and whether you can post
+atm history project --thread m120     # read a thread; does not acknowledge it
+atm inbox --id m123                    # read the wake's post context, body and attachments
+atm post --reply m120 --body 'The checks passed'  # if the inbox offers a thread reply
+atm ack m123                          # after handling the Delivered wake
+# Owner-only delivery recovery, by wake ID:
+atm wake retry m123 --accept-duplicate-risk
+atm wake give-up m123
 ```
 
-Except for JSON-only `msg history`, these commands accept `--format text|json` (default `text`). Send requires `--to` and `--body`; optional flags are `--kind`, repeatable `--attach`, `--task`, and `--project-root`. Kinds are `note` (default), `brief`, `report`, `question`, `answer`, and `review`. Inbox accepts `--for`, `--project-root`, `--unread`, `--id`, `--after`, and `--limit`; `--id` and `--after` are mutually exclusive. IDs use canonical `mN` form.
+`atm post` requires `--body`, and accepts one target (`--channel <project>`, `--to <address>`, or `--reply <id>`). An unbound caller must specify a target. An unresolved strict `--tag` refuses the post; use a name without `@`, repeat the flag for several recipients, and use full addresses across projects. A valid tag on a down seat can still queue a wake; inspect the result's `unavailable` diagnostics. Inline mentions are lenient. A direct `--to` wakes its recipient. A reply accepts a post or wake ID; follow a direct `--to <author>` inbox hint instead when offered. `--kind` is `note` (default), `brief`, `report`, `question`, `answer`, or `review`. `--attach` repeats; `--task` correlates but does not create a task. `atm decisions request` is still the way to ask for a durable owner decision.
 
-- Targets are `owner`, a full `project/name` address, or an exact bare agent name. Full addresses bypass name lookup. Bare names use `--project-root` if supplied (relative paths become absolute); otherwise they use the uniquely bound, non-Down caller pane's project, or the absolute current directory if unbound. Unknown/ambiguous names or caller bindings fail rather than guessing across projects. `system` is not a recipient or inbox.
-- If a Ready agent records a real session id but its pane has a non-excluded top-level `pending-<pid>` row and no matching recorded real session, `msg send` refuses with **message not queued** before creating a message or typing anything. A pending row means process discovery has not learned the harness's session identity; it does not mean the harness is busy. Inspect `atm list` and `atm agent list` before retrying. A genuine harness event can restore the identity. Pi-atm also retries its connection without another pi event and, after queued frames drain, can send one measured-idle identity snapshot per connection. This needs known idle, no pending messages, a real session id and no pending interactive input or open native/select dialog; it is not a heartbeat or a replay guarantee. Inspect the pane before deciding whether to start a fresh session. This refusal does not cancel older queued messages; Ready agents without a recorded session (lazy first prompts) and other lifecycle states keep ordinary queue policy. A successful `queued` result still is not delivery confirmation.
+Use `--format json` on a post to see `post_id` and `woke[].message_id` separately. A queued wake is not delivery. Use `atm inbox` for your wakes (`--unread`, `--after` and `--limit` for pages; `--for` and `--project-root` for authorized diagnostics; `--id` conflicts with `--after`). Like `atm post`, `atm channels`, `atm history`, `atm ack`, and the wake recovery commands, inbox accepts `--format text|json` (default `text`). IDs use canonical `mN` form.
+
+**Compatibility:** Old seats can read the same wake reference and still use `atm msg send` and `atm msg ack`. Old answers are direct messages, not native thread replies. An older CLI uses the legacy `atm msg retry`/`atm msg give-up` spellings; the newer CLI can use the final `atm wake` commands against a daemon that advertises only the matching old methods. Legacy `msg.history` and terminal chat remain available.
+
+- Targets are `owner`, a full `project/name` address, or an exact bare agent name. Full addresses bypass name lookup. Bare names for `post --to` resolve in the uniquely bound, non-Down caller pane's project, or the absolute current directory if unbound. `inbox --for` also takes `--project-root` (relative paths become absolute). Unknown/ambiguous names or caller bindings fail rather than guessing across projects. `system` is not a recipient or inbox.
+- If a Ready agent records a real session id but its pane has a non-excluded top-level `pending-<pid>` row and no matching recorded real session, the daemon refuses an addressed post before committing or typing anything. A pending row means process discovery has not learned the harness's session identity; it does not mean the harness is busy. Inspect `atm list` and `atm agent list` before retrying. A genuine harness event can restore the identity. Pi-atm also retries its connection without another pi event and, after queued frames drain, can send one measured-idle identity snapshot per connection. This needs known idle, no pending messages, a real session id and no pending interactive input or open native/select dialog; it is not a heartbeat or a replay guarantee. Inspect the pane before deciding whether to start a fresh session. This refusal does not cancel older queued messages; Ready agents without a recorded session (lazy first prompts) and other lifecycle states keep ordinary queue policy. A successful post result still is not delivery confirmation.
 - Sender attribution comes from the caller's pane binding; an unbound caller is Owner. There is no `--from` or send-now bypass. Owner can inspect agent inboxes; agents receive full content only for their own inbox and delivery metadata for their verified reporting descendants. System notices and Owner-only resolution rely on local socket/client-supplied pane attribution, **not authentication against hostile local clients**.
 - Body limit: 16 KiB of UTF-8 bytes, with no trimming. An empty body needs at least one attachment. At most 32 attachments, each a nonempty literal path of at most 4096 bytes; task IDs are at most 256 bytes. Prefer absolute attachment paths across worktrees. Neither CLI nor daemon uploads/reads attached files, checks their existence, or automatically reads stdin. Quote multiline shell arguments to preserve blank lines and Unicode.
 - Every agent delivery uses the one-line reference defined by `message_delivery::inbox_reference`: for `m123`, `[m123] Read: atm inbox --id m123`, with no trailing newline. The one exception is the daemon's start line (see [Starting a named agent](#starting-a-named-agent)), typed as its own text, `[m123] New session: run the shell command atm me`. The body, task and attachments stay intact in the inbox. **Delivered means the harness accepted the retrieval reference**, not that it read the body or did the work. Owner messages are delivered directly to the inbox without terminal input.
 - Owner/self inbox reads include full bodies, metadata, durable status and projected hold/retry/predecessor fields. Text shows a `delivery: <phase>` line with pane, attempt, blocking predecessor (`blocked_by`), retry time (`retry_at`) and reason only when present; JSON retains the complete delivery diagnostics. Text indents every body line by two spaces under its entry, preserving body backslashes, line breaks and tabs and escaping other control characters. Prefer `--id` for individual reads; `--format json` is the exact form, preserving original content, nulls and additive daemon fields (DEL/C1 are JSON Unicode escapes). Limit is 1–1000 (default 100), even with `--id`; pages are bounded to 512 KiB without truncating bodies. An oversized legacy entry is refused with its ID. `next_after` indicates more matching messages. Unread counts cover all statuses, independent of page/filter.
-- Fetching never acknowledges reading. Explicit `atm msg ack` takes 1–1000 distinct IDs from your inbox; the whole batch must exist and be Delivered. A wrong recipient or undelivered entry refuses the whole batch. Already-read IDs are idempotent; output counts only newly marked messages. If fetch precedes the delivery receipt, wait for Delivered before acknowledging, not by sending again.
+- Fetching never acknowledges reading. `atm ack` takes 1–1000 distinct IDs; a post ID resolves to your own wake. A missing ID or wrong recipient refuses the batch. Already-read IDs add nothing to the count. For ordinary handling, ack only after Delivered: marking an open wake read cancels automatic delivery, not input already sent.
 - Retry is Owner-only for a latched/held delivery and **keeps the same ID and increasing attempt count**. Inspect the pane first: retry can duplicate delivery, hence the required `--accept-duplicate-risk`. It does not reset the attempt limit or bypass safety guards. After another restart an unconfirmed attempted message is held again. Give-up is allowed for held Queued/Delivering messages, not just one Blocked reason; repeating it on Failed is idempotent. A late receipt can still change a given-up message to Delivered, and cancels a pending same-ID retry. Already Delivered messages cannot be retried or given up.
 - **Give-up does not clear the editor.** Its successful reply names the source's canonical inbox reference (or start line) as a **possible** leftover: text adds a `warning:` line, and JSON adds `editor_warning`. This advisory also appears for never-attempted messages and repeated give-up; it is not a fresh observation, proof of ATM authorship or proof that the reference was never submitted. Older daemon replies may omit it. Inspect the pane before editing it: releasing the message's FIFO hold does not empty an editor, so a follower can remain draft-blocked. A token-only “Enter was not sent” diagnostic likewise does not prove staging in the active editor. Give-up sends no editor input, and a late receipt still confirms delivery.
 - **Lifetime delivery notices:** owner notices deduplicate by source message and semantic reason for that message's lifetime, across retry and daemon restart. Focus notices stay in the inbox without external notification. Recognized final-failure notices can be reconstructed; a transient observation that vanished before its first notice committed cannot be recovered after a crash.
@@ -476,6 +552,10 @@ room, picker or decision action in this slice.
 
 ### Message history and search
 
+For channel history use `atm channels` and `atm history <channel>` (add
+`--thread <id>` for a thread; `--before`, `--after` or `--limit` for paging).
+The legacy JSON message-row search below remains available for delivery diagnostics.
+
 ```sh
 atm msg history --agent alpha/worker --correspondent beta/lead --text 'review'
 atm msg history --agent alpha/worker --limit 100 --cursor '<next_cursor>'
@@ -515,6 +595,8 @@ Durations must be positive and fit the policy's checked timestamp arithmetic; re
 
 A task's optional `budget` on `task.create` accepts exact cost (`{"microdollars":1000000}`), turns and an RFC3339 UTC deadline. Cost and turns cross strictly **above** their limits; a deadline is due **at** its timestamp. Unavailable usage is unknown, not zero. A past deadline is valid; a newly requested negative cost is refused.
 
+When `budget` is omitted or `null`, a new task takes the smallest present turns limit and the smallest present cost limit from the departments that list its admitted project. Both hire modes count, and the two limits may come from different departments. An explicit budget, even `{}`, wins as a whole. Defaults have no deadline. The effective budget is recorded on creation and shown by `task.get`; later edits to department files do not change it. An incomplete department scan creates the admitted task without a default and warns. A missing directory, an unplaced task, or no applicable limits is silent.
+
 A crossed limit sends the creator one ordinary system note **per task**, across all its limits and state changes. A system-created task notifies the owner. The committed message is the latch even when queued, read or failed, so restarts do not create duplicate notes. `task.get` includes `budget_status` with current crossed limits and the notification id. Deadlines include open, waiting and review time; accepted/cancelled tasks are evaluated through their completion time, not a later restart time. **Nothing is stopped, cancelled or blocked.** Notifications need a valid delivery configuration; after fixing it and restarting, budget checks catch up. With valid delivery, `[reminder] enabled=false` disables reminders only, never budget deadlines.
 
 ## Task usage
@@ -539,6 +621,8 @@ atm report --since 2026-01-01T00:00:00Z -f json
 
 Text gives whole-scope totals, per-project counts/decisions/trends, then the returned task rows. JSON preserves the daemon's entire reply, including additive fields. The default task page is 100; `next_after` explicitly marks more rows, while project blocks always cover the full scope. The read-only `org.report` parameters are `project_id`, `since`, `until`, `bucket` (default 5), `after` and `limit` (default 100); unknown keys are refused. Bucket and limit are 1–1000, a cursor must name a canonical existing task, and a complete reply exceeding 512 KiB is refused, never cut to fit.
 
+When [departments](#departments) are configured, the report shows `Title (id)` cost lines after the project rows. Each line sums only the listed projects' visible rows for the whole report scope, not the task page. A project listed by two departments counts in both; these lines are not a partition, so there is no department total. JSON includes `departments` rows with `id`, `title`, `cost` and `cost_unknown_tasks`. With no known amount, `cost` is `null`, not measured zero. Text shows `no costed tasks in view` for a null cost with zero unknown tasks, and `unknown` with a count when tasks have unknown cost. A missing directory is silent; a scan problem leaves any loaded lines in place and adds one warning (`warning` in JSON).
+
 Turns, state seconds, review rounds, rework, peak context and exact microdollar cost come from the **same ledger as task.get**, including accepted frozen records. Cost is a **lower bound**: the first session observation is a baseline, and spend while an agent held no task or several belongs to none. `null` is unknown, never zero. Known cost is labelled **harness-reported**, with contributing session harness/model facts when summaries exist; no price is estimated. Context at submission is the last valid observation before the **first result** submission, not the latest resubmission. A turn counts an observed parent prompt regardless of whether it was typed or delivered; subagent prompts do not count.
 
 Owner step-ins count verdicts (not automatic review closure), redirects (assignment/state/review/attachment, except first assignment of an owner-created task), decision answers, untagged messages to a seat holding exactly one unfinished task, and redo. A task's answer links use `rests_on` or its requester's unique unfinished task when the request was recorded. **Project decision counts instead use requester visibility and request time in [since, until), including unlinked decisions**, before task paging; owner/system requesters are unplaced. Designed owner verdicts can be distinguished using each JSON row's measure. Tagged owner messages are excluded because generated task notices cannot yet be distinguished from hand-written ones; pane typing/raw sends are not measured. Recorded `redo_tasks` increments each affected row's `redone` and redo step-in once per overrule; project `tasks_redone` counts those invalidations by visible requester, not accepted-again completions. Unannotated legacy overrules add no recorded redo. An overrule matching both answer and redo increments both kind counters but only once in the step-in total.
@@ -552,6 +636,8 @@ The reporting-line read policy is owner (an unbound caller) versus a named reade
 ## Tasks
 
 `atm task` calls the daemon's nine `task.*` methods, with one request per command and no direct-tmux fallback or automatic retry. Tasks persist in the organisation event log across daemon restarts. A task id is `t` plus its creation event sequence (`t41`, not `t041`); use the id printed by `create` in the examples below.
+
+If `create` applies a department default, it prints `budget default from: turns=tools, cost=apps` (only supplied fields). Ties use the first department ID alphabetically. JSON adds `default_budget_from` with those field-to-department mappings. An incomplete scan shows a warning on stderr in text mode, or `warning` in the JSON reply. Both fields are absent when there is nothing to report.
 
 From the creator's shell:
 
@@ -739,7 +825,7 @@ atm decisions request --kind plan --title 'Approve this plan' \
 atm decisions withdraw d41 --reason 'Superseded'
 ```
 
-`--kind` and `--title` are required; repeat `--option` for 2–32 distinct options. Both `--may-be-undone true|false` and `--changes-intent true|false` are required valued flags, with **no assumed safety facts**. The daemon derives the class and applies the existing [away policy](#away). Context defaults to empty, attachments to an empty list, and recommendation/deadline to null. Repeat `--attach` for literal paths: nothing is read, uploaded or canonicalized; use absolute paths across worktrees. Optional `--deadline` takes a future RFC3339 timestamp (offsets normalize to UTC); the daemon checks its time, and storing it does not start an expiry timer. No requester/by/from override is supported.
+`--kind` and `--title` are required; repeat `--option` for 2–32 distinct options. Both `--may-be-undone true|false` and `--changes-intent true|false` are required valued flags, with **no assumed safety facts**. The daemon derives the class and applies the existing [away policy](#away). Context defaults to empty, attachments to an empty list, and recommendation/deadline to null. Repeat `--attach` for literal paths: nothing is read, uploaded or canonicalized; use absolute paths across worktrees. Optional `--deadline` takes a future RFC3339 timestamp (offsets normalize to UTC); the daemon checks its time. A decision still pending once its deadline has passed expires: it is closed, and the agent that asked is told to ask again. No requester/by/from override is supported.
 
 Request text output is `d41 requested`, a receipt of creation, **not** approval, a Pending-state guarantee, or notification delivery. Away handling may already have taken it provisionally. Withdrawal is allowed only for a **Pending** decision, by its requester or the owner; provisional/final decisions cannot be withdrawn. Repeating an authorized withdrawal reports `(unchanged)` and preserves the original withdrawal facts, even if a different reason is supplied.
 
@@ -760,9 +846,9 @@ A timeout, disconnect, invalid result or output-write failure is **not rollback*
 
 An agent pane sees its own requests and those of its direct or transitive reporting descendants; an unbound owner caller sees all. Verified managers can list/get complete decision entries, including context, files and answers, but cannot resolve or withdraw a report's request. Current role files determine the reporting line across registered projects, including adopted seats and non-repository project folders; the entire reached chain must validate to owner before a grant. A broken requester chain contributes no manager-visible rows to a list without hiding own or other valid rows; a direct get refuses with the broken agent ID, never role text. Reader infrastructure failures fail the read rather than returning partial counts. Owner reads, own get and global count-only reads bypass role lookup. Pending and provisional decisions remain on the default list, with separate `pending_count` and `provisional_count` totals. Counts cover the union of authorized requesters, not just the page or status filter. `atm status` independently asks for the global **Pending-only** count, even from an agent pane: nonzero adds `N decisions`, zero adds nothing, and missing/unavailable/bad aggregate data adds `? decisions` plus a diagnostic without hiding session or unread counts. A provisional decision is not counted as pending; it remains in `atm decisions`.
 
-Only the owner records a final resolution. A pane bound to an agent is refused for final resolution; the [designated relay](#spoken-answer-relay) can only record a provisional spoken answer. An unbound pane (or absent pane) counts as owner, just as for messages. This is **attribution, not authentication**: clients supply their pane, and processes running as the owner can claim an unbound one. Resolved/overruled log bodies retain the optional caller pane for report attribution; exact-repeat comparisons ignore that audit metadata. A missing historical caller is reported as not recorded.
+The owner records final answers; the [designated relay](#spoken-answer-relay) may also confirm an existing provisional option in the owner's words. Only the owner may overrule a still-provisional choice. For an ordinary owner answer, an unbound pane (or absent pane) counts as owner, just as for messages. This is **attribution, not authentication**: clients supply their pane, and processes running as the owner can claim an unbound one. Resolved/overruled log bodies retain the optional caller pane for report attribution; exact-repeat comparisons ignore that audit metadata. A missing historical caller is reported as not recorded.
 
-The exact same answer (option, note and rule mark) again is an accepted decision no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. One atomic event reopens and unassigns its recorded, previously assigned, noncancelled dependent tasks, including accepted work and inherited child/review links. It clears the current submission/review/cost, retaining files, links, budgets and cumulative usage history. Unknown live task states refuse the overrule. No file, Git change, deployment or model turn is undone, and nothing is reassigned automatically. Read the new answer before deliberately assigning work again: stale submissions/verdicts fail while it is open, but after reassignment there is no attempt token to distinguish an old submission. `atm decide` prints the complete redo list and accepted-again progress; an exact repeat reports the existing redo without resetting work again. A stored deadline does not run an expiry timer. What happens to a decision while you are away is described under [Away](#away).
+The exact same answer (option, note and rule mark) again is an accepted decision no-op. A changed answer after a final resolution is refused, including adding a note or `--rule` afterwards. A different answer to a provisional choice is recorded as `overruled`. One atomic event reopens and unassigns its recorded, previously assigned, noncancelled dependent tasks, including accepted work and inherited child/review links. It clears the current submission/review/cost, retaining files, links, budgets and cumulative usage history. Unknown live task states refuse the overrule. No file, Git change, deployment or model turn is undone, and nothing is reassigned automatically. Read the new answer before deliberately assigning work again: stale submissions/verdicts fail while it is open, but after reassignment there is no attempt token to distinguish an old submission. `atm decide` prints the complete redo list and accepted-again progress; an exact repeat reports the existing redo without resetting work again. A decision still pending once its stored deadline has passed expires and is closed; a daemon that was down expires overdue decisions when it next starts. What happens to a decision while you are away is described under [Away](#away).
 
 ### Spoken-answer relay
 
@@ -784,7 +870,9 @@ atm decide d41 yes --relay
 
 A new relay requires a Pending, reversible decision: action/hire/budget and irreversible decisions still wait for your own answer. It can name any exact listed option, without a note or `--rule`, whether you are present or away. The record is `taken_provisionally`, with `by=owner` and a separate `relayed_by` seat: **not confirmed by you**. Repeating an already-provisional option is a no-op preserving its original taker/provenance; a relay cannot replace it with a different option.
 
-From the unbound owner shell, choose one of these alternatives:
+The designated relay can run `atm decide d41 yes 'Yes sounds good' --relay --confirm` on that same provisional option, quoting your exact nonblank words without `--rule`; this is final, just like your own answer.
+
+While the decision is still provisional, from the unbound owner shell choose one of these alternatives:
 
 ```sh
 atm decide d41 yes  # confirm the recorded option
@@ -827,10 +915,10 @@ After the normal 1.1 connect handshake, a named agent can send this request enve
 | `decision.request` | Required `kind`, `title`, `options`, `may_be_undone`, `changes_intent`; optional `context=""`, `files=[]`, `recommended=null`, `deadline=null` | `{"decision_id":"d41"}` |
 | `decision.list` | Optional `statuses=null` (pending + provisional), `after=null`, `limit=100` (1–1000), `count_only=false` | `decisions`, `pending_count`, `provisional_count`, `next_after` |
 | `decision.get` | `id`; optional owner-only `redo_after=null`, `redo_limit=100` (1–1000) | `{"decision":<entry>}`, optional owner-only `redo` |
-| `decision.resolve` | `id`, `option`; optional `note=null`, `standing_rule=false`, `relay=false` | `{"decision":<entry>,"changed":true}`, optional `redo` |
+| `decision.resolve` | `id`, `option`; optional `note=null`, `standing_rule=false`, `relay=false`, `confirm=false` | `{"decision":<entry>,"changed":true}`, optional `redo` |
 | `decision.withdraw` | `id`; optional `reason=null`; requester or owner only | Same mutation result |
 
-For a [relay](#spoken-answer-relay), params contain only `id`, `option` and `relay:true`; `note` and `standing_rule` keys are forbidden even when null/false. The daemon derives the designated bound recorder, never a caller-supplied identity.
+For a plain [relay](#spoken-answer-relay), send only `id`, `option` and `relay:true`; `note` and `standing_rule` keys are forbidden even when null/false. For a relay confirmation send `relay:true`, `confirm:true` and the owner's words in `note`; `standing_rule:true` is refused. The daemon derives the designated bound recorder, never a caller-supplied identity.
 
 An entry reuses the decision's `id`, `request`, timestamps, `status`, provisional/resolution/withdrawal facts, and derived `class`. Status is authoritative; historical logs may retain an earlier fact under another status. Optional facts are null. `count_only=true` returns empty rows/null cursor and global owner counts to any caller; it excludes `after` and explicit `statuses`. Pages/get are bounded to 512 KiB without truncating facts; an oversized first row is refused. Continue with `next_after` while preserving your filters. There is no project filter for a system request with no structured project.
 
@@ -865,6 +953,8 @@ atm back
 | Its kind is `action`, `hire` or `budget`, whatever else it says | Waits for you |
 | It names no recommended option | Waits for you |
 
+[Department hire decisions](#departments) have no deadline or recommended option and are never approved automatically. They require your direct `approve` answer before a named caller can use the decision as a roster or model exception.
+
 The two fields that give a decision its class are filled in by the agent that asks, so the kinds that reach outside wait whatever they claim. Both recorded outcomes are the existing `taken_provisionally` state: they stay in `atm decisions`, and `atm decide` with the same option confirms one (`resolved`) and with another overrules it (`overruled`). `atm back` takes nothing back and answers nothing: it ends the absence and prints a complete ranked return digest, with recorded work an overrule would invalidate and what still waits.
 
 The requester is told through the confirmed-message runtime, like an answer: one `system` message when its decision is taken provisionally, is its own to decide, or waits because you are away. `decision.request` itself answers as before. Your `[notify]` command still runs for a new pending decision.
@@ -881,7 +971,7 @@ stacking_cap = 1
 
 No file means 1. The daemon reads the file of every registered project when you run `atm away`, records the caps with the switch, and prints them; a change takes effect at the next `atm away`. A value below 1, an unknown key or a file that is not TOML refuses `atm away` with the file's path, and you stay present. A decision's project is that of the agent that asked.
 
-Only the owner sets the switch: as for `atm decide`, a pane bound to an agent is refused and an unbound pane counts as you. This is attribution, not authentication. The switch is in the org event log (`owner.away`, `owner.back`), so it survives a daemon restart; after one, the daemon handles whatever was left pending. Repeating away does not change the switch. Repeating back creates a fresh audited report for the last closed absence, updating work and numbers without another `owner.back`; before any absence it says so. Every report records `owner.digest_created`. Absence membership uses committed sequence boundaries, not wall-clock comparisons. Back and report creation are separate commits: retry back after an interrupted preparation; if another away intervenes, the error tells you to run back again. `--format json` prints one complete assembled result, preserving future fields. While you are away `atm status` ends with `away`, so a forgotten `atm back` shows in your status line; the mark comes with the decision count (`decision.list` adds `"away": true` to its result, and only then), so it is absent when that count cannot be read.
+Only the owner sets the switch: as for `atm decide` without relay flags, a pane bound to an agent is refused and an unbound pane counts as you. This is attribution, not authentication. The switch is in the org event log (`owner.away`, `owner.back`), so it survives a daemon restart; after one, the daemon handles whatever was left pending. Repeating away does not change the switch. Repeating back creates a fresh audited report for the last closed absence, updating work and numbers without another `owner.back`; before any absence it says so. Every report records `owner.digest_created`. Absence membership uses committed sequence boundaries, not wall-clock comparisons. Back and report creation are separate commits: retry back after an interrupted preparation; if another away intervenes, the error tells you to run back again. `--format json` prints one complete assembled result, preserving future fields. While you are away `atm status` ends with `away`, so a forgotten `atm back` shows in your status line; the mark comes with the decision count (`decision.list` adds `"away": true` to its result, and only then), so it is absent when that count cannot be read.
 
 | Method | Params | Result |
 |---|---|---|
@@ -1088,6 +1178,19 @@ The owner-run source-checkout tool `scripts/atm-supervise` records stable/previo
 One automatic rollback is conditional on **unhealthy two-way probation**, both diagnostic logs retained, unchanged verified slots/pairs and rollout's own quiet checks. Unhealthy ONE-WAY probation, uncertain final health, refused recovery or missing evidence remains **NEEDS YOU**; there is no automatic retry, resume or slot reconciliation. Pair rollback still does not rewind organisation state, and candidate credential sharing remains routing isolation, not a sandbox. See the [supervisor procedure](scripts/atm-promotion.md#supervisor) and [known limits/manual recovery](scripts/atm-promotion.md#known-limits-and-the-manual-way-out); inspect retained evidence before intervention.
 
 ## Changelog
+
+### 0.6.0
+
+- **ATM Chat:** the installable phone and desktop web app runs over a private tailnet. Read project channels, threads and direct conversations, see agent activity and open decisions, and keep drafts and available history across reconnects.
+- **Chat messages:** grouped, formatted messages, mention picking with wake outcomes, and an **Also send to chat** option for project thread replies. Edit or remove your own posts and toggle reactions.
+- **Chat files:** send files and phone photos online, open agent reports and screenshots from configured read-only roots, and preview Markdown attachments.
+- **Notifications and outbox:** with the bridge started with `--notify-dir`, opt in to phone notifications under **You → Settings**. They work only where the browser's push service is Google's FCM (Chrome on Android): the bridge refuses a subscription on any other push endpoint. Text sends queue locally and retry when the app is open and reconnected; files and photos still require an online send and manual retry.
+- **Channel CLI:** `atm channels` lists conversations and `atm history` reads channels and threads. Use `atm post` to write, edit or remove a post, `atm react` to react, `atm ack` to acknowledge a wake by post or wake ID, and `atm wake` to retry or give up a held wake.
+- **Organisation:** the owner’s Leads list includes project leads before their first direct message. `atm org` shows department rosters and would-wait reasons. Department rules can limit starts by roster or model, accept a direct owner hire approval via `atm agent up --hire`, and supply task budget defaults. `atm report` shows recorded costs by department.
+- **Decisions and task notices:** decision questions and steps can appear in channel threads, and the chat app can answer, overrule or withdraw decisions where permitted. A pending decision now expires once its deadline has passed: it is closed and the agent that asked is told to ask again. Decisions already overdue expire when 0.6.0 first starts. Automatic task updates can appear as channel posts with inbox wakes.
+- **Delivery recovery:** after a daemon restart, a matching discovery process can stand for its bound session before the next harness event. Readiness waits give more specific reasons, and on supported Claude screens ATM can take back its own exact unsent reference after a final failure without touching other drafts.
+- **Claude Code screens:** recognise more captured layouts from 2.1.327 through 2.1.330, including monitor footers, update notices, away recaps and shortened `/clear` hints. ATM can read the editor under the supported background-agent list without treating the list as permission to deliver.
+- **Feedback surveys:** on the supported idle Claude survey layout, ATM can submit a bracketed inbox reference without selecting a response. `atm send` and `atm reply` refuse input that could select a response on a recognised survey.
 
 ### 0.5.2
 

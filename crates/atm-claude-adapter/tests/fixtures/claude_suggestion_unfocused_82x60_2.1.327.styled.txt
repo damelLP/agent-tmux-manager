@@ -1,0 +1,61 @@
+Captured: claude 2.1.327, 2026-11-20, sealed rig (private user+net namespace, canned Messages API), tmux 3.8 capture-pane -p -e -N; 82x60, the pane not focused (tmux focus-events on, another window active); rig root path replaced.
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.327[39m          
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mSonnet 5.5 · API Usage Billing
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/srv/fixture-rig-root/proj[39m    
+
+[38;5;174m▎[39m [1mAuto mode is now Claude Code's default permission mode.[0m                         
+[38;5;174m▎[39m [38;5;246mAuto mode lets Claude handle permission prompts automatically. Claude checks [39m   
+[38;5;174m▎[39m [38;5;246meach tool call for risky actions and prompt injection before executing, runs the
+[38;5;174m▎[39m [38;5;246mones it assesses as lower-risk, and blocks the rest.[39m                            
+[38;5;174m▎[39m [38;5;246m]8;id=awvmy8;https://code.claude.com/docs/en/permission-modes\https://code.claude.com/docs/en/permission-modes[39m]8;;\                                
+
+[38;5;246m[48;5;237m❯ [38;5;231mhello[39m                                                                           
+
+[38;5;231m[49m●[39m go ahead with tasks 10-13              
+
+[38;5;246m✻[39m [38;5;246mChurned for 0s · done 11:21 PM[39m         
+
+[38;5;246m[48;5;237m❯ [38;5;231mnext[39m                                                                            
+
+[38;5;231m[49m●[39m go ahead with tasks 10-13              
+
+[38;5;246m✻[39m [38;5;246mCrunched for 0s · done 11:21 PM[39m        
+
+[38;5;246m[48;5;237m❯ [38;5;231mthird[39m                                                                           
+
+[38;5;231m[49m●[39m go ahead with tasks 10-13              
+
+[38;5;246m✻[39m [38;5;246mChurned for 0s · done 11:32 PM[39m         
+
+[38;5;246m[48;5;237m❯ [38;5;231mfourth[39m                                                                          
+
+[38;5;231m[49m●[39m go ahead with tasks 10-13              
+
+[38;5;246m✻[39m [38;5;246mWorked for 0s · done 11:42 PM[39m          
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                              [38;5;246mnew task? [38;5;153m/clear[38;5;246m to save [38;5;153m33 tokens[39m  
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2mgo ahead with tasks 10-13[0m              
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────
+
+[39m  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m                                            

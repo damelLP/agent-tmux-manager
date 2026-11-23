@@ -118,6 +118,8 @@ fn certainty(error: &ReservationError) -> EffectCertainty {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardedInput {
     Paste,
+    /// Only the executor's own generated inbox record, never a user draft.
+    InboxPaste,
     Enter,
 }
 
@@ -161,7 +163,7 @@ pub struct DeliveryGuardFacts {
 #[must_use]
 pub fn guard_allows_input(facts: &DeliveryGuardFacts) -> bool {
     let editor = match facts.input {
-        GuardedInput::Paste => facts.screen.input == InputState::Empty,
+        GuardedInput::Paste | GuardedInput::InboxPaste => facts.screen.input == InputState::Empty,
         GuardedInput::Enter => {
             facts.screen.input == InputState::Draft && facts.staged == Some(true)
         }
@@ -404,10 +406,11 @@ pub(super) fn observation(
     facts: Option<ScreenFacts>,
 ) -> Result<RecipientObservation, MessageError> {
     if recipient.baseline.harness_command().is_none() {
-        return Err(MessageError::Refused(format!(
-            "the harness on {} is not established yet",
-            recipient.pane
-        )));
+        let detail = recipient.shell_list_issue.map_or_else(
+            || format!("the harness on {} is not established yet", recipient.pane),
+            |issue| issue.detail().into(),
+        );
+        return Err(MessageError::Refused(detail));
     }
     // History keeps its own activity clock for a session it already saw.
     let session = recipient.session.as_ref().map(|row| SessionObservation {
@@ -417,8 +420,16 @@ pub(super) fn observation(
         last_event_at: None,
     });
     let facts = facts.unwrap_or_else(|| recipient.screen.facts(capture, &recipient.baseline));
-    recipient_observation(capture, session, facts)
+    let mut seen = recipient_observation(capture, session, facts)?;
+    seen.inbox_paste = seen.facts.turn == TurnState::Unknown
+        && recipient.screen.inbox_paste(capture, &recipient.baseline);
+    Ok(seen)
 }
+
+/// Why a retry waits on a process-matched discovery row (s3-d1): nothing
+/// reported the last attempt, so it is not typed again until the harness
+/// speaks.
+pub(super) const RETRY_WAITS_FOR_HARNESS: &str = "retry waits for the recipient's harness: it has reported nothing since the restart, so the last attempt is unconfirmed";
 
 /// [`attempt_session`] on one recipient read.
 fn session_gate(recipient: &Recipient) -> Result<Option<SessionId>, MessageError> {
@@ -432,14 +443,21 @@ fn session_gate(recipient: &Recipient) -> Result<Option<SessionId>, MessageError
 /// One capture as the plain facts a delivery guard decides on: one control
 /// read of it for the screen facts and the dialog, and the staged match and
 /// the pane's flags from that same capture.
-fn guard_facts(
+pub(super) fn guard_facts(
     input: GuardedInput,
     capture: &PaneCapture,
     screen: &AgentScreen,
     baseline: &PaneBaseline,
     reference: &str,
 ) -> DeliveryGuardFacts {
-    let control = screen.control(capture, baseline);
+    let mut control = screen.control(capture, baseline);
+    if input == GuardedInput::InboxPaste
+        && control.facts.turn == TurnState::Unknown
+        && matches!(control.dialog, ControlDialog::None | ControlDialog::Unknown)
+        && screen.inbox_paste(capture, baseline)
+    {
+        (control.facts.turn, control.dialog) = (TurnState::NotRunning, ControlDialog::None);
+    }
     DeliveryGuardFacts {
         input,
         screen: control.facts,
@@ -604,8 +622,15 @@ impl Attempt {
                 Err(error) => Err(error),
             };
         };
+        if attempt > 1 && recipient.process_matched {
+            return Err(MessageError::Refused(RETRY_WAITS_FOR_HARNESS.into()));
+        }
         let reference = delivery_line(id, &snapshot.message.content);
-        let paste = GuardedInput::Paste;
+        let paste = if reference == inbox_reference(id) {
+            GuardedInput::InboxPaste
+        } else {
+            GuardedInput::Paste
+        };
         if !guard_allows_input(&guard_facts(
             paste,
             &capture,

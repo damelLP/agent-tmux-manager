@@ -129,7 +129,7 @@ impl Rig {
     }
     async fn seed_private(&self) {
         for command in [
-            OrgCommand::SendMessage(atm_org::MessageContent {delivery_notice:None,from:Address::Owner,to:"alpha/worker".parse().unwrap(),kind:atm_org::MessageKind::Brief,body:"SECRET message body".into(),attachments:vec!["SECRET message attachment".into()],task:None}),
+            OrgCommand::SendMessage(atm_org::MessageContent {delivery_notice:None,from:Address::Owner,to:"alpha/worker".parse().unwrap(),kind:atm_org::MessageKind::Brief,body:"SECRET message body".into(),attachments:vec!["SECRET message attachment".into()],task:None,post:None}),
             OrgCommand::Decision(atm_org::DecisionCommand::Request(serde_json::from_value(json!({"requester":"alpha/worker","kind":"plan","title":"SECRET decision title","context":"SECRET decision context","files":["SECRET decision file"],"options":["yes","no"],"recommended":"yes","may_be_undone":true,"changes_intent":true})).unwrap())),
             OrgCommand::Task(atm_org::TaskCommand::Create(serde_json::from_value(json!({"title":"Public task title","kind":"work","creator":"alpha/worker","parent":null,"judges":null,"measure":{"kind":"mechanical","command":"SECRET task command"},"budget":null,"files":[{"path":"SECRET task file","kind":"brief","note":"SECRET task note"}],"rests_on":null})).unwrap())),
         ] {self.org.execute(command,now()).await.unwrap();}

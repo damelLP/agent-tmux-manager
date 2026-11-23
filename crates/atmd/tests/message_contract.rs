@@ -180,6 +180,34 @@ fn result_projection_reuses_domain_content_and_same_id_retry() {
     );
 }
 
+// s3-giverelay. Break: the owner's give-up gains a key an old daemon refuses,
+// the relay words are dropped, or retry starts accepting them.
+#[tokio::test]
+async fn give_up_relay_words_are_optional_and_give_up_only() {
+    let plain: GiveUpParams = serde_json::from_value(json!({"id":"m7"})).unwrap();
+    assert_eq!(plain.relay_words, None);
+    assert_eq!(serde_json::to_value(plain).unwrap(), json!({"id":"m7"}));
+    let relayed = json!({"id":"m7","relay_words":"Cancel them"});
+    let parsed: GiveUpParams = serde_json::from_value(relayed.clone()).unwrap();
+    assert_eq!(parsed.relay_words.as_deref(), Some("Cancel them"));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), relayed);
+    let router = router(MethodServices::new(spawn_registry())).unwrap();
+    for method in ["msg.retry", "wake.retry"] {
+        let error = router
+            .call(caller(), method, relayed.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "invalid_params", "{method}");
+    }
+    for method in ["msg.give_up", "wake.give_up"] {
+        let error = router
+            .call(caller(), method, relayed.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.code, "unavailable", "{method}");
+    }
+}
+
 // Break: dropping the additive advisory, rejecting old replies, or accepting a malformed known field.
 #[test]
 fn give_up_result_roundtrips_optional_editor_warning() {
@@ -252,8 +280,9 @@ async fn explicit_disabled_facade_preserves_its_cause_for_every_call() {
     errors.push(
         handle
             .give_up(
-                ResolveParams {
+                GiveUpParams {
                     id: MessageId::new(1),
+                    relay_words: None,
                 },
                 caller(),
             )

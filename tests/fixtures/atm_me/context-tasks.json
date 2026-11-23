@@ -9,5 +9,5 @@
     {"task_id":"t7","title":"Work","kind":"work","state":"assigned","agent_id":"project/worker","reason":null},
     {"task_id":"t9","title":"Review plan","kind":"review","state":"in_review","agent_id":"project/worker","reason":null}
   ],
-  "report_command": "atm msg send --to project/lead --kind report --body 'DONE: <result>'"
+  "report_command": "atm post --tag project/lead --kind report --body 'DONE: <result>'"
 }

@@ -434,6 +434,7 @@ mod tests {
                         note: Some("Always use this shape".into()),
                         standing_rule: true,
                         relay: false,
+                        confirm: false,
                     },
                     caller,
                 )

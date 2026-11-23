@@ -3,7 +3,9 @@
 mod fold;
 mod trend;
 mod types;
-use crate::{Address, DecisionStatus, OrgState, ProjectId, Task, TaskCost, TaskState};
+use crate::{
+    department::Department, Address, DecisionStatus, OrgState, ProjectId, Task, TaskCost, TaskState,
+};
 use atm_core::Money;
 use chrono::{DateTime, Utc};
 pub(crate) use fold::ReportLedger;
@@ -160,6 +162,43 @@ fn project<'a>(
         decisions: DecisionCounts::default(),
         trend: trend::trend(std::iter::empty(), bucket),
     })
+}
+
+/// Sum existing project rows in each department independently of task paging.
+#[must_use]
+pub fn department_costs(
+    projects: &[ProjectReport],
+    departments: &[Department],
+) -> Vec<DepartmentCostReport> {
+    if departments.is_empty() {
+        return Vec::new();
+    }
+    let by_project: BTreeMap<_, _> = projects
+        .iter()
+        .filter_map(|project| project.project_id.as_ref().map(|id| (id, project)))
+        .collect();
+    departments
+        .iter()
+        .map(|department| {
+            let mut row = DepartmentCostReport {
+                id: department.id.clone(),
+                title: department.title.clone(),
+                cost: None,
+                cost_unknown_tasks: 0,
+            };
+            for project in department
+                .projects
+                .iter()
+                .filter_map(|id| by_project.get(id))
+            {
+                add(&mut row.cost, project.cost, |a, b| a + b);
+                row.cost_unknown_tasks = row
+                    .cost_unknown_tasks
+                    .saturating_add(project.cost_unknown_tasks);
+            }
+            row
+        })
+        .collect()
 }
 
 /// Build a read-only whole-scope projection, then page its tasks. now is supplied

@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use crate::server::methods::{CallerId, CallerPane};
-use atm_org::{TaskCreated, TaskMeasure, TaskVerdict, TaskVerdictGiven};
+use atm_org::{OrgCommand, TaskCreated, TaskMeasure, TaskVerdict, TaskVerdictGiven};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -827,7 +827,7 @@ async fn reassign_cycle_can_enqueue_old_brief_after_loss_notice() {
         assert!(second.changed);
         assert!(matches!(
             second.notification,
-            Some(Notification::Queued { message_id }) if message_id == MessageId::new(8)
+            Some(Notification::Queued { message_id }) if message_id == MessageId::new(9)
         ));
         if !compose_before_return {
             snapshot_release.take().unwrap().send(()).unwrap();
@@ -841,7 +841,7 @@ async fn reassign_cycle_can_enqueue_old_brief_after_loss_notice() {
         assert!(first.changed);
         assert!(matches!(
             first.notification,
-            Some(Notification::Queued { message_id }) if message_id == MessageId::new(10)
+            Some(Notification::Queued { message_id }) if message_id == MessageId::new(13)
         ));
         forwarding.await.unwrap();
         let state = real.snapshot().await.unwrap();
@@ -872,6 +872,7 @@ async fn reassign_cycle_can_enqueue_old_brief_after_loss_notice() {
                     body: body.into(),
                     attachments: vec![],
                     task: Some("t3".parse().unwrap()),
+                    post: Some(MessageId::new(message.id.seq() - 1)),
                 },
                 "compose_before_return={compose_before_return}"
             );
@@ -1677,6 +1678,7 @@ fn verdict_answer_reads_note_and_review_by_reference() {
                         body,
                         attachments: vec![],
                         task: Some("t3".parse().unwrap()),
+                        post: None,
                     }
                 );
                 validate_send(&SendParams {
@@ -2242,6 +2244,350 @@ async fn enqueue_failure_is_a_partial_result_not_a_failed_transition() {
     assert_eq!(
         state.task(&"t3".parse().unwrap()).unwrap().state,
         TaskState::Assigned
+    );
+    assert_eq!(state.messages().count(), 0);
+    cancel.cancel();
+}
+
+#[derive(Clone, Copy)]
+enum NoticeSeam {
+    WakeTimeout,
+    RepairWins,
+    PostReceiptLost,
+    OwnerSawPost,
+    OwnerHealTimeout,
+    VerdictActorBecomesAssignee,
+}
+
+// Use the real writer and fold. At the chosen seam, intercept only the reply
+// or append under test; the worker cannot progress until this proxy replies.
+async fn mutate_at_notice_seam(
+    org: &OrgHandle,
+    seam: NoticeSeam,
+    caller: CallContext,
+    make: impl FnOnce(TaskActor) -> TaskCommand + Send + 'static,
+) -> MutationResult {
+    use crate::org::{channel_post::repair, Request};
+    use atm_org::{ChannelCommand, PostTarget};
+
+    let (requests, mut receive) = mpsc::channel(8);
+    let proxy = OrgHandle {
+        requests,
+        ..org.clone()
+    };
+    let real = org.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(request) = receive.recv().await {
+            let Request::Execute {
+                command,
+                now,
+                caller_pane,
+                reply,
+            } = request
+            else {
+                real.submit(request).unwrap();
+                continue;
+            };
+            let wake = matches!(command.as_ref(), OrgCommand::SendMessage(m) if m.post.is_some());
+            let heal = matches!(
+                command.as_ref(),
+                OrgCommand::Channel(ChannelCommand::Seen { .. })
+            );
+            let project_post = match command.as_ref() {
+                OrgCommand::Channel(ChannelCommand::Post(request)) => match &request.target {
+                    PostTarget::Channel(channel) => Some(channel.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let stale_verdict = match (seam, command.as_ref()) {
+                (
+                    NoticeSeam::VerdictActorBecomesAssignee,
+                    OrgCommand::Task(TaskCommand::Verdict { task_id, by, .. }),
+                ) => Some((task_id.clone(), by.clone())),
+                _ => None,
+            };
+            let outcome = if (wake && matches!(seam, NoticeSeam::WakeTimeout))
+                || (heal && matches!(seam, NoticeSeam::OwnerHealTimeout))
+            {
+                Err(OrgServiceError::Timeout)
+            } else {
+                let result = real.execute_receipt(*command, now, caller_pane).await;
+                if let (Some((task_id, by)), Ok(commit)) = (stale_verdict, &result) {
+                    assert_eq!(commit.events.first().unwrap().kind, "task.verdict");
+                    let Address::Agent(agent_id) = by.who.clone() else {
+                        panic!("fixture verdict must be from a named seat");
+                    };
+                    // The original verdict is now committed for the old worker;
+                    // change the assignment before releasing that verdict receipt.
+                    for command in [
+                        TaskCommand::Assign {
+                            task_id: task_id.clone(),
+                            agent_id,
+                            by: by.clone(),
+                        },
+                        TaskCommand::SetState {
+                            task_id,
+                            state: TaskState::Working,
+                            reason: None,
+                            by,
+                        },
+                    ] {
+                        assert_eq!(
+                            real.execute(OrgCommand::Task(command), now)
+                                .await
+                                .unwrap()
+                                .len(),
+                            1
+                        );
+                    }
+                }
+                if let (Some(channel), Ok(committed)) = (project_post, &result) {
+                    let posted = committed.events.first().unwrap();
+                    assert_eq!(posted.kind, "channel.posted");
+                    match seam {
+                        NoticeSeam::WakeTimeout | NoticeSeam::VerdictActorBecomesAssignee => (),
+                        NoticeSeam::RepairWins => {
+                            assert_eq!(repair(&real, now, false).await.unwrap(), 1)
+                        }
+                        NoticeSeam::PostReceiptLost => {
+                            reply.send(Err(OrgServiceError::Timeout)).unwrap();
+                            continue;
+                        }
+                        NoticeSeam::OwnerSawPost | NoticeSeam::OwnerHealTimeout => {
+                            real.execute(
+                                OrgCommand::Channel(ChannelCommand::Seen {
+                                    channel,
+                                    reader: Address::Owner,
+                                    through: MessageId::new(posted.seq),
+                                }),
+                                now,
+                            )
+                            .await
+                            .unwrap();
+                        }
+                    }
+                }
+                result
+            };
+            reply.send(outcome).unwrap();
+        }
+    });
+    let result = TaskHandle::new(proxy).mutate(caller, make).await.unwrap();
+    forward.await.unwrap();
+    result
+}
+
+async fn listed_org() -> (tempfile::TempDir, OrgHandle, CancellationToken) {
+    let rig = org().await;
+    rig.1
+        .execute(
+            OrgCommand::Adopt {
+                agent_id: "p/lead".parse().unwrap(),
+                pane: "%2".into(),
+                session_id: None,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    rig
+}
+
+// Break caught: an unconfirmed wake hides a changed task or its durable post
+// cannot be recovered. A lost post receipt must not trigger a second post.
+#[tokio::test]
+async fn task_wake_append_unconfirmed_but_committed_post_repairs_once() {
+    use crate::org::channel_post::repair;
+    for seam in [NoticeSeam::WakeTimeout, NoticeSeam::PostReceiptLost] {
+        let (_dir, org, cancel) = listed_org().await;
+        let cursor = org.status().unwrap();
+        let result = mutate_at_notice_seam(&org, seam, owner_caller(), assign).await;
+        assert!(result.changed);
+        let Some(Notification::Unconfirmed { error }) = result.notification else {
+            panic!("the post/wake receipt was not confirmed: {result:?}");
+        };
+        assert_eq!(error.code, "timeout");
+        assert!(error
+            .message
+            .contains("inspect the task and inbox before resending"));
+        let prefix = org
+            .tail(crate::org::TailParams {
+                after_seq: cursor,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            prefix.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            ["task.assigned", "channel.posted"]
+        );
+        let state = org.snapshot().await.unwrap();
+        assert_eq!(
+            state.task(&"t3".parse().unwrap()).unwrap().state,
+            TaskState::Assigned
+        );
+        let missing = atm_org::channel_query::missing_wakes(&state);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].post, Some(MessageId::new(prefix[1].seq)));
+        assert_eq!(state.messages().count(), 0);
+        let now = chrono::Utc::now();
+        assert_eq!(repair(&org, now, false).await.unwrap(), 1);
+        assert_eq!(repair(&org, now, false).await.unwrap(), 0);
+        let after = org.snapshot().await.unwrap();
+        assert_eq!(after.messages().next().unwrap().content, missing[0]);
+        let retry = TaskHandle::new(org.clone())
+            .mutate(owner_caller(), assign)
+            .await
+            .unwrap();
+        assert!(!retry.changed && retry.notification.is_none());
+        assert_eq!(org.snapshot().await.unwrap(), after);
+        cancel.cancel();
+    }
+}
+
+// Break caught: a repair that writes first turns a confirmed enqueue into
+// Unconfirmed, returns the post ID, or causes a duplicate notification.
+#[tokio::test]
+async fn task_enqueue_confirms_a_wake_the_repair_already_wrote() {
+    let (_dir, org, cancel) = listed_org().await;
+    let result = mutate_at_notice_seam(&org, NoticeSeam::RepairWins, owner_caller(), assign).await;
+    let Some(Notification::Queued { message_id }) = result.notification else {
+        panic!("repair should confirm the wake: {result:?}");
+    };
+    let state = org.snapshot().await.unwrap();
+    assert_eq!(state.messages().count(), 1);
+    let row = state.message(&message_id).unwrap();
+    let post = row
+        .content
+        .post
+        .expect("repair must have written a linked row");
+    assert!(post < message_id);
+    assert_eq!(
+        atm_org::channel_query::wake_for(&state, post, &row.content.to),
+        Some(message_id)
+    );
+    cancel.cancel();
+}
+
+// Break caught: the owner's marker is ignored, or a heal failure is reported
+// as an unconfirmed enqueue even though the row is already durable.
+#[tokio::test]
+async fn task_owner_wake_respects_seen_marker_without_downgrading_its_receipt() {
+    for seam in [NoticeSeam::OwnerSawPost, NoticeSeam::OwnerHealTimeout] {
+        let (_dir, org, cancel) = listed_org().await;
+        org.execute(
+            OrgCommand::Task(assign(TaskActor {
+                who: Address::Owner,
+                manager_of: None,
+            })),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let result = mutate_at_notice_seam(&org, seam, caller(), |by| TaskCommand::Submit {
+            task_id: "t3".parse().unwrap(),
+            what: TaskSubmission::Result,
+            files: vec![],
+            by,
+        })
+        .await;
+        let Some(Notification::Queued { message_id }) = result.notification else {
+            panic!("the owner wake was durable: {result:?}");
+        };
+        let state = org.snapshot().await.unwrap();
+        let row = state.message(&message_id).unwrap();
+        assert_eq!(row.content.to, Address::Owner);
+        assert!(row.content.post.is_some());
+        assert_eq!(
+            row.read_at.is_some(),
+            matches!(seam, NoticeSeam::OwnerSawPost)
+        );
+        cancel.cancel();
+    }
+}
+
+// Break caught: a late snapshot fabricates a self-answer after a different
+// seat's plan was approved and the verdict giver became the new holder.
+#[tokio::test]
+async fn stale_verdict_to_actor_is_suppressed_before_posting() {
+    let (_dir, org, cancel) = listed_org().await;
+    let lead: AgentId = "p/lead".parse().unwrap();
+    let worker: AgentId = "p/worker".parse().unwrap();
+    let now = chrono::Utc::now();
+    let creator = TaskActor {
+        who: Address::Agent(lead.clone()),
+        manager_of: None,
+    };
+    let created = org
+        .execute(
+            OrgCommand::Task(TaskCommand::Create(TaskCreated {
+                creator: creator.who.clone(),
+                ..created("Review plan".into())
+            })),
+            now,
+        )
+        .await
+        .unwrap();
+    let id: TaskId = format!("t{}", created[0].seq).parse().unwrap();
+    for command in [
+        TaskCommand::Assign {
+            task_id: id.clone(),
+            agent_id: worker.clone(),
+            by: creator,
+        },
+        TaskCommand::Submit {
+            task_id: id.clone(),
+            what: TaskSubmission::Plan,
+            files: vec![],
+            by: TaskActor {
+                who: Address::Agent(worker),
+                manager_of: None,
+            },
+        },
+    ] {
+        org.execute(OrgCommand::Task(command), now).await.unwrap();
+    }
+    let cursor = org.status().unwrap();
+    let judged = id.clone();
+    let result = mutate_at_notice_seam(
+        &org,
+        NoticeSeam::VerdictActorBecomesAssignee,
+        CallContext {
+            from_pane: Some(CallerPane("%2".into())),
+            ..caller()
+        },
+        move |by| TaskCommand::Verdict {
+            task_id: judged,
+            verdict: TaskVerdict::Accepted,
+            review_task: None,
+            note: None,
+            by,
+        },
+    )
+    .await;
+    let state = org.snapshot().await.unwrap();
+    let task = state.task(&id).unwrap();
+    assert_eq!(task.agent_id, Some(lead));
+    assert_eq!(task.state, TaskState::Working);
+    assert!(result.changed);
+    assert!(
+        result.notification.is_none(),
+        "a stale verdict is now addressed to its actor: {result:?}"
+    );
+    let events = org
+        .tail(crate::org::TailParams {
+            after_seq: cursor,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["task.verdict", "task.assigned", "task.state_changed"]
     );
     assert_eq!(state.messages().count(), 0);
     cancel.cancel();

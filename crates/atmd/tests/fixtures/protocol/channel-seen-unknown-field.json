@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-seen-unknown-field","method":"channel.seen","params":{"channel":"alpha","through":"m1","unexpected":true}},
+  "response": {"type":"response","id":"channel-seen-unknown-field","error":{"code":"invalid_params","message":"unknown field `unexpected`, expected `channel` or `through`"}},
+  "ignore": []
+}

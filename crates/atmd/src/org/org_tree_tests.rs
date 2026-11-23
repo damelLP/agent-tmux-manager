@@ -1,4 +1,4 @@
-use super::super::reporting_line::ReportingEdges;
+use super::super::{department_directory::DepartmentDirectory, reporting_line::ReportingEdges};
 use super::project;
 use atm_core::{Harness, SessionId, SessionStatus, SessionView};
 use atm_org::{
@@ -82,6 +82,7 @@ fn message(to: &str, body: &str) -> OrgEvent {
         body: body.into(),
         attachments: vec!["SECRET attachment".into()],
         task: Some("SECRET task reference".parse().unwrap()),
+        post: None,
     })
 }
 fn seeded() -> (OrgState, Vec<SessionView>, ReportingEdges) {
@@ -273,7 +274,6 @@ fn seeded() -> (OrgState, Vec<SessionView>, ReportingEdges) {
         });
     }
     let edges = ReportingEdges {
-        reason: None,
         edges: [
             ("alpha/lead", Ok("owner")),
             ("alpha/watch", Ok("gamma/chief")),
@@ -296,11 +296,20 @@ fn seeded() -> (OrgState, Vec<SessionView>, ReportingEdges) {
             )
         })
         .collect(),
+        ..Default::default()
     };
     (state, rows, edges)
 }
 fn value(state: &OrgState, rows: &[SessionView], edges: &ReportingEdges) -> Value {
-    serde_json::to_value(project(state, 99, rows, edges, at(5))).unwrap()
+    serde_json::to_value(project(
+        state,
+        99,
+        rows,
+        edges,
+        &DepartmentDirectory::default(),
+        at(5),
+    ))
+    .unwrap()
 }
 
 // JSON numbers have one numeric domain: the registry supplies f64, so 74.0

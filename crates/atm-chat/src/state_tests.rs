@@ -52,6 +52,7 @@ fn row(id: u64, from: &str, to: &str, body: &str) -> InboxEntry {
             attachments: vec![],
             task: None,
             delivery_notice: None,
+            post: None,
         },
         sent_at: time(0).utc,
         status: DeliveryStatus::Delivered,
@@ -66,6 +67,7 @@ fn row(id: u64, from: &str, to: &str, body: &str) -> InboxEntry {
             retry_at: None,
             blocked_by: None,
         },
+        post_context: None,
     }
 }
 fn page(rows: Vec<InboxEntry>, head: u64, older: Option<&str>) -> ChatPage {

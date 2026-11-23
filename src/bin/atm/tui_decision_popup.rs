@@ -281,6 +281,7 @@ impl DecisionPopup {
                         note: (!self.note.is_empty()).then(|| self.note.clone()),
                         standing_rule: false,
                         relay: false,
+                        confirm: false,
                     })];
                 }
             }

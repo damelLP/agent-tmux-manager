@@ -1,12 +1,13 @@
 //! Task RPC facade over the sole organisation writer.
 //!
-//! Mutation and notification enqueue are two durable operations, not a transaction.
-//! A finite worker retains responsibility when its RPC waiter times out or
-//! disappears, including a late organisation receipt. The actor's bounded FIFO
-//! and five-second appends finish that wait or close its reply. Daemon death,
-//! composition failure or an unconfirmed enqueue can still leave a task without
-//! its automatic message; inspect the task and inbox before repairing it.
-//! Replay never re-emits old notifications.
+//! Task mutation, each notification post and its wake are separate appends,
+//! not a transaction. A finite worker retains responsibility when its RPC
+//! waiter times out or disappears, including a late organisation receipt. The
+//! actor's bounded FIFO and five-second appends finish that wait or close its
+//! reply. Wake repair fills rows for committed posts, but a crash or failure
+//! before composing and posting a notice still leaves that audience without
+//! one. Replay never reconstructs notices from task facts alone. Inspect the
+//! task and inbox before resending after an unconfirmed enqueue.
 //!
 //! Known limit (crrv-B L1): the actor receipt owns only the before-image;
 //! composition reads a later snapshot. An A→B→A cycle can suppress A's loss
@@ -23,6 +24,7 @@
 //! Delivery itself belongs exclusively to the existing confirmed-message runtime.
 
 use super::{
+    channel_post::post_task_notice,
     message_inbox::caller_address,
     message_methods::validate_send,
     messages::{MessageError, SendParams},
@@ -31,9 +33,8 @@ use super::{
 };
 use crate::server::methods::{CallContext, MethodError};
 use atm_org::{
-    Address, AgentId, MessageContent, MessageId, MessageKind, OrgCommand, OrgEvent, OrgState, Task,
-    TaskActor, TaskCommand, TaskCost, TaskFileKind, TaskId, TaskKind, TaskState, TaskSubmission,
-    TaskVerdict,
+    Address, AgentId, MessageContent, MessageId, MessageKind, OrgEvent, OrgState, Task, TaskActor,
+    TaskCommand, TaskCost, TaskFileKind, TaskId, TaskKind, TaskState, TaskSubmission, TaskVerdict,
 };
 use atm_protocol::ResponseError;
 use serde::{Deserialize, Serialize};
@@ -247,10 +248,8 @@ pub fn notification(
         }
         _ => return Ok(None),
     };
-    if matches!(kind, MessageKind::Brief | MessageKind::Report)
-        && from == to
-        && matches!(&from, Address::Agent(_))
-    {
+    // A late verdict snapshot can name the verdict giver as the new holder.
+    if from == to && matches!(&from, Address::Agent(_)) {
         return Ok(None);
     }
     Ok(Some(MessageContent {
@@ -261,6 +260,7 @@ pub fn notification(
         body,
         attachments,
         task: Some(id),
+        post: None,
     }))
 }
 
@@ -273,6 +273,7 @@ fn notice(id: &TaskId, by: &Address, to: Address, change: &str) -> MessageConten
         body: format!("Task {id} changed: {change}.\nInspect current state and assignee: atm task get {id}\nDo not continue obsolete work or resume/clear on this note alone."),
         attachments: Vec::new(),
         task: Some(id.clone()),
+        post: None,
     }
 }
 
@@ -381,6 +382,7 @@ fn carry_back_notice(
         body: format!("Task {id} accepted via fix {fix} (review {review}).\nInspect the recorded reason: atm task get {id}\nRe-check current state before acting; this note does not request a resume.", id = task.id),
         attachments: Vec::new(),
         task: Some(task.id.clone()),
+        post: None,
     })
 }
 
@@ -409,13 +411,7 @@ async fn enqueue(org: OrgHandle, content: MessageContent) -> Result<MessageId, T
         attachments: content.attachments.clone(),
         task: content.task.clone(),
     })?;
-    let events = org
-        .execute(OrgCommand::SendMessage(content), chrono::Utc::now())
-        .await?;
-    events
-        .first()
-        .map(|e| MessageId::new(e.seq))
-        .ok_or_else(|| TaskError::Internal("message enqueue committed no event".into()))
+    post_task_notice(&org, content, chrono::Utc::now()).await
 }
 
 pub(super) fn target(command: &TaskCommand) -> Option<TaskId> {

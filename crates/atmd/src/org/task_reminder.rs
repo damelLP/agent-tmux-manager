@@ -248,6 +248,7 @@ fn note(to: Address, body: String, task: Option<&&Task>) -> MessageContent {
         body,
         attachments: Vec::new(),
         task: task.map(|task| task.id.clone()),
+        post: None,
     }
 }
 

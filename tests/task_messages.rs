@@ -12,7 +12,48 @@ mod stand_in;
 mod support;
 use serde_json::{json, Value};
 use stand_in::StandInMode;
-use support::{about, reference, Confirmation, MessageRig};
+use support::{about, reference, Confirmation, MessageRig, Watch};
+
+fn assert_task_inbox(rig: &MessageRig, watch: &mut Watch, inbox: &Value, legacy: Value) {
+    let mut content = inbox["content"].clone();
+    let post = content
+        .as_object_mut()
+        .unwrap()
+        .remove("post")
+        .expect("task wake must link a post");
+    assert_eq!(content, legacy);
+    let seq = |id: &Value| {
+        id.as_str()
+            .unwrap()
+            .parse::<atm_org::MessageId>()
+            .unwrap()
+            .seq()
+    };
+    let post_seq = seq(&post);
+    let wake_seq = seq(&inbox["message_id"]);
+    assert!(post_seq < wake_seq);
+    let project = content["from"].as_str().unwrap().split_once('/').unwrap().0;
+    assert_eq!(inbox["post_context"]["channel"], project);
+    assert_eq!(
+        inbox["delivery"]["confirmation"],
+        "prompt_submit_exact_reference"
+    );
+    watch.catch_up(rig);
+    let posts = watch.all(|e| e["kind"] == "channel.posted" && e["seq"] == post_seq);
+    assert_eq!(posts.len(), 1);
+    let posted = &posts[0]["body"];
+    assert_eq!(posted["channel"], project);
+    assert_eq!(posted["wake"], json!([content["to"]]));
+    for key in ["kind", "task", "body", "attachments"] {
+        assert_eq!(posted[key], content[key]);
+    }
+    assert_eq!(posted["author"], content["from"]);
+    assert_eq!(posted["route"], false);
+    let rows = watch.all(|e| e["kind"] == "msg.sent" && e["body"]["post"] == post);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["seq"], wake_seq);
+    assert_eq!(rows[0]["body"], inbox["content"]);
+}
 
 // Break caught: a task notification bypasses the guarded reference/inbox path,
 // loses task/file attribution, or reports to manager/owner instead of creator.
@@ -49,9 +90,11 @@ fn assigned_brief_and_submitted_report_travel_through_guarded_pi_references() {
         [reference(brief)]
     );
     let inbox = rig.inbox_entry(Some(&worker.pane), None, brief);
-    assert_eq!(
-        inbox["content"],
-        json!({"from":lead.id,"to":worker.id,"kind":"brief","body":format!("Task {id} assigned: Tasks é🙂\nInspect the task: atm task get {id}\nRead the attached brief files before starting."),"attachments":["brief.md"],"task":id})
+    assert_task_inbox(
+        &rig,
+        &mut watch,
+        &inbox,
+        json!({"from":lead.id,"to":worker.id,"kind":"brief","body":format!("Task {id} assigned: Tasks é🙂\nInspect the task: atm task get {id}\nRead the attached brief files before starting."),"attachments":["brief.md"],"task":id}),
     );
     assert_eq!(inbox["read_at"], Value::Null);
     let context = rig.atm_json(Some(&worker.pane), &["me", "--format", "json"]);
@@ -86,9 +129,11 @@ fn assigned_brief_and_submitted_report_travel_through_guarded_pi_references() {
         [reference(report)]
     );
     let inbox = rig.inbox_entry(Some(&lead.pane), None, report);
-    assert_eq!(
-        inbox["content"],
-        json!({"from":worker.id,"to":lead.id,"kind":"report","body":format!("Task {id} submitted (result): Tasks é🙂\nSubmitted by {}; inspect the task: atm task get {id}\nRead the attached submission files before giving a verdict.",worker.id),"attachments":["report.md"],"task":id})
+    assert_task_inbox(
+        &rig,
+        &mut watch,
+        &inbox,
+        json!({"from":worker.id,"to":lead.id,"kind":"report","body":format!("Task {id} submitted (result): Tasks é🙂\nSubmitted by {}; inspect the task: atm task get {id}\nRead the attached submission files before giving a verdict.",worker.id),"attachments":["report.md"],"task":id}),
     );
     assert_eq!(inbox["read_at"], Value::Null);
     rig.call(
@@ -216,12 +261,14 @@ fn verdict_answer_waits_for_turn_end_then_delivers_one_reference() {
             [reference(message)]
         );
         let inbox = rig.inbox_entry(Some(&worker.pane), None, message);
-        assert_eq!(
-            inbox["content"],
+        assert_task_inbox(
+            &rig,
+            &mut watch,
+            &inbox,
             json!({
                 "from":lead.id,"to":worker.id,"kind":"answer","task":id,"attachments":[],
                 "body":format!("Task {id} verdict recorded: {verdict}.\nRe-read the current task and verdict note before acting: atm task get {id}\nResume only as its current state and approved brief allow."),
-            })
+            }),
         );
         assert_eq!(inbox["read_at"], Value::Null);
         watch.catch_up(&rig);
@@ -400,9 +447,11 @@ fn invalidation_notes_wait_for_turn_end_without_interrupting_old_holder_or_revie
                 body.push_str(&format!("\nReview task: atm task get {correlated}; re-check the judged task above before continuing."));
             }
             let inbox = rig.inbox_entry(Some(&recipient.pane), None, &message);
-            assert_eq!(
-                inbox["content"],
-                json!({"from":lead.id,"to":recipient.id,"kind":"note","task":correlated,"attachments":[],"body":body})
+            assert_task_inbox(
+                &rig,
+                &mut watch,
+                &inbox,
+                json!({"from":lead.id,"to":recipient.id,"kind":"note","task":correlated,"attachments":[],"body":body}),
             );
             assert_eq!(inbox["read_at"], Value::Null);
             rig.finish_turn(&recipient.pane);
@@ -460,7 +509,8 @@ fn draft_holds_automatic_brief_without_reverting_task_or_typing_into_editor() {
     rig.test.rig.wait("message runtime observed the draft", || {
         let entry = rig.inbox_entry(Some(&worker.pane), None, message);
         entry["delivery"]["phase"] == "waiting"
-            && entry["delivery"]["reason"] == "input contains a draft"
+            && entry["delivery"]["reason"]
+                == format!("input box holds unsent text in {}", worker.pane.pane_id).as_str()
     });
     assert_eq!(
         rig.call("task.get", json!({"task_id":id}), None).unwrap()["task"]["state"],

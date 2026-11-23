@@ -32,6 +32,11 @@ mod reconciliation {
     const PI_PADDED: &str = include_str!(
         "../../../atm-pi-adapter/tests/fixtures/screen_styled_p1_A-ready-120x40_1.5.0.txt"
     );
+    // A typed, unsent draft in pi's editor (s3-stuckseat: the box that holds a seat
+    // Starting at the restart check).
+    const PI_TYPED: &str = include_str!(
+        "../../../atm-pi-adapter/tests/fixtures/screen_p5_100x40-typed-staged_1.5.0.styled.txt"
+    );
     const CLAUDE_PADDED: [&str; 2] = [
         include_str!(
             "../../../atm-claude-adapter/tests/fixtures/screen_control_p1_A120-ready-120x40_2.1.325.txt"
@@ -239,6 +244,20 @@ mod reconciliation {
                 .await
                 .unwrap();
         }
+        // Seed the foreground PID without a cwd, so registration doesn't start
+        // an unrelated detached Git lookup while a test drives paused time.
+        async fn foreground_pi_row(&self, id: &str, pane: &str) {
+            self.registry
+                .apply_lifecycle_event(
+                    SessionId::new(id),
+                    atm_core::LifecycleEvent::SessionStart { source: None },
+                    Harness::Pi,
+                    Some(150),
+                    Some(pane.into()),
+                )
+                .await
+                .unwrap();
+        }
         fn inspection(pane: &str, tag: &str, dead: bool) -> PaneInspection {
             PaneInspection::new(
                 atm_tmux::PaneInfo {
@@ -382,66 +401,67 @@ mod reconciliation {
         assert_eq!(inputs(&rig), 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn unreadable_screen_restart_and_adopt_need_no_mail_or_hook() {
-        // A cold pin needs the real adapter read, not an empty baseline's Unknown.
-        // Synthetic SGR 9 (strikethrough) is supported by tmux, not StyledScreen.
-        const UNKNOWN: &str = "\x1b[9mprivate viewport sentinel\x1b[0m\n";
-        for restart in [true, false] {
-            let rig = Rig::new().await;
-            rig.process_row("s1", 150, "%1", Harness::Pi).await;
-            if restart {
-                rig.agent("lead", Some("%1"), Some("s1")).await;
-                rig.frame("%1", "p/lead", UNKNOWN);
-            }
-            let mut committed = rig.org.committed.subscribe();
-            let (agents, _) = rig.start();
-            agents.reconciled().await.unwrap();
-            if !restart {
-                rig.frame("%1", "p/lead", UNKNOWN);
-                let mut progress_events = agents.observation_events();
-                rig.command(OrgCommand::Adopt {
-                    agent_id: "p/lead".parse().unwrap(),
-                    pane: "%1".into(),
-                    session_id: Some(SessionId::new("s1")),
-                })
-                .await;
-                progress(&mut progress_events, "finished", Some("p/lead")).await;
-            }
-            let mut inspection = Rig::inspection("%1", "p/lead", false)
-                .with_foreground_process(None, Some("pi".into()));
-            inspection.pane.height = 1;
-            let capture = PaneCapture::new(UNKNOWN.into(), inspection, CaptureFormat::Ansi);
-            rig.client.script_capture(&capture).unwrap();
-            let pane = PaneId::parse("%1").unwrap();
-            let waiting_reads = rig.client.pending_reads(&pane).unwrap();
-            assert!(waiting_reads > 0);
-            tokio::time::advance(std::time::Duration::from_millis(119_999)).await;
-            assert!(notes(&rig).await.is_empty());
-            assert_eq!(rig.client.pending_reads(&pane).unwrap(), waiting_reads);
-            tokio::time::advance(std::time::Duration::from_millis(1)).await;
-            tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                while committed.recv().await.unwrap().kind != "msg.sent" {}
-            })
-            .await
-            .expect("no diagnostic committed for the continuously unreadable seat");
-            assert_eq!(rig.client.pending_reads(&pane).unwrap(), 0);
-            assert_eq!(notes(&rig).await, [
-                "atm cannot read p/lead's screen (%1) for 120 s; pi may have changed its screen (version unknown). Delivery, readiness checks, clear, and handover need a readable screen."
-            ]);
-            assert_eq!(
-                agents.baseline_of(&"p/lead".parse().unwrap(), "%1"),
-                PaneBaseline::unproven()
-            );
-            assert_eq!(
-                rig.state("lead").await.status,
+    #[test]
+    fn unreadable_screen_restart_and_adopt_need_no_mail_or_hook() {
+        with_manual_clock(async |mut clock| {
+            // A cold pin needs the real adapter read, not an empty baseline's Unknown.
+            // Synthetic SGR 9 (strikethrough) is supported by tmux, not StyledScreen.
+            const UNKNOWN: &str = "\x1b[9mprivate viewport sentinel\x1b[0m\n";
+            for restart in [true, false] {
+                let rig = Rig::new().await;
+                rig.foreground_pi_row("s1", "%1").await;
                 if restart {
-                    AgentStatus::Starting
-                } else {
-                    AgentStatus::Ready
+                    rig.agent("lead", Some("%1"), Some("s1")).await;
+                    rig.frame("%1", "p/lead", UNKNOWN);
                 }
-            );
-        }
+                let mut committed = rig.org.committed.subscribe();
+                let (agents, _) = rig.start();
+                agents.reconciled().await.unwrap();
+                if !restart {
+                    rig.frame("%1", "p/lead", UNKNOWN);
+                    rig.command(OrgCommand::Adopt {
+                        agent_id: "p/lead".parse().unwrap(),
+                        pane: "%1".into(),
+                        session_id: Some(SessionId::new("s1")),
+                    })
+                    .await;
+                }
+                clock.settled().await;
+                let mut inspection = Rig::inspection("%1", "p/lead", false)
+                    .with_foreground_process(None, Some("pi".into()));
+                inspection.pane.height = 40;
+                let capture = PaneCapture::new(
+                    format!("{UNKNOWN}{}", "\n".repeat(39)),
+                    inspection,
+                    CaptureFormat::Ansi,
+                );
+                rig.client.script_capture(&capture).unwrap();
+                let pane = PaneId::parse("%1").unwrap();
+                let waiting_reads = rig.client.pending_reads(&pane).unwrap();
+                assert!(waiting_reads > 0);
+                clock.advance(Duration::from_millis(119_999)).await;
+                assert!(notes(&rig).await.is_empty());
+                assert_eq!(rig.client.pending_reads(&pane).unwrap(), waiting_reads);
+                clock.advance(Duration::from_millis(1)).await;
+                while committed.recv().await.unwrap().kind != "msg.sent" {}
+                assert_eq!(rig.client.pending_reads(&pane).unwrap(), 0);
+                assert_eq!(notes(&rig).await, [
+                    "atm cannot read p/lead's screen (%1) for 120 s; pi may have changed its screen (version unknown). Delivery, readiness checks, clear, and handover need a readable screen."
+                ]);
+                assert_eq!(
+                    agents.baseline_of(&"p/lead".parse().unwrap(), "%1"),
+                    PaneBaseline::unproven()
+                );
+                assert_eq!(
+                    rig.state("lead").await.status,
+                    if restart {
+                        AgentStatus::Starting
+                    } else {
+                        AgentStatus::Ready
+                    }
+                );
+            }
+        });
     }
 
     #[tokio::test]
@@ -511,10 +531,12 @@ mod reconciliation {
             std::fs::write(&role, format!("+++\nharness='claude'\n{edit}+++\n")).unwrap();
             let mut inspection = Rig::inspection("%7", "p/worker", false)
                 .with_foreground_process(None, Some("claude".into()));
-            inspection.pane.height = 1;
+            // This is the version-diagnostic case. Grow the confirming read
+            // to a normal viewport without clearing the unreadable episode.
+            inspection.pane.height = 40;
             rig.client
                 .script_capture(&PaneCapture::new(
-                    UNKNOWN.into(),
+                    format!("{UNKNOWN}{}", "\n".repeat(39)),
                     inspection,
                     CaptureFormat::Ansi,
                 ))
@@ -1111,6 +1133,43 @@ mod reconciliation {
         drop(done);
     }
 
+    struct ManualClock(watch::Receiver<()>);
+
+    impl ManualClock {
+        async fn settled(&mut self) {
+            self.0.mark_unchanged();
+            // Give the timer driver a turn, then wait for the resulting
+            // in-memory work to drain on the current-thread runtime. Callers
+            // must await a separate completion signal for detached I/O.
+            self.0.changed().await.unwrap();
+            self.0.changed().await.unwrap();
+        }
+
+        async fn advance(&mut self, by: Duration) {
+            tokio::time::advance(by).await;
+            self.settled().await;
+        }
+    }
+
+    fn with_manual_clock(test: impl AsyncFnOnce(ManualClock)) {
+        let (parked, idle) = watch::channel(());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .on_thread_park(move || parked.send_replace(()))
+            .build()
+            .unwrap()
+            .block_on(with_wall_clock_hang_guard(async {
+                // Tokio suppresses auto-advance for spawn_blocking tasks.
+                // Channel closure releases this one even if the test panics.
+                let (release, held) = tokio::sync::oneshot::channel::<()>();
+                let hold = tokio::task::spawn_blocking(move || held.blocking_recv());
+                test(ManualClock(idle)).await;
+                release.send(()).unwrap();
+                hold.await.unwrap().unwrap();
+            }));
+    }
+
     // Adapted from the A1 review probes: assertions describe the desired behavior.
     async fn progress(
         events: &mut broadcast::Receiver<crate::org::agents::ObservationProgress>,
@@ -1184,6 +1243,139 @@ mod reconciliation {
                 session: Box::new(row),
             })
             .unwrap();
+    }
+
+    /// The `session.process` facts committed since `committed` subscribed.
+    fn processes(
+        committed: &mut broadcast::Receiver<std::sync::Arc<crate::eventlog::Envelope>>,
+    ) -> Vec<Value> {
+        let mut found = Vec::new();
+        while let Ok(event) = committed.try_recv() {
+            if event.kind == "session.process" {
+                found.push(event.body.clone());
+            }
+        }
+        found
+    }
+
+    // s3-d1. Break: the observer records nothing when the harness's first
+    // event after a restart confirms the bound session's row, records from a
+    // discovery row, or records the same process again.
+    #[tokio::test]
+    async fn observer_records_the_bound_sessions_process_once() {
+        // The rig's process table: pi runs as pid 150, started at tick 1.
+        let pid = 150;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        // After a restart: only the discovery row of the seat's process.
+        rig.process_row(&format!("pending-{pid}"), pid, "%1", Harness::Pi)
+            .await;
+        rig.frame("%1", "p/lead", IDLE);
+        let mut committed = rig.org.committed.subscribe();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        assert_eq!(processes(&mut committed), Vec::<Value>::new());
+
+        // The harness speaks: its row becomes the bound session.
+        let mut events = agents.observation_events();
+        rig.inspect_only("%1", "p/lead");
+        rig.registry
+            .apply_lifecycle_event(
+                SessionId::new("s1"),
+                atm_core::LifecycleEvent::WorkingStart,
+                Harness::Pi,
+                Some(pid),
+                Some("%1".into()),
+            )
+            .await
+            .unwrap();
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let record = json!({"session_id": "s1", "pid": pid, "process_start": 1});
+        assert_eq!(processes(&mut committed), [record]);
+        let state = rig.org.snapshot().await.unwrap();
+        assert_eq!(
+            state
+                .session_process(&SessionId::new("s1"))
+                .map(|p| (p.pid, p.process_start)),
+            Some((pid, 1))
+        );
+
+        // Another row on the pane wakes the agent again: nothing new.
+        rig.inspect_only("%1", "p/lead");
+        rig.row("pending-200", "%1", false).await;
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(processes(&mut committed), Vec::<Value>::new());
+    }
+
+    // s3-d1 (the autocat case). Break: a record of the session's old process
+    // stops the new one from being recorded: the seat resumed the same
+    // session in another process, and its first event after a restart
+    // confirms it there.
+    #[tokio::test]
+    async fn a_session_resumed_in_a_new_process_is_recorded_there() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.command(OrgCommand::RecordProcess(atm_org::SessionProcess {
+            session_id: SessionId::new("s1"),
+            pid: 149,
+            process_start: 1,
+        }))
+        .await;
+        rig.process_row("pending-150", 150, "%1", Harness::Pi).await;
+        rig.frame("%1", "p/lead", IDLE);
+        let mut committed = rig.org.committed.subscribe();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        rig.inspect_only("%1", "p/lead");
+        rig.registry
+            .apply_lifecycle_event(
+                SessionId::new("s1"),
+                atm_core::LifecycleEvent::WorkingStart,
+                Harness::Pi,
+                Some(150),
+                Some("%1".into()),
+            )
+            .await
+            .unwrap();
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let record = json!({"session_id": "s1", "pid": 150, "process_start": 1});
+        assert_eq!(processes(&mut committed), [record]);
+    }
+
+    // s3-d1. Break: a session the observer binds is not recorded with its
+    // process in that pass (an idle seat may send nothing after its bind).
+    #[tokio::test]
+    async fn a_session_bound_by_the_observer_is_recorded_with_its_process() {
+        let pid = 150;
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), None).await;
+        rig.inspect_only("%1", "p/lead");
+        let mut committed = rig.org.committed.subscribe();
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        let mut events = agents.observation_events();
+        rig.inspect_only("%1", "p/lead");
+        rig.registry
+            .apply_lifecycle_event(
+                SessionId::new("fresh"),
+                atm_core::LifecycleEvent::SessionStart {
+                    source: Some("startup".into()),
+                },
+                Harness::Pi,
+                Some(pid),
+                Some("%1".into()),
+            )
+            .await
+            .unwrap();
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(
+            rig.state("lead").await.session_id,
+            Some(SessionId::new("fresh"))
+        );
+        let record = json!({"session_id": "fresh", "pid": pid, "process_start": 1});
+        assert_eq!(processes(&mut committed), [record]);
     }
 
     #[tokio::test]
@@ -1890,6 +2082,7 @@ mod reconciliation {
                             project_root: dir.path().into(),
                             name: "lead".into(),
                             caller_server: None,
+                            hire: None,
                         },
                         caller(),
                     )
@@ -2120,7 +2313,8 @@ mod reconciliation {
         .await
         .expect("the deadline worker did not confirm the unreadable screen");
         // The deadline worker consumes one successful compound capture, then
-        // leaves the reported episode dormant until a new observation.
+        // leaves the reported episode dormant: only the revalidation poll's
+        // once-a-minute re-look (s3-5c S1) reads it again.
         let first_hour = rig.client.mock().calls();
         assert_eq!(first_hour.len(), 10);
         assert!(
@@ -2128,10 +2322,15 @@ mod reconciliation {
             if subcommand == "list-panes" && args.iter().any(|arg| arg == "capture-pane"))
         );
         let mut events = rig.org.committed.subscribe();
+        // s3-5c S1: the hour's jump fires the 5 s poll once (missed ticks are
+        // delayed, not burst), which is one re-look of the dormant episode; it
+        // reads the same unreadable screen.
+        rig.frame("%1", "p/lead", "unknown\n");
         tokio::time::advance(Duration::from_secs(3600)).await;
         agents.list(ListParams::default()).await.unwrap();
         assert!(events.try_recv().is_err());
-        assert_eq!(rig.client.mock().calls().len(), 10);
+        // The re-look's inspection, tag read and capture.
+        assert_eq!(rig.client.mock().calls().len(), 13);
         assert_eq!(notes(&rig).await.len(), 1);
     }
 
@@ -3369,6 +3568,185 @@ mod reconciliation {
         assert_eq!(listed_reason(&agents).await, None);
     }
 
+    // s3-stuckseat case 1. Break: a revalidating agent is looked at again only
+    // on a harness or agent event, so an idle seat whose box empties without
+    // a redraw (a draft cleared, a pane leaving copy mode) stays Starting.
+    #[tokio::test(start_paused = true)]
+    async fn revalidating_agent_is_observed_again_until_its_screen_is_safe() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        rig.frame("%1", "p/lead", body(PI_TYPED));
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        let mut events = agents.observation_events();
+        // Still a draft: it is looked at again, and stays Starting.
+        progress(&mut events, "finished", Some("p/lead")).await;
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        // The draft goes away with no registry, hook or agent event.
+        rig.frame("%1", "p/lead", IDLE);
+        progress(&mut events, "finished", Some("p/lead")).await;
+        let lead = rig.state("lead").await;
+        assert_eq!((lead.status, lead.reason), (AgentStatus::Ready, None));
+    }
+
+    // Review S4. Break: the poll's period (its cost: one look per
+    // revalidating seat per 5 s) changes. On the paused clock each look starts
+    // exactly on a tick, so the gaps between looks are exactly the period.
+    #[tokio::test(start_paused = true)]
+    async fn revalidating_seat_is_looked_at_once_every_five_seconds() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        // One scripted look each (the mock's reads are one-shot): the restart
+        // check, its follow-up, and every poll; a missing frame would be a
+        // failed look paced by the retry backoff instead.
+        for _ in 0..10 {
+            rig.frame("%1", "p/lead", body(PI_TYPED));
+        }
+        let (agents, _) = rig.start();
+        let mut events = agents.observation_events();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+        let lead: atm_org::AgentId = "p/lead".parse().unwrap();
+        let start = tokio::time::Instant::now();
+        let end = start + Duration::from_secs(31);
+        let mut looks = Vec::new();
+        while let Ok(event) = tokio::time::timeout_at(end, events.recv()).await {
+            if let Ok(event) = event {
+                if event.phase == "started" && event.agent.as_ref() == Some(&lead) {
+                    looks.push(tokio::time::Instant::now());
+                }
+            }
+        }
+        // The restart check and its follow-up pass come first, at the start.
+        let polls: Vec<_> = looks
+            .into_iter()
+            .filter(|at| *at >= start + Duration::from_secs(1))
+            .collect();
+        assert!(polls.len() >= 5, "{} polls in 30 s", polls.len());
+        for pair in polls.windows(2) {
+            assert_eq!(pair[1] - pair[0], Duration::from_secs(5), "{polls:?}");
+        }
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+    }
+
+    // s3-5c S1. Break: a revalidating seat whose restart look was wholly
+    // unreadable is reported once and then never looked at again until a
+    // harness event, so a screen that becomes readable on its own (pi's
+    // underlined link scrolled off) leaves the seat Starting for good. Or the
+    // re-look runs at the poll's 5 s pace instead of once a minute.
+    #[test]
+    fn dormant_unreadable_revalidating_seat_is_looked_at_once_a_minute() {
+        with_manual_clock(async |mut clock| {
+            // Synthetic SGR 9 (strikethrough): tmux keeps it, StyledScreen does not
+            // read it, so the whole screen is Unknown (as in the restart test above).
+            const UNKNOWN: &str = "\x1b[9mprivate viewport sentinel\x1b[0m\n";
+            let (gate, mut entered) = mpsc::channel(1);
+            let rig = Rig::gated(Some(("msg.sent", gate))).await;
+            rig.foreground_pi_row("s1", "%1").await;
+            rig.agent("lead", Some("%1"), Some("s1")).await;
+            rig.frame("%1", "p/lead", UNKNOWN);
+            let mut committed = rig.org.committed.subscribe();
+            let since = tokio::time::Instant::now();
+            let (agents, _) = rig.start();
+            agents.reconciled().await.unwrap();
+            clock.settled().await;
+            let mut inspection = Rig::inspection("%1", "p/lead", false)
+                .with_foreground_process(None, Some("pi".into()));
+            inspection.pane.height = 40;
+            rig.client
+                .script_capture(&PaneCapture::new(
+                    format!("{UNKNOWN}{}", "\n".repeat(39)),
+                    inspection,
+                    CaptureFormat::Ansi,
+                ))
+                .unwrap();
+            clock.advance(Duration::from_secs(120)).await;
+            // Entering the in-memory writer means the detached role read is
+            // done. Release off-tick to distinguish the minute deadline from
+            // the first 5 s poll after it.
+            let release = entered.recv().await.unwrap();
+            clock.advance(Duration::from_secs(1)).await;
+            release.send(()).unwrap();
+            while committed.recv().await.unwrap().kind != "msg.sent" {}
+            let lead: atm_org::AgentId = "p/lead".parse().unwrap();
+            agents
+                .screens()
+                .unwrap()
+                .wait_for_diagnosis_to_settle(&lead, since)
+                .await;
+            assert_eq!(rig.state("lead").await.status, AgentStatus::Starting);
+
+            // Still unreadable on two re-looks, then readable with no harness event.
+            rig.frame("%1", "p/lead", UNKNOWN);
+            rig.frame("%1", "p/lead", UNKNOWN);
+            rig.frame("%1", "p/lead", IDLE);
+            let mut events = agents.observation_events();
+            let mut looks = Vec::new();
+            for after_report in 1..=200 {
+                clock.advance(Duration::from_secs(1)).await;
+                loop {
+                    match events.try_recv() {
+                        Ok(event) => {
+                            if event.phase == "started" && event.agent.as_ref() == Some(&lead) {
+                                looks.push(after_report);
+                            }
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(error) => panic!("observation events: {error}"),
+                    }
+                }
+            }
+            // The report is at t=121. The first look is due at t=181 but
+            // starts at t=185, the next 5 s tick, and recurs once a minute.
+            assert_eq!(looks, [64, 124, 184], "seconds after the report");
+            let lead = rig.state("lead").await;
+            assert_eq!((lead.status, lead.reason), (AgentStatus::Ready, None));
+            assert_eq!(notes(&rig).await.len(), 1);
+        });
+    }
+
+    // Break: the poll also captures Ready or Clearing agents (Ready ones are
+    // trusted until an event says otherwise; a clear has its own pass).
+    #[tokio::test(start_paused = true)]
+    async fn ready_and_clearing_agents_are_not_polled() {
+        let rig = Rig::new().await;
+        rig.agent("lead", Some("%1"), Some("s1")).await;
+        rig.row("s1", "%1", false).await;
+        rig.frame("%1", "p/lead", IDLE);
+        rig.agent("other", Some("%2"), Some("s2")).await;
+        rig.row("s2", "%2", false).await;
+        rig.frame("%2", "p/other", IDLE);
+        // Review S4: a Stuck seat with its session is not polled either.
+        rig.agent("third", Some("%3"), Some("s3")).await;
+        rig.row("s3", "%3", false).await;
+        rig.frame("%3", "p/third", IDLE);
+        let (agents, _) = rig.start();
+        agents.reconciled().await.unwrap();
+        assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
+        rig.command(OrgCommand::Clear {
+            agent_id: "p/other".parse().unwrap(),
+        })
+        .await;
+        rig.command(OrgCommand::Stuck {
+            agent_id: "p/third".parse().unwrap(),
+            reason: "fixture".into(),
+        })
+        .await;
+        let mut events = agents.observation_events();
+        // Paused clock: lets every paced or polled observation run.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        while events.try_recv().is_ok() {}
+        let calls = rig.client.mock().calls().len();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.phase, "started", "{event:?}");
+        }
+        assert_eq!(rig.client.mock().calls().len(), calls);
+    }
+
     #[tokio::test]
     async fn wrong_harness_is_not_liveness_or_list_activity() {
         let rig = Rig::new().await;
@@ -3558,6 +3936,7 @@ mod reconciliation {
                             let _ = respond_to.send(vec![crate::registry::PaneSession {
                                 view: view.clone(),
                                 pid: None,
+                                process_start: None,
                                 start: None,
                                 harness_version: None,
                             }]);
@@ -4775,6 +5154,101 @@ mod reconciliation {
                 assert_eq!(listed_reason(&agents).await, None, "{case} {bound}");
                 assert_eq!(rig.state("lead").await.status, AgentStatus::Ready);
             }
+        }
+    }
+
+    // Break caught: drop the shell-source cause, let it masquerade as a
+    // successful delivery observation, or keep it after a newer read/pin.
+    #[tokio::test]
+    async fn restart_shell_list_issue_is_shown_until_pin() {
+        use super::super::{
+            agent_proc::{ProcReader, ProcSample, ShellListIssue},
+            message_delivery::observation,
+            messages::MessageError,
+        };
+        use std::sync::{Arc, Mutex};
+
+        const MISSING: &str = "/etc/shells is missing (using built-in shell names)";
+        for shell_in_front in [true, false] {
+            let rig = Rig::new().await;
+            rig.agent("lead", Some("%1"), Some("s1")).await;
+            rig.row("s1", "%1", false).await;
+            let root_harness = ProcFacts {
+                system_shell: false,
+                name: "pi".into(),
+                ..idle_shell("sh")
+            };
+            let (facts, command) = if shell_in_front {
+                (shell_with_child("sh"), "sh")
+            } else {
+                (root_harness.clone(), "pi")
+            };
+            *rig.proc.lock().unwrap() = Some(facts);
+            let source = Arc::new(Mutex::new(Some(ShellListIssue::Missing)));
+            let reader: ProcReader<ProcSample> = Arc::new({
+                let (reader, source) = (rig.reader(), source.clone());
+                move |pid| {
+                    let facts = reader(pid);
+                    let shell_list_issue = *source.lock().unwrap();
+                    Box::pin(async move {
+                        facts.await.map(|facts| ProcSample {
+                            facts,
+                            shell_list_issue,
+                        })
+                    })
+                }
+            });
+            rig.frame_of("%1", "p/lead", IDLE, command);
+            let (agents, _) = spawn_agents_sampled(
+                rig.org.clone(),
+                rig.registry.clone(),
+                rig.control.clone(),
+                rig.cancel.child_token(),
+                reader,
+                Arc::new(|_| None),
+                DeliverySettings::default().readiness_timeout,
+            );
+            agents.reconciled().await.unwrap();
+            let lead = "p/lead".parse().unwrap();
+            let capture = |command: &str| {
+                PaneCapture::new(
+                    IDLE.into(),
+                    Rig::inspection("%1", "p/lead", false)
+                        .with_foreground_process(None, Some(command.into())),
+                    CaptureFormat::Ansi,
+                )
+            };
+            if shell_in_front {
+                let recipient = agents.recipient(&lead).await.unwrap();
+                assert_eq!(recipient.baseline, PaneBaseline::unproven());
+                assert_eq!(
+                    listed_reason(&agents).await,
+                    Some(format!("{SHELL_HOLDS_CHILD}; {MISSING}"))
+                );
+                assert!(matches!(observation(&recipient, &capture("sh"), None),
+                    Err(MessageError::Refused(text)) if text == MISSING));
+
+                let mut events = agents.observation_events();
+                *source.lock().unwrap() = None;
+                rig.frame_of("%1", "p/lead", IDLE, "sh");
+                update(&rig, "s1").await;
+                progress(&mut events, "finished", Some("p/lead")).await;
+                assert_eq!(
+                    listed_reason(&agents).await.as_deref(),
+                    Some(SHELL_HOLDS_CHILD)
+                );
+
+                *source.lock().unwrap() = Some(ShellListIssue::Missing);
+                *rig.proc.lock().unwrap() = Some(root_harness);
+                rig.frame("%1", "p/lead", IDLE);
+                update(&rig, "s1").await;
+                progress(&mut events, "finished", Some("p/lead")).await;
+            }
+            let recipient = agents.recipient(&lead).await.unwrap();
+            assert_eq!(recipient.baseline, pinned_to("pi"));
+            assert_eq!(listed_reason(&agents).await, None);
+            assert!(observation(&recipient, &capture("pi"), None).is_ok());
+            assert_eq!(unread(&rig), 0);
         }
     }
 

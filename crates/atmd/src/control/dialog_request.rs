@@ -192,7 +192,17 @@ pub(super) async fn dispatch(
             ..
         } => {
             let prepared = outcome(deadline, async {
-                Ok(prepare_reply(client, pane.to_string(), option, yes, no).await?)
+                let prepared = prepare_reply(client, pane.to_string(), option, yes, no).await?;
+                if let Some(moves) = prepared.submit_moves() {
+                    if reply.is_closed() {
+                        return Err(ServiceError::Unavailable);
+                    }
+                    legacy_input::guard_legacy_input(client, &pane, "reply to", |capture| {
+                        crate::org::agent_screen::legacy_submit_veto(capture, moves)
+                    })
+                    .await?;
+                }
+                Ok(prepared)
             })
             .await;
             let mut started = false;

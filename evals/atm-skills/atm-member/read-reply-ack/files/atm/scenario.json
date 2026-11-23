@@ -1,0 +1,43 @@
+{
+  "own_pane": "%3",
+  "named_commands": [
+    {
+      "argv": [
+        "me"
+      ],
+      "stdout": "Agent: project/member; manager: project/lead\nInstructions: Read the fixture and answer only when requested.\nOpen tasks: none\nUnread m47 brief from=project/lead: Reply check; read: atm inbox --id m47\nReport: atm post --tag project/lead --kind report --body 'DONE: <result>'"
+    },
+    {
+      "argv": [
+        "inbox",
+        "--id",
+        "m47"
+      ],
+      "stdout": "m47 from=project/lead to=project/member kind=brief status=delivered sent=2026-11-20T00:00:00Z read=-\ndelivery: delivered pane=%3 attempt=1\npost: m41 channel=project thread=-\nreply: atm post --reply m41 --body '...'\nattach: @RUN@/briefs/wake.md\n  Reply check\n1 unread",
+      "delivery": {
+        "status": "delivered",
+        "target": [
+          "--reply",
+          "m41"
+        ]
+      }
+    },
+    {
+      "argv": [
+        "post",
+        "--reply",
+        "m41",
+        "--body",
+        "The fixture says ready."
+      ],
+      "stdout": "m52 posted channel=project thread=m41; woke: project/lead"
+    },
+    {
+      "argv": [
+        "ack",
+        "m47"
+      ],
+      "stdout": "1 marked read"
+    }
+  ]
+}

@@ -742,5 +742,15 @@
     "style": "crates/atm-claude-adapter/tests/fixtures/screen_styled_lead-working-shells_2.1.325.txt",
     "columns": 144,
     "rows": 80
+  },
+  {
+    "key": "claude.background-agent-list",
+    "mode": "claude",
+    "state": "background-agent-list",
+    "variant": "source-only",
+    "source": "crates/atm-claude-adapter/tests/fixtures/claude_background_agent_list_version-not-recorded.plain.txt",
+    "style": "crates/atm-claude-adapter/tests/fixtures/claude_background_agent_list_version-not-recorded.styled.txt",
+    "columns": 189,
+    "rows": 40
   }
 ]

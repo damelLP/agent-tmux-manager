@@ -106,6 +106,23 @@ impl Reader {
         Ok(Self { requests })
     }
 
+    // Use the same request/response path without a filesystem thread that
+    // would race a paused Tokio clock's auto-advance.
+    #[cfg(test)]
+    pub(super) fn in_memory_for_test(
+        mut read: impl FnMut(u64, u64, &[String]) -> Result<Page, super::OrgServiceError>
+            + Send
+            + 'static,
+    ) -> Self {
+        let (requests, mut receive) = tokio::sync::mpsc::channel::<ReadRequest>(8);
+        tokio::spawn(async move {
+            while let Some(job) = receive.recv().await {
+                let _ = job.reply.send(read(job.after, job.fence, &job.topics));
+            }
+        });
+        Self { requests }
+    }
+
     pub async fn page(
         &self,
         after: u64,

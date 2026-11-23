@@ -654,3 +654,99 @@ fn unknown_live_dependency_refuses_the_overrule() {
     assert!(w.answer(d, "large").is_err());
     assert_eq!(w.state, before);
 }
+
+// Break caught: a notice that a later daemon sent as a wake row (same content,
+// linked to its post) counts as unsent, so a rollback would send it again.
+#[test]
+fn a_redo_notice_sent_as_a_wake_counts_as_sent() {
+    let mut w = World::new();
+    let d = w.request("alpha/lead", false);
+    let t = w.create(Some(d), None, None);
+    w.assign(&t, "gamma/chief").unwrap();
+    w.away();
+    w.take(d);
+    w.answer(d, "large").unwrap();
+    let notes = w.state.redo_notices();
+    assert_eq!(notes.len(), 2);
+    let post = w.event(OrgEvent::ChannelPosted(PostContent {
+        channel: ChannelId::Project("alpha".parse().unwrap()),
+        author: Address::System,
+        session_id: None,
+        kind: MessageKind::Note,
+        body: "redo".into(),
+        attachments: vec![],
+        task: None,
+        thread: None,
+        mentions: vec![],
+        wake: vec![],
+        route: false,
+        decision: None,
+        client_key: None,
+        also_in_chat: false,
+    }));
+    for note in notes {
+        w.event(OrgEvent::MessageSent(MessageContent {
+            post: Some(MessageId::new(post)),
+            ..note
+        }));
+    }
+    assert!(w.state.redo_notices().is_empty());
+}
+
+// U8: a redo task's notes become one thread reply with step `redo:<task>`.
+// Break caught: the bridge resends a task's notes once its step is posted
+// (the rows carry `post`, and a reply whose rows are still being written has
+// none yet), or the notes lose the decision they belong to.
+#[test]
+fn redo_notices_skip_a_task_whose_redo_step_is_posted() {
+    let mut w = World::new();
+    let d = w.request("alpha/lead", false);
+    let first = w.create(Some(d), None, None);
+    let second = w.create(Some(d), None, None);
+    for t in [&first, &second] {
+        w.assign(t, "gamma/chief").unwrap();
+    }
+    w.away();
+    w.take(d);
+    w.answer(d, "large").unwrap();
+    let all = w.state.redo_notices_by_decision();
+    assert_eq!(all.len(), 4);
+    assert!(all.iter().all(|(id, _)| *id == d));
+    assert_eq!(
+        all.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(),
+        w.state.redo_notices()
+    );
+    w.event(OrgEvent::ChannelPosted(PostContent {
+        channel: ChannelId::Project("alpha".parse().unwrap()),
+        author: Address::System,
+        session_id: None,
+        kind: MessageKind::Note,
+        body: "redo".into(),
+        attachments: vec![],
+        task: Some(first.clone()),
+        thread: None,
+        mentions: vec![],
+        wake: vec![],
+        route: false,
+        decision: Some(DecisionStep {
+            decision_id: d,
+            step: format!("redo:{first}"),
+        }),
+        client_key: None,
+        also_in_chat: false,
+    }));
+    let left = w.state.redo_notices_by_decision();
+    assert_eq!(
+        left.iter()
+            .map(|(id, n)| (*id, n.task.clone(), n.to.to_string()))
+            .collect::<Vec<_>>(),
+        [
+            (d, Some(second.clone()), "owner".to_owned()),
+            (d, Some(second.clone()), "gamma/chief".to_owned()),
+        ]
+    );
+    let (_, note) = left.into_iter().next().unwrap();
+    w.event(OrgEvent::MessageSent(note));
+    assert_eq!(w.state.redo_notices().len(), 1);
+    assert_eq!(w.replay(), w.state);
+}

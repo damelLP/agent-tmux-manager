@@ -33,11 +33,16 @@ const CAPACITY: usize = 32;
 #[derive(Debug, Clone)]
 pub(super) struct PreparedAgent {
     pub agent_id: AgentId,
-    #[cfg(test)]
     pub root: PathBuf,
     pub role: RoleSpec,
     pub cwd: PathBuf,
     pub trust_dirs: Vec<PathBuf>,
+}
+
+impl PreparedAgent {
+    pub(super) fn role_path(&self) -> PathBuf {
+        role_path(&self.root, &self.agent_id.name)
+    }
 }
 
 enum Operation {
@@ -250,7 +255,6 @@ fn resolve(input: Input, state: OrgState) -> Result<Resolution, AgentError> {
     let output = match role {
         Some((role, cwd, trust_dirs)) => Output::Prepared(Box::new(PreparedAgent {
             agent_id,
-            #[cfg(test)]
             root,
             role,
             cwd,
@@ -362,8 +366,12 @@ fn read_away_settings(path: &Path) -> Result<AwaySettings, AgentError> {
     }
 }
 
+fn role_path(root: &Path, name: &str) -> PathBuf {
+    root.join(".atm/roles").join(format!("{name}.md"))
+}
+
 fn read_role(root: &Path, name: &str) -> Result<(RoleSpec, PathBuf, Vec<PathBuf>), AgentError> {
-    let path = root.join(".atm/roles").join(format!("{name}.md"));
+    let path = role_path(root, name);
     let text = fs::read_to_string(&path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             AgentError::NotFound(format!("role file {} was not found", path.display()))

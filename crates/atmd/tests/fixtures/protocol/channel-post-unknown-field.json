@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-post-unknown-field","method":"channel.post","params":{"channel":"alpha","body":"x","internal":true}},
+  "response": {"type":"response","id":"channel-post-unknown-field","error":{"code":"invalid_params","message":"unknown field `internal`, expected one of `channel`, `to`, `reply_to`, `also_in_chat`, `body`, `kind`, `attachments`, `task`, `tags`, `client_key`"}},
+  "ignore": []
+}

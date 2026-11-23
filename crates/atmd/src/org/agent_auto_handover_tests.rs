@@ -250,6 +250,7 @@ impl Auto {
             body: "Read this".into(),
             attachments: Vec::new(),
             task: None,
+            post: None,
         })
         .await
     }

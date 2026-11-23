@@ -224,7 +224,11 @@ pub(super) fn spawn_watch(handovers: Handovers, timer: Arc<dyn Timer>, cancel: C
         loop {
             let due = watch.seen.iter().find(|(_, row)| row.due);
             if let Some(session) = due.map(|(session, _)| session.clone()) {
-                watch.look(&session).await;
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    () = watch.look(&session) => {}
+                }
                 continue;
             }
             let wake = watch.seen.values().filter_map(|row| row.wake).min();

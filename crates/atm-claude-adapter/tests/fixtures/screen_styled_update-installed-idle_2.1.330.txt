@@ -1,0 +1,41 @@
+Captured: Claude Code 2.1.330, 2026-11-22, read-only tmux capture-pane -p -e -N (lead supplied).
+     [2m xxx [0m x xxxxxxxxx xxxxxx xxxx xxxxxxx xxxx x xxxxx xxxxxxx xxxxxxxxx xxxxx xxxx xxxx xxxx xxxxx xxxxxxxxx xxxxx x xxxxxxxx                                                              |
+     [2m xxx [0m x xxxxxxxxx xxxxxx xxxx xxxxxxx xxxx x xxxxx xxxxxxx xxxxxxxxx xxxxx xxxx xxxx xxxxxxxxx xxxxxxxxx xxxxxxx xxxxxxxx xx                                                            |
+     [2m xxx [0m   xxxxx xxxxxxxxx xxxxx xxxxxx xxxxxxx xxxxxx xxxxx xxx xxxxx xxxx xxxxxx                                                                                                         |
+[38;5;246m  x xxxxxxxx xx xxxx xxxx[39m                                                                                                                                                                    |
+                                                                                                                                                                                             |
+[38;5;231mx[39m xxx xxxxx xx xxxxx xxxxx xxxx xxx xxxxxxx xxxxxxxx [38;5;153mxxxx[39m xx xx [38;5;153mxxxxxxx[39m xxxx xxxx xxxxx xxxxxxxxx xxx xxx xxxxx xxxxx xxxxxx xx xxxxxxxx xxxxxxx xxxx xx xxxxxxx xxxx xx x[38;5;153mxxxxxxxxxxxxxxxx[39mxx |
+                                                                                                                                                                                             |
+  [1mxxxx xxxxx xxxx xxxxx xxxx xxxxxxxx[0m                                                                                                                                                        |
+  x [1mxxxxxxx[0m [38;5;153mxxxx[39m xxxxxxxxxxxxxx xx [38;5;153mxxxxxxx[39mx xxxxxxx xx xxxxxxxx xxxx xxxx xxxxxx xx xxxxxxxxx                                                                                                |
+  x [1mxx xxxx xxxxxxx[0m xxxx xxxxx xxxxx x xx x x xxxx xxxxxxx xxxxx xxxxx xxxxxx xxxx x xxxxxxx xxxxx xxxxxxx xxx xxx xxxxxx xxxx xxxxx xx xxxxx xx xxx xxxxxxxx                                |
+  x [1mxxxxxxx xxxxx xxxxxxx xxxxxx xx x xxxxxxxxxxx xxxxx xxx xxxxxxx xxxxxx xxxxxxx[0m                                                                                                           |
+    x xxx xxxxx xxxxxx xxxxx xx xxxx                                                                                                                                                         |
+    x xxx xxxxxxx xxxx xxxxx xxx xx xxxxxxx xxx xxx xxxx xxxx xxxxx xxx xxxx                                                                                                                 |
+    x xxxx xxxxxx x xxxxxx xxx xxxxx xx xxx xxxxx x xxxxxx xx xxxxx xxxx xxxx                                                                                                                |
+    x xxxxxxxxxxxx xxxxxx xxxxxxxx xx xxxxxxxx xx xxxx xx xxxxxxxxx xxx xxxx xx xxxxxxx xxxx xxxx xx xxxx xx xxx xxxxxxx                                                                     |
+    x xx xxxx xxxxxx xxx xx xxxxxxx xxxxxxxx                                                                                                                                                 |
+  x [1mxxxxxx xxxxxxxx[0m xxx xxxxxxxxxxxx xxx xxx xxxxxxxxxxx xxxx xxxxxx xxxxxx xxx xxxxxx xxxxxx xxxxxx [38;5;153mxxxxxxxxxxxxxxxx[39mxx xxxx xxxx xx x xxxxxxxxx xxxxxxxx xxx xxxxxxxxx xxxx xxxx x xxxxxxxxx|
+    xxx xx xxxxxxxx                                                                                                                                                                          |
+  x [1mxxxxxx xxxxxxxx[0m [38;5;153mxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[39mx xx xxxxx xx xxxxx xxxxx xxx xxx xxxxx xxxxx xxxxxxxxx xxxx [1mxxxx xxxxxx xxx xxxxx xxxxx xxx xxxxx xxxxxxxx xxx[0m xxxxx xxxxxx |
+    xx                                                                                                                                                                                       |
+                                                                                                                                                                                             |
+  [1mxxx xxxxxx xxx xxxxx xxxxxx[0m                                                                                                                                                                |
+  x xxxxxxxxxxxx xxxxxxx xxxxx xxx xxxx xxxxxxx xxxxx xxxxxxxxxx xx x xxxxxxxxxxx xxx xxxxxxxx xxxxxxxx xxxx [38;5;153mxxxxxxxxxxxxxxxxxxxxxx[39m xx xxx xxx xxxxxx                                        |
+  x xxx xxxxxxxxx xxx xxxxxx xxxxxxxxxx xxx xx xxxxx xxxx xxxxxxxx xxx xx xxxxxxxx xxx xxxx xxxx xx xxxxxxx xxxx xxxxxxxxxx xxxx xx xxxx                                                     |
+                                                                                                                                                                                             |
+  [1mxxxx[0m                                                                                                                                                                                       |
+  x [1mxxxx xxx xxxxxxx xxxxxxx xxxxxxxx[0m xx xxxx xxxx xx xxxxxxxx x xxxx xx xxxx xxx xxx xxxx xxx xxxxxx xx xxx xxxxxx xx xxxx xxx xxxxxx x xxx xxxxxx xxxxxxxxxx                               |
+  x [1mxxx xxxxxx xxxx xxx xxxxx xxxx[0m                                                                                                                                                           |
+    x xxx xxxxxxx xx xx [38;5;153mxxxxxxx[39m                                                                                                                                                              |
+    x xx xx xxx xx xxxxx xxxx xxxxxxx xxxxxxx xxxxxxxx xxxx xx x xxxxxxxxx xxxx xxxx xxx xxxxxxxxxx                                                                                          |
+    x xxx xxxxxxxxx xx                                                                        |
+  x xxxx xxxxxxxx xxx xxxxx xxx xxxxx                                                                                                                                                        |
+                                               |
+[38;5;246m✻[39m [38;5;246mWorked for 6m 45s · done 0:30[39m                                                                                                                                                              |
+                                                                                                                                                     [38;5;114m✔ Update installed · /restart to apply[39m  |
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+[39m❯                                                                                             |
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+[39m  [38;5;246mxxxxxxxxxxxxxxxxxx xxxxxx xxx [38;5;151mxxx[38;5;66mxxxxxxx[38;5;246m xxx xxxxxxxxxxxx xxxx xxx xxxxxxx[39m                  |
+  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle)[39m                                                        |

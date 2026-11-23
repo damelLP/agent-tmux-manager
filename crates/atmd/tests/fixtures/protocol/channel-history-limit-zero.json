@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-history-limit-zero","method":"channel.history","params":{"channel":"alpha","limit":0}},
+  "response": {"type":"response","id":"channel-history-limit-zero","error":{"code":"invalid_params","message":"limit must be between 1 and 200"}},
+  "ignore": []
+}

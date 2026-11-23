@@ -213,6 +213,48 @@ async fn invoke(case: &Value, extra: &[&str], reply: Value) -> std::process::Out
     .await
 }
 
+// Break caught: create loses source names or a fail-open warning, prints a
+// raw terminal control, or re-requests the task for its effective budget.
+#[tokio::test]
+async fn task_create_reports_optional_budget_sources_and_warnings() {
+    let case = case("create");
+    for (metadata, text, stderr) in [
+        (json!({}), "t7 changed\n", ""),
+        (
+            json!({"default_budget_from":{"cost":"apps", "turns":"tools", "future":"ignored"}}),
+            "t7 changed\nbudget default from: turns=tools, cost=apps\n",
+            "",
+        ),
+        (
+            json!({"default_budget_from":{"cost":"tools\n"}}),
+            "t7 changed\nbudget default from: cost=tools\\n\n",
+            "",
+        ),
+        (
+            json!({"warning":"incomplete\n\u{1b}[2J"}),
+            "t7 changed\n",
+            "Warning: incomplete\\n\\u{1b}[2J\n",
+        ),
+    ] {
+        let mut reply = case["reply"].clone();
+        reply["result"]
+            .as_object_mut()
+            .unwrap()
+            .extend(metadata.as_object().unwrap().clone());
+        let out = invoke(&case, &[], reply.clone()).await;
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), text);
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), stderr);
+        let out = invoke(&case, &["--format", "json"], reply.clone()).await;
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stderr.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            reply["result"]
+        );
+    }
+}
+
 // Break caught: wrong method/default parameters, dropped output fields, false notification receipt.
 #[tokio::test]
 async fn every_method_renders_recorded_text_and_preserves_raw_json() {

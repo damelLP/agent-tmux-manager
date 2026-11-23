@@ -77,6 +77,7 @@ fn message(kind: MessageKind, body: &str) -> MessageContent {
         body: body.into(),
         attachments: vec![],
         task: None,
+        post: None,
     }
 }
 
@@ -371,7 +372,7 @@ impl Rig {
         self.state()
             .await
             .messages()
-            .map(|m| m.content.clone())
+            .filter_map(|m| today(&m.content))
             .collect()
     }
     async fn stop(self) {
@@ -390,6 +391,27 @@ async fn finish_scenario(rig: Rig, mut scenario: JoinHandle<()>) {
 }
 async fn next(watch: &mut crate::org::EventWatch) -> Arc<crate::eventlog::Envelope> {
     guarded(watch.next()).await.unwrap().unwrap()
+}
+/// The next `msg.sent` to a seat, as today's message: U8 adds a question row
+/// to the owner for every decision, and each reply's row carries `post`.
+async fn told(watch: &mut crate::org::EventWatch) -> Value {
+    loop {
+        let mut body = next(watch).await.body.clone();
+        if !is_question_row(&body) {
+            body.as_object_mut().unwrap().remove("post");
+            return body;
+        }
+    }
+}
+fn is_question_row(body: &Value) -> bool {
+    body["to"] == "owner" && body["kind"] == "question"
+}
+fn today(content: &MessageContent) -> Option<MessageContent> {
+    let row = serde_json::to_value(content).unwrap();
+    (!is_question_row(&row)).then(|| MessageContent {
+        post: None,
+        ..content.clone()
+    })
 }
 fn body(seq: u64, option: &str, text: &str) -> String {
     text.replace("d3", &format!("d{seq}"))
@@ -413,10 +435,7 @@ async fn a_request_while_away_is_taken_and_its_requester_told_once() {
         json!({"decision_id":change.to_string(),"option":"no","by":"system"})
     );
     let taken = message(MessageKind::Answer, &body(change.seq(), "no", TAKEN));
-    assert_eq!(
-        next(&mut sent).await.body,
-        serde_json::to_value(&taken).unwrap()
-    );
+    assert_eq!(told(&mut sent).await, serde_json::to_value(&taken).unwrap());
     // A detail is recorded for its requester. Its notice is the next message:
     // the reconciles it caused passed over the first decision without a second
     // notice for it.
@@ -426,20 +445,14 @@ async fn a_request_while_away_is_taken_and_its_requester_told_once() {
         json!({"decision_id":detail.to_string(),"option":"yes","by":"p/worker"})
     );
     let yours = message(MessageKind::Answer, &body(detail.seq(), "yes", YOURS));
-    assert_eq!(
-        next(&mut sent).await.body,
-        serde_json::to_value(&yours).unwrap()
-    );
+    assert_eq!(told(&mut sent).await, serde_json::to_value(&yours).unwrap());
     // What must wait is announced, and stays pending.
     let outside = rig.ask(request(false, true, Some("yes"))).await;
     let waits = message(
         MessageKind::Note,
         &body(outside.seq(), "yes", WAITS_OUTSIDE),
     );
-    assert_eq!(
-        next(&mut sent).await.body,
-        serde_json::to_value(&waits).unwrap()
-    );
+    assert_eq!(told(&mut sent).await, serde_json::to_value(&waits).unwrap());
     let state = rig.state().await;
     assert_eq!(
         state.decision(&outside).unwrap().status,
@@ -467,12 +480,13 @@ async fn decisions_pending_when_the_owner_leaves_are_handled_at_once() {
             note: None,
             standing_rule: false,
             relay: false,
+            confirm: false,
         },
         owner(),
     ))
     .await
     .unwrap();
-    assert!(next(&mut sent).await.body["body"]
+    assert!(told(&mut sent).await["body"]
         .as_str()
         .unwrap()
         .starts_with(&format!("Decision {answered} resolved: no")));
@@ -489,14 +503,8 @@ async fn decisions_pending_when_the_owner_leaves_are_handled_at_once() {
         change.to_string()
     );
     let mut bodies = vec![
-        next(&mut sent).await.body["body"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-        next(&mut sent).await.body["body"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
+        told(&mut sent).await["body"].as_str().unwrap().to_owned(),
+        told(&mut sent).await["body"].as_str().unwrap().to_owned(),
     ];
     bodies.sort();
     let mut expected = vec![
@@ -565,7 +573,7 @@ async fn a_restart_while_away_keeps_the_switch_and_handles_what_was_left_pending
     assert_eq!(
         state
             .messages()
-            .map(|m| m.content.clone())
+            .filter_map(|m| today(&m.content))
             .collect::<Vec<_>>(),
         [message(MessageKind::Answer, TAKEN)]
     );
@@ -954,9 +962,9 @@ async fn relay_oversized_committed_result_reports_commit_and_retries_without_app
             take.body,
             json!({"decision_id":id,"option":"no","by":"owner","relayed_by":"p/worker"})
         );
-        let notice = next(&mut notices).await;
-        assert_eq!(notice.body["to"], "p/worker");
-        assert!(notice.body["body"].as_str().unwrap().starts_with(&format!(
+        let notice = told(&mut notices).await;
+        assert_eq!(notice["to"], "p/worker");
+        assert!(notice["body"].as_str().unwrap().starts_with(&format!(
             "Decision {id} taken provisionally: no\nRelayed by p/worker"
         )));
         let state = org.snapshot().await.unwrap();
@@ -970,7 +978,10 @@ async fn relay_oversized_committed_result_reports_commit_and_retries_without_app
         );
         assert_eq!(decision.status, DecisionStatus::TakenProvisionally);
         assert!(decision.resolution.is_none());
-        assert_eq!(state.messages().count(), 1);
+        assert_eq!(
+            state.messages().filter_map(|m| today(&m.content)).count(),
+            1
+        );
         let before = org.status().unwrap();
         let again = guarded(methods.call(pane("%7"), "decision.resolve", answer))
             .await
@@ -1129,4 +1140,41 @@ async fn owner_relay_schema_and_disabled_service_fail_closed() {
             "invalid_params"
         );
     }
+}
+
+// Break caught: a notice a later daemon sent as a wake row (same content,
+// linked to its post) counts as unsent, so a rollback would send it again.
+#[test]
+fn a_notice_sent_as_a_wake_counts_as_sent() {
+    let mut state = folded(&[
+        OrgEvent::DecisionRequested(request(true, true, Some("yes"))),
+        away_fact(),
+        taken(Address::System),
+    ]);
+    let content = message(MessageKind::Answer, TAKEN);
+    let post = atm_org::PostContent {
+        channel: atm_org::ChannelId::Project("p".parse().unwrap()),
+        author: Address::System,
+        session_id: None,
+        kind: MessageKind::Answer,
+        body: "step".into(),
+        attachments: vec![],
+        task: None,
+        thread: None,
+        mentions: vec![],
+        wake: vec![],
+        route: false,
+        decision: None,
+        client_key: None,
+        also_in_chat: false,
+    };
+    state
+        .apply(6, now(), &OrgEvent::ChannelPosted(post))
+        .unwrap();
+    let wake = MessageContent {
+        post: Some(atm_org::MessageId::new(6)),
+        ..content
+    };
+    state.apply(7, now(), &OrgEvent::MessageSent(wake)).unwrap();
+    assert!(missing_notices(&state).is_empty());
 }

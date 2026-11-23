@@ -1,0 +1,50 @@
+# Department "tools". Draft D0 by agent-tmux-manager/departments-lead, 2026-11-21; owner's yes 10:28
+# ("Sounds awesome let's make it happen" = defaults on cp-s2-dept-1). The file name is the id.
+# Departments and projects are separate and many-to-many (owner, 16 Nov 20:49): this file names its
+# projects; no project names a department; ids and manager lines are unchanged.
+# Roster: a seat id, or `project/prefix*` where * is one or more digits (numbered copies of one job
+# description); `max` = live seats at once. Rosters start as today's role files.
+# Models: exact role-file `model` strings, or a trailing * for any rest.
+# Nothing here is enforced until D2/D3; hiring stays in report mode until the owner says "enforce".
+
+title = "Agent tools"
+goal = "atm and the harness: the tools the org runs on"
+projects = ["agent-tmux-manager", "harness"]
+
+[hire]
+mode = "report"
+
+[[roster]]
+seats = "agent-tmux-manager/lead"
+[[roster]]
+seats = "agent-tmux-manager/departments-lead"
+[[roster]]
+seats = "agent-tmux-manager/efficiency-lead"
+[[roster]]
+seats = "agent-tmux-manager/manager"
+[[roster]]
+seats = "agent-tmux-manager/build-*"
+max = 9
+[[roster]]
+seats = "agent-tmux-manager/build-hard-*"
+max = 6
+[[roster]]
+seats = "agent-tmux-manager/merge-a"
+[[roster]]
+seats = "agent-tmux-manager/merge-b"
+[[roster]]
+seats = "agent-tmux-manager/merge-c"
+[[roster]]
+seats = "agent-tmux-manager/merge-p"
+[[roster]]
+seats = "agent-tmux-manager/usage-builder"
+[[roster]]
+seats = "agent-tmux-manager/dept-build"
+[[roster]]
+seats = "agent-tmux-manager/dept-review"
+[[roster]]
+seats = "harness/lead"
+
+[spend]
+models = ["openai-codex/gpt-6.2-sol*", "claude-fable-5-2", "claude-opus-5-5", "opus"]
+# task_budget: set at D3 from measured task turns, not guessed now.

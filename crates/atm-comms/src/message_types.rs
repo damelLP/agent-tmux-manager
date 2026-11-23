@@ -6,6 +6,7 @@
 //! inbox reference, or a start line's own text.
 
 use atm_core::SessionId;
+use atm_org::ChannelId;
 pub use atm_org::{
     Address, AgentId, DeliveryStatus, MessageContent, MessageId, MessageKind, TaskId,
 };
@@ -80,6 +81,15 @@ pub struct DeliveryView {
     /// Predecessor in the recipient FIFO blocking this message, not its followers.
     pub blocked_by: Option<MessageId>,
 }
+/// Context of the linked post; the post's ID stays in `MessageContent::post`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostContext {
+    pub channel: ChannelId,
+    pub thread: Option<MessageId>,
+    /// The session of the post's author, not the wake recipient.
+    pub session_id: Option<SessionId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxEntry {
     pub message_id: MessageId,
@@ -88,6 +98,8 @@ pub struct InboxEntry {
     pub status: DeliveryStatus,
     pub read_at: Option<DateTime<Utc>>,
     pub delivery: DeliveryView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_context: Option<PostContext>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxResult {
@@ -108,6 +120,15 @@ pub struct AckResult {
 #[serde(deny_unknown_fields)]
 pub struct ResolveParams {
     pub id: MessageId,
+}
+/// The owner's give-up, or his designated relay's with his verbatim words.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GiveUpParams {
+    pub id: MessageId,
+    /// Only on a relayed give-up; absent, the request is the owner's as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_words: Option<String>,
 }
 /// Owner retry keeps the ID and attempt history; it never enqueues a replacement.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -181,8 +181,9 @@ fn named_skills_use_automatic_verdict_answers_without_duplicate_send() {
     let automatic = automatic.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(automatic.contains("verdict automatically queues one task-correlated `answer`"));
     assert!(automatic.contains("accepted result is final"));
-    assert!(!automatic.contains("atm msg send --to project/member --kind answer"));
-    assert!(recovery.contains("atm msg send --to project/member --kind answer"));
+    assert!(!automatic.contains("atm post --tag project/member --kind answer"));
+    assert!(recovery.contains("atm post --tag project/member --kind answer"));
+    assert!(!recovery.contains("atm msg send"));
     assert!(recovery.contains("authorized diagnostics"));
     assert!(recovery.contains("before resending"));
     let (_, record) = reference.split_once("### L4\n").unwrap();
@@ -190,6 +191,55 @@ fn named_skills_use_automatic_verdict_answers_without_duplicate_send() {
     assert!(record.contains("automatic answer"));
     assert!(record.contains("re-read"));
     assert!(record.contains("**Not verified:**"));
+}
+
+// Break caught: the shipped default still sends direct legacy messages, skips
+// the thread, or replaces the durable owner decision with a chat question.
+#[test]
+fn named_skills_teach_channel_wakes_and_keep_owner_decisions() {
+    for skill in SKILLS {
+        let text = document(skill);
+        for command in [
+            "atm inbox --id mN",
+            "atm post --reply",
+            "atm ack mN",
+            "atm decisions request",
+        ] {
+            assert!(text.contains(command), "{skill} is missing {command}");
+        }
+        assert!(
+            !text.contains("atm msg send") && !text.contains("atm msg ack"),
+            "{skill} teaches legacy transport"
+        );
+    }
+    let reference = fs::read_to_string(source().join("shared").join(REFERENCE)).unwrap();
+    let (_, recipe) = reference
+        .split_once("### Channel and wake recipe\n")
+        .unwrap();
+    let (recipe, _) = recipe
+        .split_once("### Mixed daemon and skill versions\n")
+        .unwrap();
+    for command in [
+        "atm inbox --id m41",
+        "atm post --reply m40",
+        "atm ack m41",
+        "atm post --tag project/lead --kind report --task unit-1",
+    ] {
+        assert!(
+            recipe.contains(command),
+            "named recipe is missing {command}"
+        );
+    }
+    assert!(!recipe.contains("atm msg send") && !recipe.contains("atm msg ack"));
+    let (_, decisions) = reference
+        .split_once("## Decision requests and visibility")
+        .unwrap();
+    let (decisions, _) = decisions.split_once("## Away and return").unwrap();
+    assert!(decisions.contains("atm decisions request --kind plan"));
+    assert!(
+        !decisions.contains("--channel"),
+        "the decisions CLI has no channel flag"
+    );
 }
 
 // Break caught: shipped recipes authorize obsolete work or duplicate automatic invalidation; structural only, not model compliance.

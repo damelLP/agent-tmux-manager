@@ -1,0 +1,5 @@
+# Synthetic: project wake, post, IDs and result for the named recipe. No model call.
+schema_version: "1.1"
+name: read-reply-ack
+expected_outcome: |
+  Read the inbox and attachment, reply once in the project thread, and ack the delivered wake.

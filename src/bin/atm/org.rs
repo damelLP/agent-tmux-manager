@@ -29,6 +29,27 @@ pub(super) struct OrgTree {
     needs_owner: NeedsOwner,
     pub(super) projects: Vec<Project>,
     unplaced_tasks: Vec<OpenTask>,
+    #[serde(default)]
+    departments: Vec<DepartmentSummary>,
+    #[serde(default)]
+    department_problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DepartmentSummary {
+    id: String,
+    title: String,
+    goal: Option<String>,
+    projects: Vec<ProjectId>,
+    problems: Vec<String>,
+    #[serde(default)]
+    would_wait: Vec<WouldWait>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WouldWait {
+    seat: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -196,6 +217,70 @@ fn render_seats(project: &Project, nested: bool, out: &mut impl Write) -> Result
     Ok(())
 }
 
+fn render_departments(tree: &OrgTree, out: &mut impl Write) -> Result<()> {
+    if tree.departments.is_empty() && tree.department_problems.is_empty() {
+        return Ok(());
+    }
+    let by_id: BTreeMap<_, _> = tree
+        .projects
+        .iter()
+        .map(|project| (&project.id, project))
+        .collect();
+    let mut covered = BTreeSet::new();
+    writeln!(out, "\nDepartments:")?;
+    if tree.departments.is_empty() {
+        writeln!(out, "  none loaded")?;
+    }
+    for dept in &tree.departments {
+        writeln!(out, "  {} ({})", cell(&dept.title), cell(&dept.id))?;
+        if let Some(goal) = &dept.goal {
+            writeln!(out, "    Goal: {}", cell(goal))?;
+        }
+        for project in dept.projects.iter().filter_map(|id| by_id.get(id)) {
+            covered.insert(&project.id);
+            let seats = project.seats.len();
+            let tasks = project.tasks_open;
+            let seat_label = if seats == 1 { "seat" } else { "seats" };
+            let task_label = if tasks == 1 { "task" } else { "tasks" };
+            writeln!(out, "    {}: {seats} {seat_label}; {tasks} open {task_label}; {} pending, {} provisional decisions",
+                cell(&project.id), project.decisions.pending, project.decisions.provisional)?;
+        }
+        for row in &dept.would_wait {
+            writeln!(
+                out,
+                "    Would wait: {} ({})",
+                cell(&row.seat),
+                cell(&row.reason)
+            )?;
+        }
+    }
+    let uncovered: Vec<_> = tree
+        .projects
+        .iter()
+        .filter(|project| !covered.contains(&project.id))
+        .map(|project| cell(&project.id))
+        .collect();
+    let uncovered = if uncovered.is_empty() {
+        "none".into()
+    } else {
+        uncovered.join(", ")
+    };
+    writeln!(out, "No department: {uncovered}")?;
+    let mut problems = tree
+        .departments
+        .iter()
+        .flat_map(|dept| &dept.problems)
+        .chain(&tree.department_problems)
+        .peekable();
+    if problems.peek().is_some() {
+        writeln!(out, "Department problems:")?;
+        for problem in problems {
+            writeln!(out, "  {}", cell(problem))?;
+        }
+    }
+    Ok(())
+}
+
 fn render_tree(tree: &OrgTree, out: &mut impl Write) -> Result<()> {
     let needs = &tree.needs_owner;
     let unnamed = if needs.unnamed_attention == 1 {
@@ -232,6 +317,7 @@ fn render_tree(tree: &OrgTree, out: &mut impl Write) -> Result<()> {
             optional(tree.reporting.reason.as_ref()),
         )?;
     }
+    render_departments(tree, out)?;
     if tree.projects.is_empty() {
         writeln!(out, "Projects: none")?;
     }

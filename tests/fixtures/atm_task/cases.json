@@ -10,8 +10,8 @@
     "name":"assign", "method":"task.assign",
     "args":["task","assign","t6","project/worker"],
     "params":{"task_id":"t6","agent_id":"project/worker"},
-    "reply":{"result":{"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m8"}}},
-    "text":"t6 changed\nnotification: queued m8 (not delivery confirmation)\n"
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m9"}}},
+    "text":"t6 changed\nnotification: queued m9 (not delivery confirmation)\n"
   },
   {
     "name":"set_state", "method":"task.set_state",
@@ -24,8 +24,8 @@
     "name":"submit", "method":"task.submit",
     "args":["task","submit","t6"],
     "params":{"task_id":"t6","what":"result","files":[]},
-    "reply":{"result":{"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m9"}}},
-    "text":"t6 changed\nnotification: queued m9 (not delivery confirmation)\n"
+    "reply":{"result":{"task_id":"t6","changed":true,"notification":{"status":"queued","message_id":"m10"}}},
+    "text":"t6 changed\nnotification: queued m10 (not delivery confirmation)\n"
   },
   {
     "name":"attach", "method":"task.attach",

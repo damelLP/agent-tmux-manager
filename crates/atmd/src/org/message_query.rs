@@ -116,7 +116,7 @@ fn page(
     for (index, message) in selected.rows.iter().take(usize::from(p.limit)).enumerate() {
         // The shared allowlist runs before accounting; no hidden body/path sizes
         // can choose a metadata page boundary. Never consult scheduler progress.
-        let entry = project_entry(message, managed, Progress::default());
+        let entry = project_entry(state, message, managed, Progress::default());
         let cursor = if selected.rows.get(index + 1).is_some() {
             Some(history_cursor(p, scope, selected.snapshot_seq, message.id)?)
         } else {

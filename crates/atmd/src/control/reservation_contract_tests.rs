@@ -144,6 +144,7 @@ async fn contract_org_constructor_preserves_existing_control_calls() {
     mock.set_next_raw_output("ATM-PANE-v1\t%7\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
     mock.set_next_raw_output(""); // positively present, pane-local tag unset
     mock.set_next_raw_output("0 1");
+    crate::control::legacy_survey_test::mock_shell(&mock, "%7");
     let cancel = CancellationToken::new();
     let (control, task) = spawn_control_with_org(
         Box::new(mock.clone()),

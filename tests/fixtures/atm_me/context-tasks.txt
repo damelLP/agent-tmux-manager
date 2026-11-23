@@ -7,5 +7,5 @@ Open tasks:
   {"agent_id":"project/worker","kind":"work","reason":null,"state":"assigned","task_id":"t7","title":"Work"}; inspect: atm task get t7
   {"agent_id":"project/worker","kind":"review","reason":null,"state":"in_review","task_id":"t9","title":"Review plan"}; inspect: atm task get t9
 Unread m7 brief from=owner: Read the attached brief; read: atm inbox --id m7
-After handling a delivered message: atm msg ack <id>
-Report: atm msg send --to project/lead --kind report --body 'DONE: <result>'
+After handling a delivered message: atm ack <id>
+Report: atm post --tag project/lead --kind report --body 'DONE: <result>'

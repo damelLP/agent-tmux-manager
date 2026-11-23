@@ -6,7 +6,7 @@
 //! Spawn typing retains daemon-owned admission even if its caller disappears.
 use super::org_mirror::{Mirror, View};
 use super::*;
-use crate::control::reservation::{pane_ops, state::InputGate, PaneId};
+use crate::control::reservation::{pane_ops, state::InputGate, CaptureFormat, PaneCapture, PaneId};
 use atm_core::SessionView;
 use atm_org::AgentStatus;
 
@@ -91,6 +91,13 @@ pub(super) async fn dispatch(
                         &text,
                     )
                     .await?;
+                    if reply.is_closed() {
+                        return Err(ServiceError::Unavailable);
+                    }
+                    guard_legacy_input(client, &ready.pane, "send to", |capture| {
+                        crate::org::agent_screen::legacy_send_veto(capture, &text)
+                    })
+                    .await?;
                     Ok(ready)
                 })
                 .await?;
@@ -145,6 +152,30 @@ pub(super) async fn dispatch(
         }
     }
     None
+}
+
+/// A fresh veto in the actor turn, after admission and before the first effect.
+pub(super) async fn guard_legacy_input(
+    client: &dyn TmuxClient,
+    pane: &PaneId,
+    operation: &str,
+    veto: impl FnOnce(&PaneCapture) -> Option<&'static str>,
+) -> Result<(), ServiceError> {
+    let refusal = |reason| {
+        ServiceError::ServerRefused(format!(
+            "Refusing to {operation} {pane}: {reason}; nothing was sent"
+        ))
+    };
+    let capture = pane_ops::capture(client, pane, CaptureFormat::Ansi)
+        .await
+        .map_err(|error| match error {
+            ReservationError::Control(error) => ServiceError::Control(error),
+            other => refusal(other.to_string()),
+        })?;
+    if let Some(reason) = veto(&capture) {
+        return Err(refusal(reason.to_owned()));
+    }
+    Ok(())
 }
 
 /// `operation` is the refusal's verb phrase: "send to", "kill", "interrupt".

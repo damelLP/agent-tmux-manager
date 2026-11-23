@@ -268,7 +268,7 @@ impl Rig {
     }
 
     /// The service folds a committed event only when the test relays it.
-    async fn relayed() -> Self {
+    pub(super) async fn relayed() -> Self {
         Self::build(true, None).await
     }
 
@@ -280,7 +280,7 @@ impl Rig {
         rig
     }
 
-    fn relay(&mut self) {
+    pub(super) fn relay(&mut self) {
         let (committed, service) = self.relay.as_mut().unwrap();
         while let Ok(envelope) = committed.try_recv() {
             service.send(envelope).unwrap();
@@ -387,7 +387,7 @@ impl Rig {
 
     /// A write's actual future must reach Pending after its commit, while
     /// the relay still withholds that commit from the message fold.
-    fn write_awaiting_fold<F>(
+    pub(super) fn write_awaiting_fold<F>(
         &self,
         seq: u64,
         work: F,
@@ -490,6 +490,7 @@ fn discovery_identity_admission_matrix() {
         excluded_session_id: None,
         reason: None,
         updated_at: utc(),
+        bound_at: None,
     };
     let row = |id: &str, pane: &str| {
         let mut domain = SessionDomain::new(
@@ -566,7 +567,7 @@ fn discovery_identity_admission_matrix() {
 }
 
 // Real registry calls use the ordinary clock: discovery reads procfs and cwd.
-async fn discovery_row(rig: &Rig) -> tempfile::TempDir {
+pub(super) async fn discovery_row(rig: &Rig) -> tempfile::TempDir {
     let cwd = tempfile::tempdir().unwrap();
     let pid = std::process::id();
     guarded(rig.rt.registry.register_discovered(
@@ -704,6 +705,96 @@ async fn send_to_discovery_only_bound_recipient_is_refused_before_append() {
         assert_eq!(rig.org.status().unwrap(), before);
         assert!(rig.inbox(pane("%1"), page()).await.messages.is_empty());
     }
+}
+
+/// This test process's start ticks, as the registry records them for the
+/// discovery row `discovery_row` registers with this pid.
+pub(super) fn own_process_start() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let after_comm = stat.rsplit_once(')').unwrap().1;
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+pub(super) fn own_process(session: &str, start: u64) -> OrgCommand {
+    OrgCommand::RecordProcess(atm_org::SessionProcess {
+        session_id: session.into(),
+        pid: std::process::id(),
+        process_start: start,
+    })
+}
+
+// s3-d1. Break: admission ignores the record, or accepts a reused pid (a
+// record with another start). The binding (2023) predates this process, so
+// only the record can confirm it.
+#[tokio::test]
+async fn send_to_a_restarted_seat_whose_process_is_recorded_is_queued() {
+    for (start, queued) in [
+        (own_process_start() + 1, false),
+        (own_process_start(), true),
+    ] {
+        let rig = Rig::seeded().await;
+        let _cwd = discovery_row(&rig).await;
+        rig.run(own_process("s1", start)).await;
+        let before = rig.org.status().unwrap();
+        let sent = guarded(
+            rig.messages
+                .send(note(Address::Agent(worker()), "after restart"), owner()),
+        )
+        .await;
+        if !queued {
+            assert!(matches!(sent, Err(MessageError::Refused(_))), "{sent:?}");
+            assert_eq!(rig.org.status().unwrap(), before);
+            continue;
+        }
+        let sent = sent.unwrap();
+        assert_eq!(rig.org.status().unwrap(), before + 1);
+        let inbox = rig.inbox(pane("%1"), page()).await;
+        assert_eq!(ids(&inbox), [sent.message_id.seq()]);
+        assert_eq!(inbox.messages[0].status, DeliveryStatus::Queued);
+    }
+}
+
+// s3-d1. Break: no rule without a record, or the binding's time not compared:
+// the same discovery row is refused while the binding predates the process.
+#[tokio::test]
+async fn send_to_a_seat_bound_after_its_process_started_is_queued() {
+    let rig = Rig::new().await;
+    rig.run(OrgCommand::RegisterProject {
+        project_id: "demo".parse().unwrap(),
+        root: "/demo".into(),
+        move_root: false,
+    })
+    .await;
+    // Bound a minute after this test process (the discovered pid) started:
+    // an injected time, so the 10 ms resolution of the start and of
+    // /proc/uptime never decides it, however young the process is.
+    let started = super::session_process::ProcessClock::read()
+        .and_then(|clock| clock.started(own_process_start()))
+        .unwrap();
+    let adopt = OrgCommand::Adopt {
+        agent_id: worker(),
+        pane: "%1".into(),
+        session_id: Some("s1".into()),
+    };
+    let bound_at = started + chrono::Duration::seconds(60);
+    let committed = guarded(rig.org.execute(adopt, bound_at)).await.unwrap();
+    rig.folded(committed.last().unwrap().seq).await;
+    let _cwd = discovery_row(&rig).await;
+    let before = rig.org.status().unwrap();
+    let sent = guarded(
+        rig.messages
+            .send(note(Address::Agent(worker()), "after restart"), owner()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rig.org.status().unwrap(), before + 1);
+    let inbox = rig.inbox(pane("%1"), page()).await;
+    assert_eq!(ids(&inbox), [sent.message_id.seq()]);
 }
 
 // A refusal is not a latched failure: the accepted real-id event restores send.
@@ -1461,6 +1552,7 @@ async fn oversized_legacy_entry_refused_with_id() {
             body: "x".repeat(600 * 1024),
             attachments: vec![],
             task: None,
+            post: None,
         }))
         .await,
     );
@@ -1805,6 +1897,7 @@ fn sent(to: Address, body: &str) -> OrgEvent {
         body: body.into(),
         attachments: vec![],
         task: None,
+        post: None,
     })
 }
 
@@ -2245,4 +2338,68 @@ async fn converted_observation_drives_the_real_policy() {
     // A capture of another pane is not this recipient's observation.
     let elsewhere = step(capture("%9", false, false, Some(false)), 10).await;
     assert!(matches!(elsewhere, Err(MessageError::Conflict(_))));
+}
+
+#[test]
+fn manager_redacted_entry_drops_post_link() {
+    use super::message_inbox::{project_entry, Progress};
+    use atm_org::{Address, MessageContent, MessageId, MessageKind, OrgEvent, OrgState};
+    let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut state = OrgState::default();
+    state
+        .apply(
+            1,
+            at,
+            &OrgEvent::ProjectRegistered {
+                project_id: "demo".parse().unwrap(),
+                root: "/demo".into(),
+            },
+        )
+        .unwrap();
+    state
+        .apply(
+            2,
+            at,
+            &OrgEvent::AgentAdopted {
+                agent_id: "demo/worker".parse().unwrap(),
+                pane: "%1".into(),
+                session_id: None,
+            },
+        )
+        .unwrap();
+    let post = atm_org::PostContent {
+        channel: atm_org::ChannelId::Project("demo".parse().unwrap()),
+        author: Address::Owner,
+        session_id: None,
+        kind: MessageKind::Note,
+        body: "hold W2".into(),
+        attachments: vec![],
+        task: None,
+        thread: None,
+        mentions: vec![],
+        wake: vec!["demo/worker".parse().unwrap()],
+        route: false,
+        decision: None,
+        client_key: None,
+        also_in_chat: false,
+    };
+    state.apply(3, at, &OrgEvent::ChannelPosted(post)).unwrap();
+    let wake = MessageContent {
+        delivery_notice: None,
+        from: Address::Owner,
+        to: "demo/worker".parse().unwrap(),
+        kind: MessageKind::Note,
+        body: "hold W2".into(),
+        attachments: vec![],
+        task: None,
+        post: Some(MessageId::new(3)),
+    };
+    state.apply(4, at, &OrgEvent::MessageSent(wake)).unwrap();
+    let message = state.message(&MessageId::new(4)).unwrap();
+    let full = project_entry(&state, message, false, Progress::default());
+    assert_eq!(full.content.post, Some(MessageId::new(3)));
+    // A manager sees delivery metadata only, not which post the row delivers.
+    let redacted = project_entry(&state, message, true, Progress::default());
+    assert_eq!(redacted.content.post, None);
+    assert_eq!(redacted.content.body, "");
 }

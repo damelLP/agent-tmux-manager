@@ -158,6 +158,135 @@ async fn exchange(
     assert!(!dir.path().join("fallback").exists());
     output
 }
+// Synthetic: the stored note and changed flag are facts from the response,
+// not echoes of the arguments. Incompatible/malformed responses are not success.
+#[tokio::test]
+async fn confirm_uses_daemon_result() {
+    let args = [
+        "decide",
+        "d41",
+        "yes",
+        "Words passed to CLI",
+        "--relay",
+        "--confirm",
+    ];
+    let params = json!({"id":"d41","option":"yes","note":"Words passed to CLI","standing_rule":false,"relay":true,"confirm":true});
+    let mut stored = resolved();
+    stored["decision"]["resolution"]["note"] = json!("Stored\nquotation");
+    stored["decision"]["resolution"]["standing_rule"] = json!(false);
+    stored["changed"] = json!(false);
+    let out = exchange(
+        &args,
+        "decision.resolve",
+        params.clone(),
+        json!({"result":stored}),
+        true,
+        false,
+    )
+    .await;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        out.stdout,
+        b"d41 resolved: yes (unchanged) by=owner\nNote: Stored\\nquotation\n"
+    );
+
+    stored["future"] = json!({"keep":true});
+    let mut json_args = args.to_vec();
+    json_args.extend(["--format", "json"]);
+    let out = exchange(
+        &json_args,
+        "decision.resolve",
+        params.clone(),
+        json!({"result":stored}),
+        true,
+        false,
+    )
+    .await;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        stored
+    );
+
+    let mut provisional = stored.clone();
+    provisional["decision"]["status"] = json!("taken_provisionally");
+    for (payload, reason) in [
+        (json!({"result":provisional}), "answer is not final"),
+        (
+            json!({"error":{"code":"invalid_params","message":"invalid decision parameters: relays cannot include note or standing_rule"}}),
+            "relays cannot include note or standing_rule",
+        ),
+    ] {
+        let out = exchange(
+            &args,
+            "decision.resolve",
+            params.clone(),
+            payload,
+            true,
+            false,
+        )
+        .await;
+        assert!(!out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(reason),
+            "{out:?}"
+        );
+    }
+}
+
+// Break caught: new flag combinations silently resolving or reaching RPC,
+// rejecting a documented flag order, or hiding the feature from --help.
+#[tokio::test]
+async fn confirm_cli_grammar() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = command(dir.path(), &["decide", "--help"])
+        .output()
+        .await
+        .unwrap();
+    assert!(help.status.success(), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        help.contains("--confirm") && help.contains("verbatim"),
+        "{help}"
+    );
+    for (args, diagnostic) in [
+        (
+            vec!["decide", "d41", "yes", "words", "--confirm"],
+            "--relay",
+        ),
+        (
+            vec!["decide", "d41", "yes", "--relay", "--confirm"],
+            "<NOTE>",
+        ),
+        (
+            vec![
+                "decide",
+                "d41",
+                "yes",
+                "words",
+                "--confirm",
+                "--relay",
+                "--rule",
+            ],
+            "--rule",
+        ),
+        (
+            vec!["decide", "d41", "yes", "words", "--relay"],
+            "cannot be used",
+        ),
+    ] {
+        let out = command(dir.path(), &args).output().await.unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(diagnostic),
+            "{out:?}"
+        );
+    }
+    assert!(!dir.path().join("fallback").exists());
+}
+
 // Synthetic: explicit measured redo versus an old daemon's unmeasured answer.
 #[tokio::test]
 async fn decide_overrule_explains_required_work_zero_repeat_and_legacy() {

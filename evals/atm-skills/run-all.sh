@@ -5,7 +5,7 @@
 #   <iteration-dir>/<case>/<config>/run-<k>/{transcript.jsonl,outputs/,timing.json,grading.json}
 #
 # Usage: run-all.sh <iteration-dir> <config> <skills-dir> [runs=3] [jobs=6] [model] [case...]
-# These are real, billed model runs.
+# These are real, billed model runs, for legacy cases only.
 
 set -u
 
@@ -16,7 +16,7 @@ shift $(($# < 6 ? $# : 6))
 mkdir -p "$iter" && iter=$(cd "$iter" && pwd -P)
 
 jobs_file=$(mktemp)
-for case_dir in "$here"/atm-*/*/; do
+for case_dir in "$here"/atm-{coordinate,implement}/*/; do
     case_dir=${case_dir%/}
     name=$(basename "$case_dir")
     if [ $# -gt 0 ] && ! printf '%s\n' "$@" | grep -qx "$name"; then continue; fi

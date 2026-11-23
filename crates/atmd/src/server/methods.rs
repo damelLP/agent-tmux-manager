@@ -20,6 +20,7 @@ use crate::registry::RegistryHandle;
 use atm_protocol::{error_code, ProtocolVersion, ResponseError};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
+use tokio::{sync::watch, time::Instant};
 
 /// Cloneable daemon dependencies shared by method registrations. Add a service
 /// field here rather than changing the router or server constructor signatures.
@@ -40,9 +41,13 @@ pub struct MethodServices {
     /// None leaves library callers unconfigured; the binary supplies its single
     /// config parse result. Invalid settings disable messages with that cause.
     pub delivery_policy: Option<Result<atm_org::delivery::DeliveryPolicy, String>>,
+    /// Missing or invalid [router] leaves model routing off (stopgap only).
+    pub router_settings: atm_org::channel_policy::RouterSettings,
     /// The reminder on a silent turn end; None leaves it off. Library callers
     /// start without it, the binary supplies its `[reminder]` settings.
     pub reminder: Option<atm_org::reminder::ReminderSettings>,
+    /// Read-only org overview config, resolved by the binary (never by the reader).
+    pub departments_dir: Option<PathBuf>,
     /// The connection tap's two destinations, as one pair: the shared
     /// receipt/activity store and the history its Activity is forwarded to.
     /// The server builds both with the message runtime, before it accepts a
@@ -70,7 +75,9 @@ impl MethodServices {
             messages: None,
             decisions: None,
             delivery_policy: None,
+            router_settings: Default::default(),
             reminder: None,
+            departments_dir: None,
             message_tap: None,
             state_dir: crate::eventlog::state_dir(),
             org: crate::org::OrgHandle::disabled("organisation service not configured"),
@@ -105,13 +112,33 @@ impl MethodError {
     }
 }
 
+/// The request's actual transport lifetime, never derived from a wire ID.
+#[derive(Clone)]
+pub(crate) struct ConnectionScope(pub(super) watch::Receiver<Option<Instant>>);
+
+impl ConnectionScope {
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        self.0.same_channel(&other.0)
+    }
+
+    pub(crate) fn closed_at(&self) -> Option<Instant> {
+        *self.0.borrow()
+    }
+
+    pub(crate) async fn wait_closed(&mut self) {
+        let _ = self.0.wait_for(Option::is_some).await;
+    }
+}
+
 pub type MethodResult = Result<Value, MethodError>;
 type MethodFuture = Pin<Box<dyn Future<Output = MethodResult> + Send>>;
 type Handler = Arc<dyn Fn(CallContext, Value) -> MethodFuture + Send + Sync>;
+type ScopedHandler = Arc<dyn Fn(CallContext, ConnectionScope, Value) -> MethodFuture + Send + Sync>;
 
 struct Method {
     deadline: Duration,
     handler: Handler,
+    scoped: Option<ScopedHandler>,
 }
 
 /// Immutable after server startup; names are advertised in lexical order.
@@ -131,12 +158,49 @@ impl MethodRouter {
         F: Fn(CallContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = MethodResult> + Send + 'static,
     {
+        self.insert(
+            name,
+            Method {
+                deadline,
+                handler: Arc::new(move |context, params| Box::pin(handler(context, params))),
+                scoped: None,
+            },
+        )
+    }
+
+    pub(crate) fn register_scoped<F, Fut>(
+        &mut self,
+        name: &'static str,
+        deadline: Duration,
+        handler: F,
+    ) -> Result<(), MethodError>
+    where
+        F: Fn(CallContext, ConnectionScope, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = MethodResult> + Send + 'static,
+    {
+        self.insert(
+            name,
+            Method {
+                deadline,
+                handler: Arc::new(|_, _| {
+                    Box::pin(async {
+                        Err(MethodError::new(
+                            error_code::REFUSED,
+                            "method requires a live connection",
+                        ))
+                    })
+                }),
+                scoped: Some(Arc::new(move |context, scope, params| {
+                    Box::pin(handler(context, scope, params))
+                })),
+            },
+        )
+    }
+
+    fn insert(&mut self, name: &'static str, method: Method) -> Result<(), MethodError> {
         match self.methods.entry(name) {
             Entry::Vacant(entry) => {
-                entry.insert(Method {
-                    deadline,
-                    handler: Arc::new(move |context, params| Box::pin(handler(context, params))),
-                });
+                entry.insert(method);
                 Ok(())
             }
             Entry::Occupied(_) => Err(MethodError::new(
@@ -151,10 +215,34 @@ impl MethodRouter {
     }
 
     pub async fn call(&self, context: CallContext, name: &str, params: Value) -> MethodResult {
+        self.dispatch(context, None, name, params).await
+    }
+
+    pub(super) async fn call_scoped(
+        &self,
+        context: CallContext,
+        scope: ConnectionScope,
+        name: &str,
+        params: Value,
+    ) -> MethodResult {
+        self.dispatch(context, Some(scope), name, params).await
+    }
+
+    async fn dispatch(
+        &self,
+        context: CallContext,
+        scope: Option<ConnectionScope>,
+        name: &str,
+        params: Value,
+    ) -> MethodResult {
         let method = self.methods.get(name).ok_or_else(|| {
             MethodError::new(error_code::UNKNOWN_METHOD, format!("no method '{name}'"))
         })?;
-        tokio::time::timeout(method.deadline, (method.handler)(context, params))
+        let call = match (scope, &method.scoped) {
+            (Some(scope), Some(handler)) => handler(context, scope, params),
+            _ => (method.handler)(context, params),
+        };
+        tokio::time::timeout(method.deadline, call)
             .await
             .map_err(|_| {
                 MethodError::new(error_code::TIMEOUT, format!("method '{name}' timed out"))
@@ -197,22 +285,45 @@ pub(crate) fn router_with_reporting(
     services: MethodServices,
     reporting: crate::org::reporting_line::ReportingFiles,
 ) -> Result<MethodRouter, MethodError> {
+    router_inner(services, reporting, None)
+}
+
+pub(crate) fn router_with_routes(
+    services: MethodServices,
+    routes: crate::org::channel_route::RouteHandle,
+) -> Result<MethodRouter, MethodError> {
+    router_inner(
+        services,
+        crate::org::reporting_line::ReportingFiles::default(),
+        Some(routes),
+    )
+}
+
+fn router_inner(
+    services: MethodServices,
+    reporting: crate::org::reporting_line::ReportingFiles,
+    routes: Option<crate::org::channel_route::RouteHandle>,
+) -> Result<MethodRouter, MethodError> {
     let mut router = MethodRouter::default();
     let agent_unavailable = services.org.status().err().map_or_else(
         || "named-agent operations are not configured".into(),
         |error| error.to_string(),
     );
+    let departments =
+        crate::org::department_directory::DepartmentFiles::new(services.departments_dir);
     crate::org::agent_context::register_agent_context_method(&mut router, services.org.clone())?;
     crate::org::org_tree_methods::register_org_tree_method(
         &mut router,
         services.org.clone(),
         services.registry.clone(),
         reporting.clone(),
+        departments.clone(),
     )?;
     crate::org::report::register(
         &mut router,
         services.org.clone(),
         reporting.clone(),
+        departments.clone(),
         chrono::Utc::now,
     )?;
     let handover_org = services.org.clone();
@@ -220,6 +331,7 @@ pub(crate) fn router_with_reporting(
         &mut router,
         services.org.clone(),
         reporting.clone(),
+        departments.clone(),
     )?;
     let decisions = services
         .decisions
@@ -232,6 +344,8 @@ pub(crate) fn router_with_reporting(
     crate::org::away::register_away_methods(&mut router, decisions.clone())?;
     crate::org::decisions::register_decision_methods(&mut router, decisions)?;
     crate::org::message_query::register(&mut router, services.org.clone(), reporting.clone())?;
+    crate::org::channel_methods::register(&mut router, services.org.clone(), chrono::Utc::now)?;
+    crate::org::channel_methods::register_routing(&mut router, routes)?;
     let org = services.org;
     router.register("log.tail", Duration::from_secs(5), move |_, params| {
         let org = org.clone();
@@ -258,7 +372,8 @@ pub(crate) fn router_with_reporting(
     register_control(&mut router, services.control.clone())?;
     let agents = services
         .agents
-        .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable));
+        .unwrap_or_else(|| crate::org::agents::AgentHandle::disabled(agent_unavailable))
+        .with_hiring(departments, reporting.clone());
     crate::org::agents::register_agent_methods(&mut router, agents.clone())?;
     let handovers = services.handovers.unwrap_or_else(|| {
         crate::org::agent_handover::Handovers::for_agents(
@@ -269,17 +384,16 @@ pub(crate) fn router_with_reporting(
     });
     crate::org::agent_handover::register_agent_handover_method(&mut router, handovers)?;
 
-    crate::org::messages::register_message_methods(
-        &mut router,
-        services
-            .messages
-            .unwrap_or_else(|| {
-                crate::org::messages::MessageHandle::disabled(
-                    "confirmed-message operations are not configured",
-                )
-            })
-            .with_reporting_files(reporting),
-    )?;
+    let messages = services
+        .messages
+        .unwrap_or_else(|| {
+            crate::org::messages::MessageHandle::disabled(
+                "confirmed-message operations are not configured",
+            )
+        })
+        .with_reporting_files(reporting);
+    crate::org::channel_methods::register_post(&mut router, messages.clone())?;
+    crate::org::messages::register_message_methods(&mut router, messages)?;
 
     super::health::register(&mut router, services.control, agents)?;
 
@@ -728,6 +842,45 @@ mod tests {
             assert!(matches!(call.as_mut().poll(cx), Poll::Ready(Err(error)) if error.0.code == error_code::TIMEOUT));
             Poll::Ready(())
         }).await;
+    }
+
+    // A routing RPC can be queued behind a pass. Stall its handler at
+    // dispatch and exercise the deadline actually set by registration.
+    #[tokio::test(start_paused = true)]
+    async fn routing_rpcs_both_allow_twenty_five_seconds() {
+        use std::{future::Future, task::Poll};
+
+        let mut router = router(MethodServices::new(crate::registry::spawn_registry())).unwrap();
+        for method in ["router.attach", "channel.route"] {
+            router.methods.get_mut(method).unwrap().scoped =
+                Some(Arc::new(|_, _, _| Box::pin(std::future::pending())));
+            let (_open, scope) = watch::channel(None);
+            let mut call = std::pin::pin!(router.call_scoped(
+                context(),
+                ConnectionScope(scope),
+                method,
+                Value::Null
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(call.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(24)).await;
+            std::future::poll_fn(|cx| {
+                assert!(
+                    call.as_mut().poll(cx).is_pending(),
+                    "{method} expired early"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+            std::future::poll_fn(|cx| {
+                assert!(matches!(call.as_mut().poll(cx), Poll::Ready(Err(error)) if error.0.code == error_code::TIMEOUT), "{method} did not expire at 25 s");
+                Poll::Ready(())
+            }).await;
+        }
     }
 
     fn context() -> CallContext {
@@ -1272,6 +1425,12 @@ mod tests {
         let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
         let (router, mock, cancel, task, _) = control_router(org).await;
         mock.set_pane_content("%7", vec!["❯ 98. previous".into(), "  99. chosen".into()]);
+        crate::control::legacy_survey_test::mock_viewport(
+            &mock,
+            "%7",
+            "❯ 98. previous\n  99. chosen\n",
+            Some(true),
+        );
         assert_eq!(
             router
                 .call(
@@ -1348,6 +1507,14 @@ mod tests {
                 json!({"action":"selected","pane":"%7","option":2}),
             ),
         ] {
+            if params["no"] != true {
+                crate::control::legacy_survey_test::mock_viewport(
+                    &mock,
+                    "%7",
+                    "Choose café?\n❯ 1. Sí\n  2. No\n",
+                    Some(true),
+                );
+            }
             assert_eq!(
                 router
                     .call(context(), "session.reply", params)
@@ -1465,6 +1632,8 @@ mod tests {
         let org_cancel = tokio_util::sync::CancellationToken::new();
         let org = crate::org::OrgHandle::open(dir.path().into(), org_cancel.clone()).await;
         let (router, mock, cancel, task, control) = control_router(org).await;
+        mock.set_next_raw_output("0 1");
+        crate::control::legacy_survey_test::mock_shell(&mock, "%7");
         successful_control_actions(&router).await;
         control.flush_audits().await;
         let records = router
@@ -1533,6 +1702,7 @@ mod tests {
                 }
                 if method == "session.send" && caller != Some(&other) {
                     mock.set_next_raw_output("0 1");
+                    crate::control::legacy_survey_test::mock_shell(&mock, "%7");
                 }
                 let result = router.call(context(), method, params).await;
                 if caller == Some(&other) {
@@ -1571,6 +1741,7 @@ mod tests {
         mock.set_next_raw_output("ATM-PANE-v1\t%7\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
         mock.set_next_raw_output(""); // untagged send pane
         mock.set_next_raw_output("0 1");
+        crate::control::legacy_survey_test::mock_shell(&mock, "%7");
         mock.set_next_raw_output("ATM-PANE-v1\t%42\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n");
         mock.set_next_raw_output(""); // untagged spawn_type pane
         successful_control_actions(&router).await;

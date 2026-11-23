@@ -1,0 +1,20 @@
+{
+  "name": "atm-chat-web",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build && node scripts/build-shell.mjs",
+    "size": "node scripts/check-size.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vite": "7.3.8",
+    "vitest": "4.1.12",
+    "ws": "8.23.0"
+  }
+}

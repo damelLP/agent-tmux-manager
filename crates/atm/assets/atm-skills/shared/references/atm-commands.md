@@ -17,10 +17,31 @@ After a named agent starts, respawns or clears to `ready`, atmd types
 for the agent's role, memory path and unread messages, not a personal skill.
 `atm me` omits both current and historical start notes from its unread list.
 
+## Named-agent channels and wakes
+
+From a bound seat, `atm post --tag project/member --body '...'` posts in your
+project and wakes the named seat. Strict tags omit the `@`; a misspelling
+refuses the post. From an owner shell specify `--channel project`, `--to`
+or `--reply` explicitly. `atm channels --all` lists channels and whether you
+can post there; `atm history project --thread m40` reads a thread without
+acknowledging it.
+
+Run the pasted `atm inbox --id m41`. Read the attachment paths and follow
+`reply: atm post --reply m40 --body '...'` or the direct `--to` hint, if a reply
+is needed. `atm ack m41` after handling Delivered. For owner-only recovery use
+`atm wake retry m41 --accept-duplicate-risk` or `atm wake give-up m41` (wake
+ID, not post ID). The owner's designated relay may give up in his verbatim words:
+`atm wake give-up --relay --confirm m41 '<his words>'`. `atm decisions request` asks for an owner decision; a chat
+reply does not resolve it. See [named-agent recipes](atm-named-agents.md).
+
+The pane commands below are plumbing or for the legacy unnamed workflow.
+`atm send` does not post to a channel and `atm reply` answers an editor dialog,
+not a thread.
+
 ## Targets: use the pane
 
 The immediate controls below take a session id prefix or a tmux pane id (`%12`).
-This is not the addressing rule for `atm agent`, `atm msg` or `atm task`.
+This is not the addressing rule for `atm post`, `atm agent` or `atm task`.
 Named lifecycle/message commands support project-scoped bare names; task agent
 addresses must be full `project/name` IDs.
 

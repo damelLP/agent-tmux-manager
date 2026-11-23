@@ -23,13 +23,23 @@
 //! Captured: Claude Code 2.1.328, 2026-11-19, sealed local canned Messages API, tmux 3.8.
 //! The shell pill adds `← for agents` immediately before `↓ to manage` and
 //! after `esc to interrupt` when busy. The rest of the row is unchanged.
+//!
+//! Captured: Claude Code 2.1.327, 2026-11-22, tmux capture-pane -p -e -N.
+//! A monitor pill has the same managed layout but no interrupt or agents hint.
+//! The completed turn still comes from the transcript, not the pill.
+//!
+//! Captured: Claude Code not recorded, not recorded, styled tmux viewport.
+//! The open background-agent list follows the managed mode footer. It exposes
+//! the editor, not input focus or a completed turn.
 use super::*;
 use atm_core::harness_control::{
     ClearProof, ControlDialog, ControlKey, ControlPolicy, ControlScreen, SessionArrival,
 };
 
+const AUTO_MODE_FOOTER: &str = "⏵⏵ auto mode on (shift+tab to cycle)";
+
 pub(super) const MODE_FOOTERS: [&str; 6] = [
-    "⏵⏵ auto mode on (shift+tab to cycle)",
+    AUTO_MODE_FOOTER,
     "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
     "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
     "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents",
@@ -65,8 +75,12 @@ pub(super) fn background_shell_footer(footer: &str) -> bool {
 }
 
 fn shell_count(value: &str) -> bool {
-    value == "1 shell"
-        || value.strip_suffix(" shells").is_some_and(|count| {
+    task_count(value, "1 shell", " shells")
+}
+
+fn task_count(value: &str, singular: &str, plural_suffix: &str) -> bool {
+    value == singular
+        || value.strip_suffix(plural_suffix).is_some_and(|count| {
             !count.is_empty()
                 && !count.starts_with('0')
                 && count != "1"
@@ -76,11 +90,68 @@ fn shell_count(value: &str) -> bool {
 
 const MANAGE_HINT: &str = " · ↓ to manage";
 
-fn managed_shell_footer(row: &str) -> Option<&str> {
+/// The exact styled list occupies the terminal suffix, never scrollback.
+pub(super) fn background_agent_footer<'a>(
+    lines: &'a [&'a str],
+    screen: &StyledScreen,
+) -> Option<(&'a [&'a str], &'a str)> {
+    const MAIN: &str = "● main";
+    const CHILD: &str = "◯ general-purpose";
+    let [before @ .., footer, "", main, child] = lines else {
+        return None;
+    };
+    let footer = footer.strip_prefix("  ")?;
+    if footer.strip_suffix(MANAGE_HINT)? != AUTO_MODE_FOOTER || main.strip_prefix("  ")? != MAIN {
+        return None;
+    }
+    let activity = child
+        .strip_prefix("  ")?
+        .strip_prefix(CHILD)?
+        .strip_prefix("  Reading ")?;
+    let (activity, telemetry) = activity.rsplit_once("  ")?;
+    let (elapsed, tokens) = telemetry.split_once(" · ↓ ")?;
+    let (minutes, seconds) = elapsed.split_once("m ")?;
+    let tokens = tokens.strip_suffix(" tokens")?;
+    let tokens = tokens.strip_suffix('k').unwrap_or(tokens);
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let count = tokens.split_once('.').map_or_else(
+        || digits(tokens),
+        |(whole, frac)| digits(whole) && matches!(frac.as_bytes(), [b'0'..=b'9']),
+    );
+    if activity.is_empty()
+        || activity.starts_with(char::is_whitespace)
+        || !digits(minutes)
+        || !digits(seconds.strip_suffix('s')?)
+        || !count
+    {
+        return None;
+    }
+    let mut rows = screen.text().split_inclusive('\n');
+    let main = rows
+        .by_ref()
+        .take(before.len() + 2)
+        .map(str::len)
+        .sum::<usize>();
+    let child = main + rows.next()?.len();
+    let label_style = |row, label: &str, bold| {
+        label.char_indices().all(|(offset, _)| {
+            let at = row + 2 + offset;
+            screen.bold_at(at) == Some(bold)
+                && screen.faint_at(at) == Some(false)
+                && screen.inverse_at(at) == Some(false)
+        })
+    };
+    (label_style(main, MAIN, true) && label_style(child, CHILD, false)).then_some((before, footer))
+}
+
+fn managed_task_footer(row: &str) -> Option<&str> {
     let footer = row.trim_end_matches(' ').strip_prefix("  ")?;
     let pill = footer
         .strip_prefix("⏵⏵ auto mode on · ")?
         .strip_suffix(MANAGE_HINT)?;
+    if task_count(pill, "1 monitor", " monitors") {
+        return Some(footer);
+    }
     let pill = pill.strip_suffix(" · ← for agents").unwrap_or(pill);
     let count = pill.strip_suffix(" · esc to interrupt").unwrap_or(pill);
     shell_count(count).then_some(footer)
@@ -102,7 +173,7 @@ fn legacy_footer(row: &str) -> &str {
 }
 
 pub(super) fn editor_footer(row: &str) -> Option<&str> {
-    managed_shell_footer(row).or_else(|| {
+    managed_task_footer(row).or_else(|| {
         let footer = legacy_footer(row);
         ((footer.starts_with("⏵⏵ ") && MODE_FOOTERS.contains(&footer))
             || background_shell_footer(footer))
@@ -111,7 +182,7 @@ pub(super) fn editor_footer(row: &str) -> Option<&str> {
 }
 
 fn control_footer(row: &str) -> Option<&str> {
-    managed_shell_footer(row).or_else(|| {
+    managed_task_footer(row).or_else(|| {
         let footer = legacy_footer(row);
         mode_footer(footer).then_some(footer)
     })
@@ -192,7 +263,7 @@ pub fn observe_control_screen(
     };
     // Without a complete header, only already-recognized ordinary facts apply.
     if let Some((start, end)) = header {
-        if let Some((facts, _)) = editor_facts(&lines, styled, Some(end), before_footer, footer) {
+        if let Some((facts, ..)) = editor_facts(&lines, styled, Some(end), before_footer, footer) {
             result.facts = facts;
         }
         if lines.get(..start).unwrap_or_default().iter().any(|line| {
@@ -249,6 +320,11 @@ fn parse_completion_draft(screen: &StyledScreen) -> Option<CompletionDraft<'_>> 
         .collect();
     while lines.last().is_some_and(|s| s.is_empty()) {
         lines.pop();
+    }
+    // The open selector precludes staging, even with a completion-like row
+    // above the editor. Invalid also keeps the control dialog Unknown.
+    if background_agent_footer(&lines, screen).is_some() {
+        return None;
     }
     let Some(lower) = lines.iter().rposition(|s| rule(s, '─')) else {
         return Some(CompletionDraft::Absent);
@@ -322,7 +398,7 @@ fn parse_completion_draft(screen: &StyledScreen) -> Option<CompletionDraft<'_>> 
         || (above_editor
             && !ordinary
                 .as_ref()
-                .is_some_and(|(facts, _)| facts.input == InputState::Draft))
+                .is_some_and(|(facts, ..)| facts.input == InputState::Draft))
     {
         return None;
     }

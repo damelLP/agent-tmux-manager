@@ -282,10 +282,11 @@ fn cli_decision_classes_and_withdraw_reask_follow_the_away_policy() {
             args.extend(["--recommended", "yes"]);
         }
         let result = rig.atm_json(Some(&seat.pane), &args);
+        // U8 adds the question post's id: still IDs, no inferred policy state.
         assert_eq!(
-            result.as_object().unwrap().len(),
-            1,
-            "creation reports an ID, not inferred policy state"
+            result.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["decision_id", "post_id"],
+            "creation reports IDs, not inferred policy state"
         );
         let id = result["decision_id"].as_str().unwrap().to_owned();
         let (message_kind, body) = if status == "taken_provisionally" {
@@ -296,6 +297,19 @@ fn cli_decision_classes_and_withdraw_reask_follow_the_away_policy() {
             ("note", format!("Decision {id} waits for the owner: he is away, and it cannot be undone or reaches outside.\nOnly work that depends on it waits. Carry on with other work."))
         };
         told(&rig, &mut watch, &seat, cursor, message_kind, &body);
+        // U8: the notice is a reply in the question's thread.
+        let step = if status == "taken_provisionally" {
+            "taken"
+        } else {
+            "waits"
+        };
+        assert_eq!(
+            rig.decision_thread(&id),
+            [
+                (seat.id.clone(), "asked".into(), vec!["owner".into()]),
+                ("system".into(), step.into(), vec![seat.id.clone()]),
+            ]
+        );
         let entry = rig
             .call("decision.get", json!({"id":id}), Some(&seat.pane))
             .unwrap();
@@ -315,12 +329,26 @@ fn cli_decision_classes_and_withdraw_reask_follow_the_away_policy() {
         }
     }
     let waiting = waiting.unwrap();
+    let mut posts = rig.watch();
     assert_eq!(
         rig.atm_json(
             Some(&seat.pane),
             &["decisions", "withdraw", &waiting, "--format", "json"]
         )["changed"],
         true
+    );
+    // U8: a withdrawal is a reply that wakes nobody.
+    posts.wait("the withdrawal's reply", |e| {
+        e["kind"] == "channel.posted"
+            && e["body"]["decision"] == json!({"decision_id":waiting,"step":"withdrawn"})
+    });
+    assert_eq!(
+        rig.decision_thread(&waiting).last().unwrap(),
+        &(
+            "system".to_owned(),
+            "withdrawn".to_owned(),
+            Vec::<String>::new()
+        )
     );
     let cursor = rig.test.rig.event_cursor(&seat.pane);
     let replacement = rig.atm_json(

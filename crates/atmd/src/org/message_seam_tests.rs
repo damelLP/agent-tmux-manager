@@ -94,6 +94,7 @@ fn message_history_seam_never_reports_a_snapshot_or_successful_record() {
         }),
         presence: PanePresence::Alive,
         facts: ScreenFacts::default(),
+        inbox_paste: false,
         copy_mode: None,
         focused: None,
     };

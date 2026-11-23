@@ -252,7 +252,8 @@ impl AgentRuntime {
     /// The agent is Ready only when this call's own capture shows a safe idle
     /// editor of a harness that is positively in the pane's foreground, with a
     /// live session row. Otherwise it is Starting until the harness's next
-    /// event, as after a daemon restart.
+    /// event. Re-adopting a bound seat with only discovery rows refuses before
+    /// making any changes rather than claiming that its binding is ready.
     pub(super) async fn adopt(
         &self,
         r: &Reservation,
@@ -316,15 +317,17 @@ impl AgentRuntime {
         }
         let role = state.agent(id).and_then(|agent| agent.role.as_ref());
         let excluded = existing.and_then(|agent| agent.excluded_session_id.clone());
+        let eligible = |row: &PaneSession| {
+            row.view.parent_session_id.is_none()
+                && excluded.as_ref() != Some(&row.view.id)
+                && role.is_none_or(|role| row.view.harness == role.config.harness.short_tag())
+        };
         let candidates = |rows: &[PaneSession]| -> Result<Option<SessionId>, AgentError> {
-            let mut eligible = rows.iter().filter(|row| {
-                row.view.parent_session_id.is_none()
-                    && !row.view.id.is_pending()
-                    && excluded.as_ref() != Some(&row.view.id)
-                    && role.is_none_or(|role| row.view.harness == role.config.harness.short_tag())
-            });
-            let first = eligible.next().map(|row| row.view.id.clone());
-            if eligible.next().is_some() {
+            let mut real = rows
+                .iter()
+                .filter(|row| eligible(row) && !row.view.id.is_pending());
+            let first = real.next().map(|row| row.view.id.clone());
+            if real.next().is_some() {
                 return Err(AgentError::Refused(format!(
                     "{pane} has more than one session; atm cannot tell which is the agent's"
                 )));
@@ -342,6 +345,25 @@ impl AgentRuntime {
                     "{pane} runs {other}, but agent {id}'s role names {wanted}; nothing was changed"
                 )));
             }
+        }
+        if session.is_none()
+            && existing.is_some_and(|agent| {
+                agent.pane.as_deref() == Some(pane.as_str())
+                    && matches!(agent.status, AgentStatus::Ready | AgentStatus::Starting)
+                    && agent
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_pending() && excluded.as_ref() != Some(id))
+            })
+            && rows
+                .iter()
+                .any(|row| eligible(row) && row.view.id.is_pending())
+        {
+            return Err(AgentError::Refused(format!(
+                "agent {id} is already adopted in {pane}; its harness has not reported its session since \
+                 the restart, so nothing was changed. It reports at the seat's next turn; a Claude seat \
+                 also reports when its pane is resized."
+            )));
         }
         // Every read and capture comes before the tag, so that once the pane
         // carries it only the organisation's writes can still fail.
@@ -478,9 +500,10 @@ impl AgentRuntime {
         let Some((root, command)) = first.pane_root_pid().zip(first.foreground_command) else {
             return Ok(None);
         };
-        let Some(facts) = (self.proc)(root).await else {
+        let Some(sample) = (self.proc)(root).await else {
             return Ok(None);
         };
+        let facts = sample.facts;
         let second = r.capture(pane, format).await?;
         Ok(
             pin(screen, (root, &command), &facts, &second).map(|(baseline, control)| {
@@ -1194,8 +1217,11 @@ impl AgentRuntime {
                     };
                     // History must see the start line before it can let an
                     // older job act on this Ready, even across replay.
+                    let resume_cols = fence
+                        .as_ref()
+                        .map(|_| usize::from(capture.inspection.pane.width));
                     let start_line = self
-                        .queue_start_line(id, session_id.as_ref(), fence.is_some())
+                        .queue_start_line(id, session_id.as_ref(), resume_cols)
                         .await;
                     let ready = self.org.execute(command, chrono::Utc::now()).await?;
                     return Ok(ClearAttempt::Cleared(ClearOutcome {
@@ -1352,6 +1378,7 @@ impl AgentRuntime {
             body,
             attachments: Vec::new(),
             task: None,
+            post: None,
         };
         self.org
             .execute(OrgCommand::SendMessage(note), chrono::Utc::now())
@@ -1788,11 +1815,12 @@ impl AgentRuntime {
                         },
                     };
                     self.org.execute(command, chrono::Utc::now()).await?;
-                    self.queue_start_line(&id, session_id.as_ref(), false).await;
+                    self.queue_start_line(&id, session_id.as_ref(), None).await;
                     return Ok(UpResult {
                         agent_id: id,
                         pane: pane.to_string(),
                         state: AgentStatus::Ready,
+                        warning: None,
                     });
                 }
                 Step::Wait(reason) => {
@@ -1943,7 +1971,7 @@ impl AgentRuntime {
             };
             let Some(baseline) = (self.proc)(root)
                 .await
-                .and_then(|facts| shell_baseline(&facts, root, &command))
+                .and_then(|sample| shell_baseline(&sample.facts, root, &command))
             else {
                 continue;
             };

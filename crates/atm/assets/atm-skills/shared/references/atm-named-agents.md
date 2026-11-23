@@ -26,25 +26,55 @@ load a skill. The role's `skills = [...]` and `profile` fields do not execute.
 A role body can explicitly direct a read of the installed `SKILL.md`; the
 operator retains existing priming until that load is verified for its harness.
 
-### Message recipe
+### Channel and wake recipe
 
-For S1–S6 and M4, substitute the IDs/manager returned by the daemon:
+For S1–S6 and M4, use the IDs and addresses returned by the daemon. These are
+alternatives at the appropriate step, not a script to run unconditionally:
 
 ```sh
 atm me
-atm inbox --id m41
-# Read the body and files listed under attach: with the native file tool.
-atm msg ack m41  # only after handling AND status=delivered
-# Message-only assignment: one report, not a duplicate of task submit.
-atm msg send --to project/lead --kind report --task unit-1 \
+atm inbox --id m41   # run the exact command from [m41] Read: ...
+# Read the body and files under attach: with the native file tool.
+# If a reply is needed and the inbox says `reply: atm post --reply m40`:
+atm post --reply m40 --body 'Answer to the post'
+# Instead of the reply above for a message-only unit with no thread
+# (never both for one wake):
+atm post --tag project/lead --kind report --task unit-1 \
   --body 'DONE: result; checks; not verified: ...' --attach /absolute/report.md
+# After handling the Delivered wake (m41, not the post m40):
+atm ack m41
 ```
 
-Kinds include `report` and `question`. `--task unit-1` is correlation text, not
-a task creation. Read IDs from command output: event-sequence IDs are not
-consecutive. A pre-read queued message may be delivered after the current
-turn ends; remember that it was handled and later ack without repeating work.
-Failed messages remain unread but cannot be acknowledged until Delivered.
+A bound seat's untargeted post goes in its project channel. Use `--tag`
+without `@` to require a seat/group to resolve and wake; repeat it for several
+recipients. Use the full `project/name` outside your project, and `owner` for
+Owner. An unresolved strict tag refuses the post; inline mentions are lenient.
+`--task unit-1` correlates the post and wake; it does not create a task. A
+manual report may instead use `--reply m40 --tag project/lead` to stay in the
+thread and target the manager. Do not also post if `atm task submit` reports
+for you. `--kind question` asks your lead for help, not for an owner decision.
+
+`post:` identifies the channel post and thread; `m41` is your wake ID. Follow
+the `--to <author>` hint for a direct answer when the CLI gives it, not
+`--reply`. If there is no hint, don't guess permission to post in a channel.
+Legacy human messages still have their full contents and can be replied to by
+legacy ID in their writable direct channel. System notes do not need a chat
+reply. With no writable project channel, use a direct `--to <manager>` for a
+new report; the project needs a `lead` record to have a project channel.
+
+Treat a queued or failed pre-read as distinct from Delivered. Remember already
+handled IDs and end the turn; ack if later Delivered without repeating work.
+An early ack can cancel automatic delivery. A successful post may queue a
+wake, not deliver it. For diagnosis use the recipient's `woke[].message_id`
+from `atm post --format json`, not `post_id`. After uncertainty about a write,
+inspect channel history, task and inbox as authorized rather than retry blindly.
+
+### Mixed daemon and skill versions
+
+During the switch, older skills still use the same inbox line and can answer
+with `atm msg send` and acknowledge with `atm msg ack`. Their answers are direct
+messages, not replies in the channel thread. If `atm me` on an older daemon
+prints the old report command, use its manager address with the recipe above.
 
 ### Durable-task recipe
 
@@ -175,7 +205,7 @@ turn, focus or editor guard. If investigation confirms a missing enqueue and a
 resume is still appropriate, send one correlated recovery answer:
 
 ```sh
-atm msg send --to project/member --kind answer --task t41 \
+atm post --tag project/member --kind answer --task t41 \
   --body 'Verdict recorded for t41; re-read atm task get t41 before resuming.'
 ```
 
@@ -221,7 +251,8 @@ true|false`/`--changes-intent true|false` are required. The daemon derives the
 requester from your pane; there is no requester override, and unbound callers
 cannot request. Repeat `--attach` for literal paths, not uploads. Optional
 `--recommended` must match an option exactly; `--deadline` takes a future
-RFC3339 timestamp but starts no expiry timer. Put `--format json` after the
+RFC3339 timestamp: a decision still pending then expires, and you are told.
+Put `--format json` after the
 mutation subcommand; do not combine list filters/cursors with a mutation.
 
 A returned `decision_id` or `dN requested` confirms creation, **not approval**,
@@ -238,11 +269,13 @@ Decisions section for the full CLI/API contract.
 
 A named caller's `atm decisions` lists only that caller's requests, including
 with `--all`; the latter changes status filtering, not authority. Only Owner
-can list all decisions or use `atm inbox --for <another-agent>`. A named lead
-cannot inspect a member's returned message ID through its own inbox. Use the
-member's task state/report and `atm agent list --format json` for readiness;
-ask the authorized manager/Owner for cross-inbox delivery diagnostics when
-needed. Do not claim a complete organisation-wide decision or receipt view.
+can list all decisions or get another seat's full inbox content. A verified
+reporting ancestor can read redacted delivery metadata, not body, attachments
+or ack rights. Use the member's task state/report and
+`atm agent list --format json` for readiness; ask an authorized manager/Owner
+for cross-inbox diagnostics when needed. `atm channels --all` and `atm history`
+are channel reads, not broader decision or inbox authority, and read access
+does not make a channel writable. Do not claim a complete receipt view.
 
 ## Away and return (M6, L5–L6, L9)
 
@@ -309,21 +342,22 @@ project's separate sealed environment for builds/tests.
 
 ### S3
 
-Fetch the exact reference ID and attachments; act on an authorized brief without
-an extra go-ahead. Already-handled late delivery is ack-only.
+Fetch the exact wake ID and attachments; act on an authorized brief without
+an extra go-ahead. Follow the direct or thread reply hint when needed.
+Already-handled late delivery is ack-only.
 **Why:** Delivered confirms reference acceptance, not reading or execution.
-**Source:** 2026-11-15 switch/chunk-7 captures: Haiku read briefs but asked again, pi acted; stale handled-message backlog incident 2026-11-15 22:59–23:01; `tests/atm_msg.rs::inbox_is_nonmutating_preserves_json_nulls_and_escapes_text_controls`.
-**Checked:** 2026-11-15; harness: Claude Code 2.1.325, pi 1.5.0/1.5.2; model: Haiku 5.5 versus gpt-6.1-sol xhigh/low; capture evidence, not successful anti-repeat wording evaluation.
-**Not verified:** This rule fixes Claude compliance or prevents duplicate action.
+**Source:** `tests/atm_post.rs::inbox_wake_text_uses_post_id_and_checks_permission_once`, `inbox_outside_channel_replies_to_author_as_actual_caller`; historical switch/chunk-7 captures.
+**Checked:** CLI contract tests; harness: stand-in; model: N/A; earlier captures with Claude Code 2.1.325 and pi 1.5.0/1.5.2 predate the new recipe.
+**Not verified:** Independent model compliance with this rule or prevention of duplicate action.
 
 ### S4
 
 Acknowledge handled Delivered messages only. Remember pre-read queued IDs and
 end the turn rather than awaiting delivery into that busy turn.
-**Why:** Fetch does not mark read; one undelivered ID refuses an entire ack batch.
-**Source:** `crates/atmd/src/org/message_service_tests.rs::queued_or_failed_ack_refuses_entire_batch`, `ack_batch_is_atomic`, `repeated_ack_returns_zero`; real queued-ack refusal on 2026-11-16.
-**Checked:** 2026-11-16; harness: pi installed package 1.5.2; model: gpt-6.1-sol/max; actual queued read/ack refusal, source contract inspected at 30475a20.
-**Not verified:** End-to-end late-delivery handling with either new skill.
+**Why:** Fetch does not mark read; acknowledging an open wake cancels its automatic delivery, which is why the recipe waits for Delivered.
+**Source:** `crates/atm-org/src/command.rs` (`ReadMessages`); `tests/atm_post.rs::real_post_inbox_and_ack_by_post_id`.
+**Checked:** CLI/daemon contract tests; harness: stand-in; model: N/A. The skill's Delivered-only rule is stricter than the CLI.
+**Not verified:** Independent model compliance with the late-delivery recipe.
 
 ### S5
 
@@ -391,10 +425,10 @@ acceptance and the assignee never gives its own verdict.
 ### M4
 
 Submit a durable task's plan/result once with its files; for message-only work
-send one correlated report/question to the manager, with attachment and marker.
+post one correlated report/question with a strict manager tag, attachment and marker.
 Keep a short visible end-of-turn marker as recovery, not a second notification.
 **Why:** Submit already reports to the creator; every extra message costs a lead turn.
-**Source:** `crates/atmd/src/org/tasks.rs::notification`; `crates/atmd/src/org/task_worker_tests.rs::system_created_task_report_falls_back_to_owner`; real chunk-7 pi submission capture.
+**Source:** `crates/atmd/src/org/tasks.rs::notification`; `tests/atm_me.rs::me_real_daemon_context_and_report_command`; real chunk-7 pi submission capture (old recipe).
 **Checked:** 2026-11-15; harness: pi 1.5.2; model: gpt-6.1-sol low; automatic report observed. New duplicate-avoidance/marker wording has no model trial.
 **Not verified:** New-skill report frequency, question routing and duplicate prevention.
 
@@ -443,9 +477,10 @@ members' relevant decision facts in reports/memory and record visibility gaps.
 ### L2
 
 Create a standalone task with approved measure, scope/worktree/tests/done/report
-contract and brief-kind attachments; assign one bound seat once.
-**Why:** A new session cannot recover an unstated brief; assignment sends the brief.
-**Source:** `tests/atm_task.rs` create/assign contract; `crates/atm-org/src/task.rs` measures; real chunk-7 task capture.
+contract and brief-kind attachments; assign one bound seat once. For a
+message-only brief, post with a strict tag and attach the brief, not raw input.
+**Why:** A new session cannot recover an unstated brief; assignment already sends it.
+**Source:** `tests/atm_task.rs` create/assign contract; `crates/atm-org/src/task.rs` measures; named strict-tag scenario in `evals/atm-skills`.
 **Checked:** 2026-11-15; harness: pi 1.5.2; model: gpt-6.1-sol low; task creation/assignment delivery observed. Intent admission inspected at 30475a20.
 **Not verified:** New lead skill's brief quality or approved-measure selection.
 
@@ -467,9 +502,9 @@ and accept/request changes. Do not duplicate automatic invalidation Notes;
 coordinate actionable late files/unlinked reviews explicitly, without claiming
 immediate interruption. A non-final verdict queues an automatic answer to
 the current assignee under the coalescing rule above; do not also send one.
-The assignee must re-read current state before resuming. Only investigate/repair
-a missing enqueue conditionally; an accepted plan is not a finished task or clear
-boundary, and final acceptance/review closure has no resume answer.
+The assignee must re-read current state before resuming. Use one tagged
+recovery answer only for a diagnosed missing enqueue. An accepted plan is not a
+finished task or clear boundary; final acceptance/review closure has no resume answer.
 **Why:** Verdict authority/measures constrain acceptance; answers retain ordinary delivery guards, and a later task state can supersede the wake.
 **Source:** `crates/atm-org/src/task.rs` Reviews and measures; `crates/atmd/src/org/tasks.rs::notification` and `execute_mutation`; `crates/atmd/src/org/task_worker_tests.rs`; `crates/atmd/tests/tasks.rs`; `tests/task_messages.rs`; `tests/atm_task.rs`.
 **Checked:** 2026-11-16 source and sealed task RPC/worker/private-daemon message/restart/CLI tests at 06c12c07; harness: N/A (model-free pi stand-in); model: N/A. Actual verdict answers, guarded references and final/no-op silence checked, not skill behavior.

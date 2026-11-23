@@ -13,7 +13,7 @@ use super::{
     tasks::TaskError,
 };
 use crate::server::methods::MethodError;
-use atm_org::{Address, AgentId, OrgState};
+use atm_org::{department, Address, AgentId, OrgState, RoleSpec};
 use atm_protocol::error_code;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,12 +23,13 @@ use std::{
 };
 use tokio::sync::{watch, Semaphore};
 
-/// One pass's immediate edges, validated through owner. An unavailable pass
-/// has no edges or line errors; callers still project all recorded seats.
+/// One pass's immediate edges, validated through owner, and models from parsed
+/// roles. An unavailable pass has neither; callers still project all seats.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReportingEdges {
     pub reason: Option<String>,
     pub edges: BTreeMap<AgentId, Result<Address, String>>,
+    pub current_models: BTreeMap<AgentId, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +48,7 @@ impl ReportingFiles {
         match detached_read(
             self.slot.clone(),
             Path::new("organisation reporting roles"),
-            move || Ok(read_edges(&state, role_manager)),
+            move || Ok(read_edges(&state, read_current_role)),
         )
         .await
         {
@@ -114,11 +115,21 @@ impl ReportingFiles {
 
 fn read_edges(
     state: &OrgState,
-    mut read: impl FnMut(&OrgState, &AgentId) -> Result<Address, AgentError>,
+    mut read: impl FnMut(&OrgState, &AgentId) -> Result<Option<RoleSpec>, AgentError>,
 ) -> Result<ReportingEdges, MethodError> {
     let mut managers = BTreeMap::new();
+    let mut current_models = BTreeMap::new();
     for agent in state.agents() {
-        let result = read(state, &agent.id).map_err(MethodError::from);
+        let result = read(state, &agent.id)
+            .and_then(|role| {
+                // A parsed model is useful even if the reporting line is broken.
+                if let Some(role) = role.as_ref() {
+                    current_models
+                        .insert(agent.id.clone(), department::role_model(role).to_owned());
+                }
+                manager_from_role(&agent.id, role.as_ref())
+            })
+            .map_err(MethodError::from);
         if let Err(error) = &result {
             if error.0.code != error_code::REFUSED && error.0.code != error_code::NOT_FOUND {
                 return Err(MethodError::new(
@@ -148,6 +159,7 @@ fn read_edges(
     Ok(ReportingEdges {
         reason: None,
         edges,
+        current_models,
     })
 }
 
@@ -182,6 +194,14 @@ pub(super) async fn outcome_manager(
 }
 
 fn role_manager(state: &OrgState, node: &AgentId) -> Result<Address, AgentError> {
+    manager_from_role(node, read_current_role(state, node)?.as_ref())
+}
+
+fn manager_from_role(node: &AgentId, role: Option<&RoleSpec>) -> Result<Address, AgentError> {
+    manager_address(node, role).ok_or_else(|| AgentError::Refused("invalid role manager".into()))
+}
+
+fn read_current_role(state: &OrgState, node: &AgentId) -> Result<Option<RoleSpec>, AgentError> {
     let agent = state
         .agent(node)
         .ok_or_else(|| AgentError::NotFound(format!("unknown agent {node}")))?;
@@ -190,7 +210,7 @@ fn role_manager(state: &OrgState, node: &AgentId) -> Result<Address, AgentError>
     let project = state
         .project(&node.project)
         .ok_or_else(|| AgentError::NotFound(format!("unknown project {}", node.project)))?;
-    let role = read_policy_with_error(
+    read_policy_with_error(
         Path::new(&project.root),
         &format!("roles/{}.md", node.name),
         256 * 1024,
@@ -200,9 +220,7 @@ fn role_manager(state: &OrgState, node: &AgentId) -> Result<Address, AgentError>
         atm_org::parse_role(&node.name, &text)
             .map_err(|_| AgentError::Refused("invalid role configuration".into()))
     })
-    .transpose()?;
-    manager_address(node, role.as_ref())
-        .ok_or_else(|| AgentError::Refused("invalid role manager".into()))
+    .transpose()
 }
 
 fn walk(

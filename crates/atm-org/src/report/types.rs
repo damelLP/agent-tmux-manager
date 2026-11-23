@@ -1,5 +1,8 @@
 //! Report inputs and read-only projections; no persisted schema lives here.
-use crate::{Address, AgentId, ProjectId, TaskCost, TaskId, TaskKind, TaskMeasure, TaskState};
+use crate::{
+    department::DepartmentId, Address, AgentId, ProjectId, TaskCost, TaskId, TaskKind, TaskMeasure,
+    TaskState,
+};
 use atm_core::Money;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -170,6 +173,25 @@ pub struct ProjectReport {
     pub decisions: DecisionCounts,
     pub trend: Trend,
 }
+/// Observed cost across the visible report projects listed by one department.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepartmentCostReport {
+    #[serde(deserialize_with = "deserialize_department_id")]
+    pub id: DepartmentId,
+    pub title: String,
+    #[serde(default, with = "crate::event::optional_money")]
+    pub cost: Option<Money>,
+    pub cost_unknown_tasks: u64,
+}
+
+fn deserialize_department_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<DepartmentId, D::Error> {
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trend {
     pub bucket: u16,

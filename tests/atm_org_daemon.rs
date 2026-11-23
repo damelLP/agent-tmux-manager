@@ -162,6 +162,7 @@ async fn org_real_daemon_and_cli_json_text_smoke() {
         "reporting line at beta/broken: invalid role configuration"
     );
     assert_eq!(tree["unplaced_tasks"][0]["title"], "Triage queue");
+    assert!(tree.get("departments").is_none() && tree.get("department_problems").is_none());
     assert!(!tree.to_string().contains("SECRET"));
     let output = cli(root, &["org"]).await;
     assert!(output.status.success(), "{output:?}");
@@ -172,6 +173,19 @@ async fn org_real_daemon_and_cli_json_text_smoke() {
     assert!(text.contains("line_error=reporting line at beta/broken: invalid role configuration"));
     assert!(text.contains("Unplaced tasks: 1"));
     assert!(!text.contains("SECRET"));
+    assert!(!text.contains("Departments:"));
+
+    // This config directory did not exist at startup. It is not the host's XDG directory.
+    let departments = root.join("config/atm/departments");
+    std::fs::create_dir_all(&departments).unwrap();
+    let file = departments.join("tools.toml");
+    let content = "title='Tools'\nprojects=['alpha']\n[[roster]]\nseats='alpha/lead'\n";
+    std::fs::write(&file, content).unwrap();
+    let department_json = cli(root, &["org", "--format", "json"]).await;
+    let department_text = cli(root, &["org"]).await;
+    std::fs::write(file, content.replace("Tools", "Updated Tools")).unwrap();
+    let updated_json = cli(root, &["org", "--format", "json"]).await;
+
     // Verify ownership before asking the private binary to signal its PID file.
     let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
     assert!(environ
@@ -199,5 +213,31 @@ async fn org_real_daemon_and_cli_json_text_smoke() {
     assert!(errors.is_empty(), "{}", String::from_utf8_lossy(&errors));
     assert!(log.contains("Daemon server listening"));
     assert!(!root.join("s/atm.sock").exists());
-    println!("private real-atmd/built-atm smoke: 3 projects, cross-project manager, broken line, private sentinels, JSON seq and text; listening-event readiness and confirmed process exit");
+    for output in [&department_json, &department_text, &updated_json] {
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+    }
+    let summary: Value = serde_json::from_slice(&department_json.stdout).unwrap();
+    assert_eq!(summary["departments"][0]["id"], "tools");
+    assert_eq!(summary["departments"][0]["title"], "Tools");
+    let roster = &summary["departments"][0]["roster"][0];
+    assert_eq!(roster["seats"], "alpha/lead");
+    // The real daemon can reconcile the seeded seat down when no pane exists.
+    // Compare with the state in this reply, not an assumed startup ordering.
+    let seat = summary["projects"][0]["seats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|seat| seat["agent_id"] == "alpha/lead")
+        .unwrap();
+    assert_eq!(roster["live"], u64::from(seat["state"] != "down"));
+    assert_eq!(summary["department_problems"], json!([]));
+    let updated: Value = serde_json::from_slice(&updated_json.stdout).unwrap();
+    assert_eq!(updated["departments"][0]["title"], "Updated Tools");
+    let text = String::from_utf8(department_text.stdout).unwrap();
+    assert!(text.contains("Departments:\n  Tools (tools)\n"), "{text}");
+    assert!(text.contains("No department: beta, gamma\n"));
+    println!("private real-atmd/built-atm smoke: base view, fresh department config, JSON and text; listening-event readiness and confirmed process exit");
 }

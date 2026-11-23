@@ -64,7 +64,7 @@ async fn bulk_edges_read_each_recorded_role_once() {
         let mut reads = BTreeMap::new();
         let first = read_edges(&state, |state, id| {
             *reads.entry(id.to_string()).or_insert(0) += 1;
-            role_manager(state, id)
+            read_current_role(state, id)
         })
         .unwrap();
         assert_eq!(
@@ -103,6 +103,15 @@ async fn bulk_edges_read_each_recorded_role_once() {
         for id in ["alpha/two", "beta/lone"] {
             assert_eq!(edge(&next, id), &Ok(Address::Owner));
         }
+        assert!(!next
+            .current_models
+            .contains_key(&"alpha/two".parse().unwrap()));
+        assert_eq!(
+            next.current_models
+                .get(&"beta/lone".parse().unwrap())
+                .map(String::as_str),
+            Some("(default)")
+        );
     }
 }
 
@@ -206,7 +215,7 @@ async fn bulk_edges_error_categories() {
                     io::Error::from_raw_os_error(code),
                 ))
             } else {
-                Ok(Address::Owner)
+                Ok(None)
             }
         });
         if expected == "refused" {
@@ -237,7 +246,7 @@ async fn bulk_edges_retain_shared_slot() {
                     entered.send(()).unwrap();
                     gate.recv().unwrap();
                 }
-                role_manager(state, id)
+                read_current_role(state, id)
             }))
         })
         .await
@@ -272,6 +281,7 @@ async fn bulk_edges_retain_shared_slot() {
     let unavailable = edges.await.unwrap();
     assert!(unavailable.reason.is_some());
     assert!(unavailable.edges.is_empty());
+    assert!(unavailable.current_models.is_empty());
     assert_eq!(ancestors.await.unwrap_err().0.code, "timeout");
     assert_eq!(files.slot.available_permits(), 0);
     tokio::time::resume();

@@ -116,6 +116,7 @@ async fn reservation_transient_snapshot_failure_keeps_send_parked_until_recovery
         .iter()
         .any(|c| matches!(c, MockCall::PasteText { .. } | MockCall::SendKeys { .. })));
     mock.set_next_raw_output("0 1");
+    crate::control::legacy_survey_test::mock_shell(&mock, "%1");
     retry.send(Ok(OrgState::default())).unwrap();
     assert_eq!(send.await.unwrap().unwrap(), "%1");
     assert_eq!(
@@ -159,6 +160,7 @@ async fn reservation_mirror_stall_parks_input_not_the_actor() {
         assert!(!send.is_finished());
         assert!(mock.calls().iter().any(|c| matches!(c, MockCall::PasteText { pane, text } if pane == "%2" && text == "independent")));
         mock.set_next_raw_output("0 1");
+        crate::control::legacy_survey_test::mock_shell(&mock, "%1");
         release.send(()).unwrap();
         assert_eq!(send.await.unwrap().unwrap(), "%1");
         cancel.cancel(); actor.await.unwrap();

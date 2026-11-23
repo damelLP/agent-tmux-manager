@@ -23,8 +23,13 @@ pub use super::agent_methods::register_agent_methods;
 pub use super::agent_screen::{agent_screen, foreground, AgentScreen, Foreground, PaneBaseline};
 pub use super::agent_types::*;
 use super::{
+    agent_hire::Hiring,
+    agent_proc::ShellListIssue,
     agent_project::AgentProjects,
     agent_unreadable::{foreground_session, ScreenEpisodes, ScreenSample},
+    department_directory::DepartmentFiles,
+    reporting_line::ReportingFiles,
+    session_process::{process_confirmed, ProcessClock},
     OrgHandle, OrgServiceError,
 };
 use crate::control::reservation::{
@@ -39,7 +44,7 @@ use atm_core::{
     harness_control::ControlDialog, DialogState, Harness, InputState, Money, SessionId,
     SessionView, TurnState,
 };
-use atm_org::{Agent, OrgCommand, OrgState};
+use atm_org::{Agent, OrgCommand, OrgState, SessionProcess};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
@@ -65,6 +70,10 @@ const OBSERVER_CONCURRENCY: usize = 8;
 // harness may be quiet, or its only row excluded. Doubling, capped.
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+// A Starting agent with a session (revalidating) is looked at again this often:
+// its pane can become safe with no harness event (a draft cleared, copy mode
+// left, an idle dim suggestion), and nothing else would wake it.
+const REVALIDATE_EVERY: Duration = Duration::from_secs(5);
 
 /// Why an agent's last observation failed; cleared by its next success.
 #[derive(Debug, Clone)]
@@ -143,8 +152,9 @@ pub enum AgentError {
 /// Reads one variable of the environment a launch takes its overrides from.
 pub(super) type SpawnEnv = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
-/// An agent's pane, its baseline, and the refusal reason of its last observation.
-type PaneRecord = (String, PaneBaseline, Option<String>);
+type PaneRefusal = (Option<String>, Option<ShellListIssue>);
+/// An agent's pane, its baseline, and its last observation's refusal and shell-list issue.
+type PaneRecord = (String, PaneBaseline, PaneRefusal);
 type HandoverWaits = Arc<std::sync::Mutex<BTreeMap<AgentId, (SavedSeat, String)>>>;
 
 #[derive(Clone)]
@@ -160,23 +170,31 @@ pub(super) struct AgentRuntime {
     /// A display-only reason for a saved handover that has not admitted Clear.
     handover_waits: HandoverWaits,
     /// Reads a pane's root process from procfs; scripted in tests.
-    pub proc: super::agent_proc::ProcReader,
+    pub proc: super::agent_proc::ProcReader<super::agent_proc::ProcSample>,
     /// The `ATM_SPAWN_*` overrides of the daemon's start environment.
     pub spawn_env: SpawnEnv,
     #[cfg(test)]
     progress: broadcast::Sender<ObservationProgress>,
+    /// Test-only: stops the revalidation poll, for tests whose scripted tmux
+    /// reads cannot take its background captures in an unknown order.
+    #[cfg(test)]
+    revalidation_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentRuntime {
     /// The baseline recorded for `agent` on `pane`, or one that refuses every
     /// read: none was recorded, or it belongs to a pane the agent has left.
     pub(super) fn baseline(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
+        self.pane_record(agent, pane)
+            .map_or_else(PaneBaseline::unproven, |(_, baseline, _)| baseline)
+    }
+
+    fn pane_record(&self, agent: &AgentId, pane: &str) -> Option<PaneRecord> {
         self.baselines
             .lock()
             .ok()
             .and_then(|baselines| baselines.get(agent).cloned())
             .filter(|(recorded, ..)| recorded == pane)
-            .map_or_else(PaneBaseline::unproven, |(_, baseline, _)| baseline)
     }
 
     /// Record what was established about an agent's pane. A poisoned store
@@ -184,31 +202,35 @@ impl AgentRuntime {
     /// this goes with what it replaces.
     pub(super) fn record_baseline(&self, agent: AgentId, pane: &str, baseline: PaneBaseline) {
         if let Ok(mut baselines) = self.baselines.lock() {
-            baselines.insert(agent, (pane.into(), baseline, None));
+            baselines.insert(agent, (pane.into(), baseline, (None, None)));
         }
     }
 
     /// Why the last observation of `agent` on `pane` found every input to it
     /// refused, if it did.
     fn refusal(&self, agent: &AgentId, pane: &str) -> Option<String> {
-        self.baselines
-            .lock()
-            .ok()
-            .and_then(|baselines| baselines.get(agent).cloned())
-            .filter(|(recorded, ..)| recorded == pane)
-            .and_then(|(.., reason)| reason)
+        self.pane_record(agent, pane)
+            .and_then(|(.., (reason, _))| reason)
     }
 
-    /// Set that reason, or with `None` drop it; the baseline stays.
-    fn set_refusal(&self, agent: &AgentId, pane: &str, reason: Option<String>) {
+    fn listed_refusal(&self, agent: &AgentId, pane: &str) -> Option<String> {
+        match self.pane_record(agent, pane)?.2 {
+            (Some(reason), Some(issue)) => Some(format!("{reason}; {}", issue.detail())),
+            (None, Some(issue)) => Some(issue.detail().into()),
+            (reason, None) => reason,
+        }
+    }
+
+    /// Set or clear the last observation's refusal and diagnostic; keep the baseline.
+    fn set_refusal(&self, agent: &AgentId, pane: &str, refusal: PaneRefusal) {
         if let Ok(mut baselines) = self.baselines.lock() {
             match baselines
                 .get_mut(agent)
                 .filter(|(recorded, ..)| recorded == pane)
             {
-                Some(entry) => entry.2 = reason,
-                None if reason.is_some() => {
-                    let record = (pane.into(), PaneBaseline::unproven(), reason);
+                Some(entry) => entry.2 = refusal,
+                None if refusal != (None, None) => {
+                    let record = (pane.into(), PaneBaseline::unproven(), refusal);
                     baselines.insert(agent.clone(), record);
                 }
                 None => {}
@@ -244,6 +266,7 @@ pub struct Recipient {
     /// What was recorded about the pane's processes. When nothing was, this is
     /// [`PaneBaseline::unproven`] and every read through `screen` refuses.
     pub baseline: PaneBaseline,
+    pub(super) shell_list_issue: Option<ShellListIssue>,
     /// The agent's excluded (old) session: a session that appears later must
     /// not be this one.
     pub excluded: Option<SessionId>,
@@ -252,6 +275,12 @@ pub struct Recipient {
     /// session the agent is recorded as bound to: a new session the observer
     /// has not bound yet, or a binding whose row is not announced yet.
     pub session: Option<SessionView>,
+    /// The pane shows a discovery row of the agent's harness, as every row is
+    /// after a daemon restart until the harness's next event.
+    pub unconfirmed: bool,
+    /// `session` is a discovery row standing for the recorded session by its
+    /// process: the harness has reported nothing since the restart.
+    pub process_matched: bool,
 }
 
 #[cfg(test)]
@@ -298,9 +327,22 @@ impl std::fmt::Debug for AgentService {
 #[derive(Debug, Clone)]
 pub struct AgentHandle {
     inner: Arc<AgentService>,
+    hiring: Option<Hiring>,
 }
 
 impl AgentHandle {
+    pub(crate) fn with_hiring(
+        mut self,
+        departments: DepartmentFiles,
+        reporting: ReportingFiles,
+    ) -> Self {
+        self.hiring = Some(Hiring {
+            departments,
+            reporting,
+        });
+        self
+    }
+
     pub(super) fn screens(&self) -> Option<&ScreenEpisodes> {
         Some(&self.inner.runtime.as_ref()?.screens)
     }
@@ -327,6 +369,13 @@ impl AgentHandle {
     }
 
     #[cfg(test)]
+    pub(super) fn pause_revalidation(&self) {
+        let rt = self.inner.runtime.as_ref().unwrap();
+        rt.revalidation_paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub(super) fn baseline_of(&self, agent: &AgentId, pane: &str) -> PaneBaseline {
         self.inner.runtime.as_ref().unwrap().baseline(agent, pane)
     }
@@ -349,6 +398,7 @@ impl AgentHandle {
                 lifecycle: None,
                 stop: CancellationToken::new(),
             }),
+            hiring: None,
         }
     }
 
@@ -492,6 +542,10 @@ impl AgentHandle {
             .runtime
             .as_ref()
             .ok_or_else(|| self.unavailable(OPERATION))?;
+        let warning = match &self.hiring {
+            Some(hiring) => hiring.check(&rt.org, &prepared, &caller, p.hire).await?,
+            None => None,
+        };
         let id = prepared.agent_id.clone();
         let launch = rt
             .prepare_launch(prepared, caller, p.caller_server.clone())
@@ -508,14 +562,17 @@ impl AgentHandle {
         let waiting = super::agent_lifecycle::Waiting::default();
         let (work, cleanup) = (rt.clone(), rt.clone());
         let (why, record, whose) = (waiting.clone(), waiting.clone(), id.clone());
-        self.lifecycle_for(
-            p.caller_server,
-            request,
-            move |r| async move { work.up(&r, launch, None, &waiting).await },
-            move |_, _| async move { cleanup.settle_up(&id, &why).await },
-        )
-        .await
-        .map_err(|error| deadline_answer(error, &whose, stuck_record(&record)))
+        let mut result = self
+            .lifecycle_for(
+                p.caller_server,
+                request,
+                move |r| async move { work.up(&r, launch, None, &waiting).await },
+                move |_, _| async move { cleanup.settle_up(&id, &why).await },
+            )
+            .await
+            .map_err(|error| deadline_answer(error, &whose, stuck_record(&record)))?;
+        result.warning = warning;
+        Ok(result)
     }
     pub async fn adopt(&self, p: AdoptParams) -> Result<AdoptResult, AgentError> {
         const OPERATION: &str = "agent.adopt";
@@ -829,8 +886,10 @@ impl AgentHandle {
                     // A Ready or Starting agent has no recorded reason: what
                     // the last observation found refused is its reason.
                     if matches!(a.status, AgentStatus::Ready | AgentStatus::Starting) {
-                        if let Some(refusal) =
-                            a.pane.as_deref().and_then(|pane| rt.refusal(&a.id, pane))
+                        if let Some(refusal) = a
+                            .pane
+                            .as_deref()
+                            .and_then(|pane| rt.listed_refusal(&a.id, pane))
                         {
                             entry.reason = Some(refusal);
                         }
@@ -882,13 +941,11 @@ impl AgentHandle {
             .pane
             .as_ref()
             .ok_or_else(|| AgentError::Refused(format!("agent {agent} has no pane")))?;
-        let rows: Vec<SessionView> = timeout(LIST_BUDGET, rt.registry.pane_sessions(pane))
+        let sessions = timeout(LIST_BUDGET, rt.registry.pane_sessions(pane))
             .await
             .map_err(|_| AgentError::Timeout)?
-            .map_err(|error| AgentError::Unavailable(format!("session registry: {error}")))?
-            .into_iter()
-            .map(|row| row.view)
-            .collect();
+            .map_err(|error| AgentError::Unavailable(format!("session registry: {error}")))?;
+        let rows: Vec<SessionView> = sessions.iter().map(|row| row.view.clone()).collect();
         let harness = harness(&state, found, &rows);
         let screen = agent_screen(harness).ok_or_else(|| {
             AgentError::Refused(format!(
@@ -896,15 +953,37 @@ impl AgentHandle {
                 harness.short_tag()
             ))
         })?;
+        let mut unconfirmed = rows.iter().any(|row| {
+            matches_agent(found, row) && row.id.is_pending() && row.harness == harness.short_tag()
+        });
         let mut eligible = rows.into_iter().filter(|row| {
             matches_agent(found, row) && !row.id.is_pending() && row.harness == harness.short_tag()
         });
-        let session = eligible.next();
+        let mut session = eligible.next();
+        let mut process_matched = false;
         if eligible.next().is_some() {
             return Err(AgentError::Conflict(format!(
                 "agent {agent} has more than one eligible session on {pane}"
             )));
         }
+        // After a daemon restart, the discovery row that is the recorded
+        // session's own process stands for that session.
+        if session.is_none() && unconfirmed {
+            let recorded = (found.session_id.as_ref()).and_then(|id| state.session_process(id));
+            let clock = recorded.is_none().then(ProcessClock::read).flatten();
+            if let Some(row) = process_confirmed(found, recorded, harness, &sessions, clock) {
+                session = (found.session_id.clone()).map(|id| SessionView {
+                    id,
+                    ..row.view.clone()
+                });
+                unconfirmed = false;
+                process_matched = true;
+            }
+        }
+        let (baseline, shell_list_issue) = rt.pane_record(agent, pane).map_or_else(
+            || (PaneBaseline::unproven(), None),
+            |(_, baseline, (_, issue))| (baseline, issue),
+        );
         Ok(Recipient {
             cursor,
             status: found.status,
@@ -912,9 +991,12 @@ impl AgentHandle {
             pane: PaneId::parse(pane)?,
             harness,
             screen,
-            baseline: rt.baseline(agent, pane),
+            baseline,
+            shell_list_issue,
             excluded: found.excluded_session_id.clone(),
             session,
+            unconfirmed,
+            process_matched,
         })
     }
 
@@ -1017,6 +1099,42 @@ impl AgentRuntime {
             .await
     }
 
+    /// Record the process `session`'s confirmed row on the agent's pane runs
+    /// in, when it is not the session's recorded one, so that a restarted
+    /// daemon knows that row while it is a discovery row again. Callers pass
+    /// only a session from a non-pending row: a guess is never recorded.
+    async fn record_process(&self, state: &OrgState, agent: &Agent, session: &SessionId) {
+        // Advisory: a failure leaves the pass's own outcome as it was.
+        if let Err(error) = self.try_record_process(state, agent, session).await {
+            tracing::warn!(agent = %agent.id, %error, "Session process not recorded");
+        }
+    }
+
+    async fn try_record_process(
+        &self,
+        state: &OrgState,
+        agent: &Agent,
+        session: &SessionId,
+    ) -> Result<(), AgentError> {
+        let Some(pane) = agent.pane.as_deref() else {
+            return Ok(());
+        };
+        let rows = self.pane_sessions(&PaneId::parse(pane)?).await?;
+        let process = (rows.iter().filter(|row| &row.view.id == session)).find_map(|row| {
+            Some(SessionProcess {
+                session_id: session.clone(),
+                pid: row.pid?,
+                process_start: row.process_start?,
+            })
+        });
+        if let Some(process) = process.filter(|p| state.session_process(session) != Some(p)) {
+            self.org
+                .execute(OrgCommand::RecordProcess(process), chrono::Utc::now())
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn inspect(
         &self,
         r: &Reservation,
@@ -1073,13 +1191,19 @@ impl AgentRuntime {
         // and `agent.list` says why every input to it is refused.
         let mut processes = None;
         let mut refused = None;
+        let mut shell_list_issue = None;
         let (root, command) = look
             .as_ref()
             .map(|(root, command)| (*root, command.as_str()))
             .unzip();
         if foreground(&stored, root, command) != Some(Foreground::Harness) {
             if let Some(root) = root {
-                processes = (self.proc)(root).await;
+                processes = (self.proc)(root).await.map(|sample| {
+                    if stored.harness_command().is_none() {
+                        shell_list_issue = sample.shell_list_issue;
+                    }
+                    sample.facts
+                });
             }
             if let Some(pane) = agent.pane.as_ref().filter(|_| {
                 (agent.status == AgentStatus::Ready || agent.session_id.is_some())
@@ -1109,7 +1233,7 @@ impl AgentRuntime {
         }
         // One write per pass: the reason, or none once the harness is in front.
         if let Some(pane) = &agent.pane {
-            self.set_refusal(&agent.id, pane, refused);
+            self.set_refusal(&agent.id, pane, (refused, shell_list_issue));
         }
         // A flow never outlives its daemon. At the restart check a clear, and
         // a start that has bound no session, have nobody driving them: the
@@ -1149,6 +1273,7 @@ impl AgentRuntime {
                     body: format!("agent {}: {reason}", agent.id),
                     attachments: Vec::new(),
                     task: None,
+                    post: None,
                 };
                 // Repair a partial Stuck/Note prefix, without duplicating a note
                 // whose append completed after its caller timed out. A note sent
@@ -1177,6 +1302,11 @@ impl AgentRuntime {
                     && row.harness == expected.short_tag()
             })
             .collect();
+        if let [row] = eligible.as_slice() {
+            if agent.session_id.as_ref() == Some(&row.id) {
+                self.record_process(state, agent, &row.id).await;
+            }
+        }
         // The single eligible row this wake may bind, checked again at the write.
         let mut binding = bind.filter(|candidate| {
             !in_mode
@@ -1200,6 +1330,7 @@ impl AgentRuntime {
                             chrono::Utc::now(),
                         )
                         .await?;
+                    self.record_process(state, agent, &candidate.session).await;
                     // The agent is Ready now. The reason above was decided
                     // for what it was before (Starting without a session
                     // has none): when its harness is not known to be in
@@ -1209,7 +1340,7 @@ impl AgentRuntime {
                         if let Some(pane) = agent.pane.as_deref() {
                             let shape = processes.as_ref().and_then(classify_pane);
                             let text = refusal_text(pane, &stored, command, shape);
-                            self.set_refusal(&agent.id, pane, Some(text));
+                            self.set_refusal(&agent.id, pane, (Some(text), shell_list_issue));
                         }
                     }
                     return Ok(());
@@ -1334,6 +1465,7 @@ impl AgentRuntime {
                         chrono::Utc::now(),
                     )
                     .await?;
+                self.record_process(state, agent, &candidate.session).await;
             }
             return Ok(());
         }
@@ -1550,7 +1682,7 @@ pub(crate) fn spawn_agents_configured(
         .filter(|(key, _)| key.starts_with("ATM_SPAWN_"))
         .collect();
     let spawn_env: SpawnEnv = Arc::new(move |key| env.get(key).cloned());
-    spawn_agents_with(
+    spawn_agents_sampled(
         org,
         registry,
         control,
@@ -1561,13 +1693,45 @@ pub(crate) fn spawn_agents_configured(
     )
 }
 
-/// [`spawn_agents`] with the procfs reader given, so tests can script it.
+/// [`spawn_agents`] with the procfs facts given, so existing tests can script them.
+#[cfg(test)]
 pub(super) fn spawn_agents_with(
     org: OrgHandle,
     registry: RegistryHandle,
     control: ControlHandle,
     cancel: CancellationToken,
     proc: super::agent_proc::ProcReader,
+    spawn_env: SpawnEnv,
+    readiness_timeout: Duration,
+) -> (AgentHandle, JoinHandle<()>) {
+    use super::agent_proc::{ProcReader, ProcSample};
+
+    let proc: ProcReader<ProcSample> = Arc::new(move |pid| {
+        let read = proc(pid);
+        Box::pin(async move {
+            read.await.map(|facts| ProcSample {
+                facts,
+                shell_list_issue: None,
+            })
+        })
+    });
+    spawn_agents_sampled(
+        org,
+        registry,
+        control,
+        cancel,
+        proc,
+        spawn_env,
+        readiness_timeout,
+    )
+}
+
+pub(super) fn spawn_agents_sampled(
+    org: OrgHandle,
+    registry: RegistryHandle,
+    control: ControlHandle,
+    cancel: CancellationToken,
+    proc: super::agent_proc::ProcReader<super::agent_proc::ProcSample>,
     spawn_env: SpawnEnv,
     readiness_timeout: Duration,
 ) -> (AgentHandle, JoinHandle<()>) {
@@ -1582,6 +1746,8 @@ pub(super) fn spawn_agents_with(
         spawn_env,
         #[cfg(test)]
         progress: broadcast::channel(4096).0,
+        #[cfg(test)]
+        revalidation_paused: Arc::default(),
     };
     let (projects, project_task) = AgentProjects::spawn(rt.org.clone(), cancel.child_token());
     let (send, ready) = watch::channel(None);
@@ -1598,6 +1764,7 @@ pub(super) fn spawn_agents_with(
             lifecycle: Some(lifecycle),
             stop: cancel.clone(),
         }),
+        hiring: None,
     };
     // Subscribe before the initial snapshot: events arriving during inspection
     // remain wakeups, never cached readiness decisions.
@@ -1659,6 +1826,7 @@ struct AgentRoute {
     excluded: Option<SessionId>,
     harness: Option<Harness>,
     ready: bool,
+    revalidating: bool,
 }
 
 impl AgentRoute {
@@ -1692,6 +1860,7 @@ impl AgentRoutes {
                         excluded: a.excluded_session_id.clone(),
                         harness: a.role.as_ref().map(|r| r.config.harness),
                         ready: a.status == AgentStatus::Ready,
+                        revalidating: a.status == AgentStatus::Starting && a.session_id.is_some(),
                     },
                 )
             })
@@ -1831,6 +2000,11 @@ async fn observer(
     let mut next_observation = BTreeMap::new();
     let mut backoff: BTreeMap<AgentId, Duration> = BTreeMap::new();
     let mut routes = AgentRoutes::default();
+    let mut revalidate = tokio::time::interval_at(
+        tokio::time::Instant::now() + REVALIDATE_EVERY,
+        REVALIDATE_EVERY,
+    );
+    revalidate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     routes.refresh(&state);
     if let Ok(rows) = rt.rows().await {
         for row in rows {
@@ -1922,6 +2096,19 @@ async fn observer(
                 }
             }
             _ = async { if let Some(at) = next_wake { tokio::time::sleep_until(at).await; } }, if next_wake.is_some() => {},
+            _ = revalidate.tick() => {
+                #[cfg(test)]
+                if rt.revalidation_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                // A seat in an unreadable episode is the diagnosis worker's. Once
+                // the worker is done with it (dormant), it is looked at again once
+                // a minute: its screen can become readable with no harness event.
+                let now = Instant::now();
+                for (id, _) in routes.agents.iter().filter(|(id, route)| route.revalidating && (!rt.screens.unreadable(id) || rt.screens.take_relook(id, now))) {
+                    pending.entry(id.clone()).or_insert(None);
+                }
+            },
             // Before registry events: routing must reflect a committed lifecycle change
             // (an agent that just left Ready) before a later row event is filtered by it.
             event = committed.recv() => {
@@ -1951,7 +2138,7 @@ async fn observer(
                             // no pass need follow the clear to drop it.
                             if let Some((id, route)) = id.as_ref().and_then(|id| Some((id, routes.agents.get(id)?))) {
                                 if let Some(pane) = &route.pane {
-                                    rt.set_refusal(id, pane, None);
+                                    rt.set_refusal(id, pane, (None, None));
                                 }
                             }
                             #[cfg(test)]
@@ -2144,6 +2331,7 @@ mod projection_join_tests {
             excluded_session_id: None,
             reason: None,
             updated_at: now,
+            bound_at: None,
         };
         let row = SessionView {
             id: "live".into(),
@@ -2386,6 +2574,7 @@ mod fence_tests {
             excluded_session_id: Some(SessionId::new("old")),
             reason: None,
             updated_at: chrono::Utc::now(),
+            bound_at: None,
         };
         for (kind, id, seq, valid) in [
             ("agent.clear_requested", "p/lead", 11, false),

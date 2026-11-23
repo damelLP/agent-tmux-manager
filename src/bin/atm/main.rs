@@ -42,6 +42,7 @@ use atm_tui::tmux;
 mod agent;
 mod agent_target;
 mod away;
+mod channels;
 mod chat;
 mod chat_entry;
 mod cli;
@@ -50,6 +51,7 @@ mod me;
 mod msg;
 mod org;
 mod output;
+mod post;
 mod relay;
 mod report;
 pub mod rpc;
@@ -343,6 +345,21 @@ enum Command {
         #[command(subcommand)]
         action: msg::MsgAction,
     },
+    /// Create, edit or remove a channel post
+    Post(post::PostArgs),
+    /// Toggle your reaction to a post
+    React(post::ReactArgs),
+    /// List channels
+    Channels(channels::ChannelsArgs),
+    /// Read one page of channel or thread history
+    History(channels::HistoryArgs),
+    /// Mark messages in your inbox read by post or wake ID
+    Ack(msg::AckArgs),
+    /// Retry or cancel a held wake
+    Wake {
+        #[command(subcommand)]
+        action: msg::WakeAction,
+    },
     /// Read messages without marking them read
     Inbox(msg::InboxArgs),
     /// Talk and read durable messages in a separate terminal screen
@@ -599,6 +616,14 @@ async fn run() -> Result<()> {
         Some(Command::Away(args)) => return away::cmd_away(args).await,
         Some(Command::Back(args)) => return away::cmd_back(args).await,
         Some(Command::Msg { action }) => return msg::cmd_msg(action).await,
+        Some(Command::Post(args)) => return post::cmd_post(args).await,
+        Some(Command::React(args)) => return post::cmd_react(args).await,
+        Some(Command::Channels(args)) => return channels::cmd_channels(args).await,
+        Some(Command::History(args)) => return channels::cmd_history(args).await,
+        Some(Command::Ack(args)) => return msg::cmd_ack(args, msg::WakeNames::Final).await,
+        Some(Command::Wake { action }) => {
+            return msg::cmd_wake(action, msg::WakeNames::Final).await
+        }
         Some(Command::Inbox(args)) => return msg::cmd_inbox(args).await,
         Some(Command::Chat(args)) => return chat_entry::cmd_chat(args).await,
         Some(Command::Agent { action }) => return agent::cmd_agent(action).await,

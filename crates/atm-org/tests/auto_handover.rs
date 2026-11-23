@@ -156,6 +156,7 @@ impl History {
             body: "Read this".into(),
             attachments: Vec::new(),
             task: None,
+            post: None,
         }));
         MessageId::new(seq)
     }

@@ -1,17 +1,21 @@
 //! Durable decisions and the single restart-recoverable answer-message bridge.
 //! Policy stays in atm-org; answers use the existing confirmed-message runtime.
+//! Relay confirmation checks designation and binding in the service snapshot;
+//! a concurrent revocation or pane rebind can miss an already checked confirmation.
 
 pub use super::decision_methods::register_decision_methods;
 use super::{
     agent_project::AgentProjects,
+    decision_steps::{self, Said},
     message_inbox::caller_address,
     messages::{MessageClock, MessageError},
     OrgHandle, OrgServiceError,
 };
 use crate::server::methods::{CallContext, MethodError};
 use atm_org::{
-    Address, AgentId, DecisionCommand, DecisionRequest, DecisionResolution, DecisionWithdrawal,
-    MessageContent, MessageKind, OrgCommand, OrgState,
+    channel_query::decision_post, Address, AgentId, ChannelCommand, ChannelId, DecisionCommand,
+    DecisionRequest, DecisionResolution, DecisionWithdrawal, MessageContent, MessageId,
+    MessageKind, OrgCommand, OrgState,
 };
 pub use atm_org::{Decision, DecisionClass, DecisionId, DecisionKind, DecisionStatus};
 use chrono::{DateTime, Utc};
@@ -28,6 +32,9 @@ use tokio_util::sync::CancellationToken;
 mod tests;
 
 const BUDGET: Duration = Duration::from_secs(20);
+/// The inline question after a committed request: inside the method's 22 s
+/// with the 20 s above, and cut short rather than fail the request.
+const ASK_BUDGET: Duration = Duration::from_secs(1);
 pub(super) const PAGE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +79,10 @@ pub struct RequestParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestResult {
     pub decision_id: DecisionId,
+    /// The question post (design 12); absent when it was not confirmed, and
+    /// the decision bridge writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_id: Option<MessageId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,10 +114,12 @@ pub struct ResolveParams {
     pub note: Option<String>,
     #[serde(default)]
     pub standing_rule: bool,
-    /// Typed serialization retains forbidden note/standing_rule keys; relay RPC
-    /// callers must send only id/option/relay, as `atm decide --relay` does.
+    /// Plain relay sends only id/option/relay; even null note or false rule keys
+    /// are forbidden. Relay confirmation includes the owner's words in note.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relay: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirm: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,13 +132,32 @@ pub struct DecisionEntry {
     #[serde(flatten)]
     pub decision: Decision,
     pub class: DecisionClass,
+    /// The question post and its channel (design 12); absent until it is
+    /// written, and for a legacy decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_id: Option<MessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<ChannelId>,
 }
 impl From<&Decision> for DecisionEntry {
     fn from(decision: &Decision) -> Self {
         Self {
             decision: decision.clone(),
             class: decision.class(),
+            post_id: None,
+            channel: None,
         }
+    }
+}
+/// A decision's row, linked to its question post.
+fn row(state: &OrgState, decision: &Decision) -> DecisionEntry {
+    let post_id = decision_post(state, decision.id, decision_steps::ASKED);
+    DecisionEntry {
+        channel: post_id
+            .and_then(|id| atm_org::channel_query::post(state, id))
+            .map(|post| post.content.channel.clone()),
+        post_id,
+        ..DecisionEntry::from(decision)
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,8 +201,12 @@ fn reporting_error(error: MethodError) -> DecisionError {
 fn entry(state: &OrgState, id: DecisionId) -> Result<DecisionEntry, DecisionError> {
     state
         .decision(&id)
-        .map(DecisionEntry::from)
+        .map(|decision| row(state, decision))
         .ok_or_else(|| DecisionError::NotFound(format!("decision {id} was not found")))
+}
+/// The owner's words as his designated relay records them (decide and give-up).
+pub(super) fn relayed_words(relay: &AgentId, words: &str) -> String {
+    format!("confirmed in his words, relayed by {relay}: '{words}'")
 }
 pub(super) fn bounded<T: Serialize>(value: T) -> Result<T, DecisionError> {
     if serde_json::to_vec(&value)
@@ -224,7 +260,7 @@ fn list(
     };
     let mut bytes = 128; // Result framing and the longest canonical cursor.
     for decision in scope.into_iter().filter(wanted) {
-        let row = DecisionEntry::from(decision);
+        let row = row(state, decision);
         let size = serde_json::to_vec(&row)
             .map_err(|e| DecisionError::Internal(e.to_string()))?
             .len()
@@ -247,7 +283,7 @@ fn list(
 
 /// Canonical system answer: its durable msg.sent is the bridge's completion
 /// marker, even after delivery failure/read. Status, not stale fields, decides.
-fn resolution_message(decision: &Decision) -> Option<MessageContent> {
+pub(super) fn resolution_message(decision: &Decision) -> Option<MessageContent> {
     let status = match decision.status {
         DecisionStatus::Resolved => "resolved",
         DecisionStatus::Overruled => "overruled",
@@ -274,13 +310,21 @@ fn resolution_message(decision: &Decision) -> Option<MessageContent> {
         body,
         attachments: vec![],
         task: None,
+        post: None,
     })
 }
-fn missing_resolution_messages(state: &OrgState) -> Vec<MessageContent> {
+/// The previous bridge's list, by content alone; `decision_steps::replies`
+/// now decides. Kept as the oracle of the rollback tests.
+#[cfg(test)]
+pub(super) fn missing_resolution_messages(state: &OrgState) -> Vec<MessageContent> {
     state
         .decisions()
         .filter_map(resolution_message)
-        .filter(|content| !state.messages().any(|m| m.content == *content))
+        .filter(|content| {
+            !state
+                .messages()
+                .any(|m| m.content.same_except_post(content))
+        })
         .collect()
 }
 
@@ -348,40 +392,73 @@ impl DecisionHandle {
         p: RequestParams,
         caller: CallContext,
     ) -> Result<RequestResult, DecisionError> {
-        self.call(true, async {
-            let state = self.org.snapshot().await?;
-            let requester = caller_address(&state, &caller)?;
-            if requester == Address::Owner {
-                return Err(DecisionError::Refused(
-                    "only a named agent may request a decision".into(),
-                ));
-            }
-            let events = self
-                .org
-                .execute(
-                    OrgCommand::Decision(DecisionCommand::Request(DecisionRequest {
-                        requester,
-                        kind: p.kind,
-                        title: p.title,
-                        context: p.context,
-                        files: p.files,
-                        options: p.options,
-                        recommended: p.recommended,
-                        may_be_undone: p.may_be_undone,
-                        changes_intent: p.changes_intent,
-                        deadline: p.deadline,
-                    })),
-                    self.clock.now()?,
-                )
-                .await?;
-            let record = events
-                .first()
-                .ok_or_else(|| DecisionError::Internal("request committed no event".into()))?;
-            Ok(RequestResult {
-                decision_id: DecisionId::new(record.seq),
+        let decision_id = self
+            .call(true, async {
+                let state = self.org.snapshot().await?;
+                let requester = caller_address(&state, &caller)?;
+                if requester == Address::Owner {
+                    return Err(DecisionError::Refused(
+                        "only a named agent may request a decision".into(),
+                    ));
+                }
+                let events = self
+                    .org
+                    .execute(
+                        OrgCommand::Decision(DecisionCommand::Request(DecisionRequest {
+                            requester,
+                            kind: p.kind,
+                            title: p.title,
+                            context: p.context,
+                            files: p.files,
+                            options: p.options,
+                            recommended: p.recommended,
+                            may_be_undone: p.may_be_undone,
+                            changes_intent: p.changes_intent,
+                            deadline: p.deadline,
+                        })),
+                        self.clock.now()?,
+                    )
+                    .await?;
+                let record = events
+                    .first()
+                    .ok_or_else(|| DecisionError::Internal("request committed no event".into()))?;
+                Ok(DecisionId::new(record.seq))
             })
+            .await?;
+        // Committed: the question may fail or be slow, never the request. The
+        // bridge pass its decision.requested starts writes it and its row.
+        let post_id = match tokio::time::timeout(ASK_BUDGET, self.ask(decision_id)).await {
+            Ok(Ok(post_id)) => post_id,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, %decision_id, "Question post not confirmed; the decision bridge writes it");
+                None
+            }
+            Err(_) => None,
+        };
+        Ok(RequestResult {
+            decision_id,
+            post_id,
         })
-        .await
+    }
+    /// Post a new decision's question; a repeat of what the bridge already
+    /// wrote is no event. Its owner row is the repair task's and the bridge's
+    /// to write. Returns the question post.
+    async fn ask(&self, id: DecisionId) -> Result<Option<MessageId>, DecisionError> {
+        let state = self.org.snapshot().await?;
+        // An answer that came first closed it: no card and no owner row.
+        let question = state
+            .decision(&id)
+            .filter(|decision| decision_steps::is_open(decision))
+            .and_then(|decision| decision_steps::question(&state, decision, true));
+        if let Some(question) = question {
+            let post = OrgCommand::Channel(ChannelCommand::Post(Box::new(question)));
+            self.org.execute(post, self.clock.now()?).await?;
+        }
+        Ok(decision_post(
+            &self.org.snapshot().await?,
+            id,
+            decision_steps::ASKED,
+        ))
     }
     async fn visible_requesters(
         &self,
@@ -478,13 +555,22 @@ impl DecisionHandle {
     }
     pub async fn resolve(
         &self,
-        p: ResolveParams,
+        mut p: ResolveParams,
         caller: CallContext,
     ) -> Result<MutationResult, DecisionError> {
-        if p.relay && (p.note.is_some() || p.standing_rule) {
-            return Err(DecisionError::InvalidParams(
-                "relays cannot include note or standing_rule".into(),
-            ));
+        let invalid = match (p.confirm, p.relay, p.standing_rule, p.note.as_deref()) {
+            (true, false, ..) => Some("--confirm requires --relay"),
+            (true, _, true, _) => Some("--confirm cannot be used with --rule"),
+            (true, _, _, note) if note.is_none_or(|note| note.trim().is_empty()) => {
+                Some("--confirm requires non-empty owner words")
+            }
+            (false, true, rule, note) if rule || note.is_some() => {
+                Some("relays cannot include note or standing_rule")
+            }
+            _ => None,
+        };
+        if let Some(reason) = invalid {
+            return Err(DecisionError::InvalidParams(reason.into()));
         }
         let permit = self
             .requests
@@ -501,7 +587,7 @@ impl DecisionHandle {
                 .await
                 .map_err(|_| DecisionError::Timeout)??;
             let state = handle.org.snapshot().await?;
-            let by = caller_address(&state, &caller)?;
+            let mut by = caller_address(&state, &caller)?;
             let committed_error = |error: DecisionError| {
                 DecisionError::Refused(format!(
                     "decision {} committed; result was not confirmed: {error}",
@@ -509,28 +595,47 @@ impl DecisionHandle {
                 ))
             };
             if p.relay {
-                let by = match by {
+                let id = p.id;
+                let relay = match by {
                     Address::Agent(by) if state.owner().relay.as_ref() == Some(&by) => by,
-                    _ => {
-                        return Err(DecisionError::Refused(
-                            "only the designated bound agent may relay a decision".into(),
-                        ))
+                    other => {
+                        return Err(DecisionError::Refused(if p.confirm {
+                            format!("{other} may not confirm as relay for decision {id}")
+                        } else {
+                            "only the designated bound agent may relay a decision".into()
+                        }))
                     }
                 };
-                return bounded(
-                    handle
-                        .mutate(
-                            p.id,
-                            DecisionCommand::Relay {
-                                decision_id: p.id,
-                                option: p.option,
-                                by,
-                            },
-                            caller,
-                        )
-                        .await?,
-                )
-                .map_err(committed_error);
+                let command = DecisionCommand::Relay {
+                    decision_id: id,
+                    option: p.option.clone(),
+                    by: relay.clone(),
+                };
+                if !p.confirm {
+                    return bounded(handle.mutate(id, command, caller).await?)
+                        .map_err(committed_error);
+                }
+                let status = state
+                    .decision(&id)
+                    .ok_or_else(|| DecisionError::NotFound(format!("decision {id} was not found")))?
+                    .status;
+                if status != DecisionStatus::TakenProvisionally {
+                    let action = if status == DecisionStatus::Pending {
+                        "confirm before relaying"
+                    } else {
+                        "confirm"
+                    };
+                    return Err(DecisionError::Refused(format!(
+                        "cannot {action} decision {id} while {status:?}"
+                    )));
+                }
+                // A relay on an existing take is a no-op only for the exact option.
+                // Check that policy on the snapshot; submit only the Resolve below.
+                state
+                    .decide(&OrgCommand::Decision(command), handle.clock.now()?)
+                    .map_err(OrgServiceError::from)?;
+                p.note = p.note.map(|words| relayed_words(&relay, &words));
+                by = Address::Owner;
             }
             if by != Address::Owner {
                 return Err(DecisionError::Refused(
@@ -617,31 +722,75 @@ impl DecisionHandle {
     }
 }
 
-async fn reconcile(org: &OrgHandle, clock: &MessageClock) -> Result<(), DecisionError> {
+/// A refused write is logged and passed over: one decision the policy will
+/// not take must not stop the bridge, and with it every decision mutation.
+fn passed_over<T>(result: Result<T, OrgServiceError>, what: &str) -> Result<(), OrgServiceError> {
+    match result {
+        Err(OrgServiceError::Refused(refusal)) => {
+            tracing::warn!(%refusal, "Decision bridge: {what} refused; passed over");
+            Ok(())
+        }
+        result => result.map(|_| ()),
+    }
+}
+
+/// One pass (design 12): the away reports, the question posts, the expiry of
+/// what is due (owner Q2), then on a fresh snapshot each step's reply (or a
+/// legacy decision's message), then the wake rows of what was posted.
+/// `started` is the committed seq at this daemon's start. Returns the next
+/// deadline to wake for.
+async fn reconcile(
+    org: &OrgHandle,
+    clock: &MessageClock,
+    started: u64,
+) -> Result<Option<DateTime<Utc>>, DecisionError> {
     loop {
         let result = async {
             super::away::apply_pending(org, clock).await?;
-            let state = org.snapshot().await?;
-            for message in missing_resolution_messages(&state)
-                .into_iter()
-                .chain(super::away::missing_notices(&state))
-                .chain(state.redo_notices())
-            {
-                org.execute(OrgCommand::SendMessage(message), clock.now()?)
-                    .await?;
+            for question in decision_steps::questions(&org.snapshot().await?, started) {
+                let post = OrgCommand::Channel(ChannelCommand::Post(Box::new(question)));
+                passed_over(org.execute(post, clock.now()?).await, "question post")?;
             }
-            Ok(())
+            // After the questions, so one that expired while the daemon was
+            // down still gets its card before its reply.
+            let now = clock.now()?;
+            for decision_id in atm_org::expiring(&org.snapshot().await?, now) {
+                let expire = OrgCommand::Decision(DecisionCommand::Expire { decision_id });
+                passed_over(org.execute(expire, now).await, "expiry")?;
+            }
+            for said in decision_steps::replies(&org.snapshot().await?) {
+                match said {
+                    Said::Post(reply) => {
+                        let post = OrgCommand::Channel(ChannelCommand::Post(reply));
+                        passed_over(org.execute(post, clock.now()?).await, "step reply")?;
+                    }
+                    Said::Message(message) => {
+                        org.execute(OrgCommand::SendMessage(*message), clock.now()?)
+                            .await?;
+                    }
+                }
+            }
+            super::channel_post::repair(org, clock.now()?, false).await?;
+            Ok(atm_org::next_deadline(&org.snapshot().await?, now))
         }
         .await;
         match result {
             Err(DecisionError::Organisation(OrgServiceError::Timeout)) => {
                 // The actor is FIFO: the next snapshot includes any late enqueue.
-                // Exact-content dedupe makes retry safe; a stopped actor still fails.
+                // Step keys and content dedupe make retry safe; a stopped actor still fails.
                 tracing::warn!("Decision answer reconcile timed out; retrying");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             result => return result,
         }
+    }
+}
+
+/// Wake at the next deadline, or never.
+async fn expiry(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -653,10 +802,13 @@ pub fn spawn_decisions(
     clock: MessageClock,
     cancel: CancellationToken,
 ) -> (DecisionHandle, JoinHandle<()>) {
-    let watch = org
-        .status()
-        .and_then(|cursor| org.watch(vec!["decision.".into(), "owner.".into()], cursor));
-    let mut watch = match watch {
+    // The committed seq at the start: a decision at or before it was asked
+    // before this daemon started, so its question wakes nobody (U8 Q3).
+    let watch = org.status().and_then(|cursor| {
+        org.watch(vec!["decision.".into(), "owner.".into()], cursor)
+            .map(|watch| (cursor, watch))
+    });
+    let (started, mut watch) = match watch {
         Ok(watch) => watch,
         Err(error) => {
             return (
@@ -678,13 +830,28 @@ pub fn spawn_decisions(
     };
     let task = tokio::spawn(async move {
         let work = async {
-            reconcile(&org, &clock).await?;
+            let mut next = reconcile(&org, &clock, started).await?;
             let _ = health.send_replace(Ok(true));
             loop {
-                let Some(_) = watch.next().await? else {
-                    return Err(DecisionError::Unavailable("decision watch closed".into()));
-                };
-                reconcile(&org, &clock).await?;
+                // Nothing about the timer is stored: after a restart the first
+                // pass expires what fell due while the daemon was down.
+                let due = next.and_then(|at| {
+                    clock
+                        .deadline(at)
+                        .inspect_err(
+                            |error| tracing::warn!(%error, "Decision deadline has no timer"),
+                        )
+                        .ok()
+                });
+                tokio::select! {
+                    event = watch.next() => {
+                        let Some(_) = event? else {
+                            return Err(DecisionError::Unavailable("decision watch closed".into()));
+                        };
+                    }
+                    () = expiry(due) => {}
+                }
+                next = reconcile(&org, &clock, started).await?;
             }
         };
         let result =

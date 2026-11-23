@@ -1,5 +1,6 @@
 //! Pure bounded capture scheduling. The actor executes ready commands; no sleeps
-//! or cached observations here. All capture paths share the per-pane interval.
+//! or cached observations here. Fresh legacy-input veto captures bypass the
+//! per-pane interval; a numbered reply's preparatory capture is still paced.
 use super::Command;
 use crate::control::reservation::{pane_ops::Action, PaneId, ReservationError};
 use std::{collections::HashMap, time::Duration};

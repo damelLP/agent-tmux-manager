@@ -69,6 +69,21 @@
 //! output and teammate lists below the footer are not established by these
 //! captures.
 //!
+//! Captured: Claude Code 2.1.327, 2.1.329 and 2.1.330, 2026-11-20, sealed rig
+//! (private user and network namespace, canned Messages API), tmux 3.8
+//! `capture-pane -p -e -N` at 82x60 (s3-stuckseat). A prompt suggestion in a
+//! pane without terminal focus is wholly faint with no inverse cursor glyph
+//! (Claude draws that glyph only while focused); it reads Empty, as above.
+//! Left unfocused for 180 s after its third turn, an idle seat appends an away
+//! recap: a `※ recap: ` row (bold label, italic text), wrapped onto rows
+//! indented two cells, ending `(turn off recaps in /config)` on the first few.
+//! It is chrome above the hint, never turn evidence; any other row after it
+//! keeps the turn Unknown. A live 82-column seat (version not recorded,
+//! read-only, not committed) showed the `/clear` hint cut to fit beside the
+//! update notice, `new task? /clear to save 480.5k toke… · ✔ Update installed ·
+//! /restart to apply`: a whole count, a cut ` tokens` and `…` are accepted; a
+//! cut count is not.
+//!
 //! Typing `/clear` can replace the footer with a slash menu (P1 B-clear-001).
 //! Captured: Claude Code 2.1.325, 2026-11-15, sealed tmux capture-pane -p -e -N, no prompt.
 //! Fullscreen also places the menu above the editor, with other matching skills
@@ -106,6 +121,27 @@
 //! transcript still proves turn state. The captured 184x11 views have no mode
 //! footer and remain Unknown; footer-added conformance variants are Synthetic.
 //!
+//! Captured: Claude Code 2.1.325 (P3, 2026-11-14), 2.1.327 and 2.1.330 (sealed
+//! rig, 2026-11-20/21), capture-pane -p -e (s3-5c). Ctrl-U clears the editor's
+//! cursor row: a one-row draft entirely (atmd sends it as Claude's retract key);
+//! a wrapped draft keeps its other rows. Then a right-aligned `ctrl+y to paste
+//! deleted text` row stands above the editor for 5.1 s (2.1.327, 2.1.330). It is
+//! not read as chrome (the 2.1.326 post-clear frame must stay unproven), so the
+//! turn reads Unknown meanwhile.
+//!
+//! Captured: Claude Code 2.1.327, 2026-11-21, sealed rig capture-pane -p -e
+//! (s3-busy). Once a seat is idle, the `/clear` hint stands on the same
+//! right-aligned row before ` · ` and an update notice: `✘ Auto-update failed ·
+//! Run claude doctor` (captured) or `✔ Update installed · Restart to update`
+//! (read on a live 2.1.327 seat; tested on a synthetic row). Both, like
+//! `/restart to apply`, are chrome there; any other notice stays unknown.
+//!
+//! Captured: Claude Code 2.1.327, 2026-11-22, sealed real tmux paste probe.
+//! A bracketed paste starting with `[` closed the optional session feedback
+//! survey unanswered and reached the composer unchanged. A bracketed paste of
+//! a lone `0` selected Dismiss; the framing alone did not prevent a choice.
+//! The opt-in readiness is for an inbox pointer paste only, not for Enter.
+//!
 //! Fresh layout evidence does not establish that a particular clear completed.
 //! `/clear` remains in history after a successful clear. Consumers own temporal,
 //! process/pane identity and copy-mode checks; identical historical text cannot
@@ -142,7 +178,67 @@ pub fn observe_screen(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> S
     inspect(input, cursor).0
 }
 
-fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts, Option<String>) {
+/// Opt-in evidence for a daemon inbox pointer paste, not a general safe-editor read.
+#[must_use]
+pub fn inbox_survey_ready(input: ScreenInput<'_>) -> bool {
+    inspect(input, None).2
+}
+
+const SURVEY_REFUSAL: &str =
+    "a feedback survey is open; answer or dismiss it in the pane, then retry";
+
+/// Refuse risky input only on the exact captured survey layout recognized by
+/// the legacy observer. It fails open with `⏸ manual mode on` or another
+/// unrecognized footer, an unrecognized notice between the survey pair and the
+/// editor border, a pane too narrow to keep the heading or choices on one row,
+/// or a frame the styled decoder rejects. A match never grants input permission.
+#[must_use]
+pub fn legacy_send_veto(
+    input: ScreenInput<'_>,
+    text: &str,
+    bracketed: Option<bool>,
+) -> Option<&'static str> {
+    let (facts, draft, _, survey_visible) = inspect(input, None);
+    let mut chars = text.chars();
+    let raw = bracketed != Some(true);
+    // Treat a whitespace-only suffix as a choice; paste trimming is unverified.
+    let selecting_paste =
+        chars.next().is_some_and(survey_choice) && (raw || chars.all(char::is_whitespace));
+    (survey_visible
+        && (choice_draft(facts.input, draft.as_deref())
+            || selecting_paste
+            || (raw && text.contains(['\t', '\r', '\n']))))
+    .then_some(SURVEY_REFUSAL)
+}
+
+/// A numbered reply can recall a choice draft before its final Enter. This veto
+/// has the same recognized layout and fail-open cases as [`legacy_send_veto`].
+#[must_use]
+pub fn legacy_submit_veto(input: ScreenInput<'_>, moves: bool) -> Option<&'static str> {
+    let (facts, draft, _, survey_visible) = inspect(input, None);
+    (survey_visible && (moves || choice_draft(facts.input, draft.as_deref())))
+        .then_some(SURVEY_REFUSAL)
+}
+
+// Read offline (not captured): Claude Code 2.1.327 bundle, 2026-11-22;
+// unchanged through 2.1.330. The submit handler accepts a single UTF-16 code
+// unit: digits 0–3 after NFKC (listed here), or one of its layout aliases.
+fn survey_choice(c: char) -> bool {
+    "0123０１２３₀₁₂₃①②③⓪⁰¹²³&é\"à".contains(c)
+}
+
+fn choice_draft(input: InputState, draft: Option<&str>) -> bool {
+    input != InputState::Empty
+        && draft.is_none_or(|draft| {
+            let mut chars = draft.trim_end_matches(' ').chars();
+            chars.next().is_some_and(survey_choice) && chars.next().is_none()
+        })
+}
+
+// The booleans are inbox paste readiness and separate survey visibility.
+type EditorRead = (ScreenFacts, Option<String>, bool, bool);
+
+fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> EditorRead {
     let decoded;
     let (text, styled) = match input {
         ScreenInput::Plain(text) if cursor.is_none() => (text, None),
@@ -160,10 +256,20 @@ fn inspect(input: ScreenInput<'_>, cursor: Option<ScreenCursor>) -> (ScreenFacts
     if text.chars().any(|c| c.is_control() && c != '\n') {
         return Default::default();
     }
-    inspect_prepared(text, styled)
+    let (facts, draft, inbox_ready, survey_visible) = inspect_prepared(text, styled);
+    let menu = inbox_ready
+        .then_some(styled)
+        .flatten()
+        .map(control::completion_draft);
+    (
+        facts,
+        draft,
+        matches!(menu, Some(control::CompletionDraft::Absent)),
+        survey_visible,
+    )
 }
 
-fn inspect_prepared(text: &str, styled: Option<&StyledScreen>) -> (ScreenFacts, Option<String>) {
+fn inspect_prepared(text: &str, styled: Option<&StyledScreen>) -> EditorRead {
     let mut lines: Vec<_> = text
         .lines()
         .map(|line| {
@@ -180,7 +286,7 @@ fn inspect_prepared(text: &str, styled: Option<&StyledScreen>) -> (ScreenFacts, 
     if let Some(dialog) = dialog(&lines) {
         let mut facts = ScreenFacts::default();
         facts.dialog = dialog;
-        return (facts, None);
+        return (facts, None, false, false);
     }
     editor(&lines, styled).unwrap_or_default()
 }
@@ -216,7 +322,7 @@ pub fn staged_draft_matches(input: ScreenInput<'_>, expected: &str) -> Option<bo
             control::CompletionDraft::Absent => {}
         }
     }
-    let (_, draft) = inspect(input, None);
+    let (_, draft, ..) = inspect(input, None);
     let draft = draft?;
     Some(draft.trim_end_matches(' ') == expected)
 }
@@ -277,8 +383,22 @@ fn dialog(lines: &[&str]) -> Option<DialogState> {
     }
 }
 
-fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<(ScreenFacts, Option<String>)> {
+fn editor(lines: &[&str], styled: Option<&StyledScreen>) -> Option<EditorRead> {
     let header_end = header_end(lines);
+    if let Some((before_footer, footer)) =
+        styled.and_then(|s| control::background_agent_footer(lines, s))
+    {
+        let mut read = editor_facts(lines, styled, header_end, before_footer, footer)?;
+        // The selector can obscure input focus. Preserve positive running
+        // evidence only; neither staging nor the survey paste opt-in is safe.
+        if read.0.turn != TurnState::Running {
+            read.0.turn = TurnState::Unknown;
+        }
+        read.0.fresh_editor = FreshEditorEvidence::Unknown;
+        read.1 = None;
+        read.2 = false;
+        return Some(read);
+    }
     let (footer, before_footer) = lines.split_last()?;
     let (footer, before_footer) = if footer.trim() == "Ctrl+Y to paste deleted text" {
         before_footer.split_last()?
@@ -295,7 +415,7 @@ fn editor_facts(
     header_end: Option<usize>,
     before_footer: &[&str],
     footer: &str,
-) -> Option<(ScreenFacts, Option<String>)> {
+) -> Option<EditorRead> {
     let lower = before_footer.iter().rposition(|line| rule(line, '─'))?;
     let below = before_footer.get(lower + 1..)?;
     // The captured status slot is adjacent to the rule, not arbitrary footer text.
@@ -388,6 +508,15 @@ fn editor_facts(
         }
         _ => top,
     };
+    // Captured: Claude Code 2.1.327, 2026-11-22, tmux capture-pane -p -e -N.
+    let survey = match (styled, lines.get(..history_end)?) {
+        (
+            Some(_),
+            [prior @ .., "● How is Claude doing this session? (optional)", "  1: Bad    2: Fine   3: Good   0: Dismiss"],
+        ) => Some(prior),
+        _ => None,
+    };
+    let history_end = recap_start(lines.get(..history_end)?).unwrap_or(history_end);
     // Status follows the transcript, whether the input is inline or bottom-pinned.
     // Only recognized trailing chrome may be skipped, never arbitrary progress text.
     let history_start = header_end.unwrap_or(0);
@@ -425,7 +554,8 @@ fn editor_facts(
         TurnState::Unknown
     };
     // Busy chrome contradicts idle history; it cannot prove Running by itself.
-    if footer.contains(" · esc to interrupt") && turn == TurnState::NotRunning {
+    let busy_footer = footer.contains(" · esc to interrupt");
+    if busy_footer && turn == TurnState::NotRunning {
         return None;
     }
     let fresh_editor = if header_end.is_some()
@@ -442,28 +572,44 @@ fn editor_facts(
     facts.turn = turn;
     facts.dialog = DialogState::None;
     facts.fresh_editor = fresh_editor;
-    Some((facts, draft.filter(|_| input == InputState::Draft)))
+    Some((
+        facts,
+        draft.filter(|_| input == InputState::Draft),
+        input == InputState::Empty
+            && survey.is_some_and(finished_before)
+            && turn == TurnState::Unknown
+            && !busy_footer,
+        survey.is_some(),
+    ))
 }
 
 fn clear_context_notice(line: &str, columns: usize) -> bool {
     const UPDATE_INSTALLED: &str = "✔ Update installed · /restart to apply";
+    const RESTART_TO_UPDATE: &str = "✔ Update installed · Restart to update";
     if !line.starts_with("  ") || line.chars().count().checked_add(2) != Some(columns) {
         return false;
     }
     let text = line.trim_start_matches(' ');
-    if matches!(
-        text,
-        UPDATE_INSTALLED | "✔ Update installed · Restart to update"
-    ) {
+    if matches!(text, UPDATE_INSTALLED | RESTART_TO_UPDATE) {
         return true;
     }
-    let Some(count) = text
-        .strip_suffix(UPDATE_INSTALLED)
-        .and_then(|prefix| prefix.strip_suffix(" · "))
+    // The idle hint stands beside one known update notice (s3-busy, 2.1.327).
+    let Some(rest) = [UPDATE_INSTALLED, RESTART_TO_UPDATE, AUTO_UPDATE_FAILED]
+        .iter()
+        .find_map(|notice| text.strip_suffix(notice)?.strip_suffix(" · "))
         .unwrap_or(text)
         .strip_prefix("new task? /clear to save ")
-        .and_then(|s| s.strip_suffix(" tokens"))
     else {
+        return false;
+    };
+    // Cut to fit beside the update notice at 82 columns (s3-stuckseat): a whole
+    // count, then a cut " tokens" and an ellipsis. A cut count is refused.
+    let Some(count) = rest.strip_suffix(" tokens").or_else(|| {
+        let cut = rest.strip_suffix('…')?;
+        [" token", " toke", " tok", " to", " t", " ", ""]
+            .iter()
+            .find_map(|tail| cut.strip_suffix(tail))
+    }) else {
         return false;
     };
     let count = count.strip_suffix(['k', 'm', 'b', 't']).unwrap_or(count);
@@ -476,9 +622,24 @@ fn clear_context_notice(line: &str, columns: usize) -> bool {
         && fraction.is_none_or(|f| matches!(f.as_bytes(), [b'1'..=b'9']))
 }
 
+/// Where a trailing away recap starts: Claude adds one to an idle seat left
+/// unfocused, `※ recap: ` and then rows indented two cells, before blank rows
+/// only (s3-stuckseat). It is chrome, not turn evidence; anything else after
+/// it stays transcript.
+fn recap_start(rows: &[&str]) -> Option<usize> {
+    let start = rows.iter().rposition(|row| row.starts_with("※ recap: "))?;
+    rows.get(start + 1..)?
+        .iter()
+        .skip_while(|row| row.starts_with("  ") && !row.trim().is_empty())
+        .all(|row| row.trim().is_empty())
+        .then_some(start)
+}
+
+const AUTO_UPDATE_FAILED: &str = "✘ Auto-update failed · Run claude doctor";
+
 fn auto_update_failure_notice(line: &str, columns: usize) -> bool {
     line.starts_with("  ")
-        && line.trim_start_matches(' ') == "✘ Auto-update failed · Run claude doctor"
+        && line.trim_start_matches(' ') == AUTO_UPDATE_FAILED
         && line.chars().count().checked_add(2) == Some(columns)
 }
 

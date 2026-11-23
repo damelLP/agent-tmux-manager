@@ -448,6 +448,7 @@ mod tests {
     async fn actions_use_owned_client_and_spawn_stages_do_not_type_early() {
         let mock = MockTmuxClient::new();
         mock.set_next_raw_output("0 1");
+        crate::control::legacy_survey_test::mock_shell(&mock, "%7");
         mock.set_next_pane_id("%42");
         mock.set_pane_cwd("%7", "/pane");
         let cancel = CancellationToken::new();

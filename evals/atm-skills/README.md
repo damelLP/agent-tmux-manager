@@ -3,7 +3,8 @@
 Each test freezes a coordinator or implementer at one moment where it must
 choose what to do next, and checks what it does. The cases live in this
 folder, in skill-creator's case-folder layout:
-`atm-coordinate/<case>/` and `atm-implement/<case>/`.
+`atm-coordinate/<case>/` and `atm-implement/<case>/` for legacy pane work,
+and `atm-member/<case>/` and `atm-lead/<case>/` for named channel work.
 
 | Case | The moment | Passes when |
 |---|---|---|
@@ -15,10 +16,35 @@ folder, in skill-creator's case-folder layout:
 | `pane-reused` | %7 now holds a pi session in another project | nothing goes to %7; the user is told |
 | `brainstorm-ends-with-marker` | an implementer with an unsettled design (superpowers loaded) | its last line is a marker; no dialog tools |
 
-They test the model's decisions, not atm. Whether atm, tmux and the harnesses
-behave the way the skills say is checked with real harnesses (see the PR).
+The legacy cases test the model's decisions. The new named fixtures are
+free, deterministic packaging/CLI/grader checks, not independent model trials.
+Real harness behavior is verified separately with a sealed daemon and seats.
 
-## How a run works
+## Named channel cases (offline)
+
+| Case | Passes when |
+|---|---|
+| `read-reply-ack` | `atm inbox --id m47` and the attachment are read, `atm post --reply m41` succeeds once, then `atm ack m47` succeeds once. |
+| `dispatch-tagged-brief` | One `atm post --tag project/member --kind brief` carries the unit and absolute attachment path, without a duplicate send. |
+
+Run both (including negative traces for late/queued acks, external reply hints,
+wrong IDs, unsuccessful commands and legacy sends) with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s evals/atm-skills -p 'test_*.py'
+```
+
+The tests supply `ATM_EVAL_NAMED_DRIVER`, an absolute path to a local fake
+executable. `run.sh` stages the named skill pair and calls that executable
+with the staged prompt and skills directory, a disposable HOME/XDG, and only
+the stand-ins plus system binaries on PATH. It records a synthetic transcript
+and the calls/results from `standin_atm.py`. No driver means **refusal**, not
+fallback to a billed model. This is a fixture runner, not a real-model seal;
+never point it at a personal harness or a real provider. `run-all.sh` discovers
+only the legacy cases. A trace records fixture behavior, not that a real
+model learned that behavior.
+
+## How a legacy run works
 
 `run.sh <case> <skills-dir> <out-dir> [model]` runs one sealed
 `claude -p` in a fresh directory under `/dev/shm`:

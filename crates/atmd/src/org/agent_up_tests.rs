@@ -60,6 +60,462 @@ const HARNESSES: [(Harness, &str, &str); 3] = [
     (Harness::Codex, CODEX_FRESH, "codex"),
 ];
 
+mod hiring {
+    use super::*;
+    use crate::{
+        org::reporting_line::ReportingFiles,
+        server::methods::{router_with_reporting, CallerPane, MethodError, MethodRouter},
+    };
+    use atm_org::{Address, DecisionCommand, DecisionId, DecisionKind, DecisionRequest,
+        DecisionResolution, DecisionStatus, ProvisionalChoice};
+
+    const ENFORCE: &str = "title='Hiring'\nprojects=['q']\n[hire]\nmode='enforce'\n";
+    const TITLE: &str = "Hire q/lead";
+    const MANAGER: &str = "%0";
+    const BOSS: &str = "%7";
+    const STRANGER: &str = "%9";
+
+    struct Fixture {
+        start: Starting,
+        dir: std::path::PathBuf,
+        reporting: ReportingFiles,
+    }
+
+    impl Fixture {
+        async fn new(rig: Rig) -> Self {
+            let start = Starting::with_role(rig, Harness::Codex, "manager='ops/manager'\n").await;
+            start.agents.pause_revalidation();
+            let ops = start.project.path().join("ops");
+            std::fs::create_dir_all(ops.join(".atm/roles")).unwrap();
+            start.rig.command(OrgCommand::RegisterProject {
+                project_id: "ops".parse().unwrap(), root: ops.to_str().unwrap().into(), move_root: false,
+            }).await;
+            for (name, pane, manager) in [("manager", MANAGER, "boss"), ("boss", BOSS, "owner"), ("stranger", STRANGER, "owner")] {
+                Self::write_role(&ops, name, manager);
+                start.rig.command(OrgCommand::Adopt {
+                    agent_id: format!("ops/{name}").parse().unwrap(), pane: pane.into(), session_id: None,
+                }).await;
+            }
+            let dir = start.project.path().join("departments");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("enforce.toml"), ENFORCE).unwrap();
+            start.rig.client.mock().clear_calls();
+            Self { start, dir, reporting: ReportingFiles::default() }
+        }
+
+        fn write_role(root: &std::path::Path, name: &str, manager: &str) {
+            std::fs::write(root.join(format!(".atm/roles/{name}.md")),
+                format!("+++\nharness='codex'\nmanager='{manager}'\n+++\nPRIVATE body\n")).unwrap();
+        }
+
+        fn root(&self) -> std::path::PathBuf {
+            self.start.params().project_root
+        }
+
+        fn role_path(&self) -> String {
+            self.root().canonicalize().unwrap().join(".atm/roles/lead.md").to_str().unwrap().into()
+        }
+
+        fn router(&self) -> MethodRouter {
+            let mut services = MethodServices::new(self.start.rig.registry.clone());
+            services.org = self.start.rig.org.clone();
+            services.agents = Some(self.start.agents.clone());
+            services.departments_dir = Some(self.dir.clone());
+            router_with_reporting(services, self.reporting.clone()).unwrap()
+        }
+
+        fn request(&self, kind: DecisionKind, title: &str, path: String) -> DecisionRequest {
+            DecisionRequest {
+                requester: "ops/manager".parse::<AgentId>().map(Address::Agent).unwrap(),
+                kind, title: title.into(), context: "Synthetic hire history".into(), files: vec![path],
+                options: vec!["approve".into(), "decline".into()], recommended: None,
+                may_be_undone: true, changes_intent: true, deadline: None,
+            }
+        }
+
+        async fn record(&self, request: DecisionRequest) -> DecisionId {
+            let events = self.start.rig.org.execute(OrgCommand::Decision(DecisionCommand::Request(request)), chrono::Utc::now()).await.unwrap();
+            DecisionId::new(events[0].seq)
+        }
+
+        async fn resolve(&self, id: DecisionId, option: &str) {
+            self.start.rig.command(OrgCommand::Decision(DecisionCommand::Resolve(DecisionResolution {
+                decision_id: id, by: Address::Owner, option: option.into(), note: None, standing_rule: false,
+            }))).await;
+        }
+
+        async fn call(&self, caller: Option<&str>, hire: Option<DecisionId>) -> Result<Value, MethodError> {
+            up(self.router(), self.root(), caller, hire).await
+        }
+
+        async fn count(&self) -> usize {
+            self.start.rig.org.snapshot().await.unwrap().decisions().count()
+        }
+    }
+
+    async fn up(router: MethodRouter, root: std::path::PathBuf, pane: Option<&str>, hire: Option<DecisionId>) -> Result<Value, MethodError> {
+        let mut params = json!({"name":"lead", "project_root":root});
+        if let Some(id) = hire {
+            params["hire"] = json!(id);
+        }
+        let caller = CallContext { from_pane: pane.map(|p| CallerPane(p.into())), ..caller() };
+        router.call(caller, "agent.up", params).await
+    }
+
+    // Break caught: placement reads or a lifecycle write happen on a refusal,
+    // or the durable decision loses its effective role/caller on registration.
+    #[tokio::test]
+    async fn hire_refusal_precedes_all_tmux_and_agent_events() {
+        for registration in ["new", "same", "moved"] {
+            let f = Fixture::new(Rig::new().await).await;
+            std::fs::write(f.root().join(".atm/project.toml"), "id='q'\n").unwrap();
+            if registration != "new" {
+                let root = if registration == "same" { f.root() } else { f.start.project.path().join("old") };
+                f.start.rig.command(OrgCommand::RegisterProject {
+                    project_id: "q".parse().unwrap(), root: root.to_str().unwrap().into(), move_root: false,
+                }).await;
+            }
+            f.start.rig.client.mock().set_panes(vec![]);
+            let mut log = f.start.rig.org.committed.subscribe();
+            let error = f.call(Some(MANAGER), None).await.unwrap_err().0;
+            assert_eq!(error.code, "refused", "{error:?}");
+            let state = f.start.rig.org.snapshot().await.unwrap();
+            let decision = state.decisions().next().unwrap();
+            assert_eq!(error.message, format!("agent q/lead was not started: department enforce: not on roster; hire decision {} is pending", decision.id));
+            assert_eq!(decision.status, DecisionStatus::Pending);
+            assert_eq!(decision.request.requester.to_string(), "ops/manager");
+            assert_eq!(decision.request.title, TITLE);
+            assert_eq!(decision.request.kind, DecisionKind::Hire);
+            assert_eq!(decision.request.options, ["approve", "decline"]);
+            assert_eq!(decision.request.files, [f.role_path()]);
+            assert!(decision.request.recommended.is_none() && decision.request.deadline.is_none());
+            for required in ["enforce", "not on roster", "ops/manager", "(default)"] {
+                assert!(decision.request.context.contains(required), "{:?}", decision.request);
+            }
+            assert!(!decision.request.context.contains("PRIVATE"));
+            assert!(state.agent(&started()).is_none());
+            let mut expected = vec![];
+            if registration != "same" { expected.push("project.registered"); }
+            expected.push("decision.requested");
+            assert_eq!(committed_kinds(&mut log), expected);
+            assert!(f.start.rig.client.mock().calls().is_empty());
+        }
+    }
+
+    // Break caught: producing two questions, losing one blocker, or sending
+    // the off-list candidate to placement before asking.
+    #[tokio::test]
+    async fn hire_model_and_roster_misses_share_one_card() {
+        let f = Fixture::new(Rig::new().await).await;
+        let role = "+++\nharness='codex'\nmanager='ops/manager'\nmodel='test-pro:max'\n+++\nPRIVATE body\n";
+        std::fs::write(f.role_path(), role).unwrap();
+        std::fs::write(
+            f.dir.join("enforce.toml"),
+            format!("{ENFORCE}[spend]\nmodels=['test-lite*']\n"),
+        ).unwrap();
+        let mut log = f.start.rig.org.committed.subscribe();
+        let error = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        let state = f.start.rig.org.snapshot().await.unwrap();
+        let decision = state.decisions().next().unwrap();
+        let reasons = "department enforce: not on roster; model \"test-pro:max\" is not allowed";
+        assert_eq!(error.code, "refused");
+        assert_eq!(error.message, format!("agent q/lead was not started: {reasons}; hire decision {} is pending", decision.id));
+        assert_eq!(decision.request.kind, DecisionKind::Hire);
+        assert_eq!(decision.request.title, TITLE);
+        assert_eq!(decision.request.files, [f.role_path()]);
+        assert_eq!(decision.request.options, ["approve", "decline"]);
+        assert!(decision.request.context.contains(reasons), "{:?}", decision.request);
+        assert!(!decision.request.context.contains("PRIVATE"));
+        assert_eq!(state.decisions().count(), 1);
+        assert_eq!(committed_kinds(&mut log), ["project.registered", "decision.requested"]);
+        assert!(state.agent(&started()).is_none());
+        assert!(f.start.rig.client.mock().calls().is_empty());
+    }
+
+    // Break caught: a large but readable policy or long escaped model makes
+    // the decision context exceed its bound or drops any department's reason.
+    #[tokio::test]
+    async fn hire_full_scan_fits_one_decision() {
+        let f = Fixture::new(Rig::new().await).await;
+        std::fs::write(f.role_path(), format!("+++\nharness='codex'\nmanager='ops/manager'\nmodel=\"{}\"\n+++\n", "\\u202e".repeat(600))).unwrap();
+        std::fs::remove_file(f.dir.join("enforce.toml")).unwrap();
+        for i in 0..32 {
+            std::fs::write(f.dir.join(format!("dept-{i:027}.toml")), format!("{ENFORCE}[spend]\nmodels=[]\n")).unwrap();
+        }
+        let error = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        let state = f.start.rig.org.snapshot().await.unwrap();
+        let card = state.decisions().next().unwrap();
+        let context = &card.request.context;
+        for text in [context.as_str(), error.message.as_str()] {
+            assert_eq!(text.matches("not on roster; model").count(), 32);
+            assert_eq!(text.matches(" is not allowed").count(), 32);
+            assert!(text.is_ascii() && !text.contains(char::is_control));
+        }
+        assert!(card.request.title.len() + 2 + context.len() < 16 * 1024);
+        assert!(error.message.ends_with(&format!("hire decision {} is pending", card.id)));
+        assert_eq!(state.decisions().count(), 1);
+    }
+
+    // Break caught: changed reasons replace a pending hire, or a changed role
+    // body invalidates an otherwise valid approval for the same seat/path.
+    #[tokio::test]
+    async fn hire_reuses_roster_card_for_a_later_model_miss() {
+        let f = Fixture::new(Rig::new().await).await;
+        let role = "+++\nharness='codex'\nmanager='ops/manager'\nmodel='test-pro:max'\n+++\nPRIVATE body\n";
+        std::fs::write(f.role_path(), role).unwrap();
+        f.start.rig.client.mock().set_panes(vec![]);
+        let first = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        assert!(first.message.contains("department enforce: not on roster"), "{first:?}");
+        let before = f.start.rig.org.snapshot().await.unwrap();
+        let pending = before.decisions().next().unwrap();
+        std::fs::write(
+            f.dir.join("enforce.toml"),
+            format!("{}[spend]\nmodels=['test-lite*']\n", ENFORCE.replace("[hire]", "roster=['q/lead']\n[hire]")),
+        ).unwrap();
+        let next = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        assert_eq!(next.message, format!("agent q/lead was not started: department enforce: model \"test-pro:max\" is not allowed; hire decision {} is pending", pending.id));
+        let after = f.start.rig.org.snapshot().await.unwrap();
+        assert_eq!(after.decisions().count(), 1);
+        assert_eq!(after.decisions().next().unwrap().request.context, pending.request.context);
+        assert!(f.start.rig.client.mock().calls().is_empty());
+
+        f.resolve(pending.id, "approve").await;
+        std::fs::write(f.role_path(), role.replace("test-pro:max", "test-other")).unwrap();
+        let unauthorized = f.call(Some(STRANGER), Some(pending.id)).await.unwrap_err().0;
+        assert!(unauthorized.message.contains("manager"), "{unauthorized:?}");
+        assert!(f.start.rig.client.mock().calls().is_empty());
+        let placement = f.call(Some(MANAGER), Some(pending.id)).await.unwrap_err().0;
+        assert!(placement.message.contains("no observation script for %0"), "{placement:?}");
+        assert!(!f.start.rig.client.mock().calls().is_empty());
+        assert_eq!(f.count().await, 1);
+    }
+
+    // Break caught: checking only the immediate manager, allowing a broken
+    // ancestor, or using an approval in place of current caller authority.
+    #[tokio::test]
+    async fn hire_requires_the_current_manager_line() {
+        let f = Fixture::new(Rig::new().await).await;
+        f.start.rig.client.mock().set_panes(vec![]);
+        let token = f.record(f.request(DecisionKind::Hire, TITLE, f.role_path())).await;
+        f.resolve(token, "approve").await;
+        for (pane, manager) in [(STRANGER, "ops/manager"), (MANAGER, "owner"), (MANAGER, "ops/bad?"), (MANAGER, "ops/unknown"), (MANAGER, "lead")] {
+            Fixture::write_role(&f.root(), "lead", manager);
+            let error = f.call(Some(pane), Some(token)).await.unwrap_err().0;
+            assert!(error.message.contains("manager"), "{manager}: {error:?}");
+            assert!(f.start.rig.client.mock().calls().is_empty());
+        }
+        Fixture::write_role(&f.root(), "lead", "ops/manager");
+        let ops = f.start.project.path().join("ops");
+        for boss_manager in ["manager", "q/lead"] {
+            // q/lead is a recorded Down seat, so it is eligible for Up.
+            if boss_manager == "q/lead" {
+                f.start.rig.command(OrgCommand::Up {
+                    agent_id: started(), role: atm_org::parse_role("lead", "+++\nharness='codex'\n+++\n").unwrap(),
+                }).await;
+                f.start.rig.command(OrgCommand::Down { agent_id: started(), reason: "fixture".into() }).await;
+            }
+            Fixture::write_role(&ops, "boss", boss_manager);
+            let error = f.call(Some(MANAGER), None).await.unwrap_err().0;
+            assert!(error.message.contains("cycle"), "{error:?}");
+        }
+        Fixture::write_role(&ops, "boss", "owner");
+        f.reporting.slot.close();
+        let error = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        assert!(error.message.contains("reader stopped"), "{error:?}");
+        assert!(f.start.rig.client.mock().calls().is_empty());
+        assert_eq!(f.count().await, 1, "authority failure did not request a hire");
+        for (pane, cause) in [(None, "no observation script for %0"), (Some("%80"), "no observation script for %80")] {
+            let error = f.call(pane, None).await.unwrap_err().0;
+            assert!(error.message.contains(cause), "owner bypass: {error:?}");
+            assert!(!f.start.rig.client.mock().calls().is_empty());
+        }
+        assert_eq!(f.count().await, 1);
+    }
+
+    // Break caught: an already-up seat reaches placement or requests a hire.
+    #[tokio::test]
+    async fn hire_refuses_already_up_without_a_decision() {
+        let f = Fixture::new(Rig::new().await).await;
+        f.start.rig.client.mock().set_panes(vec![]);
+        // This owner call registers q even though there is no place to split it.
+        f.call(None, None).await.unwrap_err();
+        f.start.rig.command(OrgCommand::Adopt {
+            agent_id: started(), pane: "%5".into(), session_id: None,
+        }).await;
+        f.start.rig.client.mock().clear_calls();
+        let error = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        assert!(error.message.contains("while Starting"), "{error:?}");
+        assert_eq!(f.count().await, 0);
+        assert!(f.start.rig.client.mock().calls().is_empty());
+    }
+
+    // Break caught: a dropped reply or another authorized caller loses the
+    // pending card; old attachments must be reported, not silently replaced.
+    #[tokio::test]
+    async fn hire_reuses_pending_request_after_a_dropped_reply() {
+        let (gate, mut receipts) = mpsc::channel(1);
+        let f = Fixture::new(Rig::gated(Some(("decision.requested", gate))).await).await;
+        f.start.rig.client.mock().set_panes(vec![]);
+        let released = {
+            let call = f.call(Some(MANAGER), None);
+            tokio::pin!(call);
+            tokio::select! {
+                result = &mut call => panic!("expected decision append before reply: {result:?}"),
+                receipt = receipts.recv() => receipt.unwrap(),
+            }
+        }; // Lose the response while the commit is in flight.
+        released.send(()).unwrap();
+        let state = f.start.rig.org.snapshot().await.unwrap();
+        let pending = state.decisions().next().unwrap();
+        let retry = f.call(Some(BOSS), None).await.unwrap_err().0;
+        assert!(retry.message.contains(&format!("hire decision {} is pending", pending.id)), "{retry:?}");
+        assert_eq!(f.count().await, 1);
+        assert!(f.start.rig.client.mock().calls().is_empty());
+
+        let f = Fixture::new(Rig::new().await).await;
+        f.start.rig.client.mock().set_panes(vec![]);
+        let old = f.record(f.request(DecisionKind::Hire, TITLE, "/old/.atm/roles/lead.md".into())).await;
+        let retry = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        for part in [old.to_string().as_str(), "attachment", "withdraw"] {
+            assert!(retry.message.contains(part), "{retry:?}");
+        }
+        assert_eq!(f.count().await, 1);
+        assert!(f.start.rig.client.mock().calls().is_empty());
+    }
+
+    // Break caught: a token is treated as approval based on only its id,
+    // status, title, or path, or can override authority. Use the real writer.
+    #[tokio::test]
+    async fn hire_checks_explicit_approval_on_the_fold() {
+        let f = Fixture::new(Rig::new().await).await;
+        f.start.rig.client.mock().set_panes(vec![]);
+        // A token still has to be valid if the roster independently allows Up.
+        std::fs::write(f.dir.join("enforce.toml"), ENFORCE.replace("[hire]", "roster=['q/lead']\n[hire]")).unwrap();
+        let unknown = DecisionId::new(9999);
+        assert_eq!(f.call(Some(MANAGER), Some(unknown)).await.unwrap_err().0.code, "refused");
+        for (kind, title, path, option) in [
+            (DecisionKind::Action, TITLE, f.role_path(), Some("approve")),
+            (DecisionKind::Hire, "Hire other/lead", f.role_path(), Some("approve")),
+            (DecisionKind::Hire, TITLE, "/old/.atm/roles/lead.md".into(), Some("approve")),
+            (DecisionKind::Hire, TITLE, f.role_path(), Some("decline")),
+            (DecisionKind::Hire, TITLE, f.role_path(), None),
+        ] {
+            let d = f.record(f.request(kind, title, path)).await;
+            if let Some(value) = option { f.resolve(d, value).await; }
+            let before = f.count().await;
+            let error = f.call(Some(MANAGER), Some(d)).await.unwrap_err().0;
+            assert_eq!(error.code, "refused", "{error:?}");
+            assert!(error.message.contains(&d.to_string()), "{error:?}");
+            assert_eq!(f.count().await, before);
+        }
+        // Inject durable historical state via the internal writer, not the RPC:
+        // today's Hire policy requires waiting and doesn't grant a relay path.
+        for relayed_by in [None, Some("ops/boss".parse().unwrap())] {
+            let mut request = f.request(DecisionKind::Hire, TITLE, f.role_path());
+            request.recommended = Some("approve".into());
+            let d = f.record(request).await;
+            f.start.rig.command(OrgCommand::Decision(DecisionCommand::TakeProvisionally(ProvisionalChoice {
+                decision_id: d, option: "approve".into(), by: "ops/manager".parse().unwrap(), relayed_by,
+            }))).await;
+            for resolve in [false, true] {
+                if resolve { f.resolve(d, "approve").await; }
+                let error = f.call(Some(MANAGER), Some(d)).await.unwrap_err().0;
+                assert_eq!(error.code, "refused", "{error:?}");
+            }
+        }
+        assert!(f.start.rig.client.mock().calls().is_empty());
+        std::fs::write(f.dir.join("enforce.toml"), ENFORCE).unwrap();
+        let token = f.record(f.request(DecisionKind::Hire, TITLE, f.role_path())).await;
+        f.resolve(token, "approve").await;
+        let error = f.call(Some(BOSS), Some(token)).await.unwrap_err().0;
+        assert!(error.message.contains("no observation script for %7"), "{error:?}");
+        assert!(!f.start.rig.client.mock().calls().is_empty());
+    }
+
+    // Break caught: entering the daemon's authority or token gate for a
+    // report-only project changes what a named caller can start.
+    #[tokio::test]
+    async fn hire_report_only_matches_missing_directory() {
+        let unknown = DecisionId::new(9999);
+        let legacy_ready = json!({"agent_id": "q/lead", "pane": "%1", "state": "ready"});
+        for (report_only, hire) in [
+            (false, None),
+            (true, None),
+            (false, Some(unknown)),
+            (true, Some(unknown)),
+        ] {
+            let case = format!("report_only={report_only}, hire={hire:?}");
+            let mut f = Fixture::new(Rig::new().await).await;
+            Fixture::write_role(&f.root(), "lead", "owner");
+            std::fs::remove_file(f.dir.join("enforce.toml")).unwrap();
+            if report_only {
+                std::fs::write(
+                    f.dir.join("report.toml"),
+                    "title='Hiring report'\nprojects=['q']\n[hire]\nmode='report'\n[spend]\nmodels=['test-lite*']\n",
+                )
+                .unwrap();
+            } else {
+                std::fs::remove_dir(&f.dir).unwrap();
+            }
+
+            f.start.script_launch();
+            f.start.frame(f.start.staged());
+            f.start.frame(Starting::screen(CODEX_FRESH, "codex"));
+            f.start.follow_up();
+            f.start.follow_up();
+            let mut request = tokio::spawn(up(f.router(), f.root(), Some(MANAGER), hire));
+            // Policy reads use the real clock; only the scripted launch is paused.
+            tokio::select! {
+                biased;
+                () = progress(&mut f.start.events, "up_prepared", Some("q/lead")) => {},
+                reply = &mut request => panic!("{case}: start returned before preparation: {reply:?}"),
+            }
+            tokio::time::pause();
+            let reply = request.await.unwrap();
+            tokio::time::resume();
+
+            assert_eq!(reply.unwrap_or_else(|error| panic!("{case}: {error:?}")), legacy_ready, "{case}");
+            let state = f.start.rig.org.snapshot().await.unwrap();
+            assert_eq!(
+                state.agent_for_pane(MANAGER).unwrap().id.to_string(),
+                "ops/manager",
+                "{case}"
+            );
+            assert_eq!(state.agent(&started()).unwrap().status, AgentStatus::Ready, "{case}");
+            assert_eq!(state.decisions().count(), 0, "{case}");
+        }
+    }
+
+    // Break caught: a bad neighbor disables enforcement, or a successful
+    // fail-open launch forgets to give its named caller the warning.
+    #[tokio::test]
+    async fn hire_department_read_failures_warn_without_overriding_known_enforcement() {
+        let mut f = Fixture::new(Rig::new().await).await;
+        std::fs::write(f.dir.join("bad.toml"), "title=17\n").unwrap();
+        let error = f.call(Some(MANAGER), None).await.unwrap_err().0;
+        assert!(error.message.contains("hire decision"), "{error:?}");
+        assert!(f.start.rig.client.mock().calls().is_empty());
+        std::fs::remove_file(f.dir.join("enforce.toml")).unwrap();
+        f.start.script_launch();
+        f.start.frame(f.start.staged());
+        f.start.frame(Starting::screen(CODEX_FRESH, "codex"));
+        f.start.follow_up();
+        f.start.follow_up();
+        let call = up(f.router(), f.root(), Some(MANAGER), None);
+        let mut request = tokio::spawn(call);
+        // Wait for real filesystem preparation and all policy reads before
+        // pausing only the scripted lifecycle clock.
+        tokio::select! {
+            () = progress(&mut f.start.events, "up_prepared", Some("q/lead")) => {},
+            result = &mut request => panic!("start returned before preparation: {result:?}"),
+        }
+        tokio::time::pause();
+        let result = request.await.unwrap().unwrap();
+        assert_eq!(result, json!({"agent_id":"q/lead", "pane":"%1", "state":"ready",
+            "warning":"department policy incomplete; hiring was not checked for q"}));
+    }
+}
+
 /// Role `lead` of project `q` on disk, the service started, the caller
 /// outside tmux: the pane to split is `%0` and the new pane will be `%1`.
 struct Starting {
@@ -223,6 +679,7 @@ impl Starting {
             project_root: self.project.path().join("q"),
             name: "lead".into(),
             caller_server: None,
+            hire: None,
         }
     }
 

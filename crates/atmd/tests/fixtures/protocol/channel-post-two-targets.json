@@ -1,0 +1,5 @@
+{
+  "request": {"protocol_version":{"major":1,"minor":1},"type":"request","id":"channel-post-two-targets","method":"channel.post","params":{"channel":"alpha","to":"owner","body":"x"}},
+  "response": {"type":"response","id":"channel-post-two-targets","error":{"code":"invalid_params","message":"exactly one of channel, to and reply_to is required"}},
+  "ignore": []
+}

@@ -74,7 +74,7 @@ use atm_core::{SessionId, SessionStatus};
 use atm_org::{
     idle::{handover_step, HandoverInput, HandoverLimits, HandoverReason, HandoverStep, WaitsFor},
     Address, AgentId, AgentStatus, DeliveryStatus, MessageContent, MessageId, MessageKind,
-    OrgCommand, OrgState,
+    OrgCommand, OrgEvent, OrgState,
 };
 use atm_protocol::error_code;
 use chrono::{DateTime, Utc};
@@ -153,6 +153,7 @@ pub(super) fn save_request(agent: &AgentId, memory: &Path) -> MessageContent {
         ),
         attachments: Vec::new(),
         task: None,
+        post: None,
     }
 }
 
@@ -540,6 +541,7 @@ impl Handovers {
             body,
             attachments: Vec::new(),
             task: None,
+            post: None,
         };
         if let Err(error) = self.execute(OrgCommand::SendMessage(note)).await {
             tracing::warn!(%agent, %error, "Handover outcome note was not recorded");
@@ -654,7 +656,7 @@ impl Handovers {
                      not confirmed: {}; the request may be queued or already delivered; \
                      nothing was cleared; inspect `atm inbox --for {} --id {message_id}`; \
                      a later handover reuses it while queued or delivering; \
-                     `atm msg give-up {message_id}` cancels an undelivered request",
+                     `atm wake give-up {message_id}` cancels an undelivered request",
                         p.agent, error.0.message, p.agent
                     );
                     error
@@ -778,9 +780,14 @@ impl Job {
         let Some(clear) = &self.completion else {
             return Err("the start line could not be identified".into());
         };
-        use StartLineDisposition::{Off, Track, Unidentified};
+        use StartLineDisposition::{Off, PlainFallback, Track, Unidentified};
         let resume = match clear.start_line {
             Track(id) => id,
+            PlainFallback(id) => {
+                return Err(format!(
+                    "resume prompt not known to fit; plain start line {id} queued"
+                ))
+            }
             Off => return Err("start lines are disabled".into()),
             Unidentified => return Err("the start line could not be identified".into()),
         };
@@ -881,23 +888,34 @@ impl Job {
         retry_at: Instant,
     ) -> Result<bool, AgentError> {
         loop {
-            tokio::select! {
+            let lagged = tokio::select! {
                 biased;
                 () = tokio::time::sleep_until(cutoff) => return Ok(false),
                 event = self.committed.recv() => match event {
                     Ok(event) if event.seq > saved_seq && lifecycle_of(&event, &target.agent) => return Err(target.changed()),
-                    Ok(_) => {},
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => true,
                     Err(error) => return Err(AgentError::Unavailable(format!("handover lifecycle evidence: {error}"))),
                 },
-                () = tokio::time::sleep_until(retry_at) => break,
-                row = self.rows.recv() => {
-                    let row = row.map_err(|error| AgentError::Unavailable(format!("session registry evidence: {error}")))?;
-                    if target.row_wake(&row)? {
-                        break;
-                    }
+                () = tokio::time::sleep_until(retry_at) => false,
+                row = self.rows.recv() => match row {
+                    Ok(row) if target.row_wake(&row)? => false,
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(error) => return Err(AgentError::Unavailable(format!("session registry evidence: {error}"))),
                 },
+            };
+            if !lagged && !self.drain_clear_rows(target)? {
+                return Ok(Instant::now() < cutoff);
+            }
+            match tokio::time::timeout_at(cutoff, self.reread_saved_seat(target, saved_seq)).await {
+                Ok(read) if Instant::now() < cutoff => read?,
+                _ => return Ok(false),
             }
         }
+    }
+
+    fn drain_clear_rows(&mut self, target: &SavedSeat) -> Result<bool, AgentError> {
         // Coalesce only after inspecting the backlog, including when the
         // timer won. A move or removal still matters if the row came back.
         for _ in 0..=self.rows.len() {
@@ -906,6 +924,7 @@ impl Job {
                     target.row_wake(&row)?;
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => return Ok(true),
                 Err(error) => {
                     return Err(AgentError::Unavailable(format!(
                         "session registry evidence: {error}"
@@ -913,7 +932,38 @@ impl Job {
                 }
             }
         }
-        Ok(Instant::now() < cutoff)
+        Ok(false)
+    }
+
+    /// A committed lifecycle change still counts if the saved tuple came back.
+    /// A registry-only disappearance and restoration of the same id and pane,
+    /// with both notices lost and no org transition, cannot be reconstructed.
+    /// The current row may then proceed to the usual reserved clear checks.
+    async fn reread_saved_seat(&mut self, seat: &SavedSeat, saved: u64) -> Result<(), AgentError> {
+        let registry = &self.service.registry;
+        let rows = registry.pane_sessions(seat.pane.as_str()).await;
+        let rows = rows
+            .map_err(|err| AgentError::Unavailable(format!("session registry evidence: {err}")))?;
+        let org = &self.service.org;
+        let unavailable =
+            |error| AgentError::Unavailable(format!("handover lifecycle evidence: {error}"));
+        let (state, through) = org.snapshot_at().await.map_err(unavailable)?;
+        let same_seat = state.agent(&seat.agent).is_some_and(|a| seat.matches(a));
+        if !same_seat || !rows.iter().any(|row| row.view.id == seat.session) {
+            return Err(seat.changed());
+        }
+        let mut seen = saved;
+        let mut events = org.watch(Vec::new(), seen).map_err(unavailable)?;
+        while seen < through {
+            let event = events.next().await.map_err(unavailable)?.ok_or_else(|| {
+                AgentError::Unavailable("handover lifecycle evidence: watch stopped".into())
+            })?;
+            if lifecycle_of(&event, &seat.agent) {
+                return Err(seat.changed());
+            }
+            seen = event.seq;
+        }
+        Ok(())
     }
 
     /// Returns once the save turn has ended with the memory file changed.
@@ -1052,7 +1102,7 @@ impl Job {
             format!(
                 "the save request {id} was not delivered to {agent} in {seconds} s; \
                  `atm inbox --for {agent} --id {id}` shows what holds it; it stays queued and a \
-                 later handover reuses it; `atm msg give-up {id}` cancels it"
+                 later handover reuses it; `atm wake give-up {id}` cancels it"
             )
         } else if !self.facts.idle {
             let dialog = match (&self.pane, self.needs_input) {
@@ -1115,17 +1165,15 @@ impl ResumeFacts {
                         .filter(|_| body("confirmation") == Some("prompt_submit_exact_reference"))
                         .ok_or_else(mismatched)?,
                 );
-            } else if event.kind == "msg.delivery_failed"
-                && event
-                    .body
-                    .get("final_failure")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-            {
-                return Err(format!(
-                    "start line {resume} failed: {}",
-                    body("reason").unwrap_or("no reason recorded")
-                ));
+            } else if event.kind == "msg.delivery_failed" {
+                if let Ok(Some(OrgEvent::MessageDeliveryFailed {
+                    reason,
+                    final_failure: true,
+                    ..
+                })) = OrgEvent::from_parts(&event.kind, &event.body)
+                {
+                    return Err(format!("start line {resume} failed: {reason}"));
+                }
             }
         }
         match (&self.bound, &self.receipt) {
@@ -1227,6 +1275,7 @@ pub(super) fn context_note(
         ),
         attachments: Vec::new(),
         task: None,
+        post: None,
     };
     Some((agent.id.clone(), note))
 }

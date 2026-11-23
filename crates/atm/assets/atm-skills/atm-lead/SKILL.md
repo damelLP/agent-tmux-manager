@@ -34,14 +34,15 @@ not successful model evaluations or permission to activate unattended operation.
   and the configured coordination socket. Keep builds/tests in the project's
   separate seal; do not scrub the pane to act as Owner.
   *Why: otherwise reports or commands can acquire the wrong attribution.*
-- **[S3](references/atm-named-agents.md#s3)** Read exact message IDs and their
-  attachments, then act within the authorized task. Handle already-processed
-  late deliveries as ack-only, not repeated assignments or decisions.
+- **[S3](references/atm-named-agents.md#s3)** Run the pasted `atm inbox --id mN`
+  and read the body and attachments. When answering, follow the hint:
+  `atm post --reply` with the post ID, or `atm post --to` for a direct target.
+  Already-handled late deliveries are ack-only.
   *Why: Delivered confirms retrieval-reference acceptance, not completed work.*
-- **[S4](references/atm-named-agents.md#s4)** Ack only handled Delivered
-  messages. Remember pre-read queued/failed IDs and return control rather
-  than waiting inside a busy turn for delivery into that same turn.
-  *Why: inbox reads do not mark read, and undelivered acks are refused.*
+- **[S4](references/atm-named-agents.md#s4)** Only after handling Delivered,
+  `atm ack mN` with the pasted wake ID. Remember pre-read queued/failed IDs
+  and end the turn rather than wait on your own delivery.
+  *Why: a fetch does not mark read; an early ack can cancel delivery.*
 - **[S5](references/atm-named-agents.md#s5)** Use returned IDs, full task agent
   addresses and every continuation cursor with the same filters.
   *Why: IDs are not consecutive and one page is not the organisation.*
@@ -65,12 +66,14 @@ not successful model evaluations or permission to activate unattended operation.
 - **[L2](references/atm-named-agents.md#l2)** Give each task an approved
   measure and a standalone brief: scope/files, worktree/branch, tests, done
   condition and report route. Attach brief-kind files before assigning one
-  bound seat. `task assign` already sends a brief; do not also send one.
-  *Why: a clear removes conversational context and assignment is the transport.*
+  bound seat. `task assign` already sends a brief; do not also post one. For
+  message-only work, use `atm post --tag <seat> --kind brief` with the unit
+  and attached brief in the project channel.
+  *Why: a clear removes conversational context; a strict tag names the seat to wake.*
 - **[L3](references/atm-named-agents.md#l3)** Check readiness with
   `atm agent list --format json`; after dispatch confirm delivery/work through
-  authorized diagnostics, task progress or the member's report. `queued mN`
-  alone proves none of these. If held/stale, inspect the available reason and
+  authorized diagnostics, task progress or the member's report. A post ID
+  or queued wake alone is not delivery. If held/stale, inspect the reason and
   ask the manager/Owner for cross-inbox diagnostics or owner-only recovery.
   Do not force raw tmux input, resend repeatedly or touch unauthorized seats.
   *Why: readiness/placeholder failures have stranded apparently sent work.*

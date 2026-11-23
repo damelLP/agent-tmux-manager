@@ -22,6 +22,7 @@ mod cost;
 mod agent_flow;
 #[cfg(test)]
 mod agent_flow_tests;
+mod agent_hire;
 mod agent_launch;
 #[cfg(test)]
 mod agent_launch_tests;
@@ -29,7 +30,7 @@ mod agent_lifecycle;
 mod agent_methods;
 mod agent_proc;
 mod agent_project;
-mod agent_screen;
+pub(crate) mod agent_screen;
 #[cfg(test)]
 mod agent_screen_tests;
 mod agent_types;
@@ -38,8 +39,18 @@ pub mod agents;
 #[cfg(test)]
 mod agents_tests;
 pub mod away;
+#[cfg(test)]
+mod channel_group_tests;
+pub(crate) mod channel_methods;
+pub(crate) mod channel_post;
+#[cfg(test)]
+mod channel_post_tests;
+pub(crate) mod channel_route;
+mod channels;
 mod decision_methods;
+mod decision_steps;
 pub mod decisions;
+pub(crate) mod department_directory;
 mod intent;
 pub mod message_delivery;
 #[cfg(test)]
@@ -58,6 +69,7 @@ mod message_persistence_tests;
 pub(crate) mod message_query;
 #[cfg(test)]
 mod message_query_tests;
+mod message_retract;
 mod message_scheduler;
 #[cfg(test)]
 mod message_seam_tests;
@@ -71,6 +83,10 @@ mod raw;
 pub(crate) mod report;
 pub(crate) mod reporting_line;
 pub mod return_digest;
+mod role_directory;
+#[cfg(test)]
+mod role_directory_tests;
+mod session_process;
 mod standing_rules;
 mod start_line;
 #[cfg(test)]

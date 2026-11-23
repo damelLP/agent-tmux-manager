@@ -111,6 +111,7 @@ fn send(
                 body: body.into(),
                 task: task.map(|t| t.parse().unwrap()),
                 attachments: vec!["attachment-only".into()],
+                post: None,
             }),
         )
         .unwrap();
@@ -185,6 +186,126 @@ fn filters_are_conjoined_literal_body_only_and_bidirectional() {
         .unwrap()),
         [14]
     );
+}
+
+fn with_linked_wake() -> OrgState {
+    let mut state = fixture();
+    let post = OrgEvent::from_parts(
+        "channel.posted",
+        &json!({
+            "channel":"alpha","author":"owner","kind":"note","body":"retired phrase",
+            "attachments":[],"task":"t7","mentions":[],"wake":["alpha/worker"],"route":false
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    state.apply(21, at(3), &post).unwrap();
+    let wake = OrgEvent::from_parts(
+        "msg.sent",
+        &json!({
+            "from":"owner","to":"alpha/worker","kind":"note","body":"retired phrase",
+            "attachments":[],"task":"t7","post":"m21"
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    state.apply(22, at(3), &wake).unwrap();
+    state
+}
+
+// Break: filters consult the durable wake copy rather than the displayed row.
+#[test]
+fn history_filters_linked_wakes_by_current_text_and_task() {
+    let mut state = with_linked_wake();
+    let scope = conversation("alpha/worker", "alpha/worker");
+    let select =
+        |state: &OrgState, filter, seq| ids(history(state, &params(filter), &scope, seq).unwrap());
+    assert_eq!(
+        select(&state, json!({"text":"retired","task":"t7"}), 22),
+        [22]
+    );
+    state
+        .apply(
+            23,
+            at(4),
+            &OrgEvent::ChannelPostEdited(PostEdited {
+                post: MessageId::new(21),
+                actor: Address::Owner,
+                body: "corrected phrase".into(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        select(&state, json!({"text":"corrected","task":"t7"}), 23),
+        [22]
+    );
+    assert!(select(&state, json!({"text":"retired"}), 23).is_empty());
+    state
+        .apply(
+            24,
+            at(4),
+            &OrgEvent::ChannelPostRemoved(PostRemoved {
+                post: MessageId::new(21),
+                actor: Address::Owner,
+            }),
+        )
+        .unwrap();
+    for p in [
+        json!({"text":"retired"}),
+        json!({"text":"corrected"}),
+        json!({"task":"t7"}),
+    ] {
+        assert!(select(&state, p, 24).is_empty());
+    }
+    assert_eq!(select(&state, json!({"text":"removed"}), 24), [22]);
+    assert_eq!(select(&state, json!({"text":"body only"}), 24), [20]);
+}
+
+// Break: reapplying mutable filters to the offset rejects a cursor that the
+// daemon issued before that wake changed; newer messages still stay fenced out.
+#[test]
+fn history_cursor_survives_an_edit_or_remove_of_its_anchor() {
+    let mut state = with_linked_wake();
+    let post = MessageId::new(21);
+    let change = |body: &str| {
+        OrgEvent::ChannelPostEdited(PostEdited {
+            post,
+            actor: Address::Owner,
+            body: body.into(),
+        })
+    };
+    state
+        .apply(23, at(4), &change("review revised text"))
+        .unwrap();
+    let scope = conversation("alpha/worker", "alpha/worker");
+    let mut p = params(json!({"text":"review","limit":1}));
+    let first = history(&state, &p, &scope, 23).unwrap();
+    assert_eq!(ids(first), [22, 16]);
+    p.cursor = Some(history_cursor(&p, &scope, 23, MessageId::new(22)).unwrap());
+    send(
+        &mut state,
+        24,
+        3,
+        "owner",
+        "alpha/worker",
+        None,
+        "new review",
+    );
+    for (seq, event) in [
+        (25, change("other text")),
+        (
+            26,
+            OrgEvent::ChannelPostRemoved(PostRemoved {
+                post,
+                actor: Address::Owner,
+            }),
+        ),
+    ] {
+        state.apply(seq, at(4), &event).unwrap();
+        let page = history(&state, &p, &scope, seq).unwrap();
+        assert_eq!(page.snapshot_seq, 23);
+        assert_eq!(ids(page), [16, 12]);
+    }
 }
 
 // Break: scanning a metadata-only inbox using a hidden-membership filter, even if empty.

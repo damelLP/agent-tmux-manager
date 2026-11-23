@@ -34,13 +34,15 @@ a command or boundary is unclear; do not replace missing evidence with a guess.
   the project's separate seal; never scrub the pane to act as Owner.
   *Why: otherwise your words can be signed Owner or reach the wrong daemon.*
 - **[S3](references/atm-named-agents.md#s3)** For `[mN] Read: atm inbox --id mN`,
-  run that exact command, read the body/attachments and act on your authorized
-  brief without another go-ahead. A previously handled late delivery is not
-  fresh work. *Why: Delivered means the retrieval reference was accepted.*
+  run that exact command and read the body and attachments. Act on an
+  authorized brief without another go-ahead. For a needed reply, follow the
+  inbox hint: `atm post --reply` with its post ID, or `atm post --to` when the
+  hint names a direct target. Do not repeat already-handled work.
+  *Why: Delivered means the retrieval reference was accepted.*
 - **[S4](references/atm-named-agents.md#s4)** After handling a **Delivered**
-  message, `atm msg ack mN`. If pre-read while Queued/Failed, remember the
-  handled ID, end the turn, and ack when later Delivered; never wait inside
-  the busy turn for its own delivery. *Why: fetching is not acknowledgement.*
+  wake, `atm ack mN` using the pasted wake ID. If pre-read while Queued/Failed,
+  remember the handled ID, end the turn, and ack when later Delivered.
+  *Why: fetching is not acknowledgement, and an early ack can cancel delivery.*
 - **[S5](references/atm-named-agents.md#s5)** Use returned IDs, full
   `project/name` for task agents, and every continuation cursor with unchanged
   filters. *Why: IDs are not consecutive and one page can omit work.*
@@ -84,10 +86,13 @@ a command or boundary is unclear; do not replace missing evidence with a guess.
 - **[M4](references/atm-named-agents.md#m4)** For a durable task, submit its
   plan/result and files **once** with `atm task submit`; it already queues a
   report to the creator. For message-only work without a canonical task ID,
-  send one correlated report/question to the manager printed by `me`, with
-  report-file attachment. Do not invent a task or send a duplicate automatic
-  report. Keep a short visible final marker (`QUESTION:`, `BLOCKED:`, `WAITING:`,
-  `DONE: plan <path>` or `DONE: <result>`); put long evidence in the file.
+  post one correlated report/question with `atm post --tag <manager>` using
+  the full manager address from `atm me` and a report-file attachment.
+  Add `--reply <post-id>` only when the inbox offered it; follow a direct
+  `--to <author>` hint instead when given. Do not invent a task or duplicate
+  an automatic report. Keep a short visible final marker (`QUESTION:`,
+  `BLOCKED:`, `WAITING:`, `DONE: plan <path>` or `DONE: <result>`); put long
+  evidence in the file.
   *Why: each extra delivered progress message starts another lead turn.*
 
 ## Choices, away and save

@@ -40,6 +40,8 @@ pub enum ApplyError {
     DuplicateDecision(DecisionId),
     #[error("invalid return digest: {0}")]
     InvalidDigest(String),
+    #[error("unknown post {0}")]
+    UnknownPost(MessageId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,10 @@ pub struct Agent {
     pub excluded_session_id: Option<SessionId>,
     pub reason: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// When the current binding was recorded: the time of the
+    /// `agent.session_bound`, or `agent.adopted` with a session, that set
+    /// `session_id`. `None` without a binding.
+    pub bound_at: Option<DateTime<Utc>>,
 }
 impl Agent {
     fn new(id: AgentId, ts: DateTime<Utc>) -> Self {
@@ -74,6 +80,7 @@ impl Agent {
             excluded_session_id: None,
             reason: None,
             updated_at: ts,
+            bound_at: None,
         }
     }
     fn transition(&mut self, status: AgentStatus, ts: DateTime<Utc>) {
@@ -136,8 +143,10 @@ pub struct OrgState {
     pub(crate) redo_history: crate::decision_redo::RedoHistory,
     pub(crate) return_history: crate::return_digest::ReturnHistory,
     summaries: HashMap<SessionId, SessionSummary>,
+    processes: HashMap<SessionId, SessionProcess>,
     decisions: BTreeMap<DecisionId, Decision>,
     pub(crate) owner: OwnerState,
+    pub(crate) channel: crate::channel::ChannelIndex,
 }
 impl OrgState {
     /// Choose an unregistered folder slug, then the first free -2, -3, ...
@@ -185,6 +194,11 @@ impl OrgState {
     #[must_use]
     pub fn session_summary(&self, id: &SessionId) -> Option<&SessionSummary> {
         self.summaries.get(id)
+    }
+    /// The latest recorded process of a session.
+    #[must_use]
+    pub fn session_process(&self, id: &SessionId) -> Option<&SessionProcess> {
+        self.processes.get(id)
     }
     pub fn projects(&self) -> impl Iterator<Item = &Project> {
         self.projects.values()
@@ -369,6 +383,17 @@ impl OrgState {
             OrgEvent::TaskFlagged(fact) => fact.check(self)?,
             OrgEvent::TaskCostRecorded(fact) => fact.check(self)?,
             OrgEvent::TaskUsageObserved(fact) => fact.check(self)?,
+            OrgEvent::SessionProcess(process) => {
+                valid_external_id("session id", process.session_id.as_str())?;
+                if process.pid == 0 {
+                    return Err(IdError {
+                        kind: "pid",
+                        value: "0".into(),
+                        rule: "must be positive",
+                    }
+                    .into());
+                }
+            }
             OrgEvent::SessionSummary(summary) => {
                 valid_external_id("session id", summary.session_id.as_str())?;
                 if let Some(pane) = &summary.pane {
@@ -380,6 +405,12 @@ impl OrgState {
             }
             OrgEvent::ControlSent(_) | OrgEvent::ControlSpawned(_) | OrgEvent::ControlKilled(_) => {
             }
+            OrgEvent::ChannelPosted(_)
+            | OrgEvent::ChannelRouted(_)
+            | OrgEvent::ChannelSeen(_)
+            | OrgEvent::ChannelPostEdited(_)
+            | OrgEvent::ChannelPostRemoved(_)
+            | OrgEvent::ChannelReacted(_) => {}
             OrgEvent::DecisionRequested(request) => self.validate_address(&request.requester)?,
             OrgEvent::DecisionTakenProvisionally(ProvisionalChoice {
                 decision_id, by, ..
@@ -447,6 +478,7 @@ impl OrgState {
                 }
             }
         }
+        self.validate_channel_event(event)?;
         Ok(())
     }
 
@@ -500,8 +532,14 @@ impl OrgState {
         event: &OrgEvent,
     ) -> Result<(), ApplyError> {
         self.validate_event(event)?;
+        // Posts and messages share one id space: `m<seq>`.
+        let id_taken = self.messages.contains_key(&MessageId::new(seq))
+            || self.channel.posts.contains_key(&MessageId::new(seq));
+        if matches!(event, OrgEvent::ChannelPosted(_)) && id_taken {
+            return Err(ApplyError::DuplicateMessage(MessageId::new(seq)));
+        }
         if let OrgEvent::MessageSent(content) = event {
-            if self.messages.contains_key(&MessageId::new(seq)) {
+            if id_taken {
                 return Err(ApplyError::DuplicateMessage(MessageId::new(seq)));
             }
             if let Some(notice) = &content.delivery_notice {
@@ -554,6 +592,7 @@ impl OrgState {
                 );
                 agent.pane = Some(pane.clone());
                 agent.session_id.clone_from(session_id);
+                agent.bound_at = session_id.as_ref().map(|_| ts);
                 if session_id.is_some() {
                     agent.excluded_session_id = None;
                 }
@@ -570,6 +609,7 @@ impl OrgState {
                 let agent = self.agent_mut(agent_id)?;
                 agent.transition(AgentStatus::Ready, ts);
                 agent.session_id = Some(session_id.clone());
+                agent.bound_at = Some(ts);
                 agent.excluded_session_id = None;
             }
             OrgEvent::AgentEditorReady { agent_id } => {
@@ -596,6 +636,7 @@ impl OrgState {
                     }
                 }
                 agent.session_id = None;
+                agent.bound_at = None;
             }
             OrgEvent::AgentStuck { agent_id, reason }
             | OrgEvent::AgentDown { agent_id, reason } => {
@@ -613,6 +654,7 @@ impl OrgState {
                 if down {
                     agent.pane = None;
                     agent.session_id = None;
+                    agent.bound_at = None;
                     agent.excluded_session_id = None;
                 }
             }
@@ -707,11 +749,21 @@ impl OrgState {
                 self.summaries
                     .insert(summary.session_id.clone(), summary.clone());
             }
+            OrgEvent::SessionProcess(process) => {
+                self.processes
+                    .insert(process.session_id.clone(), process.clone());
+            }
             OrgEvent::ControlSent(_)
             | OrgEvent::ControlSpawned(_)
             | OrgEvent::ControlKilled(_)
             | OrgEvent::AgentSaveRequested { .. }
-            | OrgEvent::AgentSaved { .. } => {}
+            | OrgEvent::AgentSaved { .. }
+            | OrgEvent::ChannelPosted(_)
+            | OrgEvent::ChannelRouted(_)
+            | OrgEvent::ChannelSeen(_)
+            | OrgEvent::ChannelPostEdited(_)
+            | OrgEvent::ChannelPostRemoved(_)
+            | OrgEvent::ChannelReacted(_) => {}
             OrgEvent::DecisionRequested(request) => {
                 let id = DecisionId::new(seq);
                 self.decisions
@@ -753,6 +805,7 @@ impl OrgState {
             OrgEvent::OwnerRelaySet(fact) => self.owner.relay.clone_from(&fact.agent),
             OrgEvent::OwnerDigestCreated(fact) => self.apply_digest(seq, fact.back_seq)?,
         }
+        self.channel.apply(seq, ts, event);
         self.reports.apply(reporting);
         Ok(())
     }

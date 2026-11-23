@@ -1,6 +1,7 @@
 //! Thin, one-shot named-agent RPC commands. No local tmux fallback or retry.
 
 use super::output::stdout;
+use atm_org::DecisionId;
 use atmd::org::agent_handover::{HandoverParams, HandoverResult};
 use atmd::org::agents::*;
 use clap::{Subcommand, ValueEnum};
@@ -34,6 +35,9 @@ pub enum AgentAction {
         name: String,
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Direct owner hire approval for this seat and role file (dN).
+        #[arg(long)]
+        hire: Option<DecisionId>,
         #[arg(long, value_enum, default_value = "text")]
         format: AgentFormat,
     },
@@ -182,6 +186,7 @@ pub(super) async fn cmd_agent_with_lookup_budget(
         AgentAction::Up {
             name,
             project_root,
+            hire,
             format,
         } => (
             request::<_, UpResult>(
@@ -190,6 +195,7 @@ pub(super) async fn cmd_agent_with_lookup_budget(
                     name,
                     project_root: absolute_root(project_root)?,
                     caller_server: None,
+                    hire,
                 },
                 85,
             )
@@ -324,6 +330,15 @@ pub(super) async fn cmd_agent_with_lookup_budget(
             true,
         ),
     };
+    if !json {
+        if let Some(warning) = value.get("warning").and_then(Value::as_str) {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "Warning: {}",
+                super::msg::escaped(warning, false)
+            );
+        }
+    }
     stdout(|out| {
         if json {
             writeln!(out, "{value}")?;

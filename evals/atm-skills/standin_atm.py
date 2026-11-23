@@ -5,7 +5,8 @@ or tmux. The run directory (--dir) holds:
 
   list.json       what `atm list -f json` prints: a row for every pane
   peek-<N>.txt    the screen `atm peek %N` prints
-  scenario.json   optional: {"watch": "%7", "stop_after_writes": 1}
+  scenario.json   optional: {"watch": "%7", "stop_after_writes": 1}, or a
+                  named seat fixture with an explicit `named_commands` list
 
 After `stop_after_writes` writes (send, reply, interrupt, kill, spawn) to the
 watched pane, its session is gone: `list` leaves its row out and `peek` fails
@@ -46,6 +47,8 @@ WRITES = {"send", "reply", "interrupt", "kill", "spawn"}
 def main(argv):
     run_dir, log_path, args = argv[1], argv[2], argv[3:]
     scenario = load_json(os.path.join(run_dir, "scenario.json"), {})
+    if "named_commands" in scenario:
+        return do_named(scenario["named_commands"], args, log_path)
     watch = scenario.get("watch")
     gone_flag = os.path.join(run_dir, "gone")
     gone = os.path.exists(gone_flag)
@@ -85,6 +88,31 @@ def main(argv):
         return rc
     print(f"atm stand-in: `atm {cmd}` isn't part of this test", file=sys.stderr)
     return 2
+
+
+def command_key(argv):
+    # Post flags in these fixtures all take one value. Flag order is immaterial.
+    if argv[:1] == ["post"] and len(argv) % 2 == 1:
+        return "post", sorted(zip(argv[1::2], argv[2::2]))
+    return argv
+
+
+def do_named(commands, argv, log_path):
+    # Unknown commands are logged too; a successful model exit cannot hide
+    # an attempt to use a legacy mutating command.
+    key = command_key(argv)
+    result = next((r for r in commands if command_key(r["argv"]) == key), None)
+    rc = result.get("rc", 0) if result else 2
+    entry = {"argv": argv, "pane": None, "rc": rc}
+    if result and "delivery" in result:
+        entry["delivery"] = result["delivery"]
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    if result:
+        print(result["stdout"])
+    else:
+        print("atm stand-in: unexpected named command", file=sys.stderr)
+    return rc
 
 
 def load_json(path, default):

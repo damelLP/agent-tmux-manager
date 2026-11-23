@@ -83,6 +83,94 @@ fn rendered(state: &OrgState, p: Value, visible: &ReportVisibility) -> Value {
 fn owner(state: &OrgState, p: Value) -> Value {
     rendered(state, p, &ReportVisibility::All)
 }
+fn project_cost_row(id: Option<&str>, cost: Option<i64>, unknown: u64) -> ProjectReport {
+    ProjectReport {
+        project_id: id.map(|id| id.parse().unwrap()),
+        tasks: OutcomeCounts::default(),
+        owner_step_ins: OwnerStepIns::default(),
+        tasks_with_step_ins: 0,
+        cost: cost.map(atm_core::Money::from_microdollars),
+        cost_unknown_tasks: unknown,
+        over_budget: None,
+        decisions: DecisionCounts::default(),
+        trend: Trend {
+            bucket: 5,
+            buckets: vec![],
+            direction: TrendDirection::default(),
+        },
+    }
+}
+
+fn cost_department(id: &str, title: &str, projects: &[&str]) -> department::Department {
+    department::parse_department(id, &format!("title={title:?}\nprojects={projects:?}")).unwrap()
+}
+
+// Break caught: assigning shared cost to just one department, including unplaced
+// or absent rows, losing titles, or reporting unobserved spend as a measured zero.
+#[test]
+fn department_costs_sum_only_matching_project_rows() {
+    let projects = [
+        project_cost_row(Some("alpha"), Some(300_000), 1),
+        project_cost_row(Some("beta"), None, 2),
+        project_cost_row(Some("gamma"), Some(200_000), 0),
+        project_cost_row(Some("delta"), Some(0), 0),
+        project_cost_row(Some("decisions-only"), None, 0),
+        project_cost_row(None, Some(900_000), 8),
+    ];
+    let departments = [
+        cost_department("apps", "App delivery", &["alpha", "beta", "missing"]),
+        cost_department("tools", "Agent tools", &["alpha", "beta", "gamma"]),
+        cost_department("empty", "Nobody", &["missing", "decisions-only"]),
+        cost_department("zero", "Zero", &["delta"]),
+    ];
+    let rows = department_costs(&projects, &departments);
+    let actual: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.id.as_str(),
+                row.title.as_str(),
+                row.cost.map(|cost| cost.as_microdollars()),
+                row.cost_unknown_tasks,
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("apps", "App delivery", Some(300_000), 3),
+            ("tools", "Agent tools", Some(500_000), 3),
+            ("empty", "Nobody", None, 0),
+            ("zero", "Zero", Some(0), 0),
+        ]
+    );
+    assert!(department_costs(&projects, &[]).is_empty());
+}
+
+// Break caught: losing unknown-only amounts/counts or wrapping large sums.
+#[test]
+fn department_costs_preserve_unknown_and_saturate() {
+    let projects = [
+        project_cost_row(Some("alpha"), Some(i64::MAX), u64::MAX),
+        project_cost_row(Some("beta"), None, 2),
+        project_cost_row(Some("gamma"), Some(1), 0),
+    ];
+    let departments = [
+        cost_department("unknown", "Unknown", &["beta"]),
+        cost_department("large", "Large", &["alpha", "beta", "gamma"]),
+    ];
+    let rows = department_costs(&projects, &departments);
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].cost, rows[0].cost_unknown_tasks), (None, 2));
+    assert_eq!(
+        (
+            rows[1].cost.map(|cost| cost.as_microdollars()),
+            rows[1].cost_unknown_tasks
+        ),
+        (Some(i64::MAX), u64::MAX),
+    );
+}
+
 fn task<'a>(value: &'a Value, id: &str) -> &'a Value {
     value["tasks"]
         .as_array()

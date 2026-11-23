@@ -193,8 +193,7 @@ async fn me_missing_role_is_plain_but_the_rest_is_shown() {
     let mut value = fixture();
     value["instructions"] = Value::Null;
     value["manager"] = json!("owner");
-    value["report_command"] =
-        json!("atm msg send --to owner --kind report --body 'DONE: <result>'");
+    value["report_command"] = json!("atm post --tag owner --kind report --body 'DONE: <result>'");
     let output = exchange(&["me"], json!({"result":value}), true, false).await;
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
@@ -206,10 +205,37 @@ async fn me_missing_role_is_plain_but_the_rest_is_shown() {
         "Memory: /project/.atm/memory/worker.md",
         "Open tasks: none",
         "Unread m7 brief from=owner",
-        "Report: atm msg send --to owner --kind report",
+        "Report: atm post --tag owner --kind report",
     ] {
         assert!(text.contains(line), "{line}: {text}");
     }
+}
+
+// Break caught: locally rewriting the report template of a pre-U12 daemon or
+// making another RPC to try to upgrade it. The named skill chooses the transport.
+#[tokio::test]
+async fn me_preserves_legacy_report_command_from_daemon() {
+    const OLD: &str = "atm msg send --to project/lead --kind report --body 'DONE: <result>'";
+    let mut value = fixture();
+    value["report_command"] = json!(OLD);
+    value["future_field"] = json!({"keep": true});
+    let text = exchange(&["me"], json!({"result":value}), true, false).await;
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains(&format!("Report: {OLD}\n")));
+    assert!(text.contains("After handling a delivered message: atm ack <id>\n"));
+    let json = exchange(
+        &["me", "--format", "json"],
+        json!({"result":value}),
+        true,
+        false,
+    )
+    .await;
+    assert!(json.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&json.stdout).unwrap(),
+        value
+    );
 }
 
 // Break caught: ignoring refusals/capabilities, rendering malformed data, swallowing write errors.
@@ -317,6 +343,7 @@ async fn me_real_daemon_context_and_report_command() {
             body: "Pending work".into(),
             attachments: vec![],
             task: None,
+            post: None,
         }),
     ] {
         org.execute(command, chrono::Utc::now()).await.unwrap();
@@ -363,6 +390,8 @@ async fn me_real_daemon_context_and_report_command() {
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["instructions"], Value::Null);
         assert_eq!(value["open_tasks"], json!([]));
+        let report = value["report_command"].as_str().unwrap();
+        assert!(text.contains(&format!("Report: {report}\n")));
         let shell = format!(
             "atm() {{ printf '%s\\0' \"$@\"; }}; {}",
             value["report_command"].as_str().unwrap()
@@ -378,7 +407,7 @@ async fn me_real_daemon_context_and_report_command() {
         assert!(output.status.success());
         assert_eq!(
             output.stdout,
-            b"msg\0send\0--to\0owner\0--kind\0report\0--body\0DONE: <result>\0"
+            b"post\0--tag\0owner\0--kind\0report\0--body\0DONE: <result>\0"
         );
         assert!(!dir.path().join("fallback").exists());
     };

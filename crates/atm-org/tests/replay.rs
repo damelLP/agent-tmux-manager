@@ -314,6 +314,13 @@ fn event_slot(event: &OrgEvent) -> usize {
         OrgEvent::TaskUsageObserved(_) => 40,
         OrgEvent::OwnerDigestCreated(_) => 41,
         OrgEvent::OwnerRelaySet(_) => 42,
+        OrgEvent::ChannelPosted(_) => 43,
+        OrgEvent::ChannelRouted(_) => 44,
+        OrgEvent::ChannelSeen(_) => 45,
+        OrgEvent::SessionProcess(_) => 46,
+        OrgEvent::ChannelPostEdited(_) => 47,
+        OrgEvent::ChannelPostRemoved(_) => 48,
+        OrgEvent::ChannelReacted(_) => 49,
     }
 }
 
@@ -431,6 +438,70 @@ fn event_case(slot: usize, text: String, n: u64, cost: i64, flag: bool) -> OrgEv
             turn: flag,
             cumulative_cost: Some(Money::from_microdollars(cost)),
             context_percent: Some((n % 101) as u8),
+        }),
+        43 => OrgEvent::ChannelPosted(PostContent {
+            channel: ChannelId::from(text.clone()),
+            author: owner_or(flag, agent_id.clone()),
+            session_id: flag.then(|| atm_core::SessionId::new(text.clone())),
+            kind: MessageKind::Note,
+            body: text.clone(),
+            attachments: vec![text.clone()],
+            task: flag.then(|| format!("t{n}").parse().unwrap()),
+            thread: flag.then_some(message_id),
+            mentions: vec![
+                Mention::Owner,
+                Mention::Seat(agent_id.clone()),
+                serde_json::from_value(json!({"later": text})).unwrap(),
+            ],
+            wake: vec![owner_or(!flag, agent_id)],
+            route: flag,
+            decision: flag.then(|| DecisionStep {
+                decision_id: DecisionId::new(n),
+                step: text.clone(),
+            }),
+            client_key: (!flag).then_some(text),
+            also_in_chat: false,
+        }),
+        44 => OrgEvent::ChannelRouted(PostRouted {
+            post: message_id,
+            wake: vec![owner_or(flag, agent_id)],
+            by: if flag {
+                RouteBy::Router {
+                    name: text.clone(),
+                    model: (!n.is_multiple_of(2)).then(|| text.clone()),
+                }
+            } else {
+                RouteBy::Stopgap {
+                    cause: text.clone(),
+                }
+            },
+            reason: flag.then_some(text),
+        }),
+        45 => OrgEvent::ChannelSeen(ChannelSeen {
+            channel: ChannelId::from(text.clone()),
+            reader: owner_or(flag, agent_id),
+            through: message_id,
+            session_id: (!flag).then(|| atm_core::SessionId::new(text)),
+        }),
+        46 => OrgEvent::SessionProcess(SessionProcess {
+            session_id: text.into(),
+            pid: n as u32,
+            process_start: n,
+        }),
+        47 => OrgEvent::ChannelPostEdited(PostEdited {
+            post: message_id,
+            actor: owner_or(flag, agent_id),
+            body: text,
+        }),
+        48 => OrgEvent::ChannelPostRemoved(PostRemoved {
+            post: message_id,
+            actor: owner_or(flag, agent_id),
+        }),
+        49 => OrgEvent::ChannelReacted(PostReacted {
+            post: message_id,
+            actor: owner_or(flag, agent_id),
+            emoji: ReactionEmoji::Eyes,
+            active: flag,
         }),
         _ => OrgEvent::OwnerBack(OwnerBack {
             by: owner_or(flag, agent_id),
@@ -598,6 +669,8 @@ fn command_slot(command: &OrgCommand) -> usize {
         OrgCommand::Saved { .. } => 24,
         OrgCommand::Owner(_) => 25,
         OrgCommand::ObserveTaskUsage(_) => 26,
+        OrgCommand::Channel(_) => 27,
+        OrgCommand::RecordProcess(_) => 28,
     }
 }
 
@@ -706,6 +779,12 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
             cumulative_cost: Some(Money::from_microdollars((n % 1000000) as i64)),
             context_percent: Some((n % 101) as u8),
         }),
+        27 => OrgCommand::Channel(channel_command_case(n, flag, agent_id)),
+        28 => OrgCommand::RecordProcess(SessionProcess {
+            session_id,
+            pid: (n % 3) as u32 + 1,
+            process_start: n % 2,
+        }),
         // Slot 25: the switch by the owner or an agent, caps from zero up, and
         // the away table applied to the decision ids a history reaches.
         _ => OrgCommand::Owner(match n % 4 {
@@ -725,6 +804,54 @@ fn command_case(slot: usize, n: u64, flag: bool) -> OrgCommand {
             },
         }),
     }
+}
+
+/// Channel commands over the one-seat project `p`: posts in its channel, to
+/// and from the owner directly, replies to whatever id `n` names, stopgap
+/// answers for it, and markers through it.
+fn channel_command_case(n: u64, flag: bool, agent_id: AgentId) -> ChannelCommand {
+    if n % 5 == 4 {
+        return ChannelCommand::Seen {
+            channel: ChannelId::from("p".to_owned()),
+            reader: owner_or(flag, agent_id),
+            through: MessageId::new(n),
+        };
+    }
+    if n % 5 == 3 {
+        return ChannelCommand::Route(PostRouted {
+            post: MessageId::new(n),
+            wake: vec![owner_or(flag, agent_id)],
+            by: RouteBy::Stopgap {
+                cause: "disabled".into(),
+            },
+            reason: None,
+        });
+    }
+    let target = match n % 3 {
+        0 => PostTarget::Channel(ChannelId::from("p".to_owned())),
+        1 => PostTarget::Direct(owner_or(!flag, agent_id.clone())),
+        _ => PostTarget::Reply(MessageId::new(n)),
+    };
+    ChannelCommand::Post(Box::new(PostRequest {
+        target,
+        author: owner_or(flag, agent_id),
+        kind: MessageKind::Note,
+        body: if n.is_multiple_of(2) {
+            "@lead @owner hi"
+        } else {
+            "hi"
+        }
+        .into(),
+        attachments: vec![],
+        task: None,
+        tags: vec![],
+        groups: Default::default(),
+        decision: None,
+        client_key: flag.then(|| format!("k{}", n % 3)),
+        also_in_chat: false,
+        no_route: false,
+        internal: !flag,
+    }))
 }
 
 /// Slot 22: a task command. A task made at event `s` of a history has the id
@@ -806,14 +933,14 @@ fn task_command_case(n: u64, flag: bool) -> TaskCommand {
 
 #[test]
 fn case_generators_cover_every_event_and_command_variant() {
-    let events: Vec<_> = (0..43)
+    let events: Vec<_> = (0..50)
         .map(|slot| event_slot(&event_case(slot, "text".into(), 1, 1, true)))
         .collect();
-    assert_eq!(events, (0..43).collect::<Vec<_>>());
-    let commands: Vec<_> = (0..27)
+    assert_eq!(events, (0..50).collect::<Vec<_>>());
+    let commands: Vec<_> = (0..29)
         .map(|slot| command_slot(&command_case(slot, 1, true)))
         .collect();
-    assert_eq!(commands, (0..27).collect::<Vec<_>>());
+    assert_eq!(commands, (0..29).collect::<Vec<_>>());
     let picks: Vec<_> = (0..6)
         .map(|pick| match command_case(21, pick, true) {
             OrgCommand::Decision(command) => decision_support::decision_command_pick(&command),
@@ -991,7 +1118,7 @@ impl ExcludedReach {
 
 proptest! {
     #[test]
-    fn event_parts_roundtrip(slot in 0usize..43, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
+    fn event_parts_roundtrip(slot in 0usize..50, text in any::<String>(), n in any::<u64>(), cost in any::<i64>(), flag in any::<bool>()) {
         let event = event_case(slot, text, n, cost, flag);
         prop_assert!(event.to_body().is_object());
         prop_assert_eq!(OrgEvent::from_parts(event.kind(), &event.to_body()).unwrap(), Some(event));
@@ -1009,7 +1136,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
         ..Config::default()
     });
     let inputs = (
-        prop::collection::vec((0usize..27, 0u64..50, any::<bool>()), 0..80),
+        prop::collection::vec((0usize..29, 0u64..50, any::<bool>()), 0..80),
         any::<usize>(),
     );
     runner
@@ -1039,7 +1166,7 @@ fn applying_a_log_is_deterministic_and_prefix_composes() {
                 }
                 // Every command is tried at every generated reachable state, not
                 // only the randomly selected command that advanced the history.
-                for candidate in 0..27 {
+                for candidate in 0..29 {
                     let mut probe = reachable.clone();
                     let command = command_case(candidate, n, flag);
                     let result = probe.decide(&command, time());

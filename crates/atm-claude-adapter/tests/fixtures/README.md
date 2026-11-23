@@ -632,3 +632,29 @@ provenance and the final `|` on each row is a storage sentinel, not pane text.
 Synthetic: removing only faint from the editor yields a typed draft; moving or
 mutating just the notice does not establish an idle editor. The new spelling
 is recognized only on a standalone aligned notice row.
+
+Captured: Claude Code 2.1.330, 2026-11-22, read-only tmux capture-pane -p -e -N
+(lead supplied). `screen_styled_update-installed-idle_2.1.330.txt` is the full
+189x40 idle viewport with a completed turn still visible above the notice.
+
+Captured: Claude Code 2.1.330, 2026-11-22, read-only tmux capture-pane -e
+(lead supplied). `screen_styled_update-installed-running_2.1.330.txt` is the
+last eight rows of the same size pane mid-turn, with a spinner and interrupt
+footer.
+
+Both have a lone `✔ Update installed · /restart to apply` immediately above the
+editor at a two-cell right margin. Earlier transcript and custom status text
+are masked in place, preserving cell widths, padding and SGR. The `Captured:`
+line and final `|` on each row are not pane text. `update_notice.rs` pins the
+idle and running observations without treating the notice as turn evidence.
+
+Captured: claude 2.1.327, 2.1.329 and 2.1.330, 2026-11-20, sealed rig (private
+user and network namespace, canned Messages API), tmux 3.8 capture-pane -p -e -N
+(s3-stuckseat). `claude_suggestion_unfocused_82x60_*` and
+`claude_suggestion_focused_82x60_2.1.330` show a prompt suggestion with and
+without terminal focus above the idle `/clear` hint;
+`claude_recap_unfocused_82x60_2.1.327` adds the away recap;
+`claude_typed_draft_200x50_2.1.329` is a one-letter typed draft. Each first line
+is its provenance; the rig's root path in the header was replaced. The cut hint
+beside the update notice in `screen_suggestions.rs` is Synthetic, rebuilt on
+these frames from a live row that was not committed.

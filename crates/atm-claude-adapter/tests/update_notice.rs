@@ -7,11 +7,21 @@ use atm_core::{DialogState, FreshEditorEvidence, InputState, ScreenFacts, Screen
 
 const COMBINED: &str = include_str!("fixtures/screen_styled_clear-update-installed_2.1.325.txt");
 const STANDALONE: &str = include_str!("fixtures/screen_styled_update-installed_2.1.325.txt");
+const STANDALONE_IDLE_330: &str =
+    include_str!("fixtures/screen_styled_update-installed-idle_2.1.330.txt");
+const STANDALONE_RUNNING_330: &str =
+    include_str!("fixtures/screen_styled_update-installed-running_2.1.330.txt");
 const UPDATE: &str = "✔ Update installed · /restart to apply";
 const RESTART_TO_UPDATE: &str = "✔ Update installed · Restart to update";
 
 fn restart_to_update_capture() -> String {
-    let capture = include_str!("fixtures/screen_styled_restart-to-update_2.1.325.txt");
+    capture_grid(
+        include_str!("fixtures/screen_styled_restart-to-update_2.1.325.txt"),
+        7,
+    )
+}
+
+fn capture_grid(capture: &str, rows: usize) -> String {
     let mut frame = String::new();
     for row in body(capture).lines() {
         let Some(row) = row.strip_suffix('|') else {
@@ -20,7 +30,7 @@ fn restart_to_update_capture() -> String {
         frame.push_str(row);
         frame.push('\n');
     }
-    assert_eq!(frame.lines().count(), 7);
+    assert_eq!(frame.lines().count(), rows);
     frame
 }
 
@@ -83,6 +93,30 @@ fn combined_update_notice_preserves_completed_turn_with_known_footer() {
 #[test]
 fn standalone_update_notice_preserves_completed_turn_with_known_footer() {
     idle(&footer(STANDALONE));
+}
+
+// Captured: Claude Code 2.1.330, 2026-11-22, read-only tmux capture-pane -p -e -N.
+// A lone update notice must not hide the completed turn in the real idle frame.
+#[test]
+fn captured_330_standalone_update_notice_preserves_idle_turn() {
+    let text = capture_grid(STANDALONE_IDLE_330, 40);
+    assert!(text.contains(UPDATE));
+    idle(&text);
+}
+
+// Captured: Claude Code 2.1.330, 2026-11-22, read-only tmux capture-pane -e.
+// The same notice and empty editor must not turn a running seat into an idle one.
+#[test]
+fn captured_330_standalone_update_notice_preserves_running_turn() {
+    let text = capture_grid(STANDALONE_RUNNING_330, 8);
+    assert!(text.contains(UPDATE));
+    let input = ScreenInput::Styled(&text);
+    let control = observe_control_screen(input, None);
+    assert_eq!(control.dialog, ControlDialog::None);
+    assert_eq!(control.facts.input, InputState::Empty);
+    assert_eq!(control.facts.turn, TurnState::Running);
+    assert_eq!(control.facts.dialog, DialogState::None);
+    assert_eq!(observe_screen(input, None), control.facts);
 }
 
 #[test]

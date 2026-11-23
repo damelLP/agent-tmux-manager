@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs one decision test: a sealed `claude -p` run of one case folder against
-# one copy of the atm skills. See README.md beside this file.
+# Runs one decision test against one copy of the ATM skills. Named cases
+# require an explicit local fixture driver; only legacy cases use claude -p.
 #
 # Usage: run.sh <case-dir> <skills-dir> <out-dir> [model]
 #
@@ -25,18 +25,34 @@ mkdir -p "$out/outputs"
 case_dir=$(cd "$1" && pwd -P) || exit 64
 skills=$(cd "$2" && pwd -P) || exit 64
 model=${4:-claude-opus-5-5}
+family=$(basename -- "$(dirname -- "$case_dir")")
+named_driver=
+case "$family" in
+    atm-member|atm-lead)
+        named_driver=${ATM_EVAL_NAMED_DRIVER:-}
+        if [[ $named_driver != /* || ! -x $named_driver ]]; then
+            echo 'named cases require ATM_EVAL_NAMED_DRIVER (an absolute executable fixture driver)' >&2
+            exit 64
+        fi
+        skill_pair=(atm-member atm-lead)
+        ;;
+    atm-coordinate|atm-implement) skill_pair=(atm-coordinate atm-implement) ;;
+    *) echo "unknown skill family: $family" >&2; exit 64 ;;
+esac
 
 # Short, so socket paths fit in sun_path.
 # work/ is the run's working directory (@RUN@ in the case's files); atm/ holds
 # what the stand-in serves, outside it.
-run=$(mktemp -d /dev/shm/atmdec.XXXXXX) || exit 1
+run_base=/dev/shm
+[ -z "$named_driver" ] || run_base=${TMPDIR:-/var/tmp}
+run=$(mktemp -d "$run_base/atmdec.XXXXXX") || exit 1
 work=$run/work
 mkdir -p "$run/bin" "$run/tmp" "$run/tmux" "$run/s" "$run/atm" "$work"
 cp -R "$case_dir/files/." "$run/"
 grep -rlF '@RUN@' "$run" 2>/dev/null | while read -r f; do sed -i "s#@RUN@#$work#g" "$f"; done
 find "$work" -type f | sort > "$run/files-before"
 
-# The skills under test: <skills-dir> holds atm-coordinate/ and atm-implement/,
+# The skills under test: <skills-dir> holds the named or legacy pair,
 # either the source (crates/atm/assets/atm-skills, whose shared/ goes into each
 # skill, as `atm setup` installs it) or an installed skills folder. They load
 # as a throwaway plugin, outside the working directory, and the prompt calls
@@ -48,7 +64,7 @@ plugin=$run/plugin
 mkdir -p "$plugin/.claude-plugin"
 printf '{"name": "atm-skills", "version": "0.0.0", "description": "atm skills"}\n' \
     > "$plugin/.claude-plugin/plugin.json"
-for s in atm-coordinate atm-implement; do
+for s in "${skill_pair[@]}"; do
     [ -f "$skills/$s/SKILL.md" ] || { echo "run.sh: no $s/SKILL.md in $skills" >&2; rm -rf "$run"; exit 64; }
     mkdir -p "$plugin/skills/$s"
     cp -R "$skills/$s/." "$plugin/skills/$s/"
@@ -72,10 +88,23 @@ printf '{"enabledPlugins": {"atm@agent-tmux-manager": false, "hindsight-memory@h
 own_pane=$(jq -r '.own_pane // "%3"' "$run/atm/scenario.json" 2>/dev/null || echo %3)
 # The prompt is prompt.md after its settings block.
 prompt=$(awk 'n >= 2 { print; next } /^---$/ { n++ }' "$case_dir/prompt.md" | sed -e '/./,$!d' -e "s#@RUN@#$work#g" \
-    -e 's#^/\(atm-coordinate\|atm-implement\)\b#/atm-skills:\1#')
+    -e 's#^/\(atm-coordinate\|atm-implement\|atm-member\|atm-lead\)\b#/atm-skills:\1#')
 node_bin=$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/node)")
 
 start=$(date +%s%N)
+if [ -n "$named_driver" ]; then
+    # No model executable lookup, personal configuration, provider credentials,
+    # or outside PATH in the fixture driver. It emits a synthetic transcript.
+    mkdir -p "$run/home" "$run/state" "$run/config" "$run/data"
+    (
+        cd "$work" && env -i HOME="$run/home" XDG_CONFIG_HOME="$run/config" \
+            XDG_STATE_HOME="$run/state" XDG_DATA_HOME="$run/data" SHELL=/bin/sh \
+            PATH="$run/bin:/usr/bin:/bin" TMPDIR="$run/tmp" TMUX_TMPDIR="$run/tmux" \
+            TMUX_PANE="$own_pane" ATM_SOCKET="$run/s/atm.sock" ATM_STATE_DIR="$run/state" \
+            ATM_TMUX_SOCKET=atm-decisions-none timeout 60 "$named_driver" "$prompt" "$plugin/skills" < /dev/null
+    ) > "$out/transcript.jsonl" 2> "$out/stderr.txt"
+    rc=$?
+else
 (
     cd "$work" && env -i HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${USER:-$(id -un)}" \
         LANG="${LANG:-C.UTF-8}" TERM=xterm-256color SHELL=/bin/bash \
@@ -88,6 +117,7 @@ start=$(date +%s%N)
         --no-session-persistence --max-turns 40 < /dev/null
 ) > "$out/transcript.jsonl" 2> "$out/stderr.txt"
 rc=$?
+fi
 end=$(date +%s%N)
 
 # Stop anything the run left behind (a background atm-wait, a stray daemon).

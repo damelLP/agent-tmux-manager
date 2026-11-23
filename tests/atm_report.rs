@@ -196,6 +196,57 @@ async fn report_matches_the_text_fixture_and_preserves_raw_json() {
     assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), value);
     assert!(!String::from_utf8(out.stdout).unwrap().contains('\u{009b}'));
 }
+// Break caught: omitting or recomputing department rows, unsafe labels, changed
+// legacy sections, a department subtotal, or typed re-serialization in JSON mode.
+#[tokio::test]
+async fn report_renders_department_costs_after_projects_and_preserves_json() {
+    let mut value = fixture();
+    value["departments"] = json!([
+        {"id":"tools","title":"Agent tools","cost":{"microdollars":300000},"cost_unknown_tasks":2,"future":[null]},
+        {"id":"zero","title":"Zero\n\u{001b} title","cost":{"microdollars":0},"cost_unknown_tasks":0},
+        {"id":"empty","title":"Nobody","cost":null,"cost_unknown_tasks":0},
+        {"id":"unpriced","title":"Unpriced","cost":null,"cost_unknown_tasks":2}
+    ]);
+    value["warning"] =
+        json!("department report may be incomplete: bad\u{001b}[31m\nspoof\u{009b}.toml");
+    const ROWS: &str = r"  Agent tools (tools): $0.30 harness-reported (2 tasks with unknown cost)
+  Zero\n\u{1b} title (zero): $0.00 harness-reported
+  Nobody (empty): no costed tasks in view
+  Unpriced (unpriced): unknown (2 tasks with unknown cost)
+";
+    const WARN: &str = r"  Warning: department report may be incomplete: bad\u{1b}[31m\nspoof\u{9b}.toml
+";
+    let out = result(&["report"], value.clone()).await;
+    success(&out);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text,
+        TEXT.replacen(
+            "Cost is a lower bound;",
+            &format!("\nDepartments:\n{ROWS}{WARN}Cost is a lower bound;"),
+            1
+        )
+    );
+    assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+
+    let out = result(&["report", "-f", "json"], value.clone()).await;
+    success(&out);
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), value);
+    assert!(!String::from_utf8(out.stdout).unwrap().contains('\u{009b}'));
+
+    value.as_object_mut().unwrap().remove("departments");
+    let out = result(&["report"], value).await;
+    success(&out);
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        TEXT.replacen(
+            "Cost is a lower bound;",
+            &format!("\nDepartments:\n{WARN}Cost is a lower bound;"),
+            1
+        )
+    );
+}
+
 // Break caught: caller identity/cwd determines a local project or an unbound caller is refused.
 #[tokio::test]
 async fn report_sends_exact_filters_with_or_without_a_named_pane() {

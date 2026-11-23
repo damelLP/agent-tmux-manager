@@ -26,6 +26,9 @@ pub struct PaneSession {
     /// The agent process, when the row tracks one. In-process child rows and
     /// rows registered without a process have none.
     pub pid: Option<u32>,
+    /// `pid`'s start in clock ticks since boot (`/proc/<pid>/stat` field 22),
+    /// recorded with it.
+    pub process_start: Option<u64>,
     /// The latest untagged `SessionStart` accepted for this row. `None` means
     /// the row has had none: a status line, discovery or another event made it.
     pub start: Option<AcceptedStart>,

@@ -151,7 +151,10 @@ fn request() -> Value {
 #[tokio::test]
 async fn decision_methods_request_read_resolve_and_repeat() {
     let rig = Rig::new().await;
-    assert_eq!(rig.request().await, json!({"decision_id":"d4"}));
+    assert_eq!(
+        rig.request().await,
+        json!({"decision_id":"d4","post_id":"m5"})
+    );
     let list = rig.call("decision.list", json!({}), None).await.unwrap();
     assert_eq!(list["pending_count"], 1);
     assert_eq!(list["provisional_count"], 0);
@@ -197,13 +200,23 @@ async fn decision_methods_request_read_resolve_and_repeat() {
         .unwrap();
     assert_eq!(audit.body["caller_pane"], "%9");
     assert_eq!(audit.body["by"], "owner");
-    let message = tokio::time::timeout(Duration::from_secs(60), answers.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // The question's row to the owner (U8) is the bridge's to write after the
+    // request returned, so it may come first: pass over it.
+    let message = loop {
+        let row = tokio::time::timeout(Duration::from_secs(60), answers.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if row.body["kind"] != "question" {
+            break row;
+        }
+    };
+    // U8: the answer is a reply's wake row: today's message plus `post`.
+    let mut body = message.body.clone();
+    assert!(body.as_object_mut().unwrap().remove("post").is_some());
     assert_eq!(
-        message.body,
+        body,
         json!({"from":"system","to":"project/worker","kind":"answer","body":"Decision d4 resolved: yes\nNote: owner note\nStanding rule: yes","attachments":[],"task":null})
     );
     let repeat = rig
@@ -212,7 +225,13 @@ async fn decision_methods_request_read_resolve_and_repeat() {
         .unwrap();
     assert_eq!(repeat["changed"], false);
     assert_eq!(repeat["decision"], answer["decision"]);
-    assert_eq!(rig.org.snapshot().await.unwrap().messages().count(), 1);
+    // One answer; the other row is the question's to the owner (U8).
+    let state = rig.org.snapshot().await.unwrap();
+    let kinds: Vec<_> = state.messages().map(|m| m.content.kind).collect();
+    assert_eq!(
+        kinds,
+        [atm_org::MessageKind::Question, atm_org::MessageKind::Answer]
+    );
     assert_eq!(
         rig.call("decision.list", json!({"count_only":true}), Some("%8"))
             .await
@@ -364,7 +383,10 @@ async fn unknown_decision_request_kind_is_invalid_params_without_writes() {
         assert_eq!(error.code, "invalid_params");
         assert!(error.message.contains("kind"));
     }
-    assert_eq!(rig.request().await, json!({"decision_id":"d4"}));
+    assert_eq!(
+        rig.request().await,
+        json!({"decision_id":"d4","post_id":"m5"})
+    );
     rig.stop().await;
 }
 
@@ -502,15 +524,17 @@ async fn decision_lists_count_all_pages_and_keep_provisional_answers_visible() {
     let page = rig.call("decision.list", json!({}), None).await.unwrap();
     assert_eq!(page["decisions"].as_array().unwrap().len(), 100);
     assert_eq!(page["pending_count"], 101);
+    // U8: each request is three records: the decision, its question post and
+    // the owner's row of it.
     assert_eq!(page["decisions"][0]["id"], "d4");
-    assert_eq!(page["decisions"][99]["id"], "d103");
-    assert_eq!(page["next_after"], "d103");
+    assert_eq!(page["decisions"][99]["id"], "d301");
+    assert_eq!(page["next_after"], "d301");
     let tail = rig
-        .call("decision.list", json!({"after":"d103"}), None)
+        .call("decision.list", json!({"after":"d301"}), None)
         .await
         .unwrap();
     assert_eq!(tail["decisions"].as_array().unwrap().len(), 1);
-    assert_eq!(tail["decisions"][0]["id"], "d104");
+    assert_eq!(tail["decisions"][0]["id"], "d304");
     assert_eq!(tail["next_after"], Value::Null);
     rig.org
         .execute(
@@ -543,13 +567,28 @@ async fn decision_lists_count_all_pages_and_keep_provisional_answers_visible() {
         .await
         .unwrap();
     assert_eq!(answer["decision"]["status"], "overruled");
-    let message = tokio::time::timeout(Duration::from_secs(60), answers.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // The take's own notice, and question rows to the owner, may still arrive
+    // first: wait for the answer.
+    let message = loop {
+        let row = tokio::time::timeout(Duration::from_secs(60), answers.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if row.body["kind"] != "question"
+            && !row.body["body"]
+                .as_str()
+                .unwrap()
+                .starts_with("Decision d4 taken provisionally")
+        {
+            break row;
+        }
+    };
+    // U8: the answer is a reply's wake row: today's message plus `post`.
+    let mut body = message.body.clone();
+    assert!(body.as_object_mut().unwrap().remove("post").is_some());
     assert_eq!(
-        message.body,
+        body,
         json!({"from":"system","to":"project/worker","kind":"answer","body":"Decision d4 overruled: no\nStanding rule: no","attachments":[],"task":null})
     );
     assert_eq!(
@@ -561,5 +600,67 @@ async fn decision_lists_count_all_pages_and_keep_provisional_answers_visible() {
             .len(),
         1
     );
+    rig.stop().await;
+}
+
+// U8 (design 12): a decision and its question post name each other. Break
+// caught: rows without the link, a link to the wrong post or channel, or a
+// link only on some methods.
+#[tokio::test]
+async fn decision_request_returns_its_question_post_and_rows_link_it() {
+    let rig = Rig::new().await;
+    let made = rig.request().await;
+    let post = made["post_id"].as_str().unwrap().to_owned();
+    // `project` has no lead: the question is in the asker's DM with the owner.
+    let channel = "project/worker+owner";
+    let state = rig.org.snapshot().await.unwrap();
+    let asked = atm_org::channel_query::post(&state, post.parse().unwrap()).unwrap();
+    assert_eq!(asked.content.channel.to_string(), channel);
+    let linked = |row: &Value| {
+        assert_eq!(row["post_id"], post, "{row}");
+        assert_eq!(row["channel"], channel, "{row}");
+    };
+    linked(&rig.call("decision.list", json!({}), None).await.unwrap()["decisions"][0]);
+    linked(
+        &rig.call("decision.get", json!({"id":"d4"}), None)
+            .await
+            .unwrap()["decision"],
+    );
+    linked(
+        &rig.call(
+            "decision.withdraw",
+            json!({"id":"d4","reason":"not needed"}),
+            Some("%7"),
+        )
+        .await
+        .unwrap()["decision"],
+    );
+    let next = rig.request().await;
+    let resolved = rig
+        .call(
+            "decision.resolve",
+            json!({"id":next["decision_id"],"option":"yes"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved["decision"]["post_id"], next["post_id"]);
+    assert_eq!(resolved["decision"]["channel"], channel);
+    rig.stop().await;
+}
+
+// The bridge relays the owner's button as a call with no pane (W0). Break
+// caught: such a caller treated as anyone but the owner.
+#[tokio::test]
+async fn decision_resolve_from_a_socket_without_a_pane_is_the_owners_answer() {
+    let rig = Rig::new().await;
+    rig.request().await;
+    let answer = rig
+        .call("decision.resolve", json!({"id":"d4","option":"no"}), None)
+        .await
+        .unwrap();
+    assert_eq!(answer["changed"], true);
+    assert_eq!(answer["decision"]["status"], "resolved");
+    assert_eq!(answer["decision"]["resolution"]["by"], "owner");
     rig.stop().await;
 }

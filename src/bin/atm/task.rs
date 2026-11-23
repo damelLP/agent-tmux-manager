@@ -14,7 +14,10 @@ use atmd::org::tasks::{
 use clap::{Args, Subcommand};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::{io::Write, time::Duration};
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
 
 const MUTATION_BUDGET: Duration = Duration::from_secs(35);
 const READ_BUDGET: Duration = Duration::from_secs(15);
@@ -395,6 +398,23 @@ fn render(method: &str, raw: &Value, out: &mut impl Write) -> Result<()> {
                     "unchanged"
                 }
             )?;
+            if let Some(sources) = raw
+                .get("default_budget_from")
+                .filter(|_| method == "task.create")
+            {
+                let fields: Vec<_> = ["turns", "cost"]
+                    .into_iter()
+                    .filter_map(|key| {
+                        Some(format!(
+                            "{key}={}",
+                            escaped(sources.get(key)?.as_str()?, false)
+                        ))
+                    })
+                    .collect();
+                if !fields.is_empty() {
+                    writeln!(out, "budget default from: {}", fields.join(", "))?;
+                }
+            }
             if let Some(notification) = raw.get("notification").filter(|value| !value.is_null()) {
                 let status = notification
                     .get("status")
@@ -477,6 +497,13 @@ pub async fn cmd_task(args: TaskArgs) -> Result<()> {
                     anyhow::anyhow!("{diagnostic}; task may have committed; inspect atm task list and atm task get <id> before retrying")
                 }
             })?;
+            if let Some(warning) = raw
+                .get("warning")
+                .filter(|_| method == "task.create")
+                .and_then(Value::as_str)
+            {
+                let _ = writeln!(io::stderr().lock(), "Warning: {}", escaped(warning, false));
+            }
             Ok(out.write_all(&text)?)
         }
     })

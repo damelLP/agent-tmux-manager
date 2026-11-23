@@ -12,7 +12,7 @@ mod tests;
 
 use std::{collections::VecDeque, future::Future, sync::Arc};
 
-use atm_org::{OrgCommand, OrgState};
+use atm_org::{ChannelCommand, OrgCommand, OrgState};
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -135,6 +135,15 @@ where
             .map(|agent| agent.id.clone())
             .or(summary.agent_id);
         bound = OrgCommand::RecordSummary(summary);
+        &bound
+    } else if let OrgCommand::Channel(ChannelCommand::Mutate { post, change, .. }) = command {
+        // Resolve on the writer, so a queued mutation cannot use a former
+        // binding sampled before a lifecycle change.
+        bound = OrgCommand::Channel(ChannelCommand::Mutate {
+            post: *post,
+            actor: super::message_inbox::address_for_pane(state, caller_pane),
+            change: change.clone(),
+        });
         &bound
     } else {
         command

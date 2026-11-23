@@ -61,8 +61,8 @@
 //! | Queued retry before logged failed_at + retry delay | RetryAt; no new failure event |
 //! | Queued, agent stuck/down, whatever the focus | Blocked(AgentUnavailable); ready resumes |
 //! | Queued, owner focused (unknown focus is focused) | Wait(OwnerFocused), notice, no timeout |
-//! | Queued, agent starting/clearing, positively running turn | Wait(SessionBusy); no readiness clock |
-//! | Queued, agent starting/clearing, no running evidence | Wait(AgentNotReady); Blocked(AgentNotReadyTimeout) after the current not-ready window + readiness_timeout |
+//! | Queued, agent starting/clearing, positively running turn | Wait(AgentStartingBusy when starting, SessionBusy when clearing); no readiness clock |
+//! | Queued, agent starting/clearing, no running evidence | Wait(InputNotEmpty/CopyMode/DialogOpen when the last look shows that, else AgentNotReady); Blocked(AgentNotReadyTimeout) after the current not-ready window + readiness_timeout; never a hold |
 //! | Queued, another message delivering or retry-pending for recipient | Wait(OtherDelivery), unbounded; predecessor's notice lists the queue |
 //! | Queued, pane unknown / gone | Bounded unknown hold / Wait grace then Fail |
 //! | Queued, positively running turn on a Ready agent | Wait(SessionBusy), regardless of row age or send_now |
@@ -88,7 +88,7 @@
 //! |---|---|
 //! | Wait CopyMode/DialogOpen/UnknownGuards/InputNotEmpty/InputUnknown | Start/continue |
 //! | Wait IdleStabilizing/InputStabilizing/PaneGoneGrace | Start/continue |
-//! | Wait OwnerFocused/SessionBusy/AgentNotReady/OtherDelivery | Reset |
+//! | Wait OwnerFocused/SessionBusy/AgentNotReady/OtherDelivery, or a Starting/Clearing agent's Wait InputNotEmpty/CopyMode/DialogOpen/AgentStartingBusy (the Starting arm's) | Reset |
 //! | PasteNow | Reset on serialized consumption; reset pane readiness after paste |
 //! | Blocked AgentUnavailable/AgentNotReadyTimeout | Reset (agent state) |
 //! | Blocked (any other reason) | Retain a running hold; never start or restart one |
@@ -427,6 +427,23 @@ pub fn track_hold(live: &mut RecipientLiveView, step: &DeliveryStep, now: DateTi
             live.hold_since = None;
             live.stale_blocker_since = None;
         }
+        // The Starting arm's waits are on the agent, whatever blocker they name;
+        // a guard's own hold (an unknown pane, say) keeps its clock.
+        DeliveryStep::Wait {
+            reason:
+                WaitReason::InputNotEmpty
+                | WaitReason::CopyMode
+                | WaitReason::DialogOpen
+                | WaitReason::AgentStartingBusy,
+            ..
+        } if matches!(
+            live.agent_status,
+            AgentStatus::Starting | AgentStatus::Clearing
+        ) =>
+        {
+            live.hold_since = None;
+            live.stale_blocker_since = None;
+        }
         DeliveryStep::Wait { .. } => {
             live.hold_since.get_or_insert(now);
         }
@@ -518,7 +535,7 @@ pub enum WaitReason {
     DialogOpen,
     #[error("pane guards are unknown")]
     UnknownGuards,
-    #[error("input contains a draft")]
+    #[error("input box holds unsent text")]
     InputNotEmpty,
     #[error("empty input with no running turn is not established")]
     InputUnknown,
@@ -528,6 +545,9 @@ pub enum WaitReason {
     InputStabilizing,
     #[error("session is busy")]
     SessionBusy,
+    /// A Starting agent whose screen shows a running turn.
+    #[error("recipient agent is starting; its session is busy")]
+    AgentStartingBusy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -737,10 +757,20 @@ pub fn next_delivery(
     match live.agent_status {
         AgentStatus::Starting | AgentStatus::Clearing => {
             if live.running_turn_since.is_some() {
-                return poll(WaitReason::SessionBusy);
+                return poll(match live.agent_status {
+                    AgentStatus::Starting => WaitReason::AgentStartingBusy,
+                    _ => WaitReason::SessionBusy,
+                });
             }
+            // Name what the last look shows; the deadline stays the agent's.
+            let reason = match (live.input_line, live.copy_mode, live.dialog_open) {
+                (InputLine::NonEmpty, _, _) => WaitReason::InputNotEmpty,
+                (_, Some(true), _) => WaitReason::CopyMode,
+                (_, _, Some(true)) => WaitReason::DialogOpen,
+                _ => WaitReason::AgentNotReady,
+            };
             return bounded_wait(
-                WaitReason::AgentNotReady,
+                reason,
                 FailureReason::AgentNotReadyTimeout,
                 live.agent_not_ready_since,
                 None,
@@ -963,6 +993,7 @@ mod tests {
                     body: "hello".into(),
                     attachments: vec![],
                     task: None,
+                    post: None,
                 }),
                 time(0),
             );
@@ -1115,6 +1146,39 @@ mod tests {
         );
         assert_eq!(live, before);
         assert_eq!(previous, Some(WaitReason::InputNotEmpty));
+    }
+
+    // Review M1 (s3-stuckseat). Break: the Starting/Clearing hold reset also
+    // swallows a wait the Starting arm did not return, so a Delivering
+    // message whose pane cannot be observed while its seat clears never
+    // blocks (the deadline moves forward on every step).
+    #[test]
+    fn unknown_pane_of_a_delivering_message_still_blocks_while_the_seat_clears() {
+        for status in [
+            AgentStatus::Ready,
+            AgentStatus::Starting,
+            AgentStatus::Clearing,
+        ] {
+            let mut h = History::new(false);
+            h.attempt(1, 0);
+            let mut live = ready();
+            (live.hold_since, live.pane, live.agent_status) = (None, PaneLiveness::Unknown, status);
+            live.agent_not_ready_since = Some(time(1));
+            let mut blocked_at = None;
+            for t in 1..=600 {
+                let step = h.step(&live, t);
+                if step
+                    == (DeliveryStep::Blocked {
+                        reason: FailureReason::ReadinessTimeout,
+                    })
+                {
+                    blocked_at = Some(t);
+                    break;
+                }
+                track_hold(&mut live, &step, time(t));
+            }
+            assert_eq!(blocked_at, Some(121), "{status:?}");
+        }
     }
 
     #[test]
@@ -1340,9 +1404,15 @@ mod tests {
                         status_since: time(0),
                         last_event_at: time(0),
                     });
+                    // A Starting or Clearing agent says so as well (s3-stuckseat Q3).
+                    let busy = if status == AgentStatus::Starting {
+                        WaitReason::AgentStartingBusy
+                    } else {
+                        WaitReason::SessionBusy
+                    };
                     for now in [0, 120, 1800, 86400] {
                         let step = h.step(&live, now);
-                        wait(step.clone(), WaitReason::SessionBusy);
+                        wait(step.clone(), busy);
                         track_hold(&mut live, &step, time(now));
                         assert_eq!(live.hold_since, None);
                     }
@@ -1410,6 +1480,72 @@ mod tests {
             live.agent_not_ready_since = Some(time(100100));
             wait(h.step(&live, 100000), WaitReason::AgentNotReady);
         }
+    }
+
+    // s3-stuckseat case 2. Break: a Starting or Clearing agent's wait says
+    // "starting or clearing" when the scheduler's own look shows the real
+    // blocker, or the shown blocker changes the not-ready deadline or starts
+    // a hold clock that outlives the Starting stretch.
+    #[test]
+    fn starting_agent_waits_with_the_blocker_it_shows() {
+        let h = History::new(false);
+        for status in [AgentStatus::Starting, AgentStatus::Clearing] {
+            for (reason, set) in [
+                (WaitReason::InputNotEmpty, 0),
+                (WaitReason::CopyMode, 1),
+                (WaitReason::DialogOpen, 2),
+                (WaitReason::AgentNotReady, 3),
+            ] {
+                let mut live = ready();
+                live.agent_status = status;
+                live.agent_not_ready_since = Some(time(0));
+                match set {
+                    0 => live.input_line = InputLine::NonEmpty,
+                    1 => live.copy_mode = Some(true),
+                    2 => live.dialog_open = Some(true),
+                    _ => live.input_line = InputLine::Unknown,
+                }
+                let step = h.step(&live, 119);
+                assert!(
+                    wait(step.clone(), reason) <= time(120),
+                    "{status:?} {reason:?}"
+                );
+                track_hold(&mut live, &step, time(119));
+                assert_eq!(live.hold_since, None, "{status:?} {reason:?}");
+                assert_eq!(
+                    h.step(&live, 120),
+                    DeliveryStep::Blocked {
+                        reason: FailureReason::AgentNotReadyTimeout
+                    },
+                    "{status:?} {reason:?}"
+                );
+            }
+        }
+    }
+
+    // Q3. Break: a starting agent with a running turn reads as a plain busy
+    // session, which hid "starting" from the person waiting.
+    #[test]
+    fn starting_agent_with_a_running_turn_says_both() {
+        let h = History::new(false);
+        let mut live = ready();
+        live.agent_status = AgentStatus::Starting;
+        live.running_turn_since = Some(time(0));
+        let step = h.step(&live, 10);
+        wait(step.clone(), WaitReason::AgentStartingBusy);
+        assert_eq!(
+            WaitReason::AgentStartingBusy.to_string(),
+            "recipient agent is starting; its session is busy"
+        );
+        assert_eq!(
+            WaitReason::InputNotEmpty.to_string(),
+            "input box holds unsent text"
+        );
+        track_hold(&mut live, &step, time(10));
+        assert_eq!(live.hold_since, None);
+        // Review NIT 1: a busy seat being cleared is not starting.
+        live.agent_status = AgentStatus::Clearing;
+        wait(h.step(&live, 10), WaitReason::SessionBusy);
     }
 
     #[test]

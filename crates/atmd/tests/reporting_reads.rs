@@ -772,11 +772,18 @@ async fn reporting_read_grants_never_grant_mutations() {
         )
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(60), notice.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // The take's notice to the asker. U8: each question's row to the owner is
+    // written by the bridge after its request returned, in an earlier pass.
+    loop {
+        let row = tokio::time::timeout(Duration::from_secs(60), notice.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if row.body["to"] == "alpha/worker" {
+            break;
+        }
+    }
     for id in [&pending, &provisional] {
         rig.ok("gamma/chief", "decision.get", json!({"id":id}))
             .await;
@@ -809,11 +816,17 @@ async fn reporting_read_grants_never_grant_mutations() {
         json!({"id":provisional,"option":"no","note":"Full owner answer"}),
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(60), answer.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // The answer to the asker (U8: question rows to the owner pass over).
+    loop {
+        let row = tokio::time::timeout(Duration::from_secs(60), answer.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if row.body["to"] == "alpha/worker" {
+            break;
+        }
+    }
     let got = rig
         .ok("gamma/chief", "decision.get", json!({"id":provisional}))
         .await;
@@ -1138,6 +1151,7 @@ async fn history_send(org: &OrgHandle, from: &str, to: &str, body: &str) -> Stri
                 body: body.into(),
                 attachments: vec!["SECRET attachment".into()],
                 task: Some("SECRET task".parse().unwrap()),
+                post: None,
             }),
             chrono::Utc::now(),
         )

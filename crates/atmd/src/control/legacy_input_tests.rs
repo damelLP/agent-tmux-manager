@@ -4,7 +4,7 @@ mod deadline_tests;
 #[path = "legacy_wait_tests.rs"]
 mod wait_tests;
 use super::*;
-use crate::control::reservation::*;
+use crate::control::{legacy_survey_test::mock_shell, reservation::*};
 use atm_core::{SessionDomain, SessionId, SessionStatus};
 use atm_tmux::{mock::MockCall, MockTmuxClient};
 use std::{future::Future, task::Poll};
@@ -113,6 +113,96 @@ fn untagged(mock: &MockTmuxClient, pane: &str) {
         "ATM-PANE-v1\t{pane}\tprivate\t0\t123\t80\t24\t1\t0\t0\t1\t0\t0\n"
     ));
     mock.set_next_raw_output("");
+}
+
+#[tokio::test]
+async fn legacy_send_checks_the_fresh_survey_frame_before_paste_or_enter() {
+    use crate::control::legacy_survey_test::{fixture, mock_viewport};
+    let (_dir, org, cancel) = healthy().await;
+    let mock = MockTmuxClient::new();
+    let registry = crate::registry::spawn_registry();
+    registry
+        .register(SessionDomain {
+            id: SessionId::new("recorded-session"),
+            harness: atm_core::Harness::ClaudeCode,
+            tmux_pane: Some("%2".into()),
+            status: SessionStatus::Idle,
+            ..SessionDomain::default()
+        })
+        .await
+        .unwrap();
+    let (control, actor) = spawn_control(Box::new(mock.clone()), registry, org, cancel.clone());
+    let survey = fixture();
+    let digit_draft = survey.replacen("❯\u{a0} ", "❯\u{a0}0", 1);
+    assert_ne!(digit_draft, survey);
+    // An unrecognized notice between the survey and the editor border is a known fail-open.
+    let unknown_notice = survey.replace("✔ Update installed", "Unrecognized notice");
+    let no_completion = survey.replace("Crunched for 27s · done 12:15", "No completion recorded");
+    let busy = survey.replace(
+        "(shift+tab to cycle)",
+        "(shift+tab to cycle) · esc to interrupt",
+    );
+    for (pane, frame, text, flag, refused) in [
+        ("%1", &survey, "0", Some(true), true),
+        ("%2", &survey, "1", Some(true), true),
+        ("%1", &survey, "１", Some(true), true),
+        ("%1", &survey, "&", Some(true), true),
+        ("%1", &survey, "4", Some(true), false),
+        ("%1", &survey, "1 test", Some(true), false),
+        ("%1", &survey, "1 test", Some(false), true),
+        ("%1", &survey, "1 test", None, true),
+        ("%1", &survey, "1 ", Some(true), true),
+        ("%1", &survey, "0\n", Some(true), true),
+        ("%1", &survey, "é\u{2003}", Some(true), true),
+        ("%1", &survey, "1 ", Some(false), true),
+        ("%1", &survey, "1 ", None, true),
+        ("%1", &digit_draft, "", Some(true), true),
+        ("%1", &no_completion, "1", Some(true), true),
+        ("%1", &busy, "1", Some(true), true),
+        ("%1", &unknown_notice, "1", Some(true), false),
+    ] {
+        mock.clear_calls();
+        mock.set_next_raw_output("0 1\t0\t0\n");
+        mock_viewport(&mock, pane, frame, flag);
+        let result = control.send(pane.into(), text.into()).await;
+        if refused {
+            let Err(error) = result else {
+                panic!("expected refusal for {text:?} with bracketed={flag:?}");
+            };
+            let error = crate::server::methods::control_error(error).0;
+            assert_eq!(error.code, "refused");
+            assert!(
+                error.message.contains("feedback survey"),
+                "{}",
+                error.message
+            );
+            assert!(input_calls(&mock).is_empty());
+        } else {
+            assert_eq!(result.unwrap(), pane);
+            assert_eq!(
+                input_calls(&mock),
+                [
+                    MockCall::PasteText {
+                        pane: pane.into(),
+                        text: text.into()
+                    },
+                    MockCall::SendKeys {
+                        pane: pane.into(),
+                        keys: "Enter".into()
+                    },
+                ]
+            );
+        }
+    }
+    // A malformed new observation is a read error, not a survey or a grant.
+    mock.clear_calls();
+    mock.set_next_raw_output("0 1\t0\t0\n");
+    mock.set_next_raw_output("malformed frame\n");
+    let err = control.send("%1".into(), "probe".into()).await.unwrap_err();
+    assert!(err.to_string().contains("invalid observation"), "{err}");
+    assert!(input_calls(&mock).is_empty());
+    cancel.cancel();
+    actor.await.unwrap();
 }
 
 #[tokio::test]
@@ -284,6 +374,7 @@ async fn reservation_other_raw_sends_and_spawn_wait_without_blocking_other_panes
                 .all(|c| matches!(c, MockCall::SendKeys { pane, .. } if pane == "%2")));
             mock.clear_calls();
             mock.set_next_raw_output("0 1");
+            mock_shell(&mock, "%1");
             release.send(()).unwrap();
             job.await.unwrap().unwrap();
             assert_eq!(send.await.unwrap().unwrap(), "%1");
@@ -375,6 +466,7 @@ async fn reservation_up_created_pane_parks_send_and_spawn_once_in_order() {
     barrier(&control).await;
     assert!(input_calls(&mock).is_empty());
     mock.set_next_raw_output("0 1");
+    mock_shell(&mock, "%9");
     release.send(()).unwrap();
     up.await.unwrap().unwrap();
     assert_eq!(send.await.unwrap().unwrap(), "%9");
@@ -463,6 +555,7 @@ async fn reservation_durable_clearing_and_excluded_rows_survive_actor_restart() 
         Err(ServiceError::Control(ControlError::NoSession { .. }))
     ));
     mock.set_next_raw_output("0 1");
+    mock_shell(&mock, "%1");
     assert_eq!(
         control.send("%1".into(), "current".into()).await.unwrap(),
         "%1"
@@ -539,6 +632,7 @@ async fn reservation_disabled_org_unknown_or_tagged_fails_closed_but_untagged_se
     assert!(input_calls(&mock).is_empty());
     untagged(&mock, "%1");
     mock.set_next_raw_output("0 1");
+    mock_shell(&mock, "%1");
     assert_eq!(
         control.send("%1".into(), "safe".into()).await.unwrap(),
         "%1"

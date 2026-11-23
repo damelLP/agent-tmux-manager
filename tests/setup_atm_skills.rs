@@ -209,6 +209,14 @@ fn setup_replaces_atms_copy_and_keeps_other_skills() {
             fs::write(skills.join(skill).join("SKILL.md"), "edited").unwrap();
             fs::write(skills.join(skill).join("stale.md"), "old").unwrap();
         }
+        for skill in ["atm-lead", "atm-member"] {
+            fs::write(skills.join(skill).join("SKILL.md"), "Run atm msg ack m41").unwrap();
+            fs::write(
+                skills.join(skill).join("references/atm-named-agents.md"),
+                "atm msg send --to project/lead",
+            )
+            .unwrap();
+        }
         kept.push(add_other_skills(&skills));
     }
 
@@ -218,6 +226,20 @@ fn setup_replaces_atms_copy_and_keeps_other_skills() {
         let skills = home.join(skills);
         assert_installed(&skills);
         assert_eq!(others(&skills), kept, "{}", skills.display());
+        for skill in ["atm-lead", "atm-member"] {
+            let entry = fs::read_to_string(skills.join(skill).join("SKILL.md")).unwrap();
+            let named =
+                fs::read_to_string(skills.join(skill).join("references/atm-named-agents.md"))
+                    .unwrap();
+            assert!(
+                entry.contains("atm ack mN"),
+                "{skill} still uses the old ack recipe"
+            );
+            assert!(
+                named.contains("atm post --reply m40"),
+                "{skill} has no installed thread recipe"
+            );
+        }
     }
 }
 

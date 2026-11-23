@@ -97,6 +97,7 @@ fn validate_withdraw(p: &WithdrawParams) -> Result<(), DecisionError> {
 }
 fn parse_resolve(params: serde_json::Value) -> Result<ResolveParams, MethodError> {
     if params.get("relay").and_then(serde_json::Value::as_bool) == Some(true)
+        && params.get("confirm").and_then(serde_json::Value::as_bool) != Some(true)
         && ["note", "standing_rule"]
             .iter()
             .any(|key| params.get(key).is_some())
@@ -193,6 +194,29 @@ mod relay_tests {
         .is_ok());
     }
 
+    // Break caught: confirm must not leak into old calls by default, silently
+    // parse a string flag, or exempt plain relay from the key-presence check.
+    #[test]
+    fn relay_confirm_params_are_additive_and_strict() {
+        let plain = json!({"id":"d3","option":"yes","note":null,"standing_rule":false});
+        let mut explicit_false = plain.clone();
+        explicit_false["confirm"] = json!(false);
+        assert_eq!(
+            serde_json::to_value(parse_resolve(explicit_false).unwrap()).unwrap(),
+            plain
+        );
+        let confirm = json!({"id":"d3","option":"yes","note":"spoken","standing_rule":false,"relay":true,"confirm":true});
+        assert_eq!(
+            serde_json::to_value(parse_resolve(confirm.clone()).unwrap()).unwrap(),
+            confirm
+        );
+        for bad in [json!("true"), Value::Null, json!(1), json!(false)] {
+            let mut params = confirm.clone();
+            params["confirm"] = bad;
+            assert_eq!(parse_resolve(params).unwrap_err().0.code, "invalid_params");
+        }
+    }
+
     // Break caught: an internal typed caller bypasses the raw schema and enters
     // rule-file or final-answer work. Reject before even awaiting the service.
     #[tokio::test]
@@ -204,6 +228,7 @@ mod relay_tests {
                 note,
                 standing_rule,
                 relay: true,
+                confirm: false,
             };
             let error = DecisionHandle::disabled("fixture")
                 .resolve(

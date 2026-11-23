@@ -1011,6 +1011,7 @@ fn live_history(high_water: u64) -> crate::org::message_history::MessageHistoryH
             body: "brief".into(),
             attachments: vec![],
             task: None,
+            post: None,
         }),
     ];
     for (seq, event) in (1..).zip(events) {
@@ -1081,6 +1082,7 @@ async fn each_tapped_event_reaches_history_with_its_own_receive_time() {
             }),
             presence: PanePresence::Alive,
             facts,
+            inbox_paste: false,
             copy_mode: Some(false),
             focused: Some(false),
         },

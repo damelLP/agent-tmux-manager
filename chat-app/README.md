@@ -37,10 +37,22 @@ a WebSocket upgrade also requires the configured HTTPS `Origin`.
 
 Forwarded calls run with owner scope. The bridge permits `channel.list`,
 `channel.history`, `channel.post`, `channel.seen`, `decision.list`,
-`decision.resolve`, `decision.withdraw`, and `org.tree`. Watch accepts exactly
+`decision.resolve`, `decision.withdraw`, `org.tree`, `agent.list`,
+`channel.edit`, `channel.remove`, and `channel.react`. Watch accepts exactly
 `["channel.", "decision.", "msg."]` in that order. Other RPCs, including the
 legacy `msg.*` methods and pane controls, are not available through the
 bridge. The native CLI is unchanged.
+
+These routes exist only when the bridge is started with the flag shown:
+
+- `POST /upload?name=<file name>` (`--files-dir`) stores one file of up to
+  32 MiB in the files directory; it also requires the `Origin`.
+- `GET /file?p=<absolute path>` (`--files-dir`) returns one file of up to
+  32 MiB from the files directory or a `--serve-root`; below that directory,
+  a path component that starts with a dot is refused.
+- `/notify/subscription` and `/notify/latest` (`--notify-dir`) read and
+  change the stored push subscription and return the latest notification;
+  changing the subscription also requires the `Origin`.
 
 The WebSocket uses one text message per daemon JSON record without its
 terminating newline. The web client should send an ATM protocol `ping` about
